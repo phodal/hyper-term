@@ -83,14 +83,33 @@ struct PendingToolCall {
 pub struct McpAgentServer {
     driver_id: Uuid,
     lifecycle: McpLifecycle,
+    enabled_tools: Vec<McpToolClass>,
     pending: HashMap<ExternalRequestId, PendingToolCall>,
 }
 
 impl McpAgentServer {
     pub fn new(driver_id: Uuid) -> Self {
+        Self::with_tools(
+            driver_id,
+            [
+                McpToolClass::GenUiCompile,
+                McpToolClass::DenoLspQuery,
+                McpToolClass::DiffReview,
+            ],
+        )
+    }
+
+    pub fn with_tools(driver_id: Uuid, tools: impl IntoIterator<Item = McpToolClass>) -> Self {
+        let mut enabled_tools = Vec::new();
+        for tool in tools {
+            if !enabled_tools.contains(&tool) {
+                enabled_tools.push(tool);
+            }
+        }
         Self {
             driver_id,
             lifecycle: McpLifecycle::New,
+            enabled_tools,
             pending: HashMap::new(),
         }
     }
@@ -311,7 +330,7 @@ impl McpAgentServer {
         }
         Ok(Some(McpServerAction::Response(rpc_result(
             id,
-            json!({"tools": tool_definitions()}),
+            json!({"tools": tool_definitions(&self.enabled_tools)}),
         ))))
     }
 
@@ -347,6 +366,13 @@ impl McpAgentServer {
                 "unknown Hyper Term tool",
             ))));
         };
+        if !self.enabled_tools.contains(&profile.class) {
+            return Ok(Some(McpServerAction::Response(rpc_error(
+                id,
+                -32602,
+                "tool is not enabled for this Agent session",
+            ))));
+        }
         let arguments = params
             .get("arguments")
             .cloned()
@@ -454,8 +480,10 @@ fn tool_profile(name: &str) -> Option<ToolProfile> {
     }
 }
 
-fn tool_definitions() -> Vec<Value> {
-    vec![
+fn tool_definitions(enabled: &[McpToolClass]) -> Vec<Value> {
+    [
+        (
+            McpToolClass::GenUiCompile,
         json!({
             "name": "hyper_term.genui.compile",
             "title": "Compile GenUI",
@@ -470,7 +498,9 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             },
             "execution": {"taskSupport": "forbidden"}
-        }),
+        })),
+        (
+            McpToolClass::DenoLspQuery,
         json!({
             "name": "hyper_term.lsp.query",
             "title": "Query Deno LSP",
@@ -495,7 +525,9 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             },
             "execution": {"taskSupport": "forbidden"}
-        }),
+        })),
+        (
+            McpToolClass::DiffReview,
         json!({
             "name": "hyper_term.diff.review",
             "title": "Build Diff Review",
@@ -511,8 +543,11 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             },
             "execution": {"taskSupport": "forbidden"}
-        }),
+        })),
     ]
+    .into_iter()
+    .filter_map(|(class, definition)| enabled.contains(&class).then_some(definition))
+    .collect()
 }
 
 fn validate_arguments(class: McpToolClass, arguments: &Value) -> Result<(), String> {
@@ -951,5 +986,52 @@ mod tests {
             };
             assert_eq!(response["result"][field], json!([]));
         }
+    }
+
+    #[test]
+    fn tool_catalog_reflects_the_executors_available_to_this_session() {
+        let mut server = McpAgentServer::with_tools(Uuid::nil(), [McpToolClass::DiffReview]);
+        server
+            .receive(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": MCP_PROTOCOL_VERSION}
+            }))
+            .unwrap();
+        server
+            .receive(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .unwrap();
+        let Some(McpServerAction::Response(list)) = server
+            .receive(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }))
+            .unwrap()
+        else {
+            panic!("expected tool list");
+        };
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(list["result"]["tools"][0]["name"], "hyper_term.diff.review");
+        let Some(McpServerAction::Response(disabled)) = server
+            .receive(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "hyper_term.lsp.query",
+                    "arguments": {"method": "textDocument/hover", "params": {}}
+                }
+            }))
+            .unwrap()
+        else {
+            panic!("expected disabled tool response");
+        };
+        assert_eq!(disabled["error"]["code"], -32602);
     }
 }

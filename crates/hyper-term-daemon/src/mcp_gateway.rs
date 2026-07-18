@@ -102,7 +102,7 @@ impl<'a, W: Write> McpGateway<'a, W> {
         Self {
             socket,
             output,
-            server: McpAgentServer::new(Uuid::new_v4()),
+            server: McpAgentServer::with_tools(Uuid::new_v4(), [McpToolClass::DiffReview]),
             task_id: None,
             pending: HashMap::new(),
         }
