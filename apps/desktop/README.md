@@ -4,21 +4,27 @@ This is the macOS-first Native SDK product shell. The default view is a normal
 Terminal; New Session explicitly offers Terminal or Agent mode.
 
 The native chrome, design tokens, mode selection, responsive layout, and Agent
-Block composition remain native. The terminal cell renderer is currently a
-child system WebView anchored into that layout. It connects directly to the
-authenticated loopback terminal plane; terminal bytes never cross the Native
-SDK JSON bridge, and Zig never spawns a shell.
+Block composition remain native. The terminal cell renderer is currently a child
+system WebView anchored into that layout. It connects directly to the
+authenticated loopback terminal plane; terminal bytes never cross the Native SDK
+JSON bridge, and Zig never spawns a shell.
 
-For a development launch, build `dist/terminal`, start `hyperd` with its default
-`127.0.0.1:47437` gateway, then provide the same token to the desktop process:
+For an integrated development launch, build the terminal and native renderer,
+then let the Rust desktop supervisor own daemon and renderer lifetime:
 
 ```sh
-HYPER_TERM_TERMINAL_URL='http://127.0.0.1:47437/?token=<32+ byte token>' native dev
+deno task build:terminal
+(cd apps/desktop && native build --release=fast)
+cargo run -p hyper-term-daemon --bin hyper-term-desktop -- \
+  --ui "$PWD/apps/desktop/zig-out/bin/hyper-term" \
+  --terminal-assets "$PWD/dist/terminal"
 ```
 
-Without that exact local URL the app keeps an honest disconnected Terminal
-placeholder. A future native cell-grid renderer can replace the WebView without
-changing the Rust PTY or reconnect protocol.
+The supervisor creates a per-launch gateway token, starts new login shells in
+the user home directory, and passes only the authenticated loopback URL to the
+Native renderer. Without that exact local URL the app keeps an honest
+disconnected Terminal placeholder. A future native cell-grid renderer can
+replace the WebView without changing the Rust PTY or reconnect protocol.
 
 ## Commands
 

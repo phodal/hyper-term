@@ -43,6 +43,9 @@ pub struct TerminalGatewayConfig {
     pub bind: SocketAddr,
     pub assets: PathBuf,
     pub token: String,
+    /// Authority-owned starting directory used when a trusted renderer does
+    /// not request an explicit directory for a new human shell.
+    pub default_cwd: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -96,6 +99,7 @@ struct GatewayRuntime {
     assets: Arc<PathBuf>,
     token: Arc<str>,
     origin: Arc<str>,
+    default_cwd: Option<PathBuf>,
     attachments: Arc<Mutex<HashMap<TerminalAttachmentId, Attachment>>>,
 }
 
@@ -196,6 +200,7 @@ pub async fn spawn_terminal_gateway(
         assets: Arc::new(assets),
         token: Arc::from(config.token),
         origin: Arc::from(format!("http://{address}")),
+        default_cwd: config.default_cwd,
         attachments: Arc::new(Mutex::new(HashMap::new())),
     };
     let router = Router::new()
@@ -251,12 +256,8 @@ async fn terminal_connection(mut socket: WebSocket, runtime: GatewayRuntime) {
             return;
         }
     };
-    let (attachment_id, after_sequence) = match &hello {
-        TerminalWebClientControl::Hello {
-            attachment_id,
-            after_sequence,
-            ..
-        } => (*attachment_id, *after_sequence),
+    let after_sequence = match &hello {
+        TerminalWebClientControl::Hello { after_sequence, .. } => *after_sequence,
         _ => unreachable!("receive_hello returns only hello"),
     };
     let active = match runtime.activate(hello) {
@@ -267,7 +268,6 @@ async fn terminal_connection(mut socket: WebSocket, runtime: GatewayRuntime) {
             return;
         }
     };
-    debug_assert!(attachment_id.is_none() || attachment_id == Some(active.attachment_id));
     let subscription = match runtime
         .daemon
         .terminal_subscription(active.terminal_id, after_sequence)
@@ -391,7 +391,9 @@ impl GatewayRuntime {
         }
 
         let attachment_id = TerminalAttachmentId::new();
-        let terminal_id = self.daemon.open_user_shell(cwd, size)?;
+        let terminal_id = self
+            .daemon
+            .open_user_shell(cwd.or_else(|| self.default_cwd.clone()), size)?;
         let client_id = ClientId::new();
         let (lease_id, _) = match self.daemon.acquire_input_lease(terminal_id, client_id) {
             Ok(lease) => lease,
@@ -741,6 +743,7 @@ mod tests {
                 bind: "127.0.0.1:0".parse().expect("socket"),
                 assets,
                 token: token.clone(),
+                default_cwd: Some(temporary.path().to_owned()),
             },
             daemon,
         )
@@ -763,11 +766,12 @@ mod tests {
             .headers_mut()
             .insert("origin", HeaderValue::from_str(&origin).expect("origin"));
         let (mut socket, _) = connect_async(request).await.expect("connect");
+        let stale_attachment_id = TerminalAttachmentId::new();
         socket
             .send(ClientMessage::Text(
                 serde_json::to_string(&TerminalWebClientControl::Hello {
                     protocol_version: TERMINAL_WEB_PROTOCOL_VERSION,
-                    attachment_id: None,
+                    attachment_id: Some(stale_attachment_id),
                     after_sequence: 0,
                     size: TerminalSize {
                         cols: 80,
@@ -775,7 +779,7 @@ mod tests {
                         pixel_width: 800,
                         pixel_height: 480,
                     },
-                    cwd: Some(temporary.path().to_owned()),
+                    cwd: None,
                 })
                 .expect("hello")
                 .into(),
@@ -783,7 +787,7 @@ mod tests {
             .await
             .expect("send hello");
 
-        let next_input_sequence = loop {
+        let (active_attachment_id, next_input_sequence) = loop {
             let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
                 .expect("ready timeout")
@@ -791,18 +795,21 @@ mod tests {
                 .expect("ready frame");
             if let ClientMessage::Text(json) = message
                 && let TerminalWebServerControl::Ready {
+                    attachment_id,
                     next_input_sequence,
                     ..
                 } = serde_json::from_str(&json).expect("ready control")
             {
-                break next_input_sequence;
+                break (attachment_id, next_input_sequence);
             }
         };
+        assert_ne!(active_attachment_id, stale_attachment_id);
         socket
             .send(ClientMessage::Binary(
                 encode_terminal_web_binary(&TerminalWebBinaryFrame::Input {
                     sequence: next_input_sequence,
-                    bytes: b"printf '__HYPER_TERM_GATEWAY_OK__\\n'\n".to_vec(),
+                    bytes: b"printf '\\137\\137HYPER_TERM_GATEWAY_OK\\137\\137:%s\\n' \"$PWD\"\n"
+                        .to_vec(),
                 })
                 .expect("input frame")
                 .into(),
@@ -810,11 +817,16 @@ mod tests {
             .await
             .expect("send input");
 
+        let expected = format!(
+            "__HYPER_TERM_GATEWAY_OK__:{}",
+            temporary
+                .path()
+                .canonicalize()
+                .expect("canonical cwd")
+                .display()
+        );
         let mut transcript = Vec::new();
-        while !transcript
-            .windows(b"__HYPER_TERM_GATEWAY_OK__".len())
-            .any(|window| window == b"__HYPER_TERM_GATEWAY_OK__")
-        {
+        while !String::from_utf8_lossy(&transcript).contains(&expected) {
             let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
                 .expect("output timeout")
@@ -828,6 +840,11 @@ mod tests {
                 }
             }
         }
+        assert!(
+            String::from_utf8_lossy(&transcript).contains(&expected),
+            "default shell cwd was not applied: {}",
+            String::from_utf8_lossy(&transcript)
+        );
 
         socket
             .send(ClientMessage::Text(
@@ -868,6 +885,7 @@ mod tests {
                 bind: "0.0.0.0:0".parse().expect("socket"),
                 assets: PathBuf::new(),
                 token: "short".into(),
+                default_cwd: None,
             },
             daemon,
         )

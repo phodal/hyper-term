@@ -63,6 +63,7 @@ fn run() -> Result<(), String> {
                 bind,
                 assets,
                 token,
+                default_cwd: None,
             },
             state,
         )
