@@ -15,11 +15,17 @@ name = "hyperd"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
 crossbeam-channel.workspace = true
+futures-util.workspace = true
 hyper-term-core = { path = "../hyper-term-core" }
 hyper-term-protocol = { path = "../hyper-term-protocol" }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio-tungstenite = "0.29.0"

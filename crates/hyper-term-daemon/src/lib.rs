@@ -22,6 +22,12 @@ use hyper_term_protocol::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod web_gateway;
+
+pub use web_gateway::{
+    TerminalGatewayConfig, TerminalGatewayError, TerminalGatewayHandle, spawn_terminal_gateway,
+};
+
 const CONTROL_SUBSCRIBER_CAPACITY: usize = 512;
 const OBSERVATION_BATCH_BYTES: u64 = 64 * 1024;
 
