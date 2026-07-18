@@ -7,7 +7,7 @@ use crate::{TerminalAttachmentId, TerminalId, TerminalSize};
 
 const MAGIC: [u8; 4] = *b"HTWS";
 const HEADER_LEN: usize = 36;
-pub const TERMINAL_WEB_PROTOCOL_VERSION: u16 = 1;
+pub const TERMINAL_WEB_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_TERMINAL_WEB_PAYLOAD_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -15,6 +15,7 @@ pub const MAX_TERMINAL_WEB_PAYLOAD_BYTES: usize = 256 * 1024;
 pub enum TerminalWebClientControl {
     Hello {
         protocol_version: u16,
+        session_id: u16,
         attachment_id: Option<TerminalAttachmentId>,
         after_sequence: u64,
         size: TerminalSize,
@@ -267,7 +268,7 @@ mod tests {
 
         assert_eq!(
             hex,
-            "4854575300010100000000000000002a0000000000000000000000000000000000000003001bff"
+            "4854575300020100000000000000002a0000000000000000000000000000000000000003001bff"
         );
     }
 
@@ -293,6 +294,7 @@ mod tests {
     fn client_hello_cannot_choose_a_program_or_environment() {
         let hello = TerminalWebClientControl::Hello {
             protocol_version: TERMINAL_WEB_PROTOCOL_VERSION,
+            session_id: 7,
             attachment_id: None,
             after_sequence: 0,
             size: TerminalSize::default(),
@@ -301,6 +303,7 @@ mod tests {
         let value = serde_json::to_value(hello).expect("serialize");
 
         assert_eq!(value["type"], "hello");
+        assert_eq!(value["session_id"], 7);
         assert!(value.get("program").is_none());
         assert!(value.get("args").is_none());
         assert!(value.get("env").is_none());

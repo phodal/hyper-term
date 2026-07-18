@@ -13,12 +13,14 @@ import {
 import {
   terminalAttachmentStorageKey,
   TerminalConnectionState,
+  terminalSessionId,
 } from "./connection-state.ts";
 import "./styles.css";
 
 const attachmentStorageKey = terminalAttachmentStorageKey(
   globalThis.location.href,
 );
+const sessionId = terminalSessionId(globalThis.location.href);
 const terminalElement = requiredElement("#terminal");
 const statusElement = requiredElement("#connection-status");
 
@@ -70,7 +72,7 @@ const terminal = new Terminal({
 const fit = new FitAddon();
 terminal.loadAddon(fit);
 terminal.open(terminalElement);
-fit.fit();
+fitTerminal();
 terminal.focus();
 
 let socket: WebSocket | null = null;
@@ -87,7 +89,7 @@ terminal.onBinary((data) => {
 });
 
 const resizeObserver = new ResizeObserver(() => {
-  fit.fit();
+  fitTerminal();
   if (!connectionState.canSend(socket?.readyState === WebSocket.OPEN)) return;
   sendControl({
     type: "resize",
@@ -105,6 +107,10 @@ document.addEventListener("visibilitychange", () => {
 connect();
 
 function connect(): void {
+  if (sessionId === null) {
+    setStatus("Invalid terminal session", true);
+    return;
+  }
   if (
     socket?.readyState === WebSocket.OPEN ||
     socket?.readyState === WebSocket.CONNECTING
@@ -124,15 +130,16 @@ function connect(): void {
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
     reconnectAttempt = 0;
-    fit.fit();
     sendControl({
       type: "hello",
       protocol_version: TERMINAL_WEB_PROTOCOL_VERSION,
+      session_id: sessionId,
       attachment_id: attachmentId,
       after_sequence: safeNumber(afterSequence),
       size: terminalSize(),
       cwd: null,
     });
+    fitTerminal();
   });
   socket.addEventListener("message", (event) => receive(event.data));
   socket.addEventListener("close", () => {
@@ -262,6 +269,14 @@ function scheduleReconnect(): void {
 function setStatus(message: string, visible: boolean): void {
   statusElement.textContent = message;
   statusElement.toggleAttribute("data-visible", visible);
+}
+
+function fitTerminal(): void {
+  try {
+    fit.fit();
+  } catch {
+    setStatus("Waiting for terminal layout…", true);
+  }
 }
 
 function showProtocolError(error: unknown): void {

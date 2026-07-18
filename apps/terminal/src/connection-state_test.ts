@@ -2,6 +2,7 @@ import { assertEquals, assertThrows } from "@std/assert";
 import {
   terminalAttachmentStorageKey,
   TerminalConnectionState,
+  terminalSessionId,
 } from "./connection-state.ts";
 
 Deno.test("an open socket cannot send terminal data before protocol ready", () => {
@@ -26,6 +27,11 @@ Deno.test("terminal tabs keep independent reconnect attachments", () => {
   assertEquals(
     terminalAttachmentStorageKey("http://127.0.0.1:47437/?token=x&tab=invalid"),
     "hyper-term.terminal-attachment.v1",
+  );
+  assertEquals(terminalSessionId("http://127.0.0.1:47437/?token=x&tab=2"), 2);
+  assertEquals(
+    terminalSessionId("http://127.0.0.1:47437/?token=x&tab=1000"),
+    null,
   );
 });
 

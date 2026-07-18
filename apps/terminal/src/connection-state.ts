@@ -41,6 +41,13 @@ export class TerminalConnectionState {
 
 export function terminalAttachmentStorageKey(locationHref: string): string {
   const base = "hyper-term.terminal-attachment.v1";
+  const tab = terminalSessionId(locationHref);
+  return tab === null ? base : `${base}.tab-${tab}`;
+}
+
+export function terminalSessionId(locationHref: string): number | null {
   const tab = new URL(locationHref).searchParams.get("tab");
-  return tab && /^[1-9][0-9]{0,2}$/.test(tab) ? `${base}.tab-${tab}` : base;
+  if (!tab || !/^[1-9][0-9]{0,2}$/.test(tab)) return null;
+  const value = Number(tab);
+  return value <= 999 ? value : null;
 }

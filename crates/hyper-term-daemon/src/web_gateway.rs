@@ -15,7 +15,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
 use hyper_term_core::{TerminalEvent, TerminalReplay, TerminalSubscription};
 use hyper_term_protocol::{
@@ -105,6 +105,7 @@ struct GatewayRuntime {
 
 #[derive(Clone, Copy)]
 struct Attachment {
+    session_id: u16,
     terminal_id: TerminalId,
     client_id: ClientId,
     next_input_sequence: u64,
@@ -130,6 +131,10 @@ enum ConnectionError {
     UnsupportedProtocol(u16),
     #[error("terminal attachment is already connected")]
     AttachmentBusy,
+    #[error("terminal attachment belongs to a different desktop tab")]
+    AttachmentSessionMismatch,
+    #[error("terminal desktop tab id {0} is invalid")]
+    InvalidSessionId(u16),
     #[error("terminal input sequence {actual} does not match expected {expected}")]
     InputSequence { expected: u64, actual: u64 },
     #[error("terminal resize generation {actual} does not match expected {expected}")]
@@ -148,6 +153,8 @@ impl ConnectionError {
             Self::HelloRequired => "hello_required",
             Self::UnsupportedProtocol(_) => "protocol",
             Self::AttachmentBusy => "attachment_busy",
+            Self::AttachmentSessionMismatch => "attachment_session",
+            Self::InvalidSessionId(_) => "session_id",
             Self::InputSequence { .. } => "input_sequence",
             Self::ResizeGeneration { .. } => "resize_generation",
             Self::InvalidMessage(_) => "invalid_message",
@@ -167,6 +174,12 @@ impl ConnectionError {
 #[derive(Deserialize)]
 struct AuthQuery {
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CloseSessionQuery {
+    token: Option<String>,
+    session_id: Option<u16>,
 }
 
 enum Outbound {
@@ -205,6 +218,7 @@ pub async fn spawn_terminal_gateway(
     };
     let router = Router::new()
         .route("/terminal", get(upgrade_terminal))
+        .route("/terminal/session/close", post(close_terminal_session))
         .fallback(get(serve_asset))
         .with_state(runtime);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -220,6 +234,35 @@ pub async fn spawn_terminal_gateway(
         shutdown: Some(shutdown_sender),
         task: Some(task),
     })
+}
+
+async fn close_terminal_session(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<CloseSessionQuery>,
+) -> Response {
+    if !constant_time_eq(
+        query.token.as_deref().unwrap_or_default().as_bytes(),
+        runtime.token.as_bytes(),
+    ) {
+        return status_response(
+            StatusCode::UNAUTHORIZED,
+            "terminal gateway token is invalid",
+        );
+    }
+    let Some(session_id @ 1..=999) = query.session_id else {
+        return status_response(StatusCode::BAD_REQUEST, "terminal session id is invalid");
+    };
+    match runtime.close_session(session_id) {
+        Ok(()) => secure_response(
+            StatusCode::NO_CONTENT,
+            "text/plain; charset=utf-8",
+            Body::empty(),
+        ),
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "terminal session close failed",
+        ),
+    }
 }
 
 async fn upgrade_terminal(
@@ -353,6 +396,7 @@ impl GatewayRuntime {
         hello: TerminalWebClientControl,
     ) -> Result<ActiveAttachment, ConnectionError> {
         let TerminalWebClientControl::Hello {
+            session_id,
             attachment_id,
             size,
             cwd,
@@ -363,11 +407,17 @@ impl GatewayRuntime {
         };
         size.validate()
             .map_err(|message| ConnectionError::InvalidMessage(message.into()))?;
+        if !(1..=999).contains(&session_id) {
+            return Err(ConnectionError::InvalidSessionId(session_id));
+        }
         let connection_id = Uuid::new_v4();
         let mut attachments = lock(&self.attachments)?;
         if let Some(attachment_id) = attachment_id
             && let Some(attachment) = attachments.get_mut(&attachment_id)
         {
+            if attachment.session_id != session_id {
+                return Err(ConnectionError::AttachmentSessionMismatch);
+            }
             if attachment.active_connection.is_some() {
                 return Err(ConnectionError::AttachmentBusy);
             }
@@ -403,6 +453,7 @@ impl GatewayRuntime {
             }
         };
         let attachment = Attachment {
+            session_id,
             terminal_id,
             client_id,
             next_input_sequence: 1,
@@ -473,6 +524,20 @@ impl GatewayRuntime {
         self.daemon.close_terminal(active.terminal_id)?;
         lock(&self.attachments)?.remove(&active.attachment_id);
         Ok(())
+    }
+
+    fn close_session(&self, session_id: u16) -> Result<(), ConnectionError> {
+        let mut attachments = lock(&self.attachments)?;
+        let Some((attachment_id, terminal_id)) = attachments
+            .iter()
+            .find(|(_, attachment)| attachment.session_id == session_id)
+            .map(|(attachment_id, attachment)| (*attachment_id, attachment.terminal_id))
+        else {
+            return Ok(());
+        };
+        let result = self.daemon.close_terminal(terminal_id);
+        attachments.remove(&attachment_id);
+        result.map_err(ConnectionError::Daemon)
     }
 
     fn deactivate(&self, active: &ActiveAttachment) {
@@ -725,6 +790,7 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use hyper_term_protocol::{TerminalWebBinaryFrame, TerminalWebServerControl};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -771,6 +837,7 @@ mod tests {
             .send(ClientMessage::Text(
                 serde_json::to_string(&TerminalWebClientControl::Hello {
                     protocol_version: TERMINAL_WEB_PROTOCOL_VERSION,
+                    session_id: 7,
                     attachment_id: Some(stale_attachment_id),
                     after_sequence: 0,
                     size: TerminalSize {
@@ -846,15 +913,50 @@ mod tests {
             String::from_utf8_lossy(&transcript)
         );
 
-        socket
-            .send(ClientMessage::Text(
-                serde_json::to_string(&TerminalWebClientControl::Close)
-                    .expect("close")
-                    .into(),
-            ))
-            .await
-            .expect("close shell");
+        assert_eq!(
+            post_close(gateway.address(), "wrong-token", 7).await,
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        assert_eq!(
+            post_close(gateway.address(), &token, 7).await,
+            StatusCode::NO_CONTENT.as_u16()
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                match message {
+                    Ok(ClientMessage::Close(_)) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("closed socket timeout");
         gateway.shutdown().await.expect("shutdown gateway");
+    }
+
+    async fn post_close(address: SocketAddr, token: &str, session_id: u16) -> u16 {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect HTTP close");
+        let request = format!(
+            "POST /terminal/session/close?token={token}&session_id={session_id} HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write HTTP close");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read HTTP close");
+        let status = String::from_utf8_lossy(&response);
+        status
+            .split_whitespace()
+            .nth(1)
+            .expect("HTTP status")
+            .parse()
+            .expect("numeric HTTP status")
     }
 
     async fn assert_websocket_rejected(

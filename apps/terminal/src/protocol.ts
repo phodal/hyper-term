@@ -1,4 +1,4 @@
-export const TERMINAL_WEB_PROTOCOL_VERSION = 1;
+export const TERMINAL_WEB_PROTOCOL_VERSION = 2;
 export const TERMINAL_WEB_HEADER_BYTES = 36;
 export const MAX_TERMINAL_WEB_PAYLOAD_BYTES = 256 * 1024;
 
@@ -21,6 +21,7 @@ export type TerminalWebClientControl =
   | {
     type: "hello";
     protocol_version: number;
+    session_id: number;
     attachment_id: string | null;
     after_sequence: number;
     size: TerminalSize;

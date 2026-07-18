@@ -14,7 +14,7 @@ Deno.test("terminal input uses the Rust-compatible binary envelope", () => {
     [...new Uint8Array(encoded)]
       .map((byte) => byte.toString(16).padStart(2, "0"))
       .join(""),
-    "4854575300010100000000000000002a0000000000000000000000000000000000000003001bff",
+    "4854575300020100000000000000002a0000000000000000000000000000000000000003001bff",
   );
 
   assertEquals(decoded, {

@@ -23,6 +23,8 @@ pub const terminal_gateway_origin = "http://127.0.0.1:47437";
 pub const max_sessions: usize = 8;
 const terminal_url_capacity: usize = 256;
 const max_gateway_token_bytes: usize = 128;
+const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
+const terminal_close_effect_key_base: u64 = 0x4854_4300;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -31,6 +33,7 @@ pub const titlebar_natural_height: f32 = 48;
 
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
+    native_sdk.security.permission_network,
     native_sdk.security.permission_view,
 };
 const shell_views = [_]native_sdk.ShellView{
@@ -170,6 +173,7 @@ pub const Msg = union(enum) {
     select_session: u8,
     close_session: u8,
     close_active_session,
+    terminal_session_closed: native_sdk.EffectResponse,
     agent_split_resized: f32,
     system_appearance: struct {
         scheme: canvas.ColorScheme,
@@ -179,7 +183,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "system_appearance", "chrome_changed" };
 };
 
 const dev_markup_reload = builtin.mode == .Debug;
@@ -201,6 +205,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .select_session => |session_id| selectSession(model, session_id),
         .close_session => |session_id| closeSession(model, session_id, fx),
         .close_active_session => closeSession(model, model.active_session_id, fx),
+        .terminal_session_closed => {},
         .agent_split_resized => |fraction| model.agent_split = std.math.clamp(fraction, 0.48, 0.76),
         .system_appearance => |appearance| {
             model.system_scheme = appearance.scheme;
@@ -242,6 +247,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         }
     }
     const index = closing_index orelse return;
+    requestTerminalClose(model, session_id, fx);
 
     if (model.session_count == 1) {
         fx.closeWindow("main");
@@ -262,6 +268,26 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     model.session_count -= 1;
     model.session_slots[model.session_count] = .{};
     refreshTerminalUrl(model);
+}
+
+fn requestTerminalClose(model: *const Model, session_id: u8, fx: *Effects) void {
+    const prefix = terminal_gateway_origin ++ "/?token=";
+    const base_url = model.terminal_base_url_storage[0..model.terminal_base_url_len];
+    if (!std.mem.startsWith(u8, base_url, prefix)) return;
+    const token = base_url[prefix.len..];
+    var storage: [terminal_close_url_capacity]u8 = undefined;
+    const url = std.fmt.bufPrint(
+        storage[0..],
+        "{s}/terminal/session/close?token={s}&session_id={d}",
+        .{ terminal_gateway_origin, token, session_id },
+    ) catch return;
+    fx.fetch(.{
+        .key = terminal_close_effect_key_base + session_id,
+        .method = .POST,
+        .url = url,
+        .timeout_ms = 2_000,
+        .on_response = Effects.responseMsg(.terminal_session_closed),
+    });
 }
 
 fn selectSession(model: *Model, session_id: u8) void {

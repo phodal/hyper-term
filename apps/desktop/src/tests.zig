@@ -93,7 +93,8 @@ test "tabs expose close controls and close the active session like a desktop ter
     defer fx.deinit();
     fx.executor = .fake;
 
-    var model = main.initialModel();
+    const url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    var model = main.initialModelWithTerminalUrl(url);
     main.update(&model, .choose_terminal, &fx);
     main.update(&model, .choose_agent, &fx);
     try testing.expectEqual(@as(u8, 3), model.active_session_id);
@@ -103,6 +104,13 @@ test "tabs expose close controls and close the active session like a desktop ter
     main.update(&model, tree.msgForPointer(close_agent.id, .up).?, &fx);
     try testing.expectEqual(@as(usize, 2), model.openSessions().len);
     try testing.expectEqual(@as(u8, 2), model.active_session_id);
+    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
+    const close_request = fx.pendingFetchAt(0).?;
+    try testing.expectEqual(std.http.Method.POST, close_request.method);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:47437/terminal/session/close?token=0123456789abcdef0123456789abcdef&session_id=3",
+        close_request.url,
+    );
 
     main.update(&model, .{ .close_session = 1 }, &fx);
     try testing.expectEqual(@as(usize, 1), model.openSessions().len);
