@@ -1246,6 +1246,7 @@ fn constant_time_eq(candidate: &[u8], expected: &[u8]) -> bool {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -1360,6 +1361,158 @@ mod tests {
             request(gateway.address(), &token, 3, "DELETE").await.0,
             StatusCode::NO_CONTENT.as_u16()
         );
+        gateway.shutdown().await.expect("shutdown gateway");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepted_artifact_preview_is_authenticated_current_and_network_closed() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        let gateway_state = temporary.path().join("gateway-state");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).expect("daemon");
+        let fake_codex = temporary.path().join("codex");
+        std::fs::write(
+            &fake_codex,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake-codex\"}}' ;;\n    *'\"method\":\"thread/start\"'*) printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"preview-thread\"}}}' ;;\n  esac\ndone\n",
+        )
+        .expect("fake Codex");
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let deno = temporary.path().join("deno");
+        let compiler_script = temporary.path().join("genui-compiler.js");
+        let compiler_wasm = temporary.path().join("esbuild.wasm");
+        let preview_shell = temporary.path().join("genui-preview.html");
+        std::fs::write(&deno, "deno").unwrap();
+        std::fs::write(&compiler_script, "compiler").unwrap();
+        std::fs::write(&compiler_wasm, "wasm").unwrap();
+        std::fs::write(
+            &preview_shell,
+            format!(
+                "<html><head>{ARTIFACT_BOOTSTRAP_MARKER}<script>hyper_term_preview_boot</script></head><body></body></html>"
+            ),
+        )
+        .unwrap();
+
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace,
+            state_directory: gateway_state,
+            daemon: daemon.clone(),
+            codex_executable: Some(fake_codex),
+            codex_auth_file: None,
+            mcp_executable: None,
+            genui_runtime: Some(AgentGenUiRuntimeConfig {
+                deno_executable: deno,
+                runtime_version: "2.9.3".into(),
+                compiler_script,
+                compiler_wasm,
+                preview_shell,
+                compiler_version: "0.28.1".into(),
+            }),
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .expect("agent gateway");
+
+        let (status, body) = request(gateway.address(), &token, 6, "POST").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id: TaskId = serde_json::from_value(response["task_id"].clone()).unwrap();
+        let proposed = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.genui.compile".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                "Compile preview fixture".into(),
+                RiskClass::ReadOnly,
+                vec!["genui_compile".into()],
+            )
+            .unwrap();
+        let authorized = daemon
+            .decide_permission(
+                task_id,
+                proposed.operation_id,
+                proposed.revision,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap();
+        let dispatching = daemon
+            .begin_operation(task_id, proposed.operation_id, authorized.revision)
+            .unwrap();
+        let bundle = "globalThis.__HYPER_PREVIEW_PROBE__ = 'ready';";
+        let css = "main{color:#d7ff72}";
+        let mut digest = Sha256::new();
+        digest.update(bundle.as_bytes());
+        digest.update(css.as_bytes());
+        let accepted = daemon
+            .accept_genui_artifact(
+                task_id,
+                proposed.operation_id,
+                dispatching.revision,
+                hyper_term_protocol::GenUiArtifactCandidate {
+                    schema_version: 1,
+                    source_revision: 9,
+                    entrypoint: "/App.tsx".into(),
+                    bundle: bundle.into(),
+                    css: css.into(),
+                    source_map: "{\"version\":3}".into(),
+                    content_digest: digest
+                        .finalize()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                        name: "esbuild-wasm".into(),
+                        version: "0.28.1".into(),
+                    },
+                    diagnostics: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let preview_path = format!(
+            "/agent/artifact/{}/preview?token={token}&session_id=6",
+            accepted.artifact_id
+        );
+        let (status, headers, body) =
+            request_path_raw(gateway.address(), &preview_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+        assert!(headers.contains("content-security-policy:"));
+        assert!(headers.contains("connect-src 'none'"));
+        assert!(headers.contains("cache-control: no-store"));
+        let document = String::from_utf8(body).unwrap();
+        assert!(document.contains("__HYPER_PREVIEW_PROBE__"));
+        assert!(document.contains(&accepted.artifact_id.to_string()));
+        assert!(!document.contains(ARTIFACT_BOOTSTRAP_MARKER));
+
+        let source_map_path = format!(
+            "/agent/artifact/{}/source-map?token={token}&session_id=6",
+            accepted.artifact_id
+        );
+        let (status, source_map) =
+            request_path(gateway.address(), &source_map_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(source_map, b"{\"version\":3}");
+        let stale_path = format!(
+            "/agent/artifact/{}/preview?token={token}&session_id=6",
+            ArtifactId::new()
+        );
+        assert_eq!(
+            request_path(gateway.address(), &stale_path, "GET", b"")
+                .await
+                .0,
+            StatusCode::NOT_FOUND.as_u16()
+        );
+
         gateway.shutdown().await.expect("shutdown gateway");
     }
 
@@ -1694,6 +1847,16 @@ mod tests {
         method: &str,
         body: &[u8],
     ) -> (u16, Vec<u8>) {
+        let (status, _, body) = request_path_raw(address, path, method, body).await;
+        (status, body)
+    }
+
+    async fn request_path_raw(
+        address: SocketAddr,
+        path: &str,
+        method: &str,
+        body: &[u8],
+    ) -> (u16, Vec<u8>, Vec<u8>) {
         let mut stream = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect agent gateway");
@@ -1725,6 +1888,10 @@ mod tests {
             .expect("HTTP status")
             .parse()
             .expect("numeric HTTP status");
-        (status, response[header_end..].to_vec())
+        (
+            status,
+            response[..header_end].to_vec(),
+            response[header_end..].to_vec(),
+        )
     }
 }
