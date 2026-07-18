@@ -113,6 +113,23 @@ cross-platform binary signing, cache management, and IPC latency. Long-lived,
 lazy sidecars amortize startup cost; no Deno process is started for a terminal-
 only session.
 
+## Implementation evidence (2026-07-19)
+
+The first cold-path compiler uses one Rust supervisor per Deno child and bounded
+JSON Lines over inherited stdio rather than a multiplexed local socket. It
+starts only after the permission broker authorizes
+`hyper_term.genui.compile`. Rust verifies the Deno executable, compiler script,
+and `esbuild.wasm` digests, clears the environment, grants read access only to
+the two runtime assets, waits for a versioned ready message, and recomputes the
+returned artifact digest. The packaged macOS app carries and signs all three
+runtime files; a signed-bundle probe compiles successfully with network, write,
+run, FFI, and workspace access absent.
+
+This closes the basic distribution, framing, and least-Deno-permission spike.
+It does not close this ADR's OS-containment, kill/hang recovery, resource-limit,
+or cross-platform rollback gates. Those remain milestone gates rather than
+being inferred from Deno CLI permissions.
+
 ## Validation gates
 
 - Measure cold start, warm request latency, idle CPU, resident memory, and

@@ -153,3 +153,18 @@ WebView and Deno JavaScript runtimes. Hot and cold paths are separated, and any
 intentional overlap in transforms or full-build validation is mediated by the
 `UiCompiler` and artifact protocols. A native compiler can replace the worker
 if measured projects exceed the WASM budget without changing artifact history.
+
+## Implementation evidence (2026-07-19)
+
+The browser Worker and the supervised Deno compiler now import one
+`compiler-engine.ts`. Both use the same bounded virtual filesystem, React
+capsules, esbuild-wasm version, external source-map output, diagnostic schema,
+and `ArtifactCandidate` digest. The Worker remains the persistent keystroke hot
+path. Deno is the approved cold-path verifier exposed through MCP; Rust checks
+the request/response revision, compiler identity, output bounds, and digest
+before the result becomes a receipt.
+
+This proves backend parity on a real single-file React compile. Incremental
+slice invalidation, stale cancellation, last-known-good acceptance in the Rust
+artifact store, source-mapped runtime navigation, and the stated p95 benchmarks
+remain open gates.

@@ -5,13 +5,16 @@ not a terminal with a chat sidebar. It treats Shell, structured agents,
 Computer Use, MCP tools, editors, browsers, and generated interfaces as
 executors and projections of one durable human–AI task model.
 
-> **Repository status:** M1 implementation and the first M3 risk spike are in
-> progress. The disposable Vite/Tauri prototype has been removed. The
+> **Repository status:** the M1 kernel baseline is implemented; M2 control-loop
+> integration and the M3 Agentic UI risk spike are active. The disposable
+> Vite/Tauri prototype has been removed. The
 > repository now contains a renderer-independent Rust protocol, journal,
-> operation reducer, Block projector, reconnectable PTY daemon, and a
-> terminal-first React Workbench built directly by pinned Deno. Proposed ADRs
-> remain subject to the validation and replacement gates recorded in each
-> decision.
+> operation reducer, Block projector, reconnectable PTY daemon, explicit Codex
+> Agent sessions, a brokered MCP gateway, and a terminal-first React Workbench
+> built directly by pinned Deno. The packaged Native SDK application now carries
+> a digest-checked Deno GenUI compiler, but performance, recovery, and OS-level
+> containment gates remain open. Proposed ADRs remain subject to the validation
+> and replacement gates recorded in each decision.
 
 ## Product thesis
 
@@ -57,7 +60,8 @@ Four product primitives make that useful:
   bulk terminal or artifact data does not travel through a JSON UI bridge.
 - Deno is a supervised tooling sidecar and ahead-of-time workbench builder, not
   the control kernel. Interactive Agentic UI compilation uses a persistent,
-  bounded `esbuild-wasm` worker.
+  bounded `esbuild-wasm` worker; approved cold-path compilation uses the same
+  virtual-file and artifact contract in a digest-pinned Deno child.
 - ACP and MCP are versioned input adapters. The renderer consumes the internal
   `BlockDocument`, never protocol DTOs directly.
 
@@ -115,9 +119,9 @@ when its failure, reconnect, security, and evidence gates pass.
 
 | Milestone | Outcome | Exit gates |
 | --- | --- | --- |
-| **M0 — Architecture baseline** | Review the twelve ADRs, freeze the first `EventEnvelope`, Task/Run/Operation, `BlockDocument`, `UiIntent`, terminal-stream, and artifact schemas. | Proposed ADRs are accepted, revised, or explicitly deferred; golden protocol fixtures and benchmark workloads are specified before implementation. |
-| **M1 — Durable Rust kernel (current)** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | A direct user terminal resolves the configured login shell without renderer-supplied executables; zsh login/interactive mode, UTF-8, truecolor, foreground-job `Ctrl-C`, resize/output ordering, reconnect, cancellation, and recovery have tests and release probes. |
-| **M2 — Agent control loop and Block workbench** | Add raw PTY agent compatibility, one ACP v1 adapter, an MCP host behind the broker, `BlockProjector`, attention reducer, and renderer-independent Workbench assets built by Deno. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; renderer failure loses no canonical state. |
+| **M0 — Architecture baseline** | Review the fourteen ADRs, freeze the first `EventEnvelope`, Task/Run/Operation, `BlockDocument`, `UiIntent`, terminal-stream, and artifact schemas. | Proposed ADRs are accepted, revised, or explicitly deferred; golden protocol fixtures and benchmark workloads are specified before implementation. |
+| **M1 — Durable Rust kernel (baseline implemented)** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | A direct user terminal resolves the configured login shell without renderer-supplied executables; zsh login/interactive mode, UTF-8, truecolor, foreground-job `Ctrl-C`, resize/output ordering, reconnect, cancellation, and recovery have tests and release probes. |
+| **M2 — Agent control loop and Block workbench (current)** | Add raw PTY agent compatibility, one ACP v1 adapter, an MCP host behind the broker, `BlockProjector`, attention reducer, and renderer-independent Workbench assets built by Deno. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; renderer failure loses no canonical state. |
 | **M3 — Agentic UI and local debugging (risk spike active)** | Add the brokered Deno tool runtime, persistent `esbuild-wasm` compilation, versioned UI IR/React artifacts, trusted editor adapters, isolated previews, source maps, and semantic Time Travel. | A broken generated UI keeps its last-known-good artifact, maps errors to its source revision, and replays without Shell, network, MCP, or Computer Use effects. |
 | **M4 — Computer Use, voice, and attention** | Implement observe–act–verify drivers, explicit capability and focus leases, before/after evidence, voice briefs, push-to-talk steering, local pause/takeover controls, and semantic notifications. | Stale observations and lease conflicts are rejected; every action has actor, target, capability, receipt, and result; voice never directly approves a consequential effect. |
 | **M5 — Native desktop product shell** | Use Native SDK as the default macOS host for the ordinary terminal surface and common blocks, with bounded Web/WASM islands for generated UI and previews. | Startup, key-to-present, burst throughput, 100k-block virtualization, CJK/IME/accessibility, responsive layout, crash recovery, focus, and a shared Native/Web design-token contract pass on the packaged app. |
@@ -193,7 +197,7 @@ Cargo.toml             Rust workspace definition
 crates/hyper-term-protocol/  versioned events, blocks, and wire frames
 crates/hyper-term-core/      journal, reducers, projections, and PTY ownership
 crates/hyper-term-daemon/    permissioned, reconnectable control-kernel host
-crates/hyper-term-drivers/   bounded sidecar supervision and Deno LSP client
+crates/hyper-term-drivers/   bounded agent, Deno LSP, and GenUI supervision
 apps/workbench/         terminal-first React Block workbench and isolated GenUI
 runtime/                pinned supervised-runtime manifests
 scripts/                Deno build and supply-chain verification tools
@@ -237,6 +241,7 @@ deno task verify:runtime
 deno task check
 deno task test
 deno task build:workbench
+deno task build:runtime
 python3 -m http.server 4173 --bind 127.0.0.1 --directory dist/workbench
 ```
 
@@ -247,16 +252,22 @@ diagnostics and Time Travel history without replacing the last-known-good
 artifact.
 
 The Rust `hyper-term-drivers` crate launches the same pinned Deno executable
-with a cleared environment, dedicated cache and scratch roots, bounded LSP
-framing, bounded stderr capture, and process-group shutdown. Its ignored
-integration test performs a real `initialize`, TypeScript diagnostics, and
-`shutdown` exchange when the verified runtime path and executable digest are
-provided:
+with a cleared environment, dedicated cache and scratch roots, bounded framing,
+bounded stderr capture, and process-group shutdown. The LSP driver receives an
+authority-created snapshot. The GenUI driver receives only its digest-pinned
+compiler script and WASM asset, has no network/write/run/FFI permission, waits
+for a versioned ready handshake, and re-computes the artifact digest in Rust.
+Ignored integration tests exercise both real child processes and the complete
+MCP approval/receipt path:
 
 ```bash
-HYPER_TERM_DENO_PATH=/absolute/path/to/deno \
-HYPER_TERM_DENO_SHA256=<manifest-executable-sha256> \
+export HYPER_TERM_DENO_PATH=/absolute/path/to/deno
+export HYPER_TERM_DENO_SHA256=<manifest-executable-sha256>
 cargo test -p hyper-term-drivers --test deno_lsp -- --ignored
+cargo test -p hyper-term-drivers --test deno_genui -- --ignored
+cargo test -p hyper-term-daemon --test mcp_flow \
+  approved_genui_tool_compiles_through_the_brokered_deno_runtime \
+  -- --ignored
 ```
 
 ## Release the macOS application
@@ -265,7 +276,9 @@ Pushing a version tag such as `v0.1.0`, or manually dispatching the
 `Release Hyper Term` workflow for an existing tag, validates the Rust, Deno, and
 Native SDK layers and builds complete Apple Silicon and Intel applications. The
 release archives contain the Rust desktop supervisor, Native SDK renderer, and
-terminal WebView assets in one `.app` bundle. Stable releases are Developer ID
+terminal WebView assets in one `.app` bundle. They also contain the per-platform
+pinned Deno executable and content-addressed GenUI compiler assets; Deno is lazy
+and does not start for ordinary terminal tabs. Stable releases are Developer ID
 signed and notarized; unsigned RC pipeline tests are labelled explicitly.
 
 The stable part of the tag must match the Cargo workspace and
@@ -286,7 +299,9 @@ JSONL, and turns command/file approval requests into inert
 authorization can produce the external approval response; persistent policy
 choices are not forwarded as one-turn wire approvals. The Native Agent surface
 renders trusted Operation and Approval Blocks and can safely reject or cancel a
-pending Codex proposal.
+pending Codex proposal. Known read-only MCP operations may be allowed once; the
+GenUI tool then compiles through the supervised Deno driver and records its
+result digest and receipt on the same Agent task.
 
 Explicit Rust-owned Shell Operations now compile a canonical profile, mint a
 revision-bound one-use lease, and launch through enforced macOS Seatbelt before
