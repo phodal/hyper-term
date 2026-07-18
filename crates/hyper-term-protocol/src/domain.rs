@@ -3,7 +3,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BlockId, EVENT_SCHEMA_VERSION, EventId, OperationId, RunId, TaskId, TerminalId};
+use crate::{
+    ActionDigest, BlockId, CompiledSandboxProfile, EVENT_SCHEMA_VERSION, EventId, OperationId,
+    RunId, SandboxLeaseId, SandboxProfileDigest, SandboxReceipt, SandboxViolation, TaskId,
+    TerminalId,
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,13 +70,17 @@ pub enum OperationState {
     Dispatching,
     Succeeded,
     Failed,
+    Violated,
     Cancelled,
     UnknownExecution,
 }
 
 impl OperationState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Violated | Self::Cancelled
+        )
     }
 }
 
@@ -187,6 +195,25 @@ pub enum DomainEvent {
         succeeded: bool,
         summary: String,
         result_digest: Option<String>,
+    },
+    SandboxProfileCompiled {
+        operation_revision: u64,
+        compiled: CompiledSandboxProfile,
+    },
+    SandboxLeaseIssued {
+        operation_revision: u64,
+        lease_id: SandboxLeaseId,
+        expires_at_ms: u64,
+        profile_digest: SandboxProfileDigest,
+        action_digest: ActionDigest,
+    },
+    SandboxReceiptRecorded {
+        operation_revision: u64,
+        receipt: SandboxReceipt,
+    },
+    SandboxViolationObserved {
+        operation_revision: u64,
+        violation: SandboxViolation,
     },
     TerminalOpened {
         terminal_id: TerminalId,

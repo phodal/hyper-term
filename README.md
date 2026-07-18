@@ -285,9 +285,17 @@ JSONL, and turns command/file approval requests into inert
 `AgentEffectProposal` values. Only a matching, revisioned Rust operation
 authorization can produce the external approval response; persistent policy
 choices are not forwarded as one-turn wire approvals. The Native Agent surface
-now renders trusted Operation and Approval Blocks and can safely reject or
-cancel a pending Codex proposal. Allow remains unavailable until the Rust-owned
-sandbox can enforce the exact effect; UI approval alone is not containment.
+renders trusted Operation and Approval Blocks and can safely reject or cancel a
+pending Codex proposal.
+
+Explicit Rust-owned Shell Operations now compile a canonical profile, mint a
+revision-bound one-use lease, and launch through enforced macOS Seatbelt before
+they enter a PTY. Ordinary user terminals remain unsandboxed user authority.
+Codex app-server approval payloads are still provider-owned opaque effects:
+returning `accept` would let the already-running Codex process execute the
+effect outside this new launch port. The Codex Allow button therefore remains
+disabled until external-enforcement negotiation or Tier 2 containment binds the
+provider process itself. UI approval alone is not containment.
 
 The real installed-binary handshake is available as an ignored integration
 test. It uses an isolated `CODEX_HOME`, so it does not read the user's normal

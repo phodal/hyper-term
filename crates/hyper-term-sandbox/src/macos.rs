@@ -296,12 +296,16 @@ fn compile_policy(
     executables.push(PathBuf::from(&command.program));
     executables.sort();
     executables.dedup();
-    for (index, executable) in executables.into_iter().enumerate() {
-        let key = format!("EXECUTABLE_{index}");
-        definitions.insert(key.clone(), executable);
-        policy.push_str(&format!(
-            "(allow process-exec (literal (param \"{key}\")))\n"
-        ));
+    if profile.process.allow_any_executable {
+        policy.push_str("(allow process-exec)\n");
+    } else {
+        for (index, executable) in executables.into_iter().enumerate() {
+            let key = format!("EXECUTABLE_{index}");
+            definitions.insert(key.clone(), executable);
+            policy.push_str(&format!(
+                "(allow process-exec (literal (param \"{key}\")))\n"
+            ));
+        }
     }
     if profile.process.allow_child_processes {
         policy.push_str("(allow process-fork)\n");
@@ -316,6 +320,7 @@ fn compile_policy(
         match rule.access {
             SandboxPathAccess::Read => {
                 policy.push_str(&format!("(allow file-read* {filter})\n"));
+                policy.push_str(&format!("(deny file-write* {filter})\n"));
             }
             SandboxPathAccess::Write => {
                 policy.push_str(&format!("(allow file-read* file-write* {filter})\n"));
@@ -403,7 +408,7 @@ mod tests {
             },
             SandboxPathRule {
                 path: workspace.join(".git"),
-                access: SandboxPathAccess::Deny,
+                access: SandboxPathAccess::Read,
             },
             SandboxPathRule {
                 path: scratch.to_path_buf(),
@@ -426,6 +431,7 @@ mod tests {
             },
             process: SandboxProcessPolicy {
                 allow_child_processes: true,
+                allow_any_executable: false,
                 allowed_executables: vec![PathBuf::from("/usr/bin/nc")],
             },
             resources: SandboxResourceLimits::default(),
@@ -490,6 +496,7 @@ mod tests {
             let outside = root.path().join("outside.txt");
             fs::create_dir_all(workspace.join(".git")).unwrap();
             fs::create_dir_all(&scratch).unwrap();
+            fs::write(workspace.join(".git/config"), "trusted metadata\n").unwrap();
             fs::write(&outside, "host secret\n").unwrap();
             Self {
                 _root: root,
@@ -612,11 +619,21 @@ mod tests {
         let git_config = fixture.workspace.join(".git/config");
         let output = run(request(
             fixture.profile(),
+            "IFS= read -r value < \"$1\" && printf '%s' \"$value\"",
+            vec![git_config.to_string_lossy().into_owned()],
+        ));
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"trusted metadata");
+        let output = run(request(
+            fixture.profile(),
             "printf denied > \"$1\"",
             vec![git_config.to_string_lossy().into_owned()],
         ));
         assert!(!output.status.success());
-        assert!(!git_config.exists());
+        assert_eq!(
+            fs::read_to_string(git_config).unwrap(),
+            "trusted metadata\n"
+        );
     }
 
     #[test]

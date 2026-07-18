@@ -132,6 +132,11 @@ impl Default for SandboxEnvironmentPolicy {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SandboxProcessPolicy {
     pub allow_child_processes: bool,
+    /// Allows any executable already visible through the filesystem policy.
+    /// This is required for user-approved shell scripts whose child commands
+    /// cannot be reduced to a static executable list before execution.
+    #[serde(default)]
+    pub allow_any_executable: bool,
     #[serde(default)]
     pub allowed_executables: Vec<PathBuf>,
 }

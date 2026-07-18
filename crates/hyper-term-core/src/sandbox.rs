@@ -77,6 +77,9 @@ pub fn canonicalize_sandbox_profile(
     {
         return Err(SandboxError::ZeroResourceLimit);
     }
+    if profile.process.allow_any_executable && !profile.process.allow_child_processes {
+        return Err(SandboxError::AnyExecutableRequiresChildProcesses);
+    }
 
     let mut canonical = profile.clone();
     let mut rules = BTreeMap::<PathBuf, SandboxPathAccess>::new();
@@ -310,6 +313,8 @@ pub enum SandboxError {
     InvalidEnvironmentValue(String),
     #[error("sandbox resource limits must be greater than zero")]
     ZeroResourceLimit,
+    #[error("allow_any_executable requires allow_child_processes")]
+    AnyExecutableRequiresChildProcesses,
     #[error("proxy-only sandbox policy requires a proxy URL")]
     EmptyProxyUrl,
     #[error("invalid proxy allow-list host {0:?}")]
@@ -471,6 +476,16 @@ mod tests {
         assert!(matches!(
             canonicalize_sandbox_profile(&traversal),
             Err(SandboxError::ParentTraversal(_))
+        ));
+    }
+
+    #[test]
+    fn any_child_executable_requires_child_process_authority() {
+        let mut profile = profile(Vec::new());
+        profile.process.allow_any_executable = true;
+        assert!(matches!(
+            canonicalize_sandbox_profile(&profile),
+            Err(SandboxError::AnyExecutableRequiresChildProcesses)
         ));
     }
 

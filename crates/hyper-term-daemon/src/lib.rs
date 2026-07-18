@@ -5,21 +5,28 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use hyper_term_core::{
-    BlockProjector, JournalError, JsonlJournal, OperationError, OperationRecord, OperationReducer,
-    ProjectorError, TerminalConfig, TerminalError, TerminalEvent, TerminalReplay,
-    TerminalSessionHandle, TerminalSubscription, TerminalSupervisor, UserShellConfig,
+    BlockProjector, CapabilityLeaseLedger, JournalError, JsonlJournal, OperationError,
+    OperationRecord, OperationReducer, ProjectorError, SandboxCompileRequest, SandboxError,
+    SandboxLaunchPlan, SandboxLauncher, SandboxLeaseError, SandboxLeaseExpectation, TerminalConfig,
+    TerminalError, TerminalEvent, TerminalReplay, TerminalSessionHandle, TerminalSubscription,
+    TerminalSupervisor, UserShellConfig,
 };
 use hyper_term_protocol::{
-    Actor, BlockDocument, BlockId, ClientId, ControlRequest, ControlRequestEnvelope,
-    ControlResponse, ControlResponseEnvelope, DomainEvent, InputLeaseId, MessageRole, NewEvent,
-    OperationAction, OperationCompletion, OperationId, OperationKind, OperationState,
-    PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, TaskId, TerminalDataFrame,
+    Actor, BlockDocument, BlockId, CapabilityLease, ClientId, CompiledSandboxProfile,
+    ControlRequest, ControlRequestEnvelope, ControlResponse, ControlResponseEnvelope, DomainEvent,
+    InputLeaseId, MessageRole, NewEvent, OperationAction, OperationCompletion, OperationId,
+    OperationKind, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass,
+    SandboxEnforcement, SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId,
+    SandboxLifetime, SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule,
+    SandboxProcessPolicy, SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame,
     TerminalId, TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame,
     read_frame, write_frame,
 };
+use hyper_term_sandbox::MacOsSeatbeltLauncher;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -43,6 +50,7 @@ pub use web_gateway::{
 
 const CONTROL_SUBSCRIBER_CAPACITY: usize = 512;
 const OBSERVATION_BATCH_BYTES: u64 = 64 * 1024;
+const SANDBOX_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct DaemonState {
@@ -58,6 +66,18 @@ struct DaemonInner {
     lease_generations: Mutex<HashMap<TerminalId, u64>>,
     cancelled_terminals: Mutex<HashSet<TerminalId>>,
     control_subscribers: Mutex<Vec<Sender<ControlResponse>>>,
+    sandbox_launcher: Arc<dyn SandboxLauncher>,
+    sandbox_leases: Mutex<CapabilityLeaseLedger>,
+    authorized_sandboxes: Mutex<HashMap<OperationId, AuthorizedSandbox>>,
+    sandbox_executions: Mutex<HashMap<TerminalId, SandboxExecutionContext>>,
+    state_directory: PathBuf,
+    scratch_root: PathBuf,
+}
+
+impl Drop for DaemonInner {
+    fn drop(&mut self) {
+        cleanup_scratch_directory(&self.scratch_root);
+    }
 }
 
 struct AuthorityState {
@@ -78,6 +98,25 @@ struct OperationTerminalContext {
     operation_id: OperationId,
 }
 
+#[derive(Clone)]
+struct AuthorizedSandbox {
+    lease_id: SandboxLeaseId,
+    plan: SandboxLaunchPlan,
+    scratch_directory: PathBuf,
+}
+
+struct PreparedSandbox {
+    authorized: AuthorizedSandbox,
+    lease: CapabilityLease,
+}
+
+#[derive(Clone)]
+struct SandboxExecutionContext {
+    compiled: CompiledSandboxProfile,
+    started_at_ms: u64,
+    scratch_directory: PathBuf,
+}
+
 #[derive(Clone, Copy)]
 struct InputLease {
     lease_id: InputLeaseId,
@@ -87,8 +126,16 @@ struct InputLease {
 
 impl DaemonState {
     pub fn open(state_directory: impl AsRef<Path>) -> Result<Self, DaemonError> {
+        Self::open_with_sandbox_launcher(state_directory, Arc::new(MacOsSeatbeltLauncher))
+    }
+
+    fn open_with_sandbox_launcher(
+        state_directory: impl AsRef<Path>,
+        sandbox_launcher: Arc<dyn SandboxLauncher>,
+    ) -> Result<Self, DaemonError> {
         fs::create_dir_all(state_directory.as_ref())?;
-        let journal = JsonlJournal::open(state_directory.as_ref().join("events.jsonl"))?;
+        let state_directory = fs::canonicalize(state_directory.as_ref())?;
+        let journal = JsonlJournal::open(state_directory.join("events.jsonl"))?;
         let mut operations = OperationReducer::default();
         let mut projectors = HashMap::new();
         let mut created_tasks = HashSet::new();
@@ -108,9 +155,15 @@ impl DaemonState {
                 .apply(event)?;
         }
 
+        let instance_id = Uuid::new_v4();
+        let scratch_root = std::env::temp_dir()
+            .join("hyper-term-agent")
+            .join(instance_id.to_string());
+        create_private_directory(&scratch_root)?;
+        let scratch_root = fs::canonicalize(scratch_root)?;
         let daemon = Self {
             inner: Arc::new(DaemonInner {
-                instance_id: Uuid::new_v4(),
+                instance_id,
                 authority: Mutex::new(AuthorityState {
                     journal,
                     operations,
@@ -122,9 +175,16 @@ impl DaemonState {
                 lease_generations: Mutex::new(HashMap::new()),
                 cancelled_terminals: Mutex::new(HashSet::new()),
                 control_subscribers: Mutex::new(Vec::new()),
+                sandbox_launcher,
+                sandbox_leases: Mutex::new(CapabilityLeaseLedger::default()),
+                authorized_sandboxes: Mutex::new(HashMap::new()),
+                sandbox_executions: Mutex::new(HashMap::new()),
+                state_directory,
+                scratch_root,
             }),
         };
         daemon.reconcile_interrupted_dispatches()?;
+        daemon.reconcile_unrecoverable_sandbox_authorizations()?;
         Ok(daemon)
     }
 
@@ -259,6 +319,15 @@ impl DaemonState {
         if record.state != OperationState::WaitingHuman {
             return Err(DaemonError::OperationNotWaiting(record.state));
         }
+        let prepared_sandbox = if matches!(
+            decision,
+            PermissionDecision::AllowOnce | PermissionDecision::AllowAlways
+        ) && matches!(record.action, OperationAction::Shell { .. })
+        {
+            Some(self.prepare_authorized_sandbox(&record, expected_revision + 1)?)
+        } else {
+            None
+        };
         self.record(NewEvent {
             task_id,
             run_id: None,
@@ -279,7 +348,7 @@ impl DaemonState {
             | PermissionDecision::RejectAlways
             | PermissionDecision::Cancelled => OperationState::Cancelled,
         };
-        self.transition(
+        let updated = self.transition(
             task_id,
             operation_id,
             expected_revision,
@@ -287,7 +356,197 @@ impl DaemonState {
             Actor::User,
             Some(format!("permission decision: {decision:?}")),
         )?;
+        if let Some(prepared) = prepared_sandbox {
+            self.activate_authorized_sandbox(task_id, updated.revision, prepared)?;
+        }
         self.operation(operation_id)
+    }
+
+    fn prepare_authorized_sandbox(
+        &self,
+        record: &OperationRecord,
+        authorized_revision: u64,
+    ) -> Result<PreparedSandbox, DaemonError> {
+        let OperationAction::Shell { command } = &record.action else {
+            return Err(DaemonError::UnsupportedTerminalAction);
+        };
+        let workspace = command
+            .cwd
+            .as_deref()
+            .ok_or(DaemonError::SandboxWorkingDirectoryRequired)?;
+        let workspace = fs::canonicalize(workspace).map_err(|error| {
+            DaemonError::InvalidSandboxWorkingDirectory {
+                path: workspace.to_path_buf(),
+                message: error.to_string(),
+            }
+        })?;
+        if !workspace.is_dir() {
+            return Err(DaemonError::InvalidSandboxWorkingDirectory {
+                path: workspace,
+                message: "not a directory".into(),
+            });
+        }
+        if workspace.starts_with(&self.inner.state_directory) {
+            return Err(DaemonError::WorkspaceInsideDaemonState);
+        }
+
+        let scratch_directory = self
+            .inner
+            .scratch_root
+            .join(record.operation_id.to_string());
+        create_private_directory(&scratch_directory)?;
+        let scratch_directory = fs::canonicalize(scratch_directory)?;
+
+        let result = (|| {
+            let mut rules = ["/System", "/usr", "/bin", "/sbin", "/Library"]
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+                .map(|path| SandboxPathRule {
+                    path,
+                    access: SandboxPathAccess::Read,
+                })
+                .collect::<Vec<_>>();
+            rules.push(SandboxPathRule {
+                path: workspace.clone(),
+                access: if record.risk == RiskClass::ReadOnly {
+                    SandboxPathAccess::Read
+                } else {
+                    SandboxPathAccess::Write
+                },
+            });
+            for metadata in [".git", ".hg", ".svn", ".jj"] {
+                rules.push(SandboxPathRule {
+                    path: workspace.join(metadata),
+                    access: SandboxPathAccess::Read,
+                });
+            }
+            rules.push(SandboxPathRule {
+                path: self.inner.state_directory.clone(),
+                access: SandboxPathAccess::Deny,
+            });
+            rules.push(SandboxPathRule {
+                path: scratch_directory.clone(),
+                access: SandboxPathAccess::Write,
+            });
+
+            let profile = hyper_term_protocol::SandboxProfile {
+                enforcement: SandboxEnforcement::Native,
+                filesystem: SandboxFileSystemPolicy { rules },
+                network: SandboxNetworkPolicy::Offline,
+                environment: SandboxEnvironmentPolicy {
+                    clear_inherited: true,
+                    variables: std::collections::BTreeMap::from([
+                        (
+                            "HOME".into(),
+                            scratch_directory.to_string_lossy().into_owned(),
+                        ),
+                        (
+                            "TMPDIR".into(),
+                            scratch_directory.to_string_lossy().into_owned(),
+                        ),
+                        ("LANG".into(), "C.UTF-8".into()),
+                        ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+                        ("TERM".into(), "xterm-256color".into()),
+                    ]),
+                },
+                process: SandboxProcessPolicy {
+                    allow_child_processes: true,
+                    allow_any_executable: true,
+                    allowed_executables: Vec::new(),
+                },
+                resources: SandboxResourceLimits::default(),
+                lifetime: SandboxLifetime::OneOperation,
+            };
+            let actor = Actor::System;
+            let plan = self
+                .inner
+                .sandbox_launcher
+                .compile(&SandboxCompileRequest {
+                    operation_id: record.operation_id,
+                    operation_revision: authorized_revision,
+                    actor: actor.clone(),
+                    command: command.clone(),
+                    profile,
+                })?;
+            if !plan.compiled.enforced
+                || plan.compiled.backend
+                    == hyper_term_protocol::SandboxBackendKind::TestOnlyUnenforced
+            {
+                return Err(DaemonError::UnenforcedSandboxBackend);
+            }
+            let issued_at_ms = now_ms()?;
+            let lease = CapabilityLease {
+                lease_id: SandboxLeaseId::new(),
+                operation_id: record.operation_id,
+                operation_revision: authorized_revision,
+                action_digest: plan.compiled.action_digest.clone(),
+                profile_digest: plan.compiled.profile_digest.clone(),
+                actor,
+                issued_at_ms,
+                expires_at_ms: issued_at_ms.saturating_add(SANDBOX_LEASE_TTL_MS),
+                one_use: true,
+            };
+            Ok(PreparedSandbox {
+                authorized: AuthorizedSandbox {
+                    lease_id: lease.lease_id,
+                    plan,
+                    scratch_directory: scratch_directory.clone(),
+                },
+                lease,
+            })
+        })();
+        if result.is_err() {
+            cleanup_scratch_directory(&scratch_directory);
+        }
+        result
+    }
+
+    fn activate_authorized_sandbox(
+        &self,
+        task_id: TaskId,
+        operation_revision: u64,
+        prepared: PreparedSandbox,
+    ) -> Result<(), DaemonError> {
+        let operation_id = prepared.lease.operation_id;
+        let activation = (|| {
+            self.record(NewEvent {
+                task_id,
+                run_id: None,
+                operation_id: Some(operation_id),
+                causation_id: None,
+                correlation_id: None,
+                payload: DomainEvent::SandboxProfileCompiled {
+                    operation_revision,
+                    compiled: prepared.authorized.plan.compiled.clone(),
+                },
+            })?;
+            self.record(NewEvent {
+                task_id,
+                run_id: None,
+                operation_id: Some(operation_id),
+                causation_id: None,
+                correlation_id: None,
+                payload: DomainEvent::SandboxLeaseIssued {
+                    operation_revision,
+                    lease_id: prepared.lease.lease_id,
+                    expires_at_ms: prepared.lease.expires_at_ms,
+                    profile_digest: prepared.lease.profile_digest.clone(),
+                    action_digest: prepared.lease.action_digest.clone(),
+                },
+            })?;
+            lock(&self.inner.sandbox_leases)?.issue(prepared.lease.clone())?;
+            let mut authorizations = lock(&self.inner.authorized_sandboxes)?;
+            if authorizations.contains_key(&operation_id) {
+                return Err(DaemonError::SandboxAuthorizationAlreadyExists(operation_id));
+            }
+            authorizations.insert(operation_id, prepared.authorized.clone());
+            Ok(())
+        })();
+        if activation.is_err() {
+            cleanup_scratch_directory(&prepared.authorized.scratch_directory);
+        }
+        activation
     }
 
     pub fn begin_operation(
@@ -382,23 +641,40 @@ impl DaemonState {
             return Err(DaemonError::UnsupportedTerminalAction);
         };
 
-        self.transition(
+        let authorized = self.consume_authorized_sandbox(&record)?;
+        let started_at_ms = now_ms()?;
+
+        if let Err(error) = self.transition(
             task_id,
             operation_id,
             expected_revision,
             OperationState::Dispatching,
             Actor::System,
-            Some("authority committed before PTY spawn".into()),
-        )?;
+            Some("sandbox lease consumed before PTY spawn".into()),
+        ) {
+            cleanup_scratch_directory(&authorized.scratch_directory);
+            return Err(error);
+        }
 
-        let session = match self
-            .inner
-            .terminals
-            .spawn(&command, &size, TerminalConfig::default())
-        {
+        let session = match self.inner.terminals.spawn_sandboxed(
+            &authorized.plan,
+            &size,
+            TerminalConfig::default(),
+        ) {
             Ok(session) => session,
             Err(error) => {
                 let message = error.to_string();
+                let finished_at_ms = now_ms().unwrap_or(started_at_ms);
+                let _ = self.record_sandbox_receipt(
+                    task_id,
+                    operation_id,
+                    expected_revision + 1,
+                    &authorized.plan.compiled,
+                    started_at_ms,
+                    finished_at_ms,
+                    SandboxOutcome::Denied,
+                    None,
+                );
                 let _ = self.transition(
                     task_id,
                     operation_id,
@@ -407,6 +683,7 @@ impl DaemonState {
                     Actor::System,
                     Some(format!("PTY spawn failed: {message}")),
                 );
+                cleanup_scratch_directory(&authorized.scratch_directory);
                 return Err(DaemonError::Terminal(error));
             }
         };
@@ -418,6 +695,14 @@ impl DaemonState {
                 task_id,
                 operation_id,
             }),
+        );
+        lock(&self.inner.sandbox_executions)?.insert(
+            terminal_id,
+            SandboxExecutionContext {
+                compiled: authorized.plan.compiled.clone(),
+                started_at_ms,
+                scratch_directory: authorized.scratch_directory.clone(),
+            },
         );
         if let Err(error) = self.record(NewEvent {
             task_id,
@@ -433,14 +718,145 @@ impl DaemonState {
         }) {
             let _ = session.close();
             lock(&self.inner.terminal_contexts)?.remove(&terminal_id);
+            lock(&self.inner.sandbox_executions)?.remove(&terminal_id);
+            let _ = self.record_sandbox_receipt(
+                task_id,
+                operation_id,
+                expected_revision + 1,
+                &authorized.plan.compiled,
+                started_at_ms,
+                now_ms().unwrap_or(started_at_ms),
+                SandboxOutcome::Unknown,
+                None,
+            );
+            let _ = self.transition(
+                task_id,
+                operation_id,
+                expected_revision + 1,
+                OperationState::Failed,
+                Actor::System,
+                Some("terminal-open event could not be journaled".into()),
+            );
+            cleanup_scratch_directory(&authorized.scratch_directory);
             return Err(error);
         }
 
         let daemon = self.clone();
-        thread::Builder::new()
+        if let Err(error) = thread::Builder::new()
             .name(format!("hyperd-terminal-{terminal_id}"))
-            .spawn(move || daemon.monitor_terminal(session, subscription, terminal_id))?;
+            .spawn(move || daemon.monitor_terminal(session, subscription, terminal_id))
+        {
+            let _ = self.inner.terminals.close(terminal_id);
+            lock(&self.inner.terminal_contexts)?.remove(&terminal_id);
+            lock(&self.inner.sandbox_executions)?.remove(&terminal_id);
+            let _ = self.record(NewEvent {
+                task_id,
+                run_id: None,
+                operation_id: Some(operation_id),
+                causation_id: None,
+                correlation_id: None,
+                payload: DomainEvent::TerminalExited {
+                    terminal_id,
+                    exit_code: None,
+                },
+            });
+            let _ = self.record_sandbox_receipt(
+                task_id,
+                operation_id,
+                expected_revision + 1,
+                &authorized.plan.compiled,
+                started_at_ms,
+                now_ms().unwrap_or(started_at_ms),
+                SandboxOutcome::Unknown,
+                None,
+            );
+            let _ = self.transition(
+                task_id,
+                operation_id,
+                expected_revision + 1,
+                OperationState::Failed,
+                Actor::System,
+                Some("terminal monitor thread could not start".into()),
+            );
+            cleanup_scratch_directory(&authorized.scratch_directory);
+            return Err(error.into());
+        }
         Ok(terminal_id)
+    }
+
+    fn consume_authorized_sandbox(
+        &self,
+        record: &OperationRecord,
+    ) -> Result<AuthorizedSandbox, DaemonError> {
+        let authorized = lock(&self.inner.authorized_sandboxes)?
+            .get(&record.operation_id)
+            .cloned()
+            .ok_or(DaemonError::SandboxAuthorizationMissing(
+                record.operation_id,
+            ))?;
+        let expected = SandboxLeaseExpectation {
+            operation_id: record.operation_id,
+            operation_revision: record.revision,
+            action_digest: authorized.plan.compiled.action_digest.clone(),
+            profile_digest: authorized.plan.compiled.profile_digest.clone(),
+            actor: Actor::System,
+        };
+        lock(&self.inner.sandbox_leases)?.consume(authorized.lease_id, &expected, now_ms()?)?;
+        lock(&self.inner.authorized_sandboxes)?.remove(&record.operation_id);
+        Ok(authorized)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_sandbox_receipt(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        operation_revision: u64,
+        compiled: &CompiledSandboxProfile,
+        started_at_ms: u64,
+        finished_at_ms: u64,
+        outcome: SandboxOutcome,
+        exit_code: Option<u32>,
+    ) -> Result<(), DaemonError> {
+        let receipt = SandboxReceipt {
+            backend: compiled.backend,
+            enforced: compiled.enforced,
+            profile_digest: compiled.profile_digest.clone(),
+            action_digest: compiled.action_digest.clone(),
+            started_at_ms,
+            finished_at_ms,
+            outcome,
+            exit_code,
+            violations: Vec::new(),
+        };
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: Some(operation_id),
+            causation_id: None,
+            correlation_id: None,
+            payload: DomainEvent::SandboxReceiptRecorded {
+                operation_revision,
+                receipt: receipt.clone(),
+            },
+        })?;
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: Some(operation_id),
+            causation_id: None,
+            correlation_id: None,
+            payload: DomainEvent::OperationReceipt {
+                operation_revision,
+                executor: format!("sandbox::{:?}", compiled.backend),
+                succeeded: outcome == SandboxOutcome::Succeeded,
+                summary: format!(
+                    "Agent command finished in an enforced {:?} sandbox with outcome {:?}",
+                    compiled.backend, outcome
+                ),
+                result_digest: None,
+            },
+        })
     }
 
     /// Opens the user's configured login shell as a direct human terminal.
@@ -626,6 +1042,32 @@ impl DaemonState {
         Ok(())
     }
 
+    fn reconcile_unrecoverable_sandbox_authorizations(&self) -> Result<(), DaemonError> {
+        let authorizations = {
+            let authority = lock(&self.inner.authority)?;
+            authority
+                .operations
+                .records()
+                .filter(|record| {
+                    record.state == OperationState::Authorized
+                        && matches!(record.action, OperationAction::Shell { .. })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for record in authorizations {
+            self.transition(
+                record.task_id,
+                record.operation_id,
+                record.revision,
+                OperationState::Failed,
+                Actor::System,
+                Some("daemon restart invalidated the in-memory one-use sandbox lease".into()),
+            )?;
+        }
+        Ok(())
+    }
+
     fn monitor_terminal(
         &self,
         session: TerminalSessionHandle,
@@ -779,6 +1221,9 @@ impl DaemonState {
         let cancelled = lock(&self.inner.cancelled_terminals)
             .map(|mut terminals| terminals.remove(&terminal_id))
             .unwrap_or(false);
+        let sandbox_execution = lock(&self.inner.sandbox_executions)
+            .ok()
+            .and_then(|mut executions| executions.remove(&terminal_id));
         if let TerminalContext::Operation(context) = context {
             let _ = self.record(NewEvent {
                 task_id: context.task_id,
@@ -798,6 +1243,31 @@ impl DaemonState {
             } else {
                 OperationState::Failed
             };
+            if let Some(execution) = &sandbox_execution {
+                let operation_revision = self
+                    .operation(context.operation_id)
+                    .map(|record| record.revision)
+                    .unwrap_or(0);
+                if operation_revision != 0 {
+                    let outcome = if cancelled {
+                        SandboxOutcome::Failed
+                    } else if exit_code == Some(0) {
+                        SandboxOutcome::Succeeded
+                    } else {
+                        SandboxOutcome::Failed
+                    };
+                    let _ = self.record_sandbox_receipt(
+                        context.task_id,
+                        context.operation_id,
+                        operation_revision,
+                        &execution.compiled,
+                        execution.started_at_ms,
+                        now_ms().unwrap_or(execution.started_at_ms),
+                        outcome,
+                        exit_code,
+                    );
+                }
+            }
             let _ = self.transition_current(context, target, "PTY exited");
         }
         if let Ok(mut contexts) = lock(&self.inner.terminal_contexts) {
@@ -805,6 +1275,9 @@ impl DaemonState {
         }
         if let Ok(mut leases) = lock(&self.inner.input_leases) {
             leases.remove(&terminal_id);
+        }
+        if let Some(execution) = sandbox_execution {
+            cleanup_scratch_directory(&execution.scratch_directory);
         }
     }
 
@@ -1013,6 +1486,28 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn now_ms() -> Result<u64, DaemonError> {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| DaemonError::ClockBeforeUnixEpoch)?
+        .as_millis();
+    u64::try_from(milliseconds).map_err(|_| DaemonError::ClockOutOfRange)
+}
+
+fn create_private_directory(path: &Path) -> Result<(), DaemonError> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn cleanup_scratch_directory(path: &Path) {
+    let _ = fs::remove_dir_all(path);
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, DaemonError> {
@@ -1511,6 +2006,10 @@ pub enum DaemonError {
     #[error(transparent)]
     Terminal(#[from] TerminalError),
     #[error(transparent)]
+    Sandbox(#[from] SandboxError),
+    #[error(transparent)]
+    SandboxLease(#[from] SandboxLeaseError),
+    #[error(transparent)]
     Wire(#[from] WireError),
     #[error("daemon state lock is poisoned")]
     LockPoisoned,
@@ -1550,6 +2049,22 @@ pub enum DaemonError {
     ActionKindMismatch,
     #[error("terminal dispatch only supports an exact shell action")]
     UnsupportedTerminalAction,
+    #[error("sandboxed Agent commands require an explicit working directory")]
+    SandboxWorkingDirectoryRequired,
+    #[error("sandbox working directory {path} is invalid: {message}")]
+    InvalidSandboxWorkingDirectory { path: PathBuf, message: String },
+    #[error("Agent workspace may not be located inside Hyper Term daemon state")]
+    WorkspaceInsideDaemonState,
+    #[error("sandbox backend did not produce an enforced operating-system boundary")]
+    UnenforcedSandboxBackend,
+    #[error("operation {0} has no live one-use sandbox authorization")]
+    SandboxAuthorizationMissing(OperationId),
+    #[error("operation {0} already has a live sandbox authorization")]
+    SandboxAuthorizationAlreadyExists(OperationId),
+    #[error("system clock is before the Unix epoch")]
+    ClockBeforeUnixEpoch,
+    #[error("system clock is outside the supported millisecond range")]
+    ClockOutOfRange,
     #[error("terminal {0} has no active daemon context")]
     TerminalContextMissing(TerminalId),
     #[error("terminal {0} already has an input lease")]
@@ -1583,6 +2098,14 @@ impl DaemonError {
             Self::ActionKindMismatch
             | Self::UnsupportedTerminalAction
             | Self::GenericDispatchRequiresOpaqueAction => "unsupported_action",
+            Self::SandboxWorkingDirectoryRequired
+            | Self::InvalidSandboxWorkingDirectory { .. }
+            | Self::WorkspaceInsideDaemonState => "invalid_sandbox_workspace",
+            Self::SandboxAuthorizationMissing(_)
+            | Self::SandboxAuthorizationAlreadyExists(_)
+            | Self::UnenforcedSandboxBackend
+            | Self::Sandbox(_)
+            | Self::SandboxLease(_) => "sandbox_error",
             Self::InvalidBoundedText { .. }
             | Self::InvalidResultDigest
             | Self::EmptyMessage

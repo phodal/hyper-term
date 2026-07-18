@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
-use hyper_term_protocol::{TerminalCommand, TerminalId, TerminalSize};
+use hyper_term_protocol::{SandboxBackendKind, TerminalCommand, TerminalId, TerminalSize};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use thiserror::Error;
 
@@ -212,6 +212,37 @@ impl TerminalSupervisor {
             builder.env(key, value);
         }
 
+        self.spawn_builder(builder, size, config)
+    }
+
+    pub fn spawn_sandboxed(
+        &self,
+        plan: &crate::SandboxLaunchPlan,
+        size: &TerminalSize,
+        config: TerminalConfig,
+    ) -> Result<TerminalSessionHandle, TerminalError> {
+        if !plan.compiled.enforced
+            || plan.compiled.backend == SandboxBackendKind::TestOnlyUnenforced
+        {
+            return Err(TerminalError::UnenforcedSandboxPlan);
+        }
+        if !plan.clear_environment {
+            return Err(TerminalError::SandboxEnvironmentNotCleared);
+        }
+        size.validate().map_err(TerminalError::InvalidSize)?;
+        if plan.command.program.trim().is_empty() {
+            return Err(TerminalError::EmptyProgram);
+        }
+
+        let mut builder = CommandBuilder::new(&plan.command.program);
+        builder.args(&plan.command.args);
+        builder.env_clear();
+        if let Some(cwd) = &plan.command.cwd {
+            builder.cwd(cwd);
+        }
+        for (key, value) in &plan.command.env {
+            builder.env(key, value);
+        }
         self.spawn_builder(builder, size, config)
     }
 
@@ -593,6 +624,10 @@ pub enum TerminalError {
     Pty(#[from] anyhow::Error),
     #[error("terminal command program is empty")]
     EmptyProgram,
+    #[error("sandbox launch plan is not enforced by an operating-system backend")]
+    UnenforcedSandboxPlan,
+    #[error("sandbox launch plan must clear the inherited environment")]
+    SandboxEnvironmentNotCleared,
     #[error("user shell path must be absolute: {0}")]
     ShellPathNotAbsolute(PathBuf),
     #[error("user shell is missing, not a file, or not executable: {0}")]
@@ -649,6 +684,46 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn sandboxed_spawn_rejects_an_unenforced_test_backend() {
+        use crate::SandboxLauncher;
+        use hyper_term_protocol::{
+            Actor, OperationId, SandboxEnforcement, SandboxEnvironmentPolicy,
+            SandboxFileSystemPolicy, SandboxLifetime, SandboxNetworkPolicy, SandboxProcessPolicy,
+            SandboxResourceLimits,
+        };
+
+        let request = crate::SandboxCompileRequest {
+            operation_id: OperationId::new(),
+            operation_revision: 4,
+            actor: Actor::System,
+            command: TerminalCommand {
+                program: "/usr/bin/true".into(),
+                args: Vec::new(),
+                cwd: Some("/tmp".into()),
+                env: BTreeMap::new(),
+            },
+            profile: hyper_term_protocol::SandboxProfile {
+                enforcement: SandboxEnforcement::Native,
+                filesystem: SandboxFileSystemPolicy::default(),
+                network: SandboxNetworkPolicy::Offline,
+                environment: SandboxEnvironmentPolicy::default(),
+                process: SandboxProcessPolicy::default(),
+                resources: SandboxResourceLimits::default(),
+                lifetime: SandboxLifetime::OneOperation,
+            },
+        };
+        let plan = crate::TestOnlyUnenforcedSandboxLauncher
+            .compile(&request)
+            .unwrap();
+        let result = TerminalSupervisor::default().spawn_sandboxed(
+            &plan,
+            &TerminalSize::default(),
+            TerminalConfig::default(),
+        );
+        assert!(matches!(result, Err(TerminalError::UnenforcedSandboxPlan)));
     }
 
     #[test]

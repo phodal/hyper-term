@@ -258,6 +258,10 @@ impl BlockProjector {
                 };
                 vec![self.upsert(block, event.sequence)?]
             }
+            DomainEvent::SandboxProfileCompiled { .. }
+            | DomainEvent::SandboxLeaseIssued { .. }
+            | DomainEvent::SandboxReceiptRecorded { .. }
+            | DomainEvent::SandboxViolationObserved { .. } => Vec::new(),
             DomainEvent::TerminalOpened {
                 terminal_id,
                 command,
@@ -514,7 +518,7 @@ fn lifecycle_for_operation(state: OperationState) -> BlockLifecycle {
         OperationState::WaitingHuman => BlockLifecycle::Waiting,
         OperationState::Authorized | OperationState::Dispatching => BlockLifecycle::Running,
         OperationState::Succeeded => BlockLifecycle::Succeeded,
-        OperationState::Failed => BlockLifecycle::Failed,
+        OperationState::Failed | OperationState::Violated => BlockLifecycle::Failed,
         OperationState::Cancelled => BlockLifecycle::Cancelled,
         OperationState::UnknownExecution => BlockLifecycle::UnknownExecution,
     }
@@ -523,7 +527,9 @@ fn lifecycle_for_operation(state: OperationState) -> BlockLifecycle {
 fn attention_for_operation(state: OperationState) -> AttentionState {
     match state {
         OperationState::WaitingHuman => AttentionState::WaitingApproval,
-        OperationState::Failed | OperationState::UnknownExecution => AttentionState::Failed,
+        OperationState::Failed | OperationState::Violated | OperationState::UnknownExecution => {
+            AttentionState::Failed
+        }
         _ => AttentionState::None,
     }
 }
