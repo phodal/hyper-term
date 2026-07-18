@@ -1,0 +1,39 @@
+use std::time::Duration;
+
+use thiserror::Error;
+
+use crate::{
+    AcpAdapterError, AgentDriverEvent, AgentEffectAuthorization, CodexAdapterError, DriverState,
+    ExternalRequestId, StructuredAgentProtocol,
+};
+
+/// Renderer-independent port used by the daemon for every structured coding agent.
+/// Provider wire formats remain inside their adapters and never become journal schema.
+pub trait StructuredAgentClient: Send + Sync {
+    fn provider_id(&self) -> &str;
+    fn protocol(&self) -> StructuredAgentProtocol;
+    fn initialize_session(&self, timeout: Duration) -> Result<String, AgentClientError>;
+    fn start_turn(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<String, AgentClientError>;
+    fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AgentClientError>;
+    fn resolve_effect(
+        &self,
+        request_id: &ExternalRequestId,
+        authorization: AgentEffectAuthorization,
+    ) -> Result<(), AgentClientError>;
+    fn state(&self) -> Result<DriverState, AgentClientError>;
+    fn stderr_tail(&self) -> Result<String, AgentClientError>;
+    fn close(&self) -> Result<DriverState, AgentClientError>;
+}
+
+#[derive(Debug, Error)]
+pub enum AgentClientError {
+    #[error(transparent)]
+    Acp(#[from] AcpAdapterError),
+    #[error(transparent)]
+    Codex(#[from] CodexAdapterError),
+}

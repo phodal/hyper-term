@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -14,8 +15,9 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use hyper_term_drivers::{
-    AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind, CodexAppServerClient,
-    CodexAppServerConfig, CodexMcpServerConfig, DriverState, ExternalRequestId, sha256_file,
+    AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentDriverEvent, AgentEffectAuthorization,
+    AgentEffectKind, CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig, DriverState,
+    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, sha256_file,
 };
 use hyper_term_protocol::{
     ArtifactId, BlockDocument, BlockId, MessageRole, OperationAction, OperationId, OperationKind,
@@ -50,9 +52,19 @@ pub struct AgentGatewayConfig {
     pub daemon: DaemonState,
     pub codex_executable: Option<PathBuf>,
     pub codex_auth_file: Option<PathBuf>,
+    pub acp_providers: Vec<AcpAgentProviderConfig>,
     pub mcp_executable: Option<PathBuf>,
     pub genui_runtime: Option<AgentGenUiRuntimeConfig>,
     pub control_socket: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcpAgentProviderConfig {
+    pub provider_id: String,
+    pub executable: PathBuf,
+    pub arguments: Vec<OsString>,
+    pub environment: BTreeMap<String, OsString>,
+    pub implementation_version: String,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +122,8 @@ pub enum AgentGatewayError {
     InvalidStateDirectory(PathBuf),
     #[error("agent gateway GenUI runtime is invalid: {0}")]
     InvalidGenUiRuntime(String),
+    #[error("agent gateway ACP provider is invalid: {0}")]
+    InvalidAcpProvider(String),
     #[error("agent gateway I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("agent gateway task failed: {0}")]
@@ -124,7 +138,9 @@ struct AgentGatewayRuntime {
 }
 
 struct AgentSession {
-    client: Arc<CodexAppServerClient>,
+    client: Arc<dyn StructuredAgentClient>,
+    provider_id: String,
+    protocol: StructuredAgentProtocol,
     task_id: TaskId,
     thread_id: String,
     progress: Mutex<AgentProgress>,
@@ -149,6 +165,13 @@ struct PendingAgentEffect {
     projection: AgentTurnProjection,
 }
 
+#[derive(Clone)]
+struct BrokeredMcpLaunch {
+    executable: PathBuf,
+    executable_sha256: String,
+    arguments: Vec<OsString>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AgentStatus {
@@ -169,13 +192,14 @@ struct AgentProgress {
 struct AgentSessionQuery {
     token: Option<String>,
     session_id: Option<u16>,
+    provider: Option<String>,
 }
 
 #[derive(Serialize)]
 struct AgentSessionResponse {
     session_id: u16,
-    provider: &'static str,
-    protocol: &'static str,
+    provider: String,
+    protocol: String,
     status: &'static str,
     task_id: TaskId,
     thread_id: String,
@@ -221,6 +245,22 @@ pub async fn spawn_agent_gateway(
         .state_directory
         .canonicalize()
         .map_err(|_| AgentGatewayError::InvalidStateDirectory(config.state_directory.clone()))?;
+    let mut provider_ids = HashSet::new();
+    for provider in &mut config.acp_providers {
+        if !valid_provider_id(&provider.provider_id)
+            || provider.provider_id == "codex"
+            || provider.implementation_version.is_empty()
+            || !provider_ids.insert(provider.provider_id.clone())
+        {
+            return Err(AgentGatewayError::InvalidAcpProvider(
+                provider.provider_id.clone(),
+            ));
+        }
+        provider.executable = provider
+            .executable
+            .canonicalize()
+            .map_err(|_| AgentGatewayError::InvalidAcpProvider(provider.provider_id.clone()))?;
+    }
     if let Some(runtime) = config.genui_runtime.as_mut() {
         if runtime.runtime_version.is_empty() || runtime.compiler_version.is_empty() {
             return Err(AgentGatewayError::InvalidGenUiRuntime(
@@ -290,16 +330,25 @@ async fn start_session(
         Ok(session_id) => session_id,
         Err(response) => return *response,
     };
-    let result = tokio::task::spawn_blocking(move || runtime.start_codex(session_id)).await;
+    let provider = query.provider.unwrap_or_else(|| "codex".into());
+    if !valid_provider_id(&provider) {
+        return status_response(StatusCode::BAD_REQUEST, "Agent provider id is invalid");
+    }
+    let result =
+        tokio::task::spawn_blocking(move || runtime.start_agent(session_id, &provider)).await;
     match result {
         Ok(Ok(response)) => json_response(StatusCode::OK, &response),
         Ok(Err(StartError::Unavailable)) => status_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Codex app-server is unavailable",
+            "Requested Agent provider is unavailable",
+        ),
+        Ok(Err(StartError::ProviderMismatch)) => status_response(
+            StatusCode::CONFLICT,
+            "Agent session already uses a different provider",
         ),
         Ok(Err(_)) | Err(_) => status_response(
             StatusCode::BAD_GATEWAY,
-            "Codex app-server failed to initialize",
+            "Agent provider failed to initialize",
         ),
     }
 }
@@ -494,6 +543,7 @@ fn authorize(
 #[derive(Debug)]
 enum StartError {
     Unavailable,
+    ProviderMismatch,
     Capacity,
     Lock,
     Driver,
@@ -515,9 +565,16 @@ enum SessionError {
 }
 
 impl AgentGatewayRuntime {
-    fn start_codex(&self, session_id: u16) -> Result<AgentSessionResponse, StartError> {
+    fn start_agent(
+        &self,
+        session_id: u16,
+        provider_id: &str,
+    ) -> Result<AgentSessionResponse, StartError> {
         let mut sessions = self.sessions.lock().map_err(|_| StartError::Lock)?;
         if let Some(session) = sessions.get(&session_id) {
+            if session.provider_id != provider_id {
+                return Err(StartError::ProviderMismatch);
+            }
             return match session.client.state().map_err(|_| StartError::Driver)? {
                 DriverState::Ready | DriverState::Busy | DriverState::Waiting => {
                     Ok(ready_response(session_id, session))
@@ -528,14 +585,6 @@ impl AgentGatewayRuntime {
         if sessions.len() >= MAX_AGENT_SESSIONS {
             return Err(StartError::Capacity);
         }
-        let executable = self
-            .config
-            .codex_executable
-            .as_ref()
-            .ok_or(StartError::Unavailable)?
-            .canonicalize()
-            .map_err(|_| StartError::Unavailable)?;
-        let executable_sha256 = sha256_file(&executable).map_err(|_| StartError::Driver)?;
         let session_root = self
             .config
             .state_directory
@@ -544,28 +593,18 @@ impl AgentGatewayRuntime {
         let task_id = self
             .config
             .daemon
-            .create_task(format!("Codex Agent session {session_id}"))
+            .create_task(format!("{provider_id} Agent session {session_id}"))
             .map_err(|_| StartError::Driver)?;
-        let brokered_mcp_server = self.mcp_config(task_id, &session_root).transpose()?;
-        let client = CodexAppServerClient::launch(CodexAppServerConfig {
-            executable,
-            executable_sha256,
-            implementation_version: "installed".into(),
-            workspace: self.config.workspace.clone(),
-            codex_home: session_root.join("codex-home"),
-            scratch_directory: session_root.join("scratch"),
-            auth_file: self.config.codex_auth_file.clone(),
-            brokered_mcp_server,
-        })
-        .map_err(|_| StartError::Driver)?;
-        client
-            .initialize(INITIALIZE_TIMEOUT)
-            .map_err(|_| StartError::Driver)?;
+        let mcp = self.mcp_launch(task_id, &session_root).transpose()?;
+        let client = self.launch_provider(provider_id, &session_root, mcp)?;
+        let protocol = client.protocol();
         let thread_id = client
-            .start_thread(INITIALIZE_TIMEOUT)
+            .initialize_session(INITIALIZE_TIMEOUT)
             .map_err(|_| StartError::Driver)?;
         let session = Arc::new(AgentSession {
-            client: Arc::new(client),
+            client,
+            provider_id: provider_id.to_owned(),
+            protocol,
             task_id,
             thread_id,
             progress: Mutex::new(AgentProgress {
@@ -578,6 +617,64 @@ impl AgentGatewayRuntime {
         let response = ready_response(session_id, &session);
         sessions.insert(session_id, session);
         Ok(response)
+    }
+
+    fn launch_provider(
+        &self,
+        provider_id: &str,
+        session_root: &std::path::Path,
+        mcp: Option<BrokeredMcpLaunch>,
+    ) -> Result<Arc<dyn StructuredAgentClient>, StartError> {
+        if provider_id == "codex" {
+            let executable = self
+                .config
+                .codex_executable
+                .as_ref()
+                .ok_or(StartError::Unavailable)?
+                .canonicalize()
+                .map_err(|_| StartError::Unavailable)?;
+            let executable_sha256 = sha256_file(&executable).map_err(|_| StartError::Driver)?;
+            let client = CodexAppServerClient::launch(CodexAppServerConfig {
+                executable,
+                executable_sha256,
+                implementation_version: "installed".into(),
+                workspace: self.config.workspace.clone(),
+                codex_home: session_root.join("codex-home"),
+                scratch_directory: session_root.join("scratch"),
+                auth_file: self.config.codex_auth_file.clone(),
+                brokered_mcp_server: mcp.map(|mcp| CodexMcpServerConfig {
+                    executable: mcp.executable,
+                    executable_sha256: mcp.executable_sha256,
+                    arguments: mcp.arguments,
+                }),
+            })
+            .map_err(|_| StartError::Driver)?;
+            return Ok(Arc::new(client));
+        }
+        let provider = self
+            .config
+            .acp_providers
+            .iter()
+            .find(|provider| provider.provider_id == provider_id)
+            .ok_or(StartError::Unavailable)?;
+        let executable_sha256 =
+            sha256_file(&provider.executable).map_err(|_| StartError::Driver)?;
+        let client = AcpAgentClient::launch(AcpAgentConfig {
+            executable: provider.executable.clone(),
+            executable_sha256,
+            arguments: provider.arguments.clone(),
+            environment: provider.environment.clone(),
+            implementation_version: provider.implementation_version.clone(),
+            provider_id: provider.provider_id.clone(),
+            workspace: self.config.workspace.clone(),
+            brokered_mcp_server: mcp.map(|mcp| AcpMcpServerConfig {
+                executable: mcp.executable,
+                executable_sha256: mcp.executable_sha256,
+                arguments: mcp.arguments,
+            }),
+        })
+        .map_err(|_| StartError::Driver)?;
+        Ok(Arc::new(client))
     }
 
     fn snapshot(&self, session_id: u16) -> Result<AgentSnapshotResponse, SessionError> {
@@ -765,10 +862,7 @@ impl AgentGatewayRuntime {
             )
             .is_err()
         {
-            set_progress_failed(
-                &session,
-                "Rejected Agent effect could not be returned to Codex",
-            );
+            set_progress_failed(&session, "Agent effect decision could not be returned");
             let _ = session.client.close();
             return Err(SessionError::Driver);
         }
@@ -806,11 +900,11 @@ impl AgentGatewayRuntime {
             .ok_or(SessionError::NotFound)
     }
 
-    fn mcp_config(
+    fn mcp_launch(
         &self,
         task_id: TaskId,
         session_root: &std::path::Path,
-    ) -> Option<Result<CodexMcpServerConfig, StartError>> {
+    ) -> Option<Result<BrokeredMcpLaunch, StartError>> {
         let executable = match self.config.mcp_executable.as_ref()?.canonicalize() {
             Ok(executable) => executable,
             Err(_) => return Some(Err(StartError::Driver)),
@@ -863,7 +957,7 @@ impl AgentGatewayRuntime {
                 runtime.compiler_version.clone().into(),
             ]);
         }
-        Some(Ok(CodexMcpServerConfig {
+        Some(Ok(BrokeredMcpLaunch {
             executable,
             executable_sha256: digest,
             arguments,
@@ -1077,6 +1171,27 @@ fn continue_turn(
                     text,
                 );
             }
+            AgentDriverEvent::ThoughtDelta {
+                thread_id,
+                turn_id: event_turn_id,
+                text,
+                ..
+            } if thread_id == session.thread_id && event_turn_id == projection.turn_id => {
+                if text.is_empty() {
+                    continue;
+                }
+                projection.plan_bytes = match projection.plan_bytes.checked_add(text.len()) {
+                    Some(total) if total <= MAX_AGENT_MESSAGE_BYTES => total,
+                    _ => continue,
+                };
+                let _ = daemon.append_message(
+                    session.task_id,
+                    projection.plan_block_id,
+                    MessageRole::Thought,
+                    Some(projection.turn_id.clone()),
+                    text,
+                );
+            }
             AgentDriverEvent::EffectProposed { proposal, .. } => {
                 let (kind, risk) = operation_kind_and_risk(proposal.kind);
                 let operation = match daemon.propose_operation(
@@ -1138,7 +1253,7 @@ fn continue_turn(
                     .is_none_or(|value| value == projection.turn_id) =>
             {
                 if status.as_deref() == Some("failed") {
-                    set_progress_failed(&session, "Codex reported a failed turn");
+                    set_progress_failed(&session, "Agent reported a failed turn");
                 } else if let Ok(mut progress) = session.progress.lock() {
                     progress.status = AgentStatus::Completed;
                     progress.error = None;
@@ -1146,7 +1261,7 @@ fn continue_turn(
                 return;
             }
             AgentDriverEvent::Exited { .. } => {
-                set_progress_failed(&session, "Codex exited before the turn completed");
+                set_progress_failed(&session, "Agent exited before the turn completed");
                 return;
             }
             _ => {}
@@ -1157,14 +1272,14 @@ fn continue_turn(
 fn operation_kind_and_risk(kind: AgentEffectKind) -> (OperationKind, RiskClass) {
     match kind {
         AgentEffectKind::Shell => (
-            OperationKind::Other("codex_shell".into()),
+            OperationKind::Other("agent_shell".into()),
             RiskClass::ExternalEffect,
         ),
         AgentEffectKind::WorkspaceEdit => (OperationKind::FileEdit, RiskClass::WorkspaceWrite),
         AgentEffectKind::Tool => (OperationKind::AgentTool, RiskClass::ExternalEffect),
         AgentEffectKind::ComputerUse => (OperationKind::ComputerUse, RiskClass::ExternalEffect),
         AgentEffectKind::Opaque => (
-            OperationKind::Other("codex_effect".into()),
+            OperationKind::Other("agent_effect".into()),
             RiskClass::ExternalEffect,
         ),
     }
@@ -1188,12 +1303,29 @@ fn bounded_error(message: &str) -> String {
 fn ready_response(session_id: u16, session: &AgentSession) -> AgentSessionResponse {
     AgentSessionResponse {
         session_id,
-        provider: "codex",
-        protocol: "codex-app-server-v2",
+        provider: session.provider_id.clone(),
+        protocol: structured_protocol_name(session.protocol).into(),
         status: "ready",
         task_id: session.task_id,
         thread_id: session.thread_id.clone(),
     }
+}
+
+fn structured_protocol_name(protocol: StructuredAgentProtocol) -> &'static str {
+    match protocol {
+        StructuredAgentProtocol::Acp => "acp-v1",
+        StructuredAgentProtocol::CodexAppServerV2 => "codex-app-server-v2",
+        StructuredAgentProtocol::ClaudeStreamJson => "claude-stream-json",
+        StructuredAgentProtocol::Mcp20251125 => "mcp-2025-11-25",
+    }
+}
+
+fn valid_provider_id(provider_id: &str) -> bool {
+    !provider_id.is_empty()
+        && provider_id.len() <= 64
+        && provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn json_response(status: StatusCode, value: &impl Serialize) -> Response {
@@ -1310,6 +1442,7 @@ mod tests {
             daemon,
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
+            acp_providers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             control_socket: temporary.path().join("hyperd.sock"),
@@ -1368,6 +1501,98 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn configured_acp_provider_uses_the_same_agent_session_projection() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).expect("daemon");
+        let fake_acp = temporary.path().join("fixture-acp");
+        std::fs::write(
+            &fake_acp,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-session-8\"}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Provider-neutral ACP is live.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+        )
+        .expect("fake ACP");
+        let mut permissions = std::fs::metadata(&fake_acp).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_acp, permissions).unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace,
+            state_directory: temporary.path().join("gateway-state"),
+            daemon,
+            codex_executable: None,
+            codex_auth_file: None,
+            acp_providers: vec![AcpAgentProviderConfig {
+                provider_id: "fixture-acp".into(),
+                executable: fake_acp,
+                arguments: Vec::new(),
+                environment: BTreeMap::new(),
+                implementation_version: "fixture-1".into(),
+            }],
+            mcp_executable: None,
+            genui_runtime: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .expect("agent gateway");
+
+        let (status, body) = request_path(
+            gateway.address(),
+            &format!("/agent/session?token={token}&session_id=8&provider=fixture-acp"),
+            "POST",
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["provider"], "fixture-acp");
+        assert_eq!(response["protocol"], "acp-v1");
+        assert_eq!(response["thread_id"], "acp-session-8");
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                &format!("/agent/session?token={token}&session_id=8&provider=codex"),
+                "POST",
+                b"",
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT.as_u16()
+        );
+
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                &format!("/agent/session/turn?token={token}&session_id=8"),
+                "POST",
+                b"Use ACP",
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+        let snapshot = loop {
+            let (status, body) = request(gateway.address(), &token, 8, "GET").await;
+            assert_eq!(status, StatusCode::OK.as_u16());
+            let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if snapshot["status"] == "completed" {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            snapshot["document"]["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block["payload"]["text"] == "Provider-neutral ACP is live.")
+        );
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn accepted_artifact_preview_is_authenticated_current_and_network_closed() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
@@ -1408,6 +1633,7 @@ mod tests {
             daemon: daemon.clone(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
+            acp_providers: Vec::new(),
             mcp_executable: None,
             genui_runtime: Some(AgentGenUiRuntimeConfig {
                 deno_executable: deno,
@@ -1546,6 +1772,7 @@ mod tests {
             daemon,
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
+            acp_providers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             control_socket: temporary.path().join("hyperd.sock"),
@@ -1690,6 +1917,7 @@ mod tests {
             daemon: daemon.clone(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
+            acp_providers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             control_socket: temporary.path().join("hyperd.sock"),
@@ -1741,7 +1969,7 @@ mod tests {
         let opaque = daemon
             .propose_operation(
                 task_id,
-                OperationKind::Other("codex_shell".into()),
+                OperationKind::Other("agent_shell".into()),
                 OperationAction::Opaque {
                     kind: "item/commandExecution/requestApproval".into(),
                     payload_digest: "b".repeat(64),
@@ -1798,6 +2026,7 @@ mod tests {
                 daemon: DaemonState::open(temporary.path().join("daemon-state")).unwrap(),
                 codex_executable: None,
                 codex_auth_file: None,
+                acp_providers: Vec::new(),
                 mcp_executable: Some(mcp),
                 genui_runtime: Some(AgentGenUiRuntimeConfig {
                     deno_executable: deno,
@@ -1814,7 +2043,7 @@ mod tests {
         };
         let session_root = state_directory.join("agents/session-7");
         let config = runtime
-            .mcp_config(TaskId::new(), &session_root)
+            .mcp_launch(TaskId::new(), &session_root)
             .expect("MCP configured")
             .expect("valid MCP config");
         let arguments = config

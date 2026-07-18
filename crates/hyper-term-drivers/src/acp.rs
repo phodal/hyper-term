@@ -16,10 +16,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal,
-    DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
-    DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
-    StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
+    AgentClientError, AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind,
+    AgentEffectProposal, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent,
+    DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
+    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox,
+    sha256_file,
 };
 
 const ACP_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -33,6 +34,58 @@ pub struct AcpMcpServerConfig {
     pub executable: PathBuf,
     pub executable_sha256: String,
     pub arguments: Vec<OsString>,
+}
+
+impl StructuredAgentClient for AcpAgentClient {
+    fn provider_id(&self) -> &str {
+        AcpAgentClient::provider_id(self)
+    }
+
+    fn protocol(&self) -> StructuredAgentProtocol {
+        StructuredAgentProtocol::Acp
+    }
+
+    fn initialize_session(&self, timeout: Duration) -> Result<String, AgentClientError> {
+        AcpAgentClient::initialize(self, timeout)?;
+        Ok(AcpAgentClient::start_session(self, timeout)?)
+    }
+
+    fn start_turn(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        _timeout: Duration,
+    ) -> Result<String, AgentClientError> {
+        Ok(AcpAgentClient::start_turn(self, session_id, prompt)?)
+    }
+
+    fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AgentClientError> {
+        Ok(AcpAgentClient::next_event(self, timeout)?)
+    }
+
+    fn resolve_effect(
+        &self,
+        request_id: &ExternalRequestId,
+        authorization: AgentEffectAuthorization,
+    ) -> Result<(), AgentClientError> {
+        Ok(AcpAgentClient::resolve_effect(
+            self,
+            request_id,
+            authorization,
+        )?)
+    }
+
+    fn state(&self) -> Result<DriverState, AgentClientError> {
+        Ok(AcpAgentClient::state(self)?)
+    }
+
+    fn stderr_tail(&self) -> Result<String, AgentClientError> {
+        Ok(AcpAgentClient::stderr_tail(self)?)
+    }
+
+    fn close(&self) -> Result<DriverState, AgentClientError> {
+        Ok(AcpAgentClient::close(self)?)
+    }
 }
 
 pub struct AcpAgentConfig {

@@ -13,10 +13,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal,
-    DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
-    DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
-    StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
+    AgentClientError, AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind,
+    AgentEffectProposal, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent,
+    DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
+    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox,
+    sha256_file,
 };
 
 const MAX_PENDING_APPROVALS: usize = 128;
@@ -411,6 +412,60 @@ impl CodexAppServerClient {
 impl Drop for CodexAppServerClient {
     fn drop(&mut self) {
         remove_staged_auth_file(self.staged_auth_file.as_ref());
+    }
+}
+
+impl StructuredAgentClient for CodexAppServerClient {
+    fn provider_id(&self) -> &str {
+        "codex"
+    }
+
+    fn protocol(&self) -> StructuredAgentProtocol {
+        StructuredAgentProtocol::CodexAppServerV2
+    }
+
+    fn initialize_session(&self, timeout: Duration) -> Result<String, AgentClientError> {
+        CodexAppServerClient::initialize(self, timeout)?;
+        Ok(CodexAppServerClient::start_thread(self, timeout)?)
+    }
+
+    fn start_turn(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<String, AgentClientError> {
+        Ok(CodexAppServerClient::start_turn(
+            self, session_id, prompt, timeout,
+        )?)
+    }
+
+    fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AgentClientError> {
+        Ok(CodexAppServerClient::next_event(self, timeout)?)
+    }
+
+    fn resolve_effect(
+        &self,
+        request_id: &ExternalRequestId,
+        authorization: AgentEffectAuthorization,
+    ) -> Result<(), AgentClientError> {
+        Ok(CodexAppServerClient::resolve_effect(
+            self,
+            request_id,
+            authorization,
+        )?)
+    }
+
+    fn state(&self) -> Result<DriverState, AgentClientError> {
+        Ok(CodexAppServerClient::state(self)?)
+    }
+
+    fn stderr_tail(&self) -> Result<String, AgentClientError> {
+        Ok(CodexAppServerClient::stderr_tail(self)?)
+    }
+
+    fn close(&self) -> Result<DriverState, AgentClientError> {
+        Ok(CodexAppServerClient::close(self)?)
     }
 }
 

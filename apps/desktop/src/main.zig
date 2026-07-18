@@ -1022,6 +1022,7 @@ fn operationKindLabel(value: ?std.json.Value) []const u8 {
         },
         else => return "Agent effect",
     };
+    if (std.mem.eql(u8, raw, "agent_shell")) return "Agent shell request";
     if (std.mem.eql(u8, raw, "codex_shell")) return "Codex shell request";
     if (std.mem.eql(u8, raw, "file_edit")) return "Workspace edit";
     if (std.mem.eql(u8, raw, "agent_tool")) return "Agent tool";

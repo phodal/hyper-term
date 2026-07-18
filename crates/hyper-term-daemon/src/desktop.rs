@@ -98,6 +98,7 @@ fn run() -> Result<i32, String> {
             daemon: daemon.clone(),
             codex_executable: resolved.codex.clone(),
             codex_auth_file: resolved.codex_auth.clone(),
+            acp_providers: Vec::new(),
             mcp_executable: resolved.mcp.clone(),
             genui_runtime: resolved
                 .genui_runtime
