@@ -20,6 +20,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  NATIVE_SDK_COMMIT: 57bf56bc58058768d436099c1005bfc66bd55ac3
   NATIVE_SDK_VERSION: 0.5.3
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
@@ -95,6 +96,17 @@ jobs:
             | (cd "$cli_dir" && shasum -a 256 -c -)
           install -m 0755 "$cli_dir/$NATIVE_ASSET" "$bin_dir/native"
           echo "$bin_dir" >> "$GITHUB_PATH"
+          framework_dir="$RUNNER_TEMP/native-sdk-framework"
+          git clone \
+            --branch "v$NATIVE_SDK_VERSION" \
+            --depth 1 \
+            https://github.com/vercel-labs/native.git \
+            "$framework_dir"
+          if [[ "$(git -C "$framework_dir" rev-parse HEAD)" != "$NATIVE_SDK_COMMIT" ]]; then
+            echo "Native SDK tag does not match audited commit $NATIVE_SDK_COMMIT" >&2
+            exit 1
+          fi
+          echo "NATIVE_SDK_PATH=$framework_dir" >> "$GITHUB_ENV"
 
       - name: Run Rust release gates
         run: |
@@ -172,6 +184,17 @@ jobs:
             | (cd "$cli_dir" && shasum -a 256 -c -)
           install -m 0755 "$cli_dir/$NATIVE_ASSET" "$bin_dir/native"
           echo "$bin_dir" >> "$GITHUB_PATH"
+          framework_dir="$RUNNER_TEMP/native-sdk-framework"
+          git clone \
+            --branch "v$NATIVE_SDK_VERSION" \
+            --depth 1 \
+            https://github.com/vercel-labs/native.git \
+            "$framework_dir"
+          if [[ "$(git -C "$framework_dir" rev-parse HEAD)" != "$NATIVE_SDK_COMMIT" ]]; then
+            echo "Native SDK tag does not match audited commit $NATIVE_SDK_COMMIT" >&2
+            exit 1
+          fi
+          echo "NATIVE_SDK_PATH=$framework_dir" >> "$GITHUB_ENV"
 
       - name: Download verified terminal renderer
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5

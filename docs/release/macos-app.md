@@ -4,6 +4,10 @@ Tags matching `vX.Y.Z` start `.github/workflows/release.yml`. The workflow
 validates the Rust, Deno, and Native SDK layers, then builds separate Apple
 Silicon and Intel application archives.
 
+The Native CLI binary and checksum come from the pinned Native SDK release. Its
+framework checkout is also pinned to the audited commit recorded by ADR 0013;
+the workflow refuses to build when the release tag resolves elsewhere.
+
 The final bundle contains:
 
 - `Contents/MacOS/hyper-term`: the Rust desktop supervisor and PTY authority;
