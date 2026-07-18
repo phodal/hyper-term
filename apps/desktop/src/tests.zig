@@ -45,7 +45,8 @@ fn containsText(widget: canvas.Widget, value: []const u8) bool {
 
 test "default session is an ordinary terminal" {
     var model = main.initialModel();
-    try testing.expectEqual(main.SessionMode.terminal, model.mode);
+    try testing.expectEqual(main.SessionMode.terminal, model.activeSession().mode);
+    try testing.expectEqual(@as(usize, 1), model.openSessions().len);
     try testing.expect(!model.new_session_open);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -74,7 +75,8 @@ test "New Session explicitly selects Terminal or Agent" {
     tree = try buildTree(arena, &model);
     const agent_item = findByText(tree.root, .menu_item, "Agent · ACP / MCP").?;
     main.update(&model, tree.msgForPointer(agent_item.id, .up).?, &fx);
-    try testing.expectEqual(main.SessionMode.agent, model.mode);
+    try testing.expectEqual(main.SessionMode.agent, model.activeSession().mode);
+    try testing.expectEqual(@as(usize, 2), model.openSessions().len);
     try testing.expect(!model.new_session_open);
 
     tree = try buildTree(arena, &model);
@@ -84,7 +86,8 @@ test "New Session explicitly selects Terminal or Agent" {
 
 test "compiled and hot-reload markup produce the same root" {
     var model = main.initialModel();
-    model.mode = .agent;
+    model.session_slots[0].mode = .agent;
+    model.session_slots[0].title = "Agent";
 
     var compiled_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer compiled_arena.deinit();
@@ -103,7 +106,8 @@ test "layout and accessibility sweeps stay clean in both modes" {
         defer arena_state.deinit();
 
         var model = main.initialModel();
-        model.mode = mode;
+        model.session_slots[0].mode = mode;
+        model.session_slots[0].title = if (mode == .terminal) "zsh" else "Agent";
         const tree = try buildTree(arena_state.allocator(), &model);
         const tokens = main.hyperTermTokens(&model);
         const sweep = canvas.LayoutAuditSweepOptions{
@@ -144,8 +148,28 @@ test "terminal web pane accepts only the authenticated fixed loopback shape" {
     try testing.expectEqual(@as(usize, 1), main.terminalPanes(&model, &panes));
     try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
     try testing.expectEqualStrings(main.terminal_view_anchor, panes[0].anchor.?);
-    try testing.expectEqualStrings(url, panes[0].url);
+    try testing.expectEqualStrings(url ++ "&tab=1", panes[0].url);
 
     model = main.initialModel();
     try testing.expectEqual(@as(usize, 0), main.terminalPanes(&model, &panes));
+}
+
+test "new terminal tabs switch reconnect namespaces without exceeding the bound" {
+    const url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    var model = main.initialModelWithTerminalUrl(url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_terminal, &fx);
+    try testing.expectEqual(@as(usize, 2), model.openSessions().len);
+    try testing.expectEqual(@as(u8, 2), model.active_session_id);
+    try testing.expectEqualStrings(url ++ "&tab=2", model.terminalUrl());
+
+    main.update(&model, .{ .select_session = 1 }, &fx);
+    try testing.expectEqual(@as(u8, 1), model.active_session_id);
+    try testing.expectEqualStrings(url ++ "&tab=1", model.terminalUrl());
+
+    for (0..main.max_sessions + 2) |_| main.update(&model, .choose_terminal, &fx);
+    try testing.expectEqual(main.max_sessions, model.openSessions().len);
 }

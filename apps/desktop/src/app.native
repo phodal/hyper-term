@@ -8,7 +8,9 @@
       <text><span weight="medium">Hyper Term</span></text>
       <separator height="16" />
       <tabs gap="2" label="Open sessions">
-        <button size="sm" variant="ghost" selected="true" icon="terminal" label="{sessionA11yLabel}">{sessionTitle}</button>
+        <for each="openSessions" key="id" as="session">
+          <button size="sm" variant="ghost" selected="{session.id == active_session_id}" icon="terminal" on-press="select_session:{session.id}" label="Open {session.title} session {session.id}">{session.title} {session.id}</button>
+        </for>
       </tabs>
     </row>
     <badge variant="secondary">{modeLabel}</badge>

@@ -1,5 +1,8 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import { TerminalConnectionState } from "./connection-state.ts";
+import {
+  terminalAttachmentStorageKey,
+  TerminalConnectionState,
+} from "./connection-state.ts";
 
 Deno.test("an open socket cannot send terminal data before protocol ready", () => {
   const state = new TerminalConnectionState();
@@ -8,6 +11,22 @@ Deno.test("an open socket cannot send terminal data before protocol ready", () =
   assertEquals(state.canSend(true), false);
   assertThrows(() => state.takeInputSequence(), Error, "not ready");
   assertThrows(() => state.takeResizeGeneration(), Error, "not ready");
+});
+
+Deno.test("terminal tabs keep independent reconnect attachments", () => {
+  const first = terminalAttachmentStorageKey(
+    "http://127.0.0.1:47437/?token=x&tab=1",
+  );
+  const second = terminalAttachmentStorageKey(
+    "http://127.0.0.1:47437/?token=x&tab=2",
+  );
+
+  assertEquals(first, "hyper-term.terminal-attachment.v1.tab-1");
+  assertEquals(second, "hyper-term.terminal-attachment.v1.tab-2");
+  assertEquals(
+    terminalAttachmentStorageKey("http://127.0.0.1:47437/?token=x&tab=invalid"),
+    "hyper-term.terminal-attachment.v1",
+  );
 });
 
 Deno.test("ready sequences advance and are fenced again on reconnect", () => {

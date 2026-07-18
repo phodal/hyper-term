@@ -20,6 +20,9 @@ pub const canvas_label = "hyper-term-canvas";
 pub const terminal_view_label = "hyper-term-terminal-view";
 pub const terminal_view_anchor = "Terminal viewport";
 pub const terminal_gateway_origin = "http://127.0.0.1:47437";
+pub const max_sessions: usize = 8;
+const terminal_url_capacity: usize = 256;
+const max_gateway_token_bytes: usize = 128;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -74,8 +77,13 @@ pub const SessionMode = enum {
     agent,
 };
 
-pub const Model = struct {
+pub const Session = struct {
+    id: u8 = 0,
     mode: SessionMode = .terminal,
+    title: []const u8 = "zsh",
+};
+
+pub const Model = struct {
     new_session_open: bool = false,
     system_scheme: canvas.ColorScheme = .dark,
     high_contrast: bool = false,
@@ -84,39 +92,58 @@ pub const Model = struct {
     chrome_trailing: f32 = 0,
     titlebar_height: f32 = titlebar_natural_height,
     agent_split: f32 = 0.64,
-    terminal_url: []const u8 = "",
+    session_slots: [max_sessions]Session = .{
+        .{ .id = 1 }, .{}, .{}, .{}, .{}, .{}, .{}, .{},
+    },
+    session_count: usize = 1,
+    active_session_id: u8 = 1,
+    next_session_id: u8 = 2,
+    terminal_base_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
+    terminal_base_url_len: usize = 0,
+    terminal_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
+    terminal_url_len: usize = 0,
 
     /// Read by update, token, and derived-binding code rather than bound
     /// directly by the declarative view.
-    pub const view_unbound = .{ "mode", "system_scheme", "high_contrast", "reduce_motion", "terminal_url", "terminalReady" };
+    pub const view_unbound = .{
+        "system_scheme",
+        "high_contrast",
+        "reduce_motion",
+        "session_slots",
+        "session_count",
+        "next_session_id",
+        "terminal_base_url_storage",
+        "terminal_base_url_len",
+        "terminal_url_storage",
+        "terminal_url_len",
+        "terminalReady",
+        "terminalUrl",
+    };
 
-    pub fn isTerminal(model: *const Model) bool {
-        return model.mode == .terminal;
+    pub fn openSessions(model: *const Model) []const Session {
+        return model.session_slots[0..model.session_count];
     }
 
-    pub fn sessionTitle(model: *const Model) []const u8 {
-        return switch (model.mode) {
-            .terminal => "zsh",
-            .agent => "zsh + Agent",
-        };
+    pub fn activeSession(model: *const Model) Session {
+        for (model.openSessions()) |session| {
+            if (session.id == model.active_session_id) return session;
+        }
+        return model.session_slots[0];
+    }
+
+    pub fn isTerminal(model: *const Model) bool {
+        return model.activeSession().mode == .terminal;
     }
 
     pub fn modeLabel(model: *const Model) []const u8 {
-        return switch (model.mode) {
+        return switch (model.activeSession().mode) {
             .terminal => "Terminal",
             .agent => "Agent",
         };
     }
 
-    pub fn sessionA11yLabel(model: *const Model) []const u8 {
-        return switch (model.mode) {
-            .terminal => "Current Terminal session",
-            .agent => "Current Agent session",
-        };
-    }
-
     pub fn terminalReady(model: *const Model) bool {
-        return model.terminal_url.len > 0;
+        return model.terminal_url_len > 0;
     }
 
     pub fn terminalDisconnected(model: *const Model) bool {
@@ -133,6 +160,10 @@ pub const Model = struct {
         else
             "zsh · hyperd disconnected";
     }
+
+    pub fn terminalUrl(model: *const Model) []const u8 {
+        return model.terminal_url_storage[0..model.terminal_url_len];
+    }
 };
 
 pub const Msg = union(enum) {
@@ -140,6 +171,7 @@ pub const Msg = union(enum) {
     dismiss_new_session,
     choose_terminal,
     choose_agent,
+    select_session: u8,
     agent_split_resized: f32,
     system_appearance: struct {
         scheme: canvas.ColorScheme,
@@ -161,13 +193,14 @@ pub fn update(model: *Model, msg: Msg, _: *Effects) void {
         .new_session => model.new_session_open = true,
         .dismiss_new_session => model.new_session_open = false,
         .choose_terminal => {
-            model.mode = .terminal;
+            appendSession(model, .terminal);
             model.new_session_open = false;
         },
         .choose_agent => {
-            model.mode = .agent;
+            appendSession(model, .agent);
             model.new_session_open = false;
         },
+        .select_session => |session_id| selectSession(model, session_id),
         .agent_split_resized => |fraction| model.agent_split = std.math.clamp(fraction, 0.48, 0.76),
         .system_appearance => |appearance| {
             model.system_scheme = appearance.scheme;
@@ -179,6 +212,31 @@ pub fn update(model: *Model, msg: Msg, _: *Effects) void {
             model.chrome_trailing = chrome.insets.right;
             model.titlebar_height = @max(titlebar_natural_height, chrome.insets.top);
         },
+    }
+}
+
+fn appendSession(model: *Model, mode: SessionMode) void {
+    if (model.session_count >= max_sessions) return;
+    const session_id = model.next_session_id;
+    model.session_slots[model.session_count] = .{
+        .id = session_id,
+        .mode = mode,
+        .title = if (mode == .terminal) "zsh" else "Agent",
+    };
+    model.session_count += 1;
+    model.active_session_id = session_id;
+    model.next_session_id +%= 1;
+    if (model.next_session_id == 0) model.next_session_id = 1;
+    refreshTerminalUrl(model);
+}
+
+fn selectSession(model: *Model, session_id: u8) void {
+    for (model.openSessions()) |session| {
+        if (session.id == session_id) {
+            model.active_session_id = session_id;
+            refreshTerminalUrl(model);
+            return;
+        }
     }
 }
 
@@ -288,8 +346,31 @@ pub fn initialModel() Model {
 
 pub fn initialModelWithTerminalUrl(url: []const u8) Model {
     var model = initialModel();
-    if (trustedTerminalUrl(url)) model.terminal_url = url;
+    if (trustedTerminalUrl(url)) {
+        @memcpy(model.terminal_base_url_storage[0..url.len], url);
+        model.terminal_base_url_len = url.len;
+        refreshTerminalUrl(&model);
+    }
     return model;
+}
+
+fn refreshTerminalUrl(model: *Model) void {
+    if (model.terminal_base_url_len == 0) {
+        model.terminal_url_len = 0;
+        return;
+    }
+    const formatted = std.fmt.bufPrint(
+        model.terminal_url_storage[0..],
+        "{s}&tab={d}",
+        .{
+            model.terminal_base_url_storage[0..model.terminal_base_url_len],
+            model.active_session_id,
+        },
+    ) catch {
+        model.terminal_url_len = 0;
+        return;
+    };
+    model.terminal_url_len = formatted.len;
 }
 
 pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize {
@@ -297,7 +378,7 @@ pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize
     out[0] = .{
         .label = terminal_view_label,
         .anchor = terminal_view_anchor,
-        .url = model.terminal_url,
+        .url = model.terminalUrl(),
     };
     return 1;
 }
@@ -306,7 +387,7 @@ pub fn trustedTerminalUrl(url: []const u8) bool {
     const prefix = terminal_gateway_origin ++ "/?token=";
     if (!std.mem.startsWith(u8, url, prefix)) return false;
     const token = url[prefix.len..];
-    if (token.len < 32) return false;
+    if (token.len < 32 or token.len > max_gateway_token_bytes) return false;
     for (token) |character| {
         if (!std.ascii.isAlphanumeric(character) and character != '-' and character != '_') return false;
     }

@@ -10,10 +10,15 @@ import {
   type TerminalWebClientControl,
   type TerminalWebServerControl,
 } from "./protocol.ts";
-import { TerminalConnectionState } from "./connection-state.ts";
+import {
+  terminalAttachmentStorageKey,
+  TerminalConnectionState,
+} from "./connection-state.ts";
 import "./styles.css";
 
-const attachmentStorageKey = "hyper-term.terminal-attachment.v1";
+const attachmentStorageKey = terminalAttachmentStorageKey(
+  globalThis.location.href,
+);
 const terminalElement = requiredElement("#terminal");
 const statusElement = requiredElement("#connection-status");
 

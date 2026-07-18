@@ -38,3 +38,9 @@ export class TerminalConnectionState {
     if (!this.#ready) throw new Error("terminal protocol is not ready");
   }
 }
+
+export function terminalAttachmentStorageKey(locationHref: string): string {
+  const base = "hyper-term.terminal-attachment.v1";
+  const tab = new URL(locationHref).searchParams.get("tab");
+  return tab && /^[1-9][0-9]{0,2}$/.test(tab) ? `${base}.tab-${tab}` : base;
+}
