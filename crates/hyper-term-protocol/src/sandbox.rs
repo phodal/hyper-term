@@ -1,0 +1,234 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use thiserror::Error;
+
+use crate::{Actor, OperationId, SandboxLeaseId};
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum DigestError {
+    #[error("a SHA-256 digest must contain exactly 64 lowercase hexadecimal characters")]
+    InvalidSha256,
+}
+
+macro_rules! sha256_digest {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn parse(value: impl Into<String>) -> Result<Self, DigestError> {
+                let value = value.into();
+                if value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(DigestError::InvalidSha256);
+                }
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(value).map_err(de::Error::custom)
+            }
+        }
+    };
+}
+
+sha256_digest!(ActionDigest);
+sha256_digest!(SandboxProfileDigest);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxEnforcement {
+    Native,
+    IsolatedTask,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBackendKind {
+    MacOsSeatbelt,
+    LinuxBubblewrap,
+    WindowsRestrictedToken,
+    TestOnlyUnenforced,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPathAccess {
+    Read,
+    Write,
+    Deny,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxPathRule {
+    pub path: PathBuf,
+    pub access: SandboxPathAccess,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxFileSystemPolicy {
+    #[serde(default)]
+    pub rules: Vec<SandboxPathRule>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SandboxNetworkPolicy {
+    Offline,
+    ProxyOnly {
+        proxy_url: String,
+        #[serde(default)]
+        allowed_hosts: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxEnvironmentPolicy {
+    pub clear_inherited: bool,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+}
+
+impl Default for SandboxEnvironmentPolicy {
+    fn default() -> Self {
+        Self {
+            clear_inherited: true,
+            variables: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxProcessPolicy {
+    pub allow_child_processes: bool,
+    #[serde(default)]
+    pub allowed_executables: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxResourceLimits {
+    pub wall_time_ms: Option<u64>,
+    pub max_processes: Option<u32>,
+    pub max_output_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxLifetime {
+    OneOperation,
+    OneTask,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxProfile {
+    pub enforcement: SandboxEnforcement,
+    pub filesystem: SandboxFileSystemPolicy,
+    pub network: SandboxNetworkPolicy,
+    pub environment: SandboxEnvironmentPolicy,
+    pub process: SandboxProcessPolicy,
+    pub resources: SandboxResourceLimits,
+    pub lifetime: SandboxLifetime,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CompiledSandboxProfile {
+    pub backend: SandboxBackendKind,
+    pub enforced: bool,
+    pub profile: SandboxProfile,
+    pub profile_digest: SandboxProfileDigest,
+    pub action_digest: ActionDigest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CapabilityLease {
+    pub lease_id: SandboxLeaseId,
+    pub operation_id: OperationId,
+    pub operation_revision: u64,
+    pub action_digest: ActionDigest,
+    pub profile_digest: SandboxProfileDigest,
+    pub actor: Actor,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub one_use: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxOutcome {
+    Succeeded,
+    Failed,
+    Violated,
+    Denied,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxViolation {
+    pub code: String,
+    pub message: String,
+    pub resource: Option<String>,
+    pub occurred_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxReceipt {
+    pub backend: SandboxBackendKind,
+    pub enforced: bool,
+    pub profile_digest: SandboxProfileDigest,
+    pub action_digest: ActionDigest,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+    pub outcome: SandboxOutcome,
+    pub exit_code: Option<u32>,
+    #[serde(default)]
+    pub violations: Vec<SandboxViolation>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digests_reject_ambiguous_text() {
+        assert!(ActionDigest::parse("0".repeat(64)).is_ok());
+        assert_eq!(
+            ActionDigest::parse("A".repeat(64)),
+            Err(DigestError::InvalidSha256)
+        );
+        assert_eq!(
+            SandboxProfileDigest::parse("0".repeat(63)),
+            Err(DigestError::InvalidSha256)
+        );
+    }
+}

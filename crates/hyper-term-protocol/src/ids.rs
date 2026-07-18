@@ -54,6 +54,7 @@ uuid_id!(InputLeaseId);
 uuid_id!(OperationId);
 uuid_id!(RequestId);
 uuid_id!(RunId);
+uuid_id!(SandboxLeaseId);
 uuid_id!(TaskId);
 uuid_id!(TerminalId);
 uuid_id!(TerminalAttachmentId);

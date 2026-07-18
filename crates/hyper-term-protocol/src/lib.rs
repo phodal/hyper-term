@@ -3,12 +3,14 @@
 mod block;
 mod domain;
 mod ids;
+mod sandbox;
 mod terminal_web;
 mod wire;
 
 pub use block::*;
 pub use domain::*;
 pub use ids::*;
+pub use sandbox::*;
 pub use terminal_web::*;
 pub use wire::*;
 
