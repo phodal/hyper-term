@@ -105,8 +105,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec,
-        DriverState, sandbox_permission_profile, sha256_file,
+        DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverEvent, DriverFraming, DriverKind,
+        DriverManifest, DriverProcess, DriverSpec, DriverState, sandbox_permission_profile,
+        sha256_file,
     };
 
     #[test]
@@ -184,6 +185,7 @@ console.log(JSON.stringify(result));"#,
             sandbox: Some(sandbox),
             framing: DriverFraming::JsonLines,
             max_frame_bytes: 4096,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         })
         .unwrap();
         let DriverEvent::Message { payload, .. } =

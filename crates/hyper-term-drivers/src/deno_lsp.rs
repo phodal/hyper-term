@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,12 +11,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    DEFAULT_MAX_DRIVER_FRAME_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
-    DriverManifest, DriverProcess, DriverSpec, DriverState,
-    deno_containment::compile_deno_task_sandbox, process::sandbox_permission_profile,
+    DEFAULT_MAX_DRIVER_FRAME_BYTES, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError,
+    DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
+    deno_containment::compile_deno_task_sandbox,
+    process::{BoundedDriverInbox, sandbox_permission_profile},
 };
 
 const MAX_BUFFERED_LSP_EVENTS: usize = 512;
+const MAX_BUFFERED_LSP_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct DenoLspConfig {
     pub executable: PathBuf,
@@ -31,7 +33,7 @@ pub struct DenoLspClient {
     process: DriverProcess,
     next_request_id: AtomicU64,
     request_gate: Mutex<()>,
-    inbox: Mutex<VecDeque<DriverEvent>>,
+    inbox: Mutex<BoundedDriverInbox>,
     workspace_uri: String,
 }
 
@@ -95,12 +97,16 @@ impl DenoLspClient {
             sandbox: Some(sandbox),
             framing: DriverFraming::ContentLength,
             max_frame_bytes: DEFAULT_MAX_DRIVER_FRAME_BYTES,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         })?;
         Ok(Self {
             process,
             next_request_id: AtomicU64::new(1),
             request_gate: Mutex::new(()),
-            inbox: Mutex::new(VecDeque::new()),
+            inbox: Mutex::new(BoundedDriverInbox::new(
+                MAX_BUFFERED_LSP_EVENTS,
+                MAX_BUFFERED_LSP_OUTPUT_BYTES,
+            )),
             workspace_uri,
         })
     }
@@ -293,13 +299,9 @@ impl DenoLspClient {
                 DriverEvent::Exited { state, .. } => {
                     return Err(DenoLspError::Exited(state));
                 }
-                event => {
-                    let mut inbox = lock(&self.inbox)?;
-                    if inbox.len() == MAX_BUFFERED_LSP_EVENTS {
-                        return Err(DenoLspError::InboxOverflow);
-                    }
-                    inbox.push_back(event);
-                }
+                event => lock(&self.inbox)?
+                    .push_back(event)
+                    .map_err(|_| DenoLspError::InboxOverflow)?,
             }
         }
     }

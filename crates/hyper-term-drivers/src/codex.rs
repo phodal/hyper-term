@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
@@ -13,13 +13,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal, DriverError,
-    DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
-    ExternalRequestId, StructuredAgentProtocol, sha256_file,
+    AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal,
+    DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
+    DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
+    StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
 };
 
 const MAX_PENDING_APPROVALS: usize = 128;
 const MAX_BUFFERED_MESSAGES: usize = 512;
+const MAX_BUFFERED_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const HYPER_TERM_MCP_TOOLS: &[&str] = &[
     "hyper_term.genui.compile",
@@ -50,7 +52,7 @@ pub struct CodexAppServerClient {
     process: DriverProcess,
     next_request_id: AtomicU64,
     request_gate: Mutex<()>,
-    inbox: Mutex<VecDeque<DriverEvent>>,
+    inbox: Mutex<BoundedDriverInbox>,
     pending: Mutex<HashMap<ExternalRequestId, AgentEffectProposal>>,
     workspace: String,
     staged_auth_file: Option<PathBuf>,
@@ -110,6 +112,7 @@ impl CodexAppServerClient {
             sandbox: None,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: CODEX_FRAME_BYTES,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         }) {
             Ok(process) => process,
             Err(error) => {
@@ -121,7 +124,10 @@ impl CodexAppServerClient {
             process,
             next_request_id: AtomicU64::new(1),
             request_gate: Mutex::new(()),
-            inbox: Mutex::new(VecDeque::new()),
+            inbox: Mutex::new(BoundedDriverInbox::new(
+                MAX_BUFFERED_MESSAGES,
+                MAX_BUFFERED_MESSAGE_BYTES,
+            )),
             pending: Mutex::new(HashMap::new()),
             workspace: workspace_text,
             staged_auth_file,
@@ -323,13 +329,9 @@ impl CodexAppServerClient {
                 DriverEvent::Exited { state, .. } => {
                     return Err(CodexAdapterError::Exited(state));
                 }
-                event => {
-                    let mut inbox = lock(&self.inbox)?;
-                    if inbox.len() == MAX_BUFFERED_MESSAGES {
-                        return Err(CodexAdapterError::InboxOverflow);
-                    }
-                    inbox.push_back(event);
-                }
+                event => lock(&self.inbox)?
+                    .push_back(event)
+                    .map_err(|_| CodexAdapterError::InboxOverflow)?,
             }
         }
     }

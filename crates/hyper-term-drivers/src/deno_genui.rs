@@ -12,8 +12,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    DEFAULT_MAX_DRIVER_FRAME_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
-    DriverManifest, DriverProcess, DriverSpec, DriverState,
+    DEFAULT_MAX_DRIVER_FRAME_BYTES, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError,
+    DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
     deno_containment::compile_deno_task_sandbox, process::sandbox_permission_profile, sha256_file,
 };
 
@@ -155,6 +155,7 @@ impl DenoGenUiCompiler {
             sandbox: Some(sandbox),
             framing: DriverFraming::JsonLines,
             max_frame_bytes: DEFAULT_MAX_DRIVER_FRAME_BYTES,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         })?;
         wait_until_ready(&process, &config.compiler_version, timeout)?;
         process.mark_ready()?;

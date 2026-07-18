@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +25,8 @@ const STDERR_TAIL_BYTES: usize = 64 * 1024;
 const EXIT_AFTER_STDOUT_GRACE: Duration = Duration::from_millis(200);
 const EFFECT_TIMEOUT_GRACE: Duration = Duration::from_millis(100);
 const MAX_SANDBOX_ARGUMENT_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_DRIVER_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +81,9 @@ pub struct DriverSpec {
     pub sandbox: Option<SandboxLaunchPlan>,
     pub framing: DriverFraming,
     pub max_frame_bytes: usize,
+    /// Maximum decoded payload bytes retained in the supervisor event queue.
+    /// The budget is released only when the consumer receives an event.
+    pub max_pending_output_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,13 +101,65 @@ pub enum DriverEvent {
     },
 }
 
+pub(crate) struct BoundedDriverInbox {
+    events: VecDeque<(DriverEvent, usize)>,
+    output_bytes: usize,
+    max_events: usize,
+    max_output_bytes: usize,
+}
+
+impl BoundedDriverInbox {
+    pub fn new(max_events: usize, max_output_bytes: usize) -> Self {
+        Self {
+            events: VecDeque::new(),
+            output_bytes: 0,
+            max_events,
+            max_output_bytes,
+        }
+    }
+
+    pub fn push_back(&mut self, event: DriverEvent) -> Result<(), DriverEvent> {
+        let output_bytes = driver_event_output_bytes(&event);
+        let Some(next_output_bytes) = self.output_bytes.checked_add(output_bytes) else {
+            return Err(event);
+        };
+        if self.events.len() == self.max_events || next_output_bytes > self.max_output_bytes {
+            return Err(event);
+        }
+        self.events.push_back((event, output_bytes));
+        self.output_bytes = next_output_bytes;
+        Ok(())
+    }
+
+    pub fn pop_front(&mut self) -> Option<DriverEvent> {
+        let (event, output_bytes) = self.events.pop_front()?;
+        self.output_bytes = self.output_bytes.saturating_sub(output_bytes);
+        Some(event)
+    }
+}
+
+fn driver_event_output_bytes(event: &DriverEvent) -> usize {
+    match event {
+        DriverEvent::Message { payload, .. } => serde_json::to_vec(payload)
+            .map(|payload| payload.len())
+            .unwrap_or(usize::MAX),
+        DriverEvent::ProtocolError { message } => message.len(),
+        DriverEvent::Exited { .. } => 0,
+    }
+}
+
 pub struct DriverProcess {
     manifest: DriverManifest,
     framing: DriverFraming,
     max_frame_bytes: usize,
     input: Mutex<Option<ChildStdin>>,
     shared: Arc<DriverShared>,
-    events: Receiver<DriverEvent>,
+    events: Receiver<QueuedDriverEvent>,
+}
+
+struct QueuedDriverEvent {
+    event: DriverEvent,
+    output_bytes: usize,
 }
 
 struct DriverShared {
@@ -110,6 +167,7 @@ struct DriverShared {
     process_group_id: u32,
     state: Mutex<DriverState>,
     stderr: Mutex<VecDeque<u8>>,
+    pending_output_bytes: AtomicUsize,
     effect_in_flight: AtomicBool,
     exit_reported: AtomicBool,
 }
@@ -161,6 +219,7 @@ impl DriverProcess {
             process_group_id,
             state: Mutex::new(DriverState::Starting),
             stderr: Mutex::new(VecDeque::with_capacity(STDERR_TAIL_BYTES)),
+            pending_output_bytes: AtomicUsize::new(0),
             effect_in_flight: AtomicBool::new(false),
             exit_reported: AtomicBool::new(false),
         });
@@ -175,6 +234,7 @@ impl DriverProcess {
             output,
             spec.framing,
             spec.max_frame_bytes,
+            spec.max_pending_output_bytes,
             event_tx,
         ) {
             let _ = terminate_process(&shared, Duration::from_millis(100));
@@ -240,7 +300,14 @@ impl DriverProcess {
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<DriverEvent, DriverError> {
         match self.events.recv_timeout(timeout) {
-            Ok(event) => Ok(event),
+            Ok(queued) => {
+                if queued.output_bytes > 0 {
+                    self.shared
+                        .pending_output_bytes
+                        .fetch_sub(queued.output_bytes, Ordering::AcqRel);
+                }
+                Ok(queued.event)
+            }
             Err(RecvTimeoutError::Timeout)
                 if self.shared.effect_in_flight.load(Ordering::Acquire) =>
             {
@@ -454,7 +521,8 @@ fn spawn_protocol_reader(
     output: impl Read + Send + 'static,
     framing: DriverFraming,
     max_frame_bytes: usize,
-    events: Sender<DriverEvent>,
+    max_pending_output_bytes: usize,
+    events: Sender<QueuedDriverEvent>,
 ) -> Result<(), DriverError> {
     thread::Builder::new()
         .name("hyper-driver-protocol".into())
@@ -462,13 +530,36 @@ fn spawn_protocol_reader(
             let mut reader = BufReader::new(output);
             let mut sequence = 0;
             loop {
-                match framing.read(&mut reader, max_frame_bytes) {
-                    Ok(Some(payload)) => {
+                match framing.read_sized(&mut reader, max_frame_bytes) {
+                    Ok(Some(frame)) => {
+                        if let Err(error) = reserve_pending_output(
+                            &shared,
+                            frame.payload_bytes,
+                            max_pending_output_bytes,
+                        ) {
+                            let _ = send_driver_event(
+                                &events,
+                                DriverEvent::ProtocolError {
+                                    message: error.to_string(),
+                                },
+                            );
+                            finish_after_output_closed(&shared, &events, true);
+                            return;
+                        }
                         sequence += 1;
                         if events
-                            .send(DriverEvent::Message { sequence, payload })
+                            .send(QueuedDriverEvent {
+                                event: DriverEvent::Message {
+                                    sequence,
+                                    payload: frame.payload,
+                                },
+                                output_bytes: frame.payload_bytes,
+                            })
                             .is_err()
                         {
+                            shared
+                                .pending_output_bytes
+                                .fetch_sub(frame.payload_bytes, Ordering::AcqRel);
                             return;
                         }
                     }
@@ -478,7 +569,7 @@ fn spawn_protocol_reader(
                     }
                     Err(error) => {
                         let message = error.to_string();
-                        let _ = events.send(DriverEvent::ProtocolError { message });
+                        let _ = send_driver_event(&events, DriverEvent::ProtocolError { message });
                         finish_after_output_closed(&shared, &events, true);
                         return;
                     }
@@ -486,6 +577,36 @@ fn spawn_protocol_reader(
             }
         })?;
     Ok(())
+}
+
+fn reserve_pending_output(
+    shared: &DriverShared,
+    payload_bytes: usize,
+    maximum: usize,
+) -> Result<(), DriverError> {
+    match shared
+        .pending_output_bytes
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current
+                .checked_add(payload_bytes)
+                .filter(|pending| *pending <= maximum)
+        }) {
+        Ok(_) => Ok(()),
+        Err(current) => Err(DriverError::PendingOutputBudgetExceeded {
+            pending: current.saturating_add(payload_bytes),
+            maximum,
+        }),
+    }
+}
+
+fn send_driver_event(
+    events: &Sender<QueuedDriverEvent>,
+    event: DriverEvent,
+) -> Result<(), crossbeam_channel::SendError<QueuedDriverEvent>> {
+    events.send(QueuedDriverEvent {
+        event,
+        output_bytes: 0,
+    })
 }
 
 fn spawn_stderr_reader(
@@ -515,7 +636,7 @@ fn spawn_stderr_reader(
 
 fn finish_after_output_closed(
     shared: &Arc<DriverShared>,
-    events: &Sender<DriverEvent>,
+    events: &Sender<QueuedDriverEvent>,
     protocol_failed: bool,
 ) {
     let mut status = wait_for_exit(shared, EXIT_AFTER_STDOUT_GRACE)
@@ -547,10 +668,13 @@ fn finish_after_output_closed(
         *state = final_state;
     }
     if !shared.exit_reported.swap(true, Ordering::AcqRel) {
-        let _ = events.send(DriverEvent::Exited {
-            code: status.and_then(|value| value.code()),
-            state: final_state,
-        });
+        let _ = send_driver_event(
+            events,
+            DriverEvent::Exited {
+                code: status.and_then(|value| value.code()),
+                state: final_state,
+            },
+        );
     }
 }
 
@@ -667,6 +791,13 @@ fn validate_spec(spec: &DriverSpec) -> Result<(), DriverError> {
             "max frame must be between 1 and {DEFAULT_MAX_DRIVER_FRAME_BYTES} bytes"
         )));
     }
+    if spec.max_pending_output_bytes == 0
+        || spec.max_pending_output_bytes > MAX_PENDING_DRIVER_OUTPUT_BYTES
+    {
+        return Err(DriverError::InvalidSpec(format!(
+            "pending output budget must be between 1 and {MAX_PENDING_DRIVER_OUTPUT_BYTES} bytes"
+        )));
+    }
     if spec.arguments.len() > 128
         || spec
             .arguments
@@ -751,6 +882,8 @@ pub enum DriverError {
     InvalidFrame(String),
     #[error("driver frame is {size} bytes; maximum is {maximum}")]
     FrameTooLarge { size: usize, maximum: usize },
+    #[error("driver pending output is {pending} bytes; maximum is {maximum}")]
+    PendingOutputBudgetExceeded { pending: usize, maximum: usize },
     #[error("invalid driver specification: {0}")]
     InvalidSpec(String),
     #[error("executable digest mismatch: expected {expected}, got {actual}")]
@@ -804,6 +937,7 @@ mod tests {
             sandbox: None,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: 1024,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         })
         .unwrap();
         assert_eq!(
@@ -837,6 +971,7 @@ mod tests {
             sandbox: None,
             framing: DriverFraming::ContentLength,
             max_frame_bytes: 1024,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         });
         assert!(matches!(
             result,
@@ -857,6 +992,7 @@ mod tests {
             sandbox: None,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: 1024,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         })
         .unwrap();
         process.mark_ready().unwrap();
@@ -880,6 +1016,7 @@ mod tests {
             sandbox: None,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: 1024,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         })
         .unwrap();
         process.mark_ready().unwrap();
@@ -892,6 +1029,65 @@ mod tests {
             })
         ));
         assert_eq!(process.state().unwrap(), DriverState::UnknownExecution);
+    }
+
+    #[test]
+    fn pending_output_budget_fails_closed_during_an_effect() {
+        let temp = TempDir::new().unwrap();
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let payload = "x".repeat(700);
+        let script = format!(
+            "read ignored; printf '%s\\n%s\\n' '{{\"data\":\"{payload}\"}}' '{{\"data\":\"{payload}\"}}'"
+        );
+        let process = DriverProcess::spawn(DriverSpec {
+            manifest: manifest(&shell, DriverKind::DenoGenUi),
+            executable: shell,
+            arguments: vec![OsString::from("-c"), OsString::from(script)],
+            working_directory: temp.path().canonicalize().unwrap(),
+            environment: BTreeMap::new(),
+            sandbox: None,
+            framing: DriverFraming::JsonLines,
+            max_frame_bytes: 1024,
+            max_pending_output_bytes: 1024,
+        })
+        .unwrap();
+        process.mark_ready().unwrap();
+        process.begin_effect().unwrap();
+        process
+            .send_json(&serde_json::json!({"run": true}))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        assert!(matches!(
+            process.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DriverEvent::Message { sequence: 1, .. }
+        ));
+        let DriverEvent::ProtocolError { message } =
+            process.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("output overflow did not produce a protocol error")
+        };
+        assert!(message.contains("pending output"));
+        assert!(matches!(
+            process.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DriverEvent::Exited {
+                state: DriverState::UnknownExecution,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn secondary_inbox_is_bounded_by_bytes_and_releases_consumed_events() {
+        let event = DriverEvent::Message {
+            sequence: 1,
+            payload: serde_json::json!({"data": "x".repeat(700)}),
+        };
+        let mut inbox = BoundedDriverInbox::new(8, 1024);
+        inbox.push_back(event.clone()).unwrap();
+        assert!(inbox.push_back(event.clone()).is_err());
+        assert_eq!(inbox.pop_front(), Some(event.clone()));
+        assert!(inbox.push_back(event).is_ok());
     }
 
     #[test]
@@ -916,6 +1112,7 @@ mod tests {
             sandbox: None,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: 1024,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         })
         .unwrap();
         let process_group_id = process.shared.process_group_id;
@@ -969,6 +1166,7 @@ mod tests {
             sandbox: Some(plan),
             framing: DriverFraming::JsonLines,
             max_frame_bytes: 1024,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
         });
         assert!(matches!(
             result,

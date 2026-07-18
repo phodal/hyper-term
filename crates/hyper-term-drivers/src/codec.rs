@@ -15,12 +15,27 @@ pub enum DriverFraming {
     JsonLines,
 }
 
+pub(crate) struct DecodedDriverFrame {
+    pub payload: Value,
+    pub payload_bytes: usize,
+}
+
 impl DriverFraming {
     pub fn read<R: BufRead>(
         self,
         reader: &mut R,
         max_bytes: usize,
     ) -> Result<Option<Value>, DriverError> {
+        Ok(self
+            .read_sized(reader, max_bytes)?
+            .map(|frame| frame.payload))
+    }
+
+    pub(crate) fn read_sized<R: BufRead>(
+        self,
+        reader: &mut R,
+        max_bytes: usize,
+    ) -> Result<Option<DecodedDriverFrame>, DriverError> {
         match self {
             Self::ContentLength => read_content_length(reader, max_bytes),
             Self::JsonLines => read_json_line(reader, max_bytes),
@@ -58,7 +73,7 @@ impl DriverFraming {
 fn read_content_length<R: BufRead>(
     reader: &mut R,
     max_bytes: usize,
-) -> Result<Option<Value>, DriverError> {
+) -> Result<Option<DecodedDriverFrame>, DriverError> {
     let mut content_length = None;
     let mut header_bytes = 0;
     loop {
@@ -111,13 +126,16 @@ fn read_content_length<R: BufRead>(
     }
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload)?;
-    Ok(Some(serde_json::from_slice(&payload)?))
+    Ok(Some(DecodedDriverFrame {
+        payload: serde_json::from_slice(&payload)?,
+        payload_bytes: length,
+    }))
 }
 
 fn read_json_line<R: BufRead>(
     reader: &mut R,
     max_bytes: usize,
-) -> Result<Option<Value>, DriverError> {
+) -> Result<Option<DecodedDriverFrame>, DriverError> {
     let mut line = Vec::new();
     let read = read_bounded_line(reader, &mut line, max_bytes + 2)?;
     if read == 0 {
@@ -138,7 +156,10 @@ fn read_json_line<R: BufRead>(
     if line.is_empty() {
         return Err(DriverError::InvalidFrame("empty JSON line".into()));
     }
-    Ok(Some(serde_json::from_slice(&line)?))
+    Ok(Some(DecodedDriverFrame {
+        payload: serde_json::from_slice(&line)?,
+        payload_bytes: line.len(),
+    }))
 }
 
 fn read_bounded_line<R: BufRead>(
