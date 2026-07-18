@@ -14,11 +14,12 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use hyper_term_drivers::{
-    AgentDriverEvent, AgentEffectKind, CodexAppServerClient, CodexAppServerConfig,
-    CodexMcpServerConfig, DriverState, sha256_file,
+    AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind, CodexAppServerClient,
+    CodexAppServerConfig, CodexMcpServerConfig, DriverState, ExternalRequestId, sha256_file,
 };
 use hyper_term_protocol::{
-    BlockDocument, BlockId, MessageRole, OperationAction, OperationKind, RiskClass, TaskId,
+    BlockDocument, BlockId, MessageRole, OperationAction, OperationId, OperationKind,
+    PermissionDecision, RiskClass, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -110,6 +111,25 @@ struct AgentSession {
     task_id: TaskId,
     thread_id: String,
     progress: Mutex<AgentProgress>,
+    pending_effect: Mutex<Option<PendingAgentEffect>>,
+}
+
+#[derive(Clone)]
+struct AgentTurnProjection {
+    turn_id: String,
+    agent_block_id: BlockId,
+    plan_block_id: BlockId,
+    agent_message_bytes: usize,
+    plan_bytes: usize,
+}
+
+#[derive(Clone)]
+struct PendingAgentEffect {
+    request_id: ExternalRequestId,
+    payload_sha256: String,
+    operation_id: OperationId,
+    operation_revision: u64,
+    projection: AgentTurnProjection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -159,6 +179,13 @@ struct AgentTurnResponse {
     status: AgentStatus,
 }
 
+#[derive(Deserialize)]
+struct AgentPermissionRequest {
+    operation_id: OperationId,
+    expected_revision: u64,
+    decision: PermissionDecision,
+}
+
 pub async fn spawn_agent_gateway(
     mut config: AgentGatewayConfig,
 ) -> Result<AgentGatewayHandle, AgentGatewayError> {
@@ -192,6 +219,7 @@ pub async fn spawn_agent_gateway(
                 .delete(close_session),
         )
         .route("/agent/session/turn", post(start_turn))
+        .route("/agent/session/permission", post(decide_permission))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_PROMPT_BYTES))
         .with_state(runtime.clone());
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -301,6 +329,43 @@ async fn start_turn(
     }
 }
 
+async fn decide_permission(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let request = match serde_json::from_slice::<AgentPermissionRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return status_response(StatusCode::BAD_REQUEST, "Permission decision is invalid");
+        }
+    };
+    let result =
+        tokio::task::spawn_blocking(move || runtime.reject_effect(session_id, request)).await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::ACCEPTED, &response),
+        Ok(Err(SessionError::NotFound)) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Ok(Err(SessionError::UnsafeApproval)) => status_response(
+            StatusCode::FORBIDDEN,
+            "Allow is unavailable until the Rust sandbox can enforce the exact effect",
+        ),
+        Ok(Err(SessionError::NoPendingEffect | SessionError::StalePermission)) => status_response(
+            StatusCode::CONFLICT,
+            "Permission decision no longer matches the pending effect",
+        ),
+        Ok(Err(_)) | Err(_) => status_response(
+            StatusCode::BAD_GATEWAY,
+            "Permission decision could not be delivered safely",
+        ),
+    }
+}
+
 fn authorize(
     runtime: &AgentGatewayRuntime,
     query: &AgentSessionQuery,
@@ -339,6 +404,10 @@ enum SessionError {
     Lock,
     Daemon,
     Thread,
+    NoPendingEffect,
+    StalePermission,
+    UnsafeApproval,
+    Driver,
 }
 
 impl AgentGatewayRuntime {
@@ -400,6 +469,7 @@ impl AgentGatewayRuntime {
                 turn_id: None,
                 error: None,
             }),
+            pending_effect: Mutex::new(None),
         });
         let response = ready_response(session_id, &session);
         sessions.insert(session_id, session);
@@ -466,6 +536,83 @@ impl AgentGatewayRuntime {
             .spawn(move || run_turn(worker_session, daemon, prompt))
             .map_err(|_| {
                 set_progress_failed(&session, "Agent turn worker could not start");
+                SessionError::Thread
+            })?;
+        Ok(AgentTurnResponse {
+            session_id,
+            status: AgentStatus::Running,
+        })
+    }
+
+    fn reject_effect(
+        &self,
+        session_id: u16,
+        request: AgentPermissionRequest,
+    ) -> Result<AgentTurnResponse, SessionError> {
+        if !matches!(
+            request.decision,
+            PermissionDecision::RejectOnce | PermissionDecision::Cancelled
+        ) {
+            return Err(SessionError::UnsafeApproval);
+        }
+        let session = self.session(session_id)?;
+        let mut pending = session
+            .pending_effect
+            .lock()
+            .map_err(|_| SessionError::Lock)?;
+        let effect = pending.clone().ok_or(SessionError::NoPendingEffect)?;
+        if effect.operation_id != request.operation_id
+            || effect.operation_revision != request.expected_revision
+        {
+            return Err(SessionError::StalePermission);
+        }
+        let decided = self
+            .config
+            .daemon
+            .decide_permission(
+                session.task_id,
+                effect.operation_id,
+                effect.operation_revision,
+                request.decision,
+            )
+            .map_err(|_| SessionError::StalePermission)?;
+        if session
+            .client
+            .resolve_effect(
+                &effect.request_id,
+                AgentEffectAuthorization {
+                    operation_id: effect.operation_id,
+                    operation_revision: decided.revision,
+                    proposal_sha256: effect.payload_sha256,
+                    decision: request.decision,
+                },
+            )
+            .is_err()
+        {
+            set_progress_failed(
+                &session,
+                "Rejected Agent effect could not be returned to Codex",
+            );
+            let _ = session.client.close();
+            return Err(SessionError::Driver);
+        }
+        pending.take();
+        drop(pending);
+        if let Ok(mut progress) = session.progress.lock() {
+            progress.status = AgentStatus::Running;
+            progress.error = None;
+        } else {
+            let _ = session.client.close();
+            return Err(SessionError::Lock);
+        }
+        let daemon = self.config.daemon.clone();
+        let projection = effect.projection;
+        let worker_session = Arc::clone(&session);
+        std::thread::Builder::new()
+            .name(format!("hyper-term-agent-{session_id}-resume"))
+            .spawn(move || continue_turn(worker_session, daemon, projection))
+            .map_err(|_| {
+                set_progress_failed(&session, "Agent turn resume worker could not start");
                 SessionError::Thread
             })?;
         Ok(AgentTurnResponse {
@@ -541,10 +688,24 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
         return;
     }
 
-    let agent_block_id = BlockId::new();
-    let plan_block_id = BlockId::new();
-    let mut agent_message_bytes = 0_usize;
-    let mut plan_bytes = 0_usize;
+    continue_turn(
+        session,
+        daemon,
+        AgentTurnProjection {
+            turn_id,
+            agent_block_id: BlockId::new(),
+            plan_block_id: BlockId::new(),
+            agent_message_bytes: 0,
+            plan_bytes: 0,
+        },
+    );
+}
+
+fn continue_turn(
+    session: Arc<AgentSession>,
+    daemon: DaemonState,
+    mut projection: AgentTurnProjection,
+) {
     let deadline = Instant::now() + COMPLETE_TURN_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -566,11 +727,14 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
                 turn_id: event_turn_id,
                 text,
                 ..
-            } if thread_id == session.thread_id && event_turn_id == turn_id => {
+            } if thread_id == session.thread_id && event_turn_id == projection.turn_id => {
                 if text.is_empty() {
                     continue;
                 }
-                agent_message_bytes = match agent_message_bytes.checked_add(text.len()) {
+                projection.agent_message_bytes = match projection
+                    .agent_message_bytes
+                    .checked_add(text.len())
+                {
                     Some(total) if total <= MAX_AGENT_MESSAGE_BYTES => total,
                     _ => {
                         set_progress_failed(&session, "Agent response exceeded its 256 KiB bound");
@@ -581,9 +745,9 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
                 if daemon
                     .append_message(
                         session.task_id,
-                        agent_block_id,
+                        projection.agent_block_id,
                         MessageRole::Agent,
-                        Some(turn_id.clone()),
+                        Some(projection.turn_id.clone()),
                         text,
                     )
                     .is_err()
@@ -598,41 +762,67 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
                 turn_id: event_turn_id,
                 text,
                 ..
-            } if thread_id == session.thread_id && event_turn_id == turn_id => {
+            } if thread_id == session.thread_id && event_turn_id == projection.turn_id => {
                 if text.is_empty() {
                     continue;
                 }
-                plan_bytes = match plan_bytes.checked_add(text.len()) {
+                projection.plan_bytes = match projection.plan_bytes.checked_add(text.len()) {
                     Some(total) if total <= MAX_AGENT_MESSAGE_BYTES => total,
                     _ => continue,
                 };
                 let _ = daemon.append_message(
                     session.task_id,
-                    plan_block_id,
+                    projection.plan_block_id,
                     MessageRole::Thought,
-                    Some(turn_id.clone()),
+                    Some(projection.turn_id.clone()),
                     text,
                 );
             }
             AgentDriverEvent::EffectProposed { proposal, .. } => {
                 let (kind, risk) = operation_kind_and_risk(proposal.kind);
-                if daemon
-                    .propose_operation(
-                        session.task_id,
-                        kind,
-                        OperationAction::Opaque {
-                            kind: proposal.method,
-                            payload_digest: proposal.payload_sha256,
-                        },
-                        proposal.summary,
-                        risk,
-                        proposal.required_capabilities,
-                    )
-                    .is_err()
-                {
-                    set_progress_failed(&session, "Agent effect proposal could not be journaled");
+                let operation = match daemon.propose_operation(
+                    session.task_id,
+                    kind,
+                    OperationAction::Opaque {
+                        kind: proposal.method.clone(),
+                        payload_digest: proposal.payload_sha256.clone(),
+                    },
+                    proposal.summary.clone(),
+                    risk,
+                    proposal.required_capabilities.clone(),
+                ) {
+                    Ok(operation) => operation,
+                    Err(_) => {
+                        set_progress_failed(
+                            &session,
+                            "Agent effect proposal could not be journaled",
+                        );
+                        return;
+                    }
+                };
+                let mut pending = match session.pending_effect.lock() {
+                    Ok(pending) => pending,
+                    Err(_) => {
+                        set_progress_failed(
+                            &session,
+                            "Agent effect proposal could not be retained",
+                        );
+                        return;
+                    }
+                };
+                if pending.is_some() {
+                    set_progress_failed(&session, "Agent emitted overlapping effect proposals");
+                    let _ = session.client.close();
                     return;
                 }
+                *pending = Some(PendingAgentEffect {
+                    request_id: proposal.request_id,
+                    payload_sha256: proposal.payload_sha256,
+                    operation_id: operation.operation_id,
+                    operation_revision: operation.revision,
+                    projection,
+                });
+                drop(pending);
                 if let Ok(mut progress) = session.progress.lock() {
                     progress.status = AgentStatus::WaitingApproval;
                 }
@@ -646,7 +836,7 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
             } if thread_id == session.thread_id
                 && event_turn_id
                     .as_deref()
-                    .is_none_or(|value| value == turn_id) =>
+                    .is_none_or(|value| value == projection.turn_id) =>
             {
                 if status.as_deref() == Some("failed") {
                     set_progress_failed(&session, "Codex reported a failed turn");
@@ -667,7 +857,10 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
 
 fn operation_kind_and_risk(kind: AgentEffectKind) -> (OperationKind, RiskClass) {
     match kind {
-        AgentEffectKind::Shell => (OperationKind::Shell, RiskClass::ExternalEffect),
+        AgentEffectKind::Shell => (
+            OperationKind::Other("codex_shell".into()),
+            RiskClass::ExternalEffect,
+        ),
         AgentEffectKind::WorkspaceEdit => (OperationKind::FileEdit, RiskClass::WorkspaceWrite),
         AgentEffectKind::Tool => (OperationKind::AgentTool, RiskClass::ExternalEffect),
         AgentEffectKind::ComputerUse => (OperationKind::ComputerUse, RiskClass::ExternalEffect),
@@ -831,6 +1024,149 @@ mod tests {
             request(gateway.address(), &token, 3, "DELETE").await.0,
             StatusCode::NO_CONTENT.as_u16()
         );
+        gateway.shutdown().await.expect("shutdown gateway");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_only_agent_can_reject_an_effect_and_finish_the_turn() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        let state = temporary.path().join("gateway-state");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).expect("daemon");
+        let fake_codex = temporary.path().join("codex");
+        std::fs::write(
+            &fake_codex,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake-codex\"}}' ;;\n    *'\"method\":\"thread/start\"'*) printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-4\"}}}' ;;\n    *'\"method\":\"turn/start\"'*)\n      printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-2\"}}}'\n      printf '%s\\n' '{\"id\":77,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"threadId\":\"thread-4\",\"turnId\":\"turn-2\",\"itemId\":\"command-1\",\"command\":\"touch forbidden\"}}' ;;\n    *'\"id\":77'*'\"decision\":\"decline\"'*)\n      printf '%s\\n' '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-4\",\"turnId\":\"turn-2\",\"itemId\":\"message-2\",\"delta\":\"The command was rejected.\"}}'\n      printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-4\",\"turn\":{\"id\":\"turn-2\",\"status\":\"completed\"}}}' ;;\n  esac\ndone\n",
+        )
+        .expect("fake Codex");
+        let mut permissions = std::fs::metadata(&fake_codex)
+            .expect("fake Codex metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).expect("fake Codex executable");
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            token: token.clone(),
+            workspace,
+            state_directory: state,
+            daemon,
+            codex_executable: Some(fake_codex),
+            codex_auth_file: None,
+            mcp_executable: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .expect("agent gateway");
+
+        assert_eq!(
+            request(gateway.address(), &token, 4, "POST").await.0,
+            StatusCode::OK.as_u16()
+        );
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                &format!("/agent/session/turn?token={token}&session_id=4"),
+                "POST",
+                b"Try a command",
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+
+        let (operation_id, operation_revision) =
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let (status, body) = request(gateway.address(), &token, 4, "GET").await;
+                    assert_eq!(status, StatusCode::OK.as_u16());
+                    let snapshot: serde_json::Value =
+                        serde_json::from_slice(&body).expect("snapshot response");
+                    assert_ne!(
+                        snapshot["status"], "failed",
+                        "Agent failed before approval: {snapshot}"
+                    );
+                    if snapshot["status"] == "waiting_approval" {
+                        let approval = snapshot["document"]["blocks"]
+                            .as_array()
+                            .expect("snapshot blocks")
+                            .iter()
+                            .find(|block| block["kind"] == "approval")
+                            .expect("approval block");
+                        break (
+                            approval["payload"]["operation_id"]
+                                .as_str()
+                                .expect("operation id")
+                                .to_owned(),
+                            approval["payload"]["operation_revision"]
+                                .as_u64()
+                                .expect("operation revision"),
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Agent did not reach waiting approval");
+        let unsafe_decision = serde_json::json!({
+            "operation_id": operation_id,
+            "expected_revision": operation_revision,
+            "decision": "allow_once"
+        });
+        let (status, _) = request_path(
+            gateway.address(),
+            &format!("/agent/session/permission?token={token}&session_id=4"),
+            "POST",
+            &serde_json::to_vec(&unsafe_decision).expect("unsafe permission decision"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
+
+        let decision = serde_json::json!({
+            "operation_id": operation_id,
+            "expected_revision": operation_revision,
+            "decision": "reject_once"
+        });
+        let (status, _) = request_path(
+            gateway.address(),
+            &format!("/agent/session/permission?token={token}&session_id=4"),
+            "POST",
+            &serde_json::to_vec(&decision).expect("permission decision"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16());
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (status, body) = request(gateway.address(), &token, 4, "GET").await;
+                assert_eq!(status, StatusCode::OK.as_u16());
+                let snapshot: serde_json::Value =
+                    serde_json::from_slice(&body).expect("snapshot response");
+                if snapshot["status"] == "completed" {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Agent did not complete after rejection");
+        let blocks = snapshot["document"]["blocks"]
+            .as_array()
+            .expect("snapshot blocks");
+        assert!(blocks.iter().any(|block| {
+            block["kind"] == "operation" && block["payload"]["state"] == "cancelled"
+        }));
+        assert!(blocks.iter().any(|block| {
+            block["kind"] == "approval"
+                && block["payload"]["decision"] == "reject_once"
+                && block["actions"].as_array().is_some_and(Vec::is_empty)
+        }));
+        assert!(blocks.iter().any(|block| {
+            block["payload"]["role"] == "agent"
+                && block["payload"]["text"] == "The command was rejected."
+        }));
+
         gateway.shutdown().await.expect("shutdown gateway");
     }
 
