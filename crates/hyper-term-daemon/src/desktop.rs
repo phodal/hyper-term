@@ -207,7 +207,10 @@ impl Options {
                 .state_directory
                 .unwrap_or_else(|| default_state_directory(home)),
             shell_cwd: self.shell_cwd.unwrap_or_else(|| home.to_owned()),
-            codex: self.codex.or_else(|| find_executable("codex")),
+            codex: self
+                .codex
+                .or_else(|| std::env::var_os("HYPER_TERM_CODEX_PATH").map(PathBuf::from))
+                .or_else(|| find_executable("codex", home)),
             codex_auth: self.codex_auth.or_else(|| {
                 let candidate = home.join(".codex/auth.json");
                 candidate.is_file().then_some(candidate)
@@ -287,17 +290,32 @@ fn desktop_token() -> String {
 }
 
 #[cfg(unix)]
-fn find_executable(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_string_lossy()
-        .split(':')
-        .map(Path::new)
-        .map(|directory| directory.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
+fn find_executable(name: &str, home: &Path) -> Option<PathBuf> {
+    find_executable_in(name, home, std::env::var_os("PATH").as_deref())
+}
+
+#[cfg(unix)]
+fn find_executable_in(name: &str, home: &Path, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path_candidates = path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join(name));
+    let known_candidates = [
+        home.join(".local/bin").join(name),
+        home.join(".bun/bin").join(name),
+        home.join("bin").join(name),
+        home.join("Library/pnpm").join(name),
+        PathBuf::from("/opt/homebrew/bin").join(name),
+        PathBuf::from("/usr/local/bin").join(name),
+        PathBuf::from("/Applications/Codex.app/Contents/MacOS").join(name),
+        home.join("Applications/Codex.app/Contents/MacOS")
+            .join(name),
+    ];
+    path_candidates.chain(known_candidates).find(|candidate| {
+        std::fs::metadata(candidate)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(unix)]
@@ -373,5 +391,21 @@ mod tests {
         let token = desktop_token();
         assert_eq!(token.len(), 64);
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn codex_discovery_survives_a_finder_style_empty_path() {
+        let temporary = tempfile::tempdir().expect("temporary home");
+        let executable = temporary.path().join(".local/bin/codex");
+        std::fs::create_dir_all(executable.parent().unwrap()).expect("binary directory");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("fake Codex");
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        assert_eq!(
+            find_executable_in("codex", temporary.path(), None),
+            Some(executable)
+        );
     }
 }
