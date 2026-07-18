@@ -120,6 +120,7 @@ jobs:
           deno task test
           deno task build:terminal
           deno task build:workbench
+          deno task build:runtime
 
       - name: Run Native SDK release gates
         working-directory: apps/desktop
@@ -133,6 +134,14 @@ jobs:
         with:
           name: terminal-renderer
           path: dist/terminal
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload verified GenUI runtime assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: genui-runtime
+          path: dist/runtime
           if-no-files-found: error
           retention-days: 7
 
@@ -159,6 +168,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Install pinned Deno
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.9.3
 
       - name: Install pinned Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -202,6 +216,12 @@ jobs:
           name: terminal-renderer
           path: dist/terminal
 
+      - name: Download verified GenUI runtime assets
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: genui-runtime
+          path: dist/runtime
+
       - name: Build Rust desktop supervisor
         shell: bash
         env:
@@ -239,11 +259,16 @@ jobs:
             "$RUNNER_TEMP/Hyper Term.app" \
             "target/$RUST_TARGET/release/hyper-term-desktop" \
             "target/$RUST_TARGET/release/hyper-term-mcp" \
-            dist/terminal
+            dist/terminal \
+            "$(command -v deno)" \
+            dist/runtime
           "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term" --help \
             | grep -F "Hyper Term desktop host"
           "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term-mcp" --help \
             | grep -F "Hyper Term brokered MCP connector"
+          test -x "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/deno"
+          test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/genui-compiler.js"
+          test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/esbuild.wasm"
 
       - name: Select release signing mode
         shell: bash
@@ -354,6 +379,13 @@ jobs:
             --force \
             --options runtime \
             --timestamp \
+            --entitlements runtime/deno.entitlements.plist \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$app/Contents/Resources/runtime/deno"
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
             --sign "$APPLE_SIGNING_IDENTITY" \
             "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
@@ -379,6 +411,12 @@ jobs:
             --options runtime \
             --sign - \
             "$app/Contents/MacOS/hyper-term"
+          codesign \
+            --force \
+            --options runtime \
+            --entitlements runtime/deno.entitlements.plist \
+            --sign - \
+            "$app/Contents/Resources/runtime/deno"
           codesign --force --options runtime --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
 

@@ -43,6 +43,7 @@ cd "$hyper_repo_root"
 "$hyper_deno" task check
 "$hyper_deno" task test
 "$hyper_deno" task build:terminal
+"$hyper_deno" task build:runtime
 cargo build \
   --locked \
   --release \
@@ -63,24 +64,24 @@ native package \
   --web-layer include \
   --signing none
 
-mv \
-  "$hyper_staging_app/Contents/MacOS/hyper-term" \
-  "$hyper_staging_app/Contents/MacOS/hyper-term-ui"
-install -m 0755 \
+"$hyper_repo_root/scripts/assemble_macos_app.sh" \
+  "$hyper_staging_app" \
   "$hyper_repo_root/target/release/hyper-term-desktop" \
-  "$hyper_staging_app/Contents/MacOS/hyper-term"
-install -m 0755 \
   "$hyper_repo_root/target/release/hyper-term-mcp" \
-  "$hyper_staging_app/Contents/MacOS/hyper-term-mcp"
-mkdir -p "$hyper_staging_app/Contents/Resources/terminal"
-cp -R \
-  "$hyper_repo_root/dist/terminal/." \
-  "$hyper_staging_app/Contents/Resources/terminal/"
+  "$hyper_repo_root/dist/terminal" \
+  "$hyper_deno" \
+  "$hyper_repo_root/dist/runtime"
 
 codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term-ui"
 codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term-mcp"
 codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term"
-codesign --force --deep --sign - "$hyper_staging_app"
+codesign \
+  --force \
+  --options runtime \
+  --entitlements "$hyper_repo_root/runtime/deno.entitlements.plist" \
+  --sign - \
+  "$hyper_staging_app/Contents/Resources/runtime/deno"
+codesign --force --sign - "$hyper_staging_app"
 codesign --verify --deep --strict "$hyper_staging_app"
 
 hyper_bundle_executable=$(plutil -extract CFBundleExecutable raw -o - \
@@ -99,6 +100,12 @@ if [[ ! -x "$hyper_staging_app/Contents/MacOS/hyper-term-mcp" ]]; then
 fi
 if [[ ! -f "$hyper_staging_app/Contents/Resources/terminal/index.html" ]]; then
   echo "packaged terminal renderer is unavailable" >&2
+  exit 1
+fi
+if [[ ! -x "$hyper_staging_app/Contents/Resources/runtime/deno" \
+  || ! -f "$hyper_staging_app/Contents/Resources/runtime/genui-compiler.js" \
+  || ! -f "$hyper_staging_app/Contents/Resources/runtime/esbuild.wasm" ]]; then
+  echo "packaged brokered GenUI runtime is unavailable" >&2
   exit 1
 fi
 

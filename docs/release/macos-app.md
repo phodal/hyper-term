@@ -14,11 +14,17 @@ The final bundle contains:
 - `Contents/MacOS/hyper-term-ui`: the Native SDK window and renderer;
 - `Contents/MacOS/hyper-term-mcp`: the Agent-mode-only, brokered stdio MCP connector;
 - `Contents/Resources/terminal`: the built terminal WebView assets.
+- `Contents/Resources/runtime/deno`: the pinned, supervised Deno sidecar;
+- `Contents/Resources/runtime/genui-compiler.js` and `esbuild.wasm`: the
+  digest-checked cold-path GenUI compiler used only after broker approval.
 
 Native SDK first creates an unsigned `.app`. The workflow then composes the
 complete bundle, signs every Mach-O executable and the outer bundle, submits it
 to Apple's notary service, staples the ticket, and finally creates the release
 ZIP. Modifying the bundle after the signing step invalidates its signature.
+The bundled Deno executable is re-signed with the reviewed V8/JIT entitlements
+in `runtime/deno.entitlements.plist`; Rust still clears its environment and
+starts it without shell, network, write, FFI, or workspace permissions.
 
 For pipeline testing, a pre-release tag may run without Apple secrets. In that
 case the workflow ad-hoc signs the bundle and gives the asset an explicit
