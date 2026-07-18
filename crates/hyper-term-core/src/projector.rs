@@ -258,6 +258,22 @@ impl BlockProjector {
                 };
                 vec![self.upsert(block, event.sequence)?]
             }
+            DomainEvent::ArtifactAccepted { artifact } => {
+                let block_id = stable_block_id("artifact", self.task_id.to_string());
+                let mut block = BlockEnvelope::new(
+                    block_id,
+                    self.task_id,
+                    BlockKind::Artifact,
+                    event.sequence,
+                    BlockPayload::Artifact {
+                        artifact: artifact.clone(),
+                    },
+                );
+                block.render_slot = RenderSlot::Inspector;
+                block.trust_class = TrustClass::IsolatedArtifact;
+                block.lifecycle = BlockLifecycle::Succeeded;
+                vec![self.upsert(block, event.sequence)?]
+            }
             DomainEvent::SandboxProfileCompiled { .. }
             | DomainEvent::SandboxLeaseIssued { .. }
             | DomainEvent::SandboxReceiptRecorded { .. }
@@ -601,8 +617,8 @@ pub enum ProjectorError {
 #[cfg(test)]
 mod tests {
     use hyper_term_protocol::{
-        EVENT_SCHEMA_VERSION, EventEnvelope, EventId, MessageRole, OperationId, OperationKind,
-        RiskClass,
+        AcceptedGenUiArtifact, ArtifactId, EVENT_SCHEMA_VERSION, EventEnvelope, EventId,
+        GenUiCompilerIdentity, MessageRole, OperationId, OperationKind, RiskClass,
     };
 
     use super::*;
@@ -722,5 +738,66 @@ mod tests {
             .snapshot()
             .unwrap();
         assert_eq!(first.semantic_digest, second.semantic_digest);
+    }
+
+    #[test]
+    fn a_new_artifact_replaces_the_task_last_known_good_block() {
+        let task_id = TaskId::new();
+        let first_id = ArtifactId::new();
+        let second_id = ArtifactId::new();
+        let artifact = |artifact_id, source_revision, digest: &str| AcceptedGenUiArtifact {
+            artifact_id,
+            source_revision,
+            entrypoint: "/App.tsx".into(),
+            content_digest: digest.into(),
+            compiler: GenUiCompilerIdentity {
+                name: "esbuild-wasm".into(),
+                version: "0.28.1".into(),
+            },
+        };
+        let events = [
+            event(
+                1,
+                task_id,
+                None,
+                DomainEvent::TaskCreated {
+                    title: "GenUI task".into(),
+                },
+            ),
+            event(
+                2,
+                task_id,
+                Some(OperationId::new()),
+                DomainEvent::ArtifactAccepted {
+                    artifact: artifact(first_id, 1, &"a".repeat(64)),
+                },
+            ),
+            event(
+                3,
+                task_id,
+                Some(OperationId::new()),
+                DomainEvent::ArtifactAccepted {
+                    artifact: artifact(second_id, 2, &"b".repeat(64)),
+                },
+            ),
+        ];
+        let snapshot = BlockProjector::replay(task_id, &events)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let artifacts = snapshot
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.payload {
+                BlockPayload::Artifact { artifact } => Some((block, artifact)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].1.artifact_id, second_id);
+        assert_eq!(artifacts[0].1.source_revision, 2);
+        assert_eq!(artifacts[0].0.trust_class, TrustClass::IsolatedArtifact);
+        assert_eq!(artifacts[0].0.render_slot, RenderSlot::Inspector);
+        assert_eq!(artifacts[0].0.block_revision, 2);
     }
 }

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BLOCK_SCHEMA_VERSION, BlockId, MessageRole, OperationId, OperationKind, OperationState,
-    PermissionDecision, RiskClass, TaskId, TerminalId, TerminalSize,
+    AcceptedGenUiArtifact, BLOCK_SCHEMA_VERSION, BlockId, MessageRole, OperationId, OperationKind,
+    OperationState, PermissionDecision, RiskClass, TaskId, TerminalId, TerminalSize,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -13,6 +13,7 @@ pub enum BlockKind {
     Operation,
     Approval,
     Receipt,
+    Artifact,
     Terminal,
     Review,
     Diagnostic,
@@ -98,6 +99,9 @@ pub enum BlockPayload {
         succeeded: bool,
         summary: String,
         result_digest: Option<String>,
+    },
+    Artifact {
+        artifact: AcceptedGenUiArtifact,
     },
     Terminal {
         terminal_id: TerminalId,

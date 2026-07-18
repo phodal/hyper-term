@@ -1,4 +1,4 @@
-export const BLOCK_SCHEMA_VERSION = 1;
+export const BLOCK_SCHEMA_VERSION = 2;
 
 export type BlockKind =
   | "task"
@@ -6,6 +6,7 @@ export type BlockKind =
   | "operation"
   | "approval"
   | "receipt"
+  | "artifact"
   | "terminal"
   | "review"
   | "diagnostic";
