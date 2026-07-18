@@ -9,7 +9,7 @@
       <separator height="16" />
       <tabs gap="2" label="Open sessions">
         <for each="openSessions" key="id" as="session">
-          <button size="sm" variant="ghost" selected="{session.id == active_session_id}" icon="terminal" on-press="select_session:{session.id}" label="Open {session.title} session {session.id}">{session.title} {session.id}</button>
+          <button size="sm" variant="ghost" selected="{session.id == active_session_id}" icon="terminal" on-press="select_session:{session.id}" label="{session.accessibility_label}">{session.title} {session.id}</button>
         </for>
       </tabs>
     </row>

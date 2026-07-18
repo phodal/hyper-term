@@ -81,6 +81,7 @@ pub const Session = struct {
     id: u8 = 0,
     mode: SessionMode = .terminal,
     title: []const u8 = "zsh",
+    accessibility_label: []const u8 = "Terminal session",
 };
 
 pub const Model = struct {
@@ -222,6 +223,7 @@ fn appendSession(model: *Model, mode: SessionMode) void {
         .id = session_id,
         .mode = mode,
         .title = if (mode == .terminal) "zsh" else "Agent",
+        .accessibility_label = if (mode == .terminal) "Terminal session" else "Agent session",
     };
     model.session_count += 1;
     model.active_session_id = session_id;
