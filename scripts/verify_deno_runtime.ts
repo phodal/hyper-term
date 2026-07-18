@@ -3,7 +3,12 @@ interface RuntimeManifest {
   runtime: string;
   version: string;
   tool_protocol_version: number;
-  artifacts: Array<{ target: string; sha256: string; url: string }>;
+  artifacts: Array<{
+    target: string;
+    sha256: string;
+    executable_sha256?: string;
+    url: string;
+  }>;
 }
 
 const path = new URL("../runtime/deno-manifest.json", import.meta.url);
@@ -23,6 +28,12 @@ if (manifest.tool_protocol_version !== 1 || manifest.artifacts.length === 0) {
 for (const artifact of manifest.artifacts) {
   if (!/^[a-f0-9]{64}$/.test(artifact.sha256)) {
     throw new Error(`invalid SHA-256 for ${artifact.target}`);
+  }
+  if (
+    artifact.executable_sha256 !== undefined &&
+    !/^[a-f0-9]{64}$/.test(artifact.executable_sha256)
+  ) {
+    throw new Error(`invalid executable SHA-256 for ${artifact.target}`);
   }
   const url = new URL(artifact.url);
   if (url.protocol !== "https:" || url.hostname !== "github.com") {

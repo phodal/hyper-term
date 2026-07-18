@@ -203,6 +203,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-term-drivers"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "hyper-term-protocol"
 version = "0.1.0"
 dependencies = [

@@ -10,6 +10,7 @@
       "target": "aarch64-apple-darwin",
       "archive": "deno-aarch64-apple-darwin.zip",
       "sha256": "1b2972f7ceb6df28d9600eab18d423bebb9aa18db02f01d7eb37a5b501482203",
+      "executable_sha256": "80c83cdfb20289f8818a71220b570df363f6f0ba93580c29c70f08ab14e93568",
       "url": "https://github.com/denoland/deno/releases/download/v2.9.3/deno-aarch64-apple-darwin.zip"
     },
     {

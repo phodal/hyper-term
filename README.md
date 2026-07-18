@@ -173,6 +173,7 @@ Cargo.toml             Rust workspace definition
 crates/hyper-term-protocol/  versioned events, blocks, and wire frames
 crates/hyper-term-core/      journal, reducers, projections, and PTY ownership
 crates/hyper-term-daemon/    permissioned, reconnectable control-kernel host
+crates/hyper-term-drivers/   bounded sidecar supervision and Deno LSP client
 apps/workbench/         terminal-first React Block workbench and isolated GenUI
 runtime/                pinned supervised-runtime manifests
 scripts/                Deno build and supply-chain verification tools
@@ -224,6 +225,19 @@ is inlined at build time, accepts only channel-bound accepted artifacts, checks
 their SHA-256 digest again, and denies network access. A failed compile updates
 diagnostics and Time Travel history without replacing the last-known-good
 artifact.
+
+The Rust `hyper-term-drivers` crate launches the same pinned Deno executable
+with a cleared environment, dedicated cache and scratch roots, bounded LSP
+framing, bounded stderr capture, and process-group shutdown. Its ignored
+integration test performs a real `initialize`, TypeScript diagnostics, and
+`shutdown` exchange when the verified runtime path and executable digest are
+provided:
+
+```bash
+HYPER_TERM_DENO_PATH=/absolute/path/to/deno \
+HYPER_TERM_DENO_SHA256=<manifest-executable-sha256> \
+cargo test -p hyper-term-drivers --test deno_lsp -- --ignored
+```
 
 ## License
 

@@ -3,6 +3,7 @@ members = [
   "crates/hyper-term-protocol",
   "crates/hyper-term-core",
   "crates/hyper-term-daemon",
+  "crates/hyper-term-drivers",
 ]
 resolver = "3"
 
@@ -15,6 +16,7 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0"
 crossbeam-channel = "0.5.15"
+libc = "0.2.186"
 portable-pty = "0.9.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
