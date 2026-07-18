@@ -80,7 +80,7 @@ test "New Session explicitly selects Terminal or Agent" {
     try testing.expect(!model.new_session_open);
 
     tree = try buildTree(arena, &model);
-    try testing.expect(containsText(tree.root, "Native Block surface"));
+    try testing.expect(containsText(tree.root, "Ask Codex"));
     try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) != null);
 }
 
@@ -108,7 +108,112 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
         .body = "{\"session_id\":2,\"provider\":\"codex\",\"protocol\":\"codex-app-server-v2\",\"status\":\"ready\"}",
     } }, &fx);
     try testing.expectEqual(main.AgentConnection.ready, model.activeSession().agent_connection);
-    try testing.expectEqualStrings("Codex app-server ready · permission broker active", model.agentStatus());
+    try testing.expectEqualStrings("Codex app-server ready · type a prompt", model.agentStatus());
+    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
+    try testing.expectEqual(std.http.Method.GET, fx.pendingFetchAt(1).?.method);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2",
+        fx.pendingFetchAt(1).?.url,
+    );
+}
+
+test "Agent composer posts a bounded prompt to the active Codex turn" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_turn_status = .ready;
+    model.agent_composer_buffer.set("Explain the PTY boundary");
+    main.update(&model, .send_agent_prompt, &fx);
+
+    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
+    const request = fx.pendingFetchAt(1).?;
+    try testing.expectEqual(std.http.Method.POST, request.method);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session/turn?token=abcdef0123456789abcdef0123456789&session_id=2",
+        request.url,
+    );
+    try testing.expectEqualStrings("Explain the PTY boundary", request.body);
+    try testing.expectEqualStrings("", model.agentComposerText());
+    try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+}
+
+test "Agent snapshot renders canonical user and Agent message blocks" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"completed","error":null,"document":{"blocks":[
+        \\  {"kind":"task","payload":{"type":"task","title":"Agent"}},
+        \\  {"kind":"message","payload":{"type":"message","role":"user","text":"What changed?"}},
+        \\  {"kind":"message","payload":{"type":"message","role":"agent","text":"The Agent tab now streams **BlockDocument** messages."}}
+        \\]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqual(main.AgentTurnStatus.completed, model.agent_turn_status);
+    try testing.expectEqual(@as(usize, 2), model.agentMessages().len);
+    try testing.expectEqualStrings("What changed?", model.agentMessages()[0].text());
+    try testing.expectEqualStrings("The Agent tab now streams **BlockDocument** messages.", model.agentMessages()[1].text());
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "What changed?"));
+    try testing.expect(containsText(tree.root, "BlockDocument"));
+    try testing.expect(findByLabel(tree.root, "Agent prompt composer") != null);
+    try testing.expect(findByLabel(tree.root, "Send prompt") != null);
+    const tokens = main.hyperTermTokens(&model);
+    const sweep = canvas.LayoutAuditSweepOptions{
+        .tokens = tokens,
+        .min_size = geometry.SizeF.init(main.window_min_width, main.window_min_height),
+        .default_size = geometry.SizeF.init(main.window_width, main.window_height),
+    };
+    try canvas.expectLayoutAuditSweepClean(testing.allocator, tree.root, sweep);
+    try canvas.expectA11yAuditSweepClean(testing.allocator, tree.root, .{
+        .tokens = tokens,
+        .min_size = sweep.min_size,
+        .default_size = sweep.default_size,
+    });
+}
+
+test "running Agent snapshots schedule one bounded refresh timer" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"status\":\"running\",\"error\":null,\"document\":{\"blocks\":[]}}",
+    } }, &fx);
+
+    try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+    try testing.expectEqual(@as(usize, 1), fx.pendingTimerCount());
+    const timer = fx.pendingTimerAt(0).?;
+    try testing.expectEqual(main.agent_poll_timer_key_base + 2, timer.key);
+    try testing.expectEqual(@as(u64, 250), timer.interval_ms);
 }
 
 test "closing an Agent tab closes its PTY and Codex app-server" {

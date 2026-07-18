@@ -74,23 +74,66 @@
         </row>
         <separator />
         <scroll grow="1" label="Agent blocks">
-          <column gap="10" padding="12">
-            <card>
-              <column gap="8" padding="12">
-                <row gap="8" cross="center">
-                  <icon name="info" width="14" height="14" foreground="info" />
-                  <text><span weight="medium">Native Block surface</span></text>
-                </row>
-                <text wrap="true" foreground="text_muted">Messages, plans, tools, approvals, diffs, Computer Use evidence, and generated UI will render here from the Rust BlockDocument.</text>
-              </column>
-            </card>
-            <timeline gap="4" label="Agent plan">
-              <timeline-item title="Connect hyperd" description="Authenticate the local control and terminal planes." meta="ready" variant="secondary" />
-              <timeline-item title="Start Agent session" description="Launch Codex app-server through the Rust permission broker." meta="{agentConnectionLabel}" variant="secondary" />
-              <timeline-item title="Mount Agentic UI" description="Lease a bounded WebView Block only when requested." meta="pending" variant="secondary" connector="false" />
-            </timeline>
+          <column gap="12" padding="12">
+            <if test="{hasAgentMessages}">
+              <for each="agentMessages" key="id" as="message">
+                <if test="{message.isUser}">
+                  <row>
+                    <spacer grow="1" />
+                    <bubble>
+                      <column gap="5" padding="10">
+                        <text foreground="text_muted">{message.roleLabel}</text>
+                        <text wrap="true">{message.text}</text>
+                        <if test="{message.truncated}">
+                          <text foreground="warning">Message clipped to 8 KiB in this view.</text>
+                        </if>
+                      </column>
+                    </bubble>
+                  </row>
+                </if>
+                <else>
+                  <card>
+                    <column gap="7" padding="11">
+                      <row gap="7" cross="center">
+                        <icon name="circle-dot" width="13" height="13" foreground="accent" />
+                        <text foreground="text_muted">{message.roleLabel}</text>
+                      </row>
+                      <markdown source="{message.text}" />
+                      <if test="{message.truncated}">
+                        <text foreground="warning">Message clipped to 8 KiB in this view.</text>
+                      </if>
+                    </column>
+                  </card>
+                </else>
+              </for>
+              <if test="{agent_history_clipped}">
+                <text foreground="text_muted">Showing the latest 12 messages.</text>
+              </if>
+            </if>
+            <else>
+              <card>
+                <column gap="8" padding="12">
+                  <row gap="8" cross="center">
+                    <icon name="info" width="14" height="14" foreground="info" />
+                    <text><span weight="medium">Ask Codex</span></text>
+                  </row>
+                  <text wrap="true" foreground="text_muted">This Agent tab keeps prompts, streaming responses, plans, and future approvals in the Rust-owned BlockDocument.</text>
+                </column>
+              </card>
+            </else>
           </column>
         </scroll>
+        <separator />
+        <column padding="10">
+          <input-group label="Agent prompt composer" height="112">
+            <textarea text="{agentComposerText}" placeholder="Ask Codex about this workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerDisabled}" label="Agent prompt" />
+            <input-group-actions>
+              <text foreground="text_muted">Command Enter to send</text>
+              <spacer grow="1" />
+              <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentComposerDisabled}" label="Send prompt"></button>
+            </input-group-actions>
+          </input-group>
+        </column>
         <status-bar>{agentStatus}</status-bar>
       </column>
     </split>

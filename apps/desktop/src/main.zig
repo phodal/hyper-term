@@ -26,9 +26,16 @@ const agent_url_capacity: usize = 256;
 const max_gateway_token_bytes: usize = 128;
 const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
 const agent_effect_url_capacity: usize = agent_url_capacity + 64;
+const max_agent_messages: usize = 12;
+const max_agent_message_bytes: usize = 8 * 1024;
+const max_agent_error_bytes: usize = 512;
+const max_agent_prompt_bytes: usize = 16 * 1024;
 const terminal_close_effect_key_base: u64 = 0x4854_4300;
 pub const agent_start_effect_key_base: u64 = 0x4854_4100;
 const agent_close_effect_key_base: u64 = 0x4854_4200;
+pub const agent_turn_effect_key_base: u64 = 0x4854_4400;
+pub const agent_snapshot_effect_key_base: u64 = 0x4854_4500;
+pub const agent_poll_timer_key_base: u64 = 0x4854_4600;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -91,6 +98,42 @@ pub const AgentConnection = enum {
     failed,
 };
 
+pub const AgentTurnStatus = enum {
+    idle,
+    ready,
+    running,
+    completed,
+    waiting_approval,
+    failed,
+};
+
+pub const AgentMessageRole = enum { user, agent, system, thought };
+
+pub const AgentMessageView = struct {
+    id: u16 = 0,
+    role: AgentMessageRole = .agent,
+    text_storage: [max_agent_message_bytes]u8 = [_]u8{0} ** max_agent_message_bytes,
+    text_len: usize = 0,
+    truncated: bool = false,
+
+    pub fn text(message: *const AgentMessageView) []const u8 {
+        return message.text_storage[0..message.text_len];
+    }
+
+    pub fn roleLabel(message: *const AgentMessageView) []const u8 {
+        return switch (message.role) {
+            .user => "You",
+            .agent => "Agent",
+            .system => "System",
+            .thought => "Plan",
+        };
+    }
+
+    pub fn isUser(message: *const AgentMessageView) bool {
+        return message.role == .user;
+    }
+};
+
 pub const Session = struct {
     id: u8 = 0,
     mode: SessionMode = .terminal,
@@ -122,6 +165,15 @@ pub const Model = struct {
     terminal_url_len: usize = 0,
     agent_base_url_storage: [agent_url_capacity]u8 = [_]u8{0} ** agent_url_capacity,
     agent_base_url_len: usize = 0,
+    agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
+    agent_messages: [max_agent_messages]AgentMessageView = [_]AgentMessageView{.{}} ** max_agent_messages,
+    agent_message_count: usize = 0,
+    agent_history_clipped: bool = false,
+    agent_projection_session_id: u8 = 0,
+    agent_turn_status: AgentTurnStatus = .idle,
+    agent_error_storage: [max_agent_error_bytes]u8 = [_]u8{0} ** max_agent_error_bytes,
+    agent_error_len: usize = 0,
+    agent_snapshot_in_flight_session_id: u8 = 0,
 
     /// Read by update, token, and derived-binding code rather than bound
     /// directly by the declarative view.
@@ -138,8 +190,17 @@ pub const Model = struct {
         "terminal_url_len",
         "agent_base_url_storage",
         "agent_base_url_len",
+        "agent_composer_buffer",
+        "agent_messages",
+        "agent_message_count",
+        "agent_projection_session_id",
+        "agent_turn_status",
+        "agent_error_storage",
+        "agent_error_len",
+        "agent_snapshot_in_flight_session_id",
         "terminalReady",
         "terminalUrl",
+        "agentError",
     };
 
     pub fn openSessions(model: *const Model) []const Session {
@@ -181,6 +242,14 @@ pub const Model = struct {
     }
 
     pub fn agentConnectionLabel(model: *const Model) []const u8 {
+        if (model.activeSession().agent_connection == .ready) {
+            return switch (model.agent_turn_status) {
+                .running => "working",
+                .waiting_approval => "approval",
+                .failed => "failed",
+                else => "ready",
+            };
+        }
         return switch (model.activeSession().agent_connection) {
             .unavailable => "unavailable",
             .connecting => "connecting",
@@ -190,12 +259,44 @@ pub const Model = struct {
     }
 
     pub fn agentStatus(model: *const Model) []const u8 {
+        if (model.activeSession().agent_connection == .ready) {
+            return switch (model.agent_turn_status) {
+                .running => "Codex is responding · BlockDocument streaming",
+                .waiting_approval => "Effect proposed · waiting for Rust permission flow",
+                .failed => if (model.agent_error_len > 0) model.agentError() else "Agent turn failed",
+                .completed => "Turn complete · history journaled locally",
+                else => "Codex app-server ready · type a prompt",
+            };
+        }
         return switch (model.activeSession().agent_connection) {
             .unavailable => "Codex unavailable · no command executed",
             .connecting => "Codex app-server connecting · no command executed",
             .ready => "Codex app-server ready · permission broker active",
             .failed => "Codex app-server failed · no command executed",
         };
+    }
+
+    pub fn agentComposerText(model: *const Model) []const u8 {
+        return model.agent_composer_buffer.text();
+    }
+
+    pub fn agentComposerDisabled(model: *const Model) bool {
+        return model.activeSession().agent_connection != .ready or
+            model.agent_base_url_len == 0 or
+            model.agent_turn_status == .running or
+            model.agent_turn_status == .waiting_approval;
+    }
+
+    pub fn agentMessages(model: *const Model) []const AgentMessageView {
+        return model.agent_messages[0..model.agent_message_count];
+    }
+
+    pub fn hasAgentMessages(model: *const Model) bool {
+        return model.agent_message_count > 0;
+    }
+
+    pub fn agentError(model: *const Model) []const u8 {
+        return model.agent_error_storage[0..model.agent_error_len];
     }
 };
 
@@ -210,6 +311,11 @@ pub const Msg = union(enum) {
     terminal_session_closed: native_sdk.EffectResponse,
     agent_session_started: native_sdk.EffectResponse,
     agent_session_closed: native_sdk.EffectResponse,
+    agent_composer_changed: canvas.TextInputEvent,
+    send_agent_prompt,
+    agent_turn_started: native_sdk.EffectResponse,
+    agent_snapshot_received: native_sdk.EffectResponse,
+    agent_poll: native_sdk.EffectTimer,
     agent_split_resized: f32,
     system_appearance: struct {
         scheme: canvas.ColorScheme,
@@ -219,7 +325,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_poll", "system_appearance", "chrome_changed" };
 };
 
 const dev_markup_reload = builtin.mode == .Debug;
@@ -240,12 +346,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             model.new_session_open = false;
         },
-        .select_session => |session_id| selectSession(model, session_id),
+        .select_session => |session_id| {
+            const previous = model.active_session_id;
+            selectSession(model, session_id);
+            if (previous != model.active_session_id) {
+                resetAgentProjection(model, model.active_session_id);
+                requestActiveAgentSnapshot(model, fx);
+            }
+        },
         .close_session => |session_id| closeSession(model, session_id, fx),
         .close_active_session => closeSession(model, model.active_session_id, fx),
         .terminal_session_closed => {},
-        .agent_session_started => |response| applyAgentStartResponse(model, response),
+        .agent_session_started => |response| applyAgentStartResponse(model, response, fx),
         .agent_session_closed => {},
+        .agent_composer_changed => |edit| model.agent_composer_buffer.apply(edit),
+        .send_agent_prompt => requestAgentTurn(model, fx),
+        .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
+        .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
+        .agent_poll => |timer| {
+            if (timer.outcome == .fired) requestActiveAgentSnapshot(model, fx);
+        },
         .agent_split_resized => |fraction| model.agent_split = std.math.clamp(fraction, 0.48, 0.76),
         .system_appearance => |appearance| {
             model.system_scheme = appearance.scheme;
@@ -289,8 +409,12 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     }
     const index = closing_index orelse return;
     const session = model.session_slots[index];
+    const was_active = model.active_session_id == session_id;
     requestTerminalClose(model, session_id, fx);
-    if (session.mode == .agent) requestAgentClose(model, session_id, fx);
+    if (session.mode == .agent) {
+        requestAgentClose(model, session_id, fx);
+        fx.cancelTimer(agent_poll_timer_key_base + session_id);
+    }
 
     if (model.session_count == 1) {
         fx.closeWindow("main");
@@ -311,6 +435,10 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     model.session_count -= 1;
     model.session_slots[model.session_count] = .{};
     refreshTerminalUrl(model);
+    if (was_active) {
+        resetAgentProjection(model, model.active_session_id);
+        requestActiveAgentSnapshot(model, fx);
+    }
 }
 
 fn requestAgentStart(model: *Model, session_id: u8, fx: *Effects) void {
@@ -351,7 +479,20 @@ fn writeAgentSessionUrl(model: *const Model, session_id: u8, storage: []u8) ?[]c
     ) catch null;
 }
 
-fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse) void {
+fn writeAgentTurnUrl(model: *const Model, session_id: u8, storage: []u8) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(
+        storage,
+        "{s}/agent/session/turn?token={s}&session_id={d}",
+        .{ origin, token, session_id },
+    ) catch null;
+}
+
+fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
     if (response.key <= agent_start_effect_key_base) return;
     const raw_session_id = response.key - agent_start_effect_key_base;
     if (raw_session_id > std.math.maxInt(u8)) return;
@@ -361,6 +502,199 @@ fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse) v
         !response.truncated and
         std.mem.indexOf(u8, response.body, "\"status\":\"ready\"") != null;
     setAgentConnection(model, session_id, if (ready) .ready else .failed);
+    if (session_id == model.active_session_id) {
+        resetAgentProjection(model, session_id);
+        model.agent_turn_status = if (ready) .ready else .failed;
+        if (ready) requestAgentSnapshot(model, session_id, fx);
+    }
+}
+
+fn requestAgentTurn(model: *Model, fx: *Effects) void {
+    if (model.agentComposerDisabled()) return;
+    const prompt = std.mem.trim(u8, model.agent_composer_buffer.text(), " \t\r\n");
+    if (prompt.len == 0) return;
+    const session_id = model.active_session_id;
+    var storage: [agent_effect_url_capacity + 8]u8 = undefined;
+    const request_url = writeAgentTurnUrl(model, session_id, storage[0..]) orelse return;
+    fx.fetch(.{
+        .key = agent_turn_effect_key_base + session_id,
+        .method = .POST,
+        .url = request_url,
+        .body = prompt,
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_turn_started),
+    });
+    model.agent_composer_buffer.clear();
+    model.agent_turn_status = .running;
+    model.agent_error_len = 0;
+}
+
+fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    const session_id = effectSessionId(response.key, agent_turn_effect_key_base) orelse return;
+    if (session_id != model.active_session_id) return;
+    const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
+    if (!accepted) {
+        model.agent_turn_status = .failed;
+        setAgentError(model, "Agent turn could not be started");
+        return;
+    }
+    requestAgentSnapshot(model, session_id, fx);
+}
+
+fn requestActiveAgentSnapshot(model: *Model, fx: *Effects) void {
+    const session = model.activeSession();
+    if (session.mode == .agent and session.agent_connection == .ready) {
+        requestAgentSnapshot(model, session.id, fx);
+    }
+}
+
+fn requestAgentSnapshot(model: *Model, session_id: u8, fx: *Effects) void {
+    if (model.agent_snapshot_in_flight_session_id != 0) return;
+    var storage: [agent_effect_url_capacity]u8 = undefined;
+    const request_url = writeAgentSessionUrl(model, session_id, storage[0..]) orelse return;
+    model.agent_snapshot_in_flight_session_id = session_id;
+    fx.fetch(.{
+        .key = agent_snapshot_effect_key_base + session_id,
+        .url = request_url,
+        .timeout_ms = 4_000,
+        .on_response = Effects.responseMsg(.agent_snapshot_received),
+    });
+}
+
+const AgentSnapshotWire = struct {
+    status: []const u8,
+    @"error": ?[]const u8 = null,
+    document: struct {
+        blocks: []const AgentBlockWire,
+    },
+};
+
+const AgentBlockWire = struct {
+    kind: []const u8,
+    payload: struct {
+        @"type": []const u8,
+        role: ?[]const u8 = null,
+        text: ?[]const u8 = null,
+    },
+};
+
+fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    const session_id = effectSessionId(response.key, agent_snapshot_effect_key_base) orelse return;
+    if (model.agent_snapshot_in_flight_session_id == session_id) {
+        model.agent_snapshot_in_flight_session_id = 0;
+    }
+    if (session_id != model.active_session_id) {
+        requestActiveAgentSnapshot(model, fx);
+        return;
+    }
+    if (response.outcome != .ok or response.status != 200 or response.truncated) {
+        model.agent_turn_status = .failed;
+        setAgentError(model, "Agent history could not be refreshed");
+        return;
+    }
+    const parsed = std.json.parseFromSlice(
+        AgentSnapshotWire,
+        std.heap.page_allocator,
+        response.body,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        model.agent_turn_status = .failed;
+        setAgentError(model, "Agent history response was invalid");
+        return;
+    };
+    defer parsed.deinit();
+    projectAgentMessages(model, parsed.value.document.blocks);
+    model.agent_turn_status = parseAgentTurnStatus(parsed.value.status);
+    if (parsed.value.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
+    if (model.agent_turn_status == .running) scheduleAgentPoll(session_id, fx);
+}
+
+fn projectAgentMessages(model: *Model, blocks: []const AgentBlockWire) void {
+    for (&model.agent_messages) |*message| message.* = .{};
+    model.agent_message_count = 0;
+    var message_total: usize = 0;
+    for (blocks) |block| {
+        if (std.mem.eql(u8, block.kind, "message") and
+            std.mem.eql(u8, block.payload.@"type", "message") and
+            block.payload.role != null and block.payload.text != null)
+        {
+            message_total += 1;
+        }
+    }
+    var skip = message_total -| max_agent_messages;
+    model.agent_history_clipped = skip > 0;
+    for (blocks) |block| {
+        if (!std.mem.eql(u8, block.kind, "message") or
+            !std.mem.eql(u8, block.payload.@"type", "message")) continue;
+        const role_text = block.payload.role orelse continue;
+        const text_value = block.payload.text orelse continue;
+        if (skip > 0) {
+            skip -= 1;
+            continue;
+        }
+        if (model.agent_message_count == max_agent_messages) break;
+        const slot = &model.agent_messages[model.agent_message_count];
+        slot.id = @intCast(model.agent_message_count + 1);
+        slot.role = parseAgentMessageRole(role_text);
+        const text_len = utf8BoundedLength(text_value, slot.text_storage.len);
+        @memcpy(slot.text_storage[0..text_len], text_value[0..text_len]);
+        slot.text_len = text_len;
+        slot.truncated = text_len < text_value.len;
+        model.agent_message_count += 1;
+    }
+    model.agent_projection_session_id = model.active_session_id;
+}
+
+fn parseAgentMessageRole(value: []const u8) AgentMessageRole {
+    if (std.mem.eql(u8, value, "user")) return .user;
+    if (std.mem.eql(u8, value, "system")) return .system;
+    if (std.mem.eql(u8, value, "thought")) return .thought;
+    return .agent;
+}
+
+fn parseAgentTurnStatus(value: []const u8) AgentTurnStatus {
+    if (std.mem.eql(u8, value, "ready")) return .ready;
+    if (std.mem.eql(u8, value, "running")) return .running;
+    if (std.mem.eql(u8, value, "completed")) return .completed;
+    if (std.mem.eql(u8, value, "waiting_approval")) return .waiting_approval;
+    if (std.mem.eql(u8, value, "failed")) return .failed;
+    return .idle;
+}
+
+fn scheduleAgentPoll(session_id: u8, fx: *Effects) void {
+    fx.startTimer(.{
+        .key = agent_poll_timer_key_base + session_id,
+        .interval_ms = 250,
+        .on_fire = Effects.timerMsg(.agent_poll),
+    });
+}
+
+fn effectSessionId(key: u64, base: u64) ?u8 {
+    if (key <= base) return null;
+    const raw_session_id = key - base;
+    if (raw_session_id > std.math.maxInt(u8)) return null;
+    return @intCast(raw_session_id);
+}
+
+fn resetAgentProjection(model: *Model, session_id: u8) void {
+    for (&model.agent_messages) |*message| message.* = .{};
+    model.agent_message_count = 0;
+    model.agent_history_clipped = false;
+    model.agent_projection_session_id = session_id;
+    model.agent_turn_status = .idle;
+    model.agent_error_len = 0;
+}
+
+fn setAgentError(model: *Model, message: []const u8) void {
+    const length = utf8BoundedLength(message, model.agent_error_storage.len);
+    @memcpy(model.agent_error_storage[0..length], message[0..length]);
+    model.agent_error_len = length;
+}
+
+fn utf8BoundedLength(value: []const u8, maximum: usize) usize {
+    var end = @min(value.len, maximum);
+    while (end > 0 and !std.unicode.utf8ValidateSlice(value[0..end])) end -= 1;
+    return end;
 }
 
 fn setAgentConnection(model: *Model, session_id: u8, connection: AgentConnection) void {
@@ -583,12 +917,9 @@ fn trustedGatewayToken(token: []const u8) bool {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const app_state = try std.heap.page_allocator.create(HyperTermApp);
-    defer std.heap.page_allocator.destroy(app_state);
-
     const terminal_url = init.environ_map.get("HYPER_TERM_TERMINAL_URL") orelse "";
     const agent_url = init.environ_map.get("HYPER_TERM_AGENT_URL") orelse "";
-    app_state.* = HyperTermApp.init(std.heap.page_allocator, initialModelWithServices(terminal_url, agent_url), .{
+    const app_state = try HyperTermApp.create(std.heap.page_allocator, .{
         .name = "hyper-term",
         .scene = shell_scene,
         .canvas_label = canvas_label,
@@ -604,7 +935,8 @@ pub fn main(init: std.process.Init) !void {
         else
             null,
     });
-    defer app_state.deinit();
+    defer app_state.destroy();
+    app_state.model = initialModelWithServices(terminal_url, agent_url);
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "hyper-term",
