@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::fs;
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -9,8 +10,9 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, bounded, select};
 use hyper_term_drivers::{
-    AgentEffectAuthorization, ExternalRequestId, MAX_MCP_FRAME_BYTES, McpAgentServer,
-    McpAuthorizationOutcome, McpServerAction, McpToolCall, McpToolClass, McpToolResult,
+    AgentEffectAuthorization, DenoLspClient, DenoLspConfig, ExternalRequestId, MAX_MCP_FRAME_BYTES,
+    McpAgentServer, McpAuthorizationOutcome, McpServerAction, McpToolCall, McpToolClass,
+    McpToolResult, path_to_file_uri,
 };
 use hyper_term_protocol::{
     ControlRequest, ControlResponse, DomainEvent, OperationAction, OperationCompletion,
@@ -27,10 +29,23 @@ const AUTHORITY_TIMEOUT: Duration = Duration::from_secs(3);
 const MCP_INPUT_CAPACITY: usize = 64;
 const AUTHORITY_EVENT_CAPACITY: usize = 512;
 const MAX_DIFF_OUTPUT_BYTES: usize = 800 * 1024;
+const MAX_LSP_DOCUMENT_BYTES: u64 = 1024 * 1024;
+const MAX_LSP_RESULT_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct DenoMcpExecutorConfig {
+    pub executable: PathBuf,
+    pub executable_sha256: String,
+    pub runtime_version: String,
+    pub workspace_snapshot: PathBuf,
+    pub cache_directory: PathBuf,
+    pub scratch_directory: PathBuf,
+}
 
 #[derive(Clone, Debug)]
 pub struct McpStdioConfig {
     socket: PathBuf,
+    deno_lsp: Option<DenoMcpExecutorConfig>,
 }
 
 impl McpStdioConfig {
@@ -41,7 +56,25 @@ impl McpStdioConfig {
         if !socket.is_absolute() {
             return Err(McpGatewayError::SocketMustBeAbsolute);
         }
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            deno_lsp: None,
+        })
+    }
+
+    pub fn with_deno_lsp(mut self, config: DenoMcpExecutorConfig) -> Result<Self, McpGatewayError> {
+        if !config.executable.is_absolute()
+            || !config.workspace_snapshot.is_absolute()
+            || !config.cache_directory.is_absolute()
+            || !config.scratch_directory.is_absolute()
+        {
+            return Err(McpGatewayError::DenoPathsMustBeAbsolute);
+        }
+        if config.runtime_version.is_empty() || !is_sha256(&config.executable_sha256) {
+            return Err(McpGatewayError::InvalidDenoManifest);
+        }
+        self.deno_lsp = Some(config);
+        Ok(self)
     }
 }
 
@@ -56,7 +89,7 @@ where
 {
     let (authority_events, observer) = spawn_authority_observer(&config.socket)?;
     let input_events = spawn_mcp_reader(input)?;
-    let mut gateway = McpGateway::new(config.socket, output);
+    let mut gateway = McpGateway::new(config, output);
     let result = loop {
         select! {
             recv(input_events) -> message => match message {
@@ -93,16 +126,24 @@ struct McpGateway<'a, W> {
     socket: PathBuf,
     output: &'a mut W,
     server: McpAgentServer,
+    deno_lsp_config: Option<DenoMcpExecutorConfig>,
+    deno_lsp: Option<DenoLspExecutor>,
     task_id: Option<TaskId>,
     pending: HashMap<OperationId, PendingAuthorityCall>,
 }
 
 impl<'a, W: Write> McpGateway<'a, W> {
-    fn new(socket: PathBuf, output: &'a mut W) -> Self {
+    fn new(config: McpStdioConfig, output: &'a mut W) -> Self {
+        let mut tools = vec![McpToolClass::DiffReview];
+        if config.deno_lsp.is_some() {
+            tools.push(McpToolClass::DenoLspQuery);
+        }
         Self {
-            socket,
+            socket: config.socket,
             output,
-            server: McpAgentServer::with_tools(Uuid::new_v4(), [McpToolClass::DiffReview]),
+            server: McpAgentServer::with_tools(Uuid::new_v4(), tools),
+            deno_lsp_config: config.deno_lsp,
+            deno_lsp: None,
             task_id: None,
             pending: HashMap::new(),
         }
@@ -263,7 +304,7 @@ impl<'a, W: Write> McpGateway<'a, W> {
                 );
             }
         };
-        let result = execute_tool(&call);
+        let result = self.execute_tool(&call);
         let result_digest = sha256_json(&result)?;
         let succeeded = !result.is_error;
         let completion = OperationCompletion {
@@ -378,6 +419,35 @@ impl<'a, W: Write> McpGateway<'a, W> {
         )?;
         Ok(())
     }
+
+    fn execute_tool(&mut self, call: &McpToolCall) -> McpToolResult {
+        match call.class {
+            McpToolClass::DiffReview => diff_review(&call.arguments),
+            McpToolClass::DenoLspQuery => {
+                if self.deno_lsp.is_none() {
+                    let Some(config) = self.deno_lsp_config.take() else {
+                        return tool_failure("Deno LSP executor is not configured");
+                    };
+                    match DenoLspExecutor::launch(config) {
+                        Ok(executor) => self.deno_lsp = Some(executor),
+                        Err(error) => {
+                            return tool_failure(format!("Deno LSP could not start: {error}"));
+                        }
+                    }
+                }
+                match self
+                    .deno_lsp
+                    .as_mut()
+                    .expect("executor was initialized")
+                    .query(&call.arguments)
+                {
+                    Ok(result) => result,
+                    Err(error) => tool_failure(format!("Deno LSP query failed: {error}")),
+                }
+            }
+            McpToolClass::GenUiCompile => tool_failure("GenUI compiler executor is not configured"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -410,21 +480,142 @@ fn risk_for(class: McpToolClass) -> RiskClass {
     }
 }
 
-fn execute_tool(call: &McpToolCall) -> McpToolResult {
-    match call.class {
-        McpToolClass::DiffReview => diff_review(&call.arguments),
-        McpToolClass::GenUiCompile => McpToolResult {
-            text: "GenUI compilation is brokered, but this build has no attached Deno compiler executor"
-                .into(),
-            structured_content: None,
-            is_error: true,
-        },
-        McpToolClass::DenoLspQuery => McpToolResult {
-            text: "Deno LSP is brokered, but this build has no attached workspace snapshot executor"
-                .into(),
-            structured_content: None,
-            is_error: true,
-        },
+fn tool_failure(message: impl Into<String>) -> McpToolResult {
+    McpToolResult {
+        text: message.into(),
+        structured_content: None,
+        is_error: true,
+    }
+}
+
+struct DenoLspExecutor {
+    client: DenoLspClient,
+    workspace_snapshot: PathBuf,
+    opened_documents: HashMap<PathBuf, i32>,
+}
+
+impl DenoLspExecutor {
+    fn launch(config: DenoMcpExecutorConfig) -> Result<Self, String> {
+        let workspace_snapshot = config
+            .workspace_snapshot
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let client = DenoLspClient::launch(DenoLspConfig {
+            executable: config.executable,
+            executable_sha256: config.executable_sha256,
+            runtime_version: config.runtime_version,
+            workspace_snapshot: workspace_snapshot.clone(),
+            cache_directory: config.cache_directory,
+            scratch_directory: config.scratch_directory,
+        })
+        .map_err(|error| error.to_string())?;
+        client
+            .initialize(Duration::from_secs(10))
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            client,
+            workspace_snapshot,
+            opened_documents: HashMap::new(),
+        })
+    }
+
+    fn query(&mut self, arguments: &Value) -> Result<McpToolResult, String> {
+        let method = arguments["method"]
+            .as_str()
+            .ok_or_else(|| "method is missing".to_owned())?;
+        let relative = arguments["documentPath"]
+            .as_str()
+            .ok_or_else(|| "documentPath is missing".to_owned())?;
+        let relative = Path::new(relative);
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err("documentPath must stay within the workspace snapshot".into());
+        }
+        let document = self
+            .workspace_snapshot
+            .join(relative)
+            .canonicalize()
+            .map_err(|_| "document does not exist in the workspace snapshot".to_owned())?;
+        if !document.starts_with(&self.workspace_snapshot) || !document.is_file() {
+            return Err("documentPath escapes the workspace snapshot".into());
+        }
+        let metadata = fs::metadata(&document).map_err(|error| error.to_string())?;
+        if metadata.len() > MAX_LSP_DOCUMENT_BYTES {
+            return Err(format!(
+                "document exceeds the {MAX_LSP_DOCUMENT_BYTES}-byte LSP bound"
+            ));
+        }
+        let uri = path_to_file_uri(&document).map_err(|error| error.to_string())?;
+        if !self.opened_documents.contains_key(&document) {
+            let source = fs::read_to_string(&document)
+                .map_err(|_| "document is not bounded UTF-8 source".to_owned())?;
+            self.client
+                .notify(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": language_id(&document),
+                            "version": 1,
+                            "text": source
+                        }
+                    }),
+                )
+                .map_err(|error| error.to_string())?;
+            self.opened_documents.insert(document.clone(), 1);
+        }
+        let text_document = json!({"uri": uri});
+        let position = arguments
+            .get("position")
+            .cloned()
+            .unwrap_or_else(|| json!({"line": 0, "character": 0}));
+        let params = match method {
+            "textDocument/documentSymbol" => json!({"textDocument": text_document}),
+            "textDocument/formatting" => json!({
+                "textDocument": text_document,
+                "options": {"tabSize": 2, "insertSpaces": true}
+            }),
+            "textDocument/references" => json!({
+                "textDocument": text_document,
+                "position": position,
+                "context": {
+                    "includeDeclaration": arguments["includeDeclaration"].as_bool().unwrap_or(true)
+                }
+            }),
+            _ => json!({"textDocument": text_document, "position": position}),
+        };
+        let response = self
+            .client
+            .request(method, params, Duration::from_secs(10))
+            .map_err(|error| error.to_string())?;
+        let result = response.get("result").cloned().unwrap_or(Value::Null);
+        let structured = json!({
+            "method": method,
+            "documentPath": relative.to_string_lossy(),
+            "result": result
+        });
+        let text = serde_json::to_string_pretty(&structured).map_err(|error| error.to_string())?;
+        if text.len() > MAX_LSP_RESULT_BYTES {
+            return Err(format!(
+                "LSP result exceeds the {MAX_LSP_RESULT_BYTES}-byte result bound"
+            ));
+        }
+        Ok(McpToolResult::success(text, Some(structured)))
+    }
+}
+
+fn language_id(path: &Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("ts") | Some("mts") | Some("cts") => "typescript",
+        Some("tsx") => "typescriptreact",
+        Some("js") | Some("mjs") | Some("cjs") => "javascript",
+        Some("jsx") => "javascriptreact",
+        Some("json") | Some("jsonc") => "json",
+        _ => "plaintext",
     }
 }
 
@@ -497,6 +688,13 @@ fn diff_review(arguments: &Value) -> McpToolResult {
 fn sha256_json(value: &impl serde::Serialize) -> Result<String, McpGatewayError> {
     let digest = Sha256::digest(serde_json::to_vec(value)?);
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 enum InputEvent {
@@ -612,6 +810,10 @@ pub enum McpGatewayError {
     AgentModeRequired,
     #[error("MCP authority socket must be absolute")]
     SocketMustBeAbsolute,
+    #[error("Deno MCP executor paths must be absolute")]
+    DenoPathsMustBeAbsolute,
+    #[error("Deno MCP executor manifest is incomplete")]
+    InvalidDenoManifest,
     #[error("hyperd rejected the MCP operation ({code}): {message}")]
     AuthorityRejected { code: String, message: String },
     #[error("hyperd returned an unexpected MCP response: {0:?}")]

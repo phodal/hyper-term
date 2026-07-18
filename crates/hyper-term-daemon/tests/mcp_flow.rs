@@ -6,7 +6,9 @@ use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hyper_term_daemon::{DaemonState, McpStdioConfig, run_mcp_stdio, spawn_unix_server};
+use hyper_term_daemon::{
+    DaemonState, DenoMcpExecutorConfig, McpStdioConfig, run_mcp_stdio, spawn_unix_server,
+};
 use hyper_term_drivers::DriverFraming;
 use hyper_term_protocol::{
     BlockPayload, DomainEvent, EventEnvelope, OperationState, PermissionDecision,
@@ -114,6 +116,127 @@ fn approved_diff_tool_runs_through_mcp_and_leaves_a_receipt() {
             } if *id == operation_id && executor == "hyper-term-mcp" && digest.len() == 64
         )
     }));
+
+    client_io.shutdown(Shutdown::Write).unwrap();
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore = "requires HYPER_TERM_DENO_PATH and HYPER_TERM_DENO_SHA256"]
+fn approved_lsp_tool_queries_the_pinned_deno_snapshot() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("hyperd.sock");
+    let state_directory = directory.path().join("state");
+    let snapshot = directory.path().join("snapshot");
+    let cache = directory.path().join("deno-cache");
+    let scratch = directory.path().join("deno-scratch");
+    std::fs::create_dir(&snapshot).unwrap();
+    std::fs::create_dir(&cache).unwrap();
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::write(
+        snapshot.join("main.ts"),
+        "export function answer(): number { return 42; }\n",
+    )
+    .unwrap();
+    let state = DaemonState::open(&state_directory).unwrap();
+    let _server = spawn_unix_server(&socket, state.clone()).unwrap();
+    let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
+    client_io
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let gateway_input = gateway_io.try_clone().unwrap();
+    let deno = std::path::PathBuf::from(
+        std::env::var_os("HYPER_TERM_DENO_PATH").expect("HYPER_TERM_DENO_PATH"),
+    )
+    .canonicalize()
+    .unwrap();
+    let config = McpStdioConfig::new(socket.canonicalize().unwrap(), true)
+        .unwrap()
+        .with_deno_lsp(DenoMcpExecutorConfig {
+            executable: deno,
+            executable_sha256: std::env::var("HYPER_TERM_DENO_SHA256")
+                .expect("HYPER_TERM_DENO_SHA256"),
+            runtime_version: "2.9.3".into(),
+            workspace_snapshot: snapshot.canonicalize().unwrap(),
+            cache_directory: cache.canonicalize().unwrap(),
+            scratch_directory: scratch.canonicalize().unwrap(),
+        })
+        .unwrap();
+    let gateway = thread::spawn(move || run_mcp_stdio(config, gateway_input, &mut gateway_io));
+    let mut output = BufReader::new(client_io.try_clone().unwrap());
+
+    send(
+        &mut client_io,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "lsp-test", "version": "1"}
+            }
+        }),
+    );
+    send(
+        &mut client_io,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    send(
+        &mut client_io,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "hyper_term.lsp.query",
+                "arguments": {
+                    "method": "textDocument/documentSymbol",
+                    "documentPath": "main.ts"
+                }
+            }
+        }),
+    );
+    let initialized = receive_id(&mut output, 1);
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    let (task_id, operation_id, waiting_revision) = wait_for_permission(&state_directory);
+    state
+        .decide_permission(
+            task_id,
+            operation_id,
+            waiting_revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+
+    let result = receive_id(&mut output, 8);
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert_eq!(
+        result["result"]["structuredContent"]["method"],
+        "textDocument/documentSymbol"
+    );
+    assert!(
+        result["result"]["structuredContent"]["result"]
+            .as_array()
+            .is_some_and(|symbols| !symbols.is_empty())
+    );
+    assert!(
+        state
+            .block_snapshot(task_id)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| {
+                matches!(
+                    &block.payload,
+                    BlockPayload::OperationReceipt {
+                        operation_id: id,
+                        succeeded: true,
+                        ..
+                    } if *id == operation_id
+                )
+            })
+    );
 
     client_io.shutdown(Shutdown::Write).unwrap();
     gateway.join().unwrap().unwrap();

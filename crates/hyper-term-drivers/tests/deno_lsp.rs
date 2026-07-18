@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use hyper_term_drivers::{DenoLspClient, DenoLspConfig, DriverEvent, DriverState};
-use serde_json::{Value, json};
+use hyper_term_drivers::{DenoLspClient, DenoLspConfig, DriverState};
+use serde_json::json;
 use tempfile::TempDir;
 
 #[test]
@@ -48,9 +48,15 @@ fn pinned_deno_lsp_completes_a_real_initialize_handshake() {
             }),
         )
         .unwrap();
-    let diagnostics = wait_for_diagnostics(&client);
+    let symbols = client
+        .request(
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": source_uri}}),
+            Duration::from_secs(10),
+        )
+        .unwrap();
     assert!(
-        diagnostics
+        symbols["result"]
             .as_array()
             .is_some_and(|items| !items.is_empty())
     );
@@ -58,27 +64,4 @@ fn pinned_deno_lsp_completes_a_real_initialize_handshake() {
         client.shutdown(Duration::from_secs(2)).unwrap(),
         DriverState::Closed
     );
-}
-
-fn wait_for_diagnostics(client: &DenoLspClient) -> Value {
-    for _ in 0..32 {
-        let DriverEvent::Message { payload, .. } = client
-            .recv_timeout(Duration::from_secs(2))
-            .expect("Deno LSP stopped before publishing diagnostics")
-        else {
-            continue;
-        };
-        if payload["method"] == "textDocument/publishDiagnostics" {
-            return payload["params"]["diagnostics"].clone();
-        }
-        if payload["method"] == "workspace/configuration" {
-            client
-                .respond(
-                    payload["id"].clone(),
-                    json!([{"enable": true, "lint": true}]),
-                )
-                .unwrap();
-        }
-    }
-    panic!("Deno LSP did not publish diagnostics");
 }

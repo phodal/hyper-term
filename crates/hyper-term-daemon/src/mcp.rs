@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use hyper_term_daemon::{McpStdioConfig, run_mcp_stdio};
+use hyper_term_daemon::{DenoMcpExecutorConfig, McpStdioConfig, run_mcp_stdio};
 
 fn main() {
     if let Err(error) = run() {
@@ -17,6 +17,11 @@ fn run() -> Result<(), String> {
              Usage: hyper-term-mcp --agent-mode --socket PATH\n\n\
              Options:\n  --agent-mode   Required capability fence\n  \
              --socket PATH  hyperd Unix control socket\n  \
+             --deno PATH    Enable Deno LSP with this pinned executable\n  \
+             --deno-sha256 DIGEST  Expected Deno executable digest\n  \
+             --workspace-snapshot PATH  Authority-created read snapshot\n  \
+             --deno-cache PATH    Private prewarmed Deno cache\n  \
+             --deno-scratch PATH  Private Deno scratch directory\n  \
              -h, --help     Show this help"
         );
         return Ok(());
@@ -24,17 +29,60 @@ fn run() -> Result<(), String> {
     let socket = options
         .socket
         .ok_or_else(|| "--socket is required".to_owned())?;
-    let config =
+    let mut config =
         McpStdioConfig::new(socket, options.agent_mode).map_err(|error| error.to_string())?;
+    let deno_values = [
+        options.deno.is_some(),
+        options.deno_sha256.is_some(),
+        options.workspace_snapshot.is_some(),
+        options.deno_cache.is_some(),
+        options.deno_scratch.is_some(),
+    ];
+    if deno_values.iter().any(|value| *value) {
+        if !deno_values.iter().all(|value| *value) {
+            return Err("Deno LSP requires --deno, --deno-sha256, --workspace-snapshot, --deno-cache, and --deno-scratch".into());
+        }
+        config = config
+            .with_deno_lsp(DenoMcpExecutorConfig {
+                executable: options.deno.expect("checked"),
+                executable_sha256: options.deno_sha256.expect("checked"),
+                runtime_version: options.deno_version,
+                workspace_snapshot: options.workspace_snapshot.expect("checked"),
+                cache_directory: options.deno_cache.expect("checked"),
+                scratch_directory: options.deno_scratch.expect("checked"),
+            })
+            .map_err(|error| error.to_string())?;
+    }
     run_mcp_stdio(config, std::io::stdin(), &mut std::io::stdout())
         .map_err(|error| error.to_string())
 }
 
-#[derive(Default)]
 struct Options {
     socket: Option<PathBuf>,
     agent_mode: bool,
+    deno: Option<PathBuf>,
+    deno_sha256: Option<String>,
+    deno_version: String,
+    workspace_snapshot: Option<PathBuf>,
+    deno_cache: Option<PathBuf>,
+    deno_scratch: Option<PathBuf>,
     help: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            socket: None,
+            agent_mode: false,
+            deno: None,
+            deno_sha256: None,
+            deno_version: "2.9.3".into(),
+            workspace_snapshot: None,
+            deno_cache: None,
+            deno_scratch: None,
+            help: false,
+        }
+    }
 }
 
 impl Options {
@@ -51,12 +99,41 @@ impl Options {
                     ));
                 }
                 "--agent-mode" => options.agent_mode = true,
+                "--deno" => {
+                    options.deno = Some(PathBuf::from(required(&mut arguments, "--deno")?));
+                }
+                "--deno-sha256" => {
+                    options.deno_sha256 = Some(required(&mut arguments, "--deno-sha256")?);
+                }
+                "--deno-version" => {
+                    options.deno_version = required(&mut arguments, "--deno-version")?;
+                }
+                "--workspace-snapshot" => {
+                    options.workspace_snapshot = Some(PathBuf::from(required(
+                        &mut arguments,
+                        "--workspace-snapshot",
+                    )?));
+                }
+                "--deno-cache" => {
+                    options.deno_cache =
+                        Some(PathBuf::from(required(&mut arguments, "--deno-cache")?));
+                }
+                "--deno-scratch" => {
+                    options.deno_scratch =
+                        Some(PathBuf::from(required(&mut arguments, "--deno-scratch")?));
+                }
                 "-h" | "--help" => options.help = true,
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
         Ok(options)
     }
+}
+
+fn required(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
+    arguments
+        .next()
+        .ok_or_else(|| format!("{option} requires a value"))
 }
 
 #[cfg(test)]

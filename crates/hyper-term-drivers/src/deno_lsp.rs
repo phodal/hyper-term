@@ -49,7 +49,7 @@ impl DenoLspClient {
         let workspace = config.workspace_snapshot.canonicalize()?;
         let cache = config.cache_directory.canonicalize()?;
         let scratch = config.scratch_directory.canonicalize()?;
-        let workspace_uri = file_uri(&workspace)?;
+        let workspace_uri = path_to_file_uri(&workspace)?;
         let environment = BTreeMap::from([
             ("DENO_DIR".into(), cache.into_os_string()),
             ("DENO_NO_PROMPT".into(), OsString::from("1")),
@@ -223,6 +223,13 @@ impl DenoLspClient {
             let event = self.process.recv_timeout(remaining)?;
             match event {
                 DriverEvent::Message { ref payload, .. }
+                    if server_request_response(payload, &self.workspace_uri).is_some() =>
+                {
+                    let response = server_request_response(payload, &self.workspace_uri)
+                        .expect("guard checked the response");
+                    self.process.send_json(&response)?;
+                }
+                DriverEvent::Message { ref payload, .. }
                     if payload.get("id") == Some(&Value::from(id)) =>
                 {
                     if let Some(error) = payload.get("error") {
@@ -251,6 +258,32 @@ impl DenoLspClient {
     }
 }
 
+fn server_request_response(payload: &Value, workspace_uri: &str) -> Option<Value> {
+    let id = payload.get("id")?;
+    if !(id.is_string() || id.is_i64() || id.is_u64()) {
+        return None;
+    }
+    let result = match payload.get("method").and_then(Value::as_str)? {
+        "workspace/configuration" => {
+            let count = payload
+                .pointer("/params/items")
+                .and_then(Value::as_array)
+                .map_or(1, Vec::len);
+            Value::Array(
+                (0..count)
+                    .map(|_| json!({"enable": true, "lint": true, "unstable": false}))
+                    .collect(),
+            )
+        }
+        "workspace/workspaceFolders" => {
+            json!([{"uri": workspace_uri, "name": "workspace-snapshot"}])
+        }
+        "window/workDoneProgress/create" | "client/registerCapability" => Value::Null,
+        _ => return None,
+    };
+    Some(json!({"jsonrpc": "2.0", "id": id.clone(), "result": result}))
+}
+
 fn event_payload(event: DriverEvent) -> Value {
     match event {
         DriverEvent::Message { payload, .. } => payload,
@@ -258,7 +291,7 @@ fn event_payload(event: DriverEvent) -> Value {
     }
 }
 
-fn file_uri(path: &Path) -> Result<String, DenoLspError> {
+pub fn path_to_file_uri(path: &Path) -> Result<String, DenoLspError> {
     let value = path
         .to_str()
         .ok_or_else(|| DenoLspError::InvalidConfig("workspace path is not UTF-8".into()))?
@@ -311,7 +344,24 @@ mod tests {
 
     #[test]
     fn file_uri_encodes_workspace_paths() {
-        let uri = file_uri(Path::new("/tmp/hyper term/界面")).unwrap();
+        let uri = path_to_file_uri(Path::new("/tmp/hyper term/界面")).unwrap();
         assert_eq!(uri, "file:///tmp/hyper%20term/%E7%95%8C%E9%9D%A2");
+    }
+
+    #[test]
+    fn fixed_lsp_configuration_requests_are_answered_without_renderer_input() {
+        let response = server_request_response(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "workspace/configuration",
+                "params": {"items": [{"section": "deno"}, {"section": "typescript"}]}
+            }),
+            "file:///snapshot",
+        )
+        .unwrap();
+        assert_eq!(response["id"], 4);
+        assert_eq!(response["result"].as_array().unwrap().len(), 2);
+        assert_eq!(response["result"][0]["enable"], true);
     }
 }

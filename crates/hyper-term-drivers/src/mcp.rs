@@ -519,9 +519,23 @@ fn tool_definitions(enabled: &[McpToolClass]) -> Vec<Value> {
                             "textDocument/formatting"
                         ]
                     },
-                    "params": {"type": "object"}
+                    "documentPath": {
+                        "type": "string",
+                        "maxLength": 4096,
+                        "description": "UTF-8 path relative to the authority-created workspace snapshot"
+                    },
+                    "position": {
+                        "type": "object",
+                        "properties": {
+                            "line": {"type": "integer", "minimum": 0},
+                            "character": {"type": "integer", "minimum": 0}
+                        },
+                        "required": ["line", "character"],
+                        "additionalProperties": false
+                    },
+                    "includeDeclaration": {"type": "boolean"}
                 },
-                "required": ["method", "params"],
+                "required": ["method", "documentPath"],
                 "additionalProperties": false
             },
             "execution": {"taskSupport": "forbidden"}
@@ -579,10 +593,38 @@ fn validate_arguments(class: McpToolClass, arguments: &Value) -> Result<(), Stri
             if !ALLOWED_METHODS.contains(&method) {
                 return Err("LSP method is not in the read-only query allowlist".into());
             }
-            if !object.get("params").is_some_and(Value::is_object) {
-                return Err("LSP params must be an object".into());
+            required_bounded_string(object, "documentPath", 4096)?;
+            let position_required = matches!(
+                method,
+                "textDocument/hover"
+                    | "textDocument/completion"
+                    | "textDocument/definition"
+                    | "textDocument/references"
+            );
+            if position_required && !object.contains_key("position") {
+                return Err(format!("{method} requires a position"));
             }
-            reject_extra(object, &["method", "params"])
+            if let Some(position) = object.get("position") {
+                let position = position
+                    .as_object()
+                    .ok_or_else(|| "LSP position must be an object".to_owned())?;
+                for key in ["line", "character"] {
+                    if !position.get(key).is_some_and(Value::is_u64) {
+                        return Err(format!("LSP position {key} must be a non-negative integer"));
+                    }
+                }
+                reject_extra(position, &["line", "character"])?;
+            }
+            if object
+                .get("includeDeclaration")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err("includeDeclaration must be a boolean".into());
+            }
+            reject_extra(
+                object,
+                &["method", "documentPath", "position", "includeDeclaration"],
+            )
         }
         McpToolClass::DiffReview => {
             required_bounded_string(object, "before", 524_288)?;
@@ -913,7 +955,10 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "hyper_term.lsp.query",
-                    "arguments": {"method": "workspace/executeCommand", "params": {}}
+                    "arguments": {
+                        "method": "workspace/executeCommand",
+                        "documentPath": "main.ts"
+                    }
                 }
             }))
             .unwrap()
@@ -1025,7 +1070,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "hyper_term.lsp.query",
-                    "arguments": {"method": "textDocument/hover", "params": {}}
+                    "arguments": {"method": "textDocument/hover", "documentPath": "main.ts"}
                 }
             }))
             .unwrap()
