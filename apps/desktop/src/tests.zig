@@ -148,6 +148,62 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
 }
 
+test "accepted artifact blocks drive an isolated Agent preview pane" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"completed","error":null,"document":{"blocks":[
+        \\  {"block_id":"00000000-0000-4000-8000-000000000031","kind":"artifact","trust_class":"isolated_artifact","payload":{"type":"artifact","artifact":{"artifact_id":"55555555-5555-4555-8555-555555555555","source_revision":7,"entrypoint":"/App.tsx","content_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","compiler":{"name":"esbuild-wasm","version":"0.28.1"}}}}
+        \\]}}
+        ,
+    } }, &fx);
+
+    try testing.expect(model.hasGenUiArtifact());
+    try testing.expectEqualStrings("55555555", model.genUiArtifactLabel());
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/artifact/55555555-5555-4555-8555-555555555555/preview?token=abcdef0123456789abcdef0123456789&session_id=2#55555555-5555-4555-8555-555555555555",
+        model.genUiPreviewUrl(),
+    );
+    try testing.expectEqual(@as(usize, 0), model.agentBlocks().len);
+
+    var panes: [2]main.HyperTermApp.WebViewPane = undefined;
+    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings(main.genui_view_label, panes[1].label);
+    try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
+    try testing.expectEqualStrings(model.genUiPreviewUrl(), panes[1].url);
+    try testing.expectEqual(@as(u64, 7), panes[1].reload_token);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(tree.root, main.genui_view_anchor) != null);
+    try testing.expect(containsText(tree.root, "accepted · isolated"));
+    try testing.expect(containsText(tree.root, "55555555"));
+    const tokens = main.hyperTermTokens(&model);
+    const sweep = canvas.LayoutAuditSweepOptions{
+        .tokens = tokens,
+        .min_size = geometry.SizeF.init(main.window_min_width, main.window_min_height),
+        .default_size = geometry.SizeF.init(main.window_width, main.window_height),
+    };
+    try canvas.expectLayoutAuditSweepClean(testing.allocator, tree.root, sweep);
+    try canvas.expectA11yAuditSweepClean(testing.allocator, tree.root, .{
+        .tokens = tokens,
+        .min_size = sweep.min_size,
+        .default_size = sweep.default_size,
+    });
+}
+
 test "Agent snapshot renders trusted operation and approval blocks" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
@@ -488,6 +544,11 @@ test "Agent gateway accepts only an authenticated dynamic loopback shape" {
     try testing.expect(!main.trustedAgentUrl("http://127.0.0.1:55321.evil/?token=abcdef0123456789abcdef0123456789"));
     try testing.expect(!main.trustedAgentUrl("http://127.0.0.1:55321/?token=short"));
     try testing.expect(main.trustedAgentUrl("http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789"));
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321",
+        main.trustedAgentOrigin("http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789").?,
+    );
+    try testing.expect(main.trustedAgentOrigin("http://127.0.0.1:55321.evil/?token=abcdef0123456789abcdef0123456789") == null);
 }
 
 test "new terminal tabs switch reconnect namespaces without exceeding the bound" {

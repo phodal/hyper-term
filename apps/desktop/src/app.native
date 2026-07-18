@@ -70,6 +70,21 @@
           <badge variant="secondary">{agentConnectionLabel}</badge>
         </row>
         <separator />
+        <if test="{hasGenUiArtifact}">
+          <column height="236" background="background" label="Agentic UI preview">
+            <row gap="8" padding="8" cross="center" background="surface_subtle">
+              <icon name="eye" width="13" height="13" foreground="accent" />
+              <text grow="1"><span weight="medium">Agentic UI</span></text>
+              <badge variant="secondary">{genUiStatus}</badge>
+            </row>
+            <column grow="1" background="background" label="Agentic UI preview viewport"></column>
+            <row padding="6" gap="6" cross="center">
+              <text foreground="text_muted">Artifact</text>
+              <text grow="1" foreground="text_muted"><span mono="true">{genUiArtifactLabel}</span></text>
+            </row>
+          </column>
+          <separator />
+        </if>
         <scroll grow="1" label="Agent blocks">
           <column gap="12" padding="12">
             <if test="{hasAgentBlocks}">

@@ -19,10 +19,13 @@ const geometry = native_sdk.geometry;
 pub const canvas_label = "hyper-term-canvas";
 pub const terminal_view_label = "hyper-term-terminal-view";
 pub const terminal_view_anchor = "Terminal viewport";
+pub const genui_view_label = "hyper-term-genui-view";
+pub const genui_view_anchor = "Agentic UI preview viewport";
 pub const terminal_gateway_origin = "http://127.0.0.1:47437";
 pub const max_sessions: usize = 8;
 const terminal_url_capacity: usize = 256;
 const agent_url_capacity: usize = 256;
+const genui_url_capacity: usize = 512;
 const max_gateway_token_bytes: usize = 128;
 const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
 const agent_effect_url_capacity: usize = agent_url_capacity + 64;
@@ -74,6 +77,17 @@ const shell_views = [_]native_sdk.ShellView{
         .width = 1,
         .height = 1,
         .layer = 20,
+    },
+    .{
+        .label = genui_view_label,
+        .kind = .webview,
+        .parent = canvas_label,
+        .url = "zero://inline",
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+        .layer = 21,
     },
 };
 const shell_windows = [_]native_sdk.ShellWindow{.{
@@ -274,6 +288,11 @@ pub const Model = struct {
     terminal_url_len: usize = 0,
     agent_base_url_storage: [agent_url_capacity]u8 = [_]u8{0} ** agent_url_capacity,
     agent_base_url_len: usize = 0,
+    genui_preview_url_storage: [genui_url_capacity]u8 = [_]u8{0} ** genui_url_capacity,
+    genui_preview_url_len: usize = 0,
+    genui_artifact_id_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
+    genui_artifact_id_len: usize = 0,
+    genui_source_revision: u64 = 0,
     agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
     agent_blocks: [max_agent_blocks]AgentBlockView = [_]AgentBlockView{.{}} ** max_agent_blocks,
     agent_block_count: usize = 0,
@@ -300,6 +319,11 @@ pub const Model = struct {
         "terminal_url_len",
         "agent_base_url_storage",
         "agent_base_url_len",
+        "genui_preview_url_storage",
+        "genui_preview_url_len",
+        "genui_artifact_id_storage",
+        "genui_artifact_id_len",
+        "genui_source_revision",
         "agent_composer_buffer",
         "agent_blocks",
         "agent_block_count",
@@ -311,6 +335,7 @@ pub const Model = struct {
         "agent_permission_in_flight_session_id",
         "terminalReady",
         "terminalUrl",
+        "genUiPreviewUrl",
         "agentError",
     };
 
@@ -412,6 +437,22 @@ pub const Model = struct {
 
     pub fn agentError(model: *const Model) []const u8 {
         return model.agent_error_storage[0..model.agent_error_len];
+    }
+
+    pub fn hasGenUiArtifact(model: *const Model) bool {
+        return model.activeSession().mode == .agent and model.genui_preview_url_len > 0;
+    }
+
+    pub fn genUiArtifactLabel(model: *const Model) []const u8 {
+        return model.genui_artifact_id_storage[0..@min(model.genui_artifact_id_len, 8)];
+    }
+
+    pub fn genUiPreviewUrl(model: *const Model) []const u8 {
+        return model.genui_preview_url_storage[0..model.genui_preview_url_len];
+    }
+
+    pub fn genUiStatus(model: *const Model) []const u8 {
+        return if (model.hasGenUiArtifact()) "accepted · isolated" else "no artifact";
     }
 };
 
@@ -764,6 +805,16 @@ const AgentBlockWire = struct {
         state: ?[]const u8 = null,
         prompt: ?[]const u8 = null,
         decision: ?[]const u8 = null,
+        artifact: ?struct {
+            artifact_id: []const u8,
+            source_revision: u64,
+            entrypoint: []const u8,
+            content_digest: []const u8,
+            compiler: struct {
+                name: []const u8,
+                version: []const u8,
+            },
+        } = null,
     },
 };
 
@@ -801,6 +852,12 @@ fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse
 fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
     for (&model.agent_blocks) |*block| block.* = .{};
     model.agent_block_count = 0;
+    clearGenUiArtifact(model);
+    for (blocks) |block| {
+        if (validGenUiArtifactBlock(block)) {
+            projectGenUiArtifact(model, block);
+        }
+    }
     var block_total: usize = 0;
     for (blocks) |block| {
         if (renderableAgentBlock(block)) block_total += 1;
@@ -828,6 +885,46 @@ fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
         model.agent_block_count += 1;
     }
     model.agent_projection_session_id = model.active_session_id;
+}
+
+fn validGenUiArtifactBlock(block: AgentBlockWire) bool {
+    if (!std.mem.eql(u8, block.kind, "artifact") or
+        !std.mem.eql(u8, block.payload.type, "artifact") or
+        block.trust_class == null or
+        !std.mem.eql(u8, block.trust_class.?, "isolated_artifact") or
+        block.payload.artifact == null) return false;
+    const artifact = block.payload.artifact.?;
+    return validOperationId(artifact.artifact_id) and
+        artifact.source_revision > 0 and
+        artifact.entrypoint.len > 0 and
+        artifact.compiler.name.len > 0 and
+        artifact.compiler.version.len > 0 and
+        isSha256(artifact.content_digest);
+}
+
+fn projectGenUiArtifact(model: *Model, block: AgentBlockWire) void {
+    const artifact = block.payload.artifact.?;
+    @memcpy(
+        model.genui_artifact_id_storage[0..artifact.artifact_id.len],
+        artifact.artifact_id,
+    );
+    model.genui_artifact_id_len = artifact.artifact_id.len;
+    model.genui_source_revision = artifact.source_revision;
+    refreshGenUiPreviewUrl(model);
+}
+
+fn clearGenUiArtifact(model: *Model) void {
+    model.genui_preview_url_len = 0;
+    model.genui_artifact_id_len = 0;
+    model.genui_source_revision = 0;
+}
+
+fn isSha256(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
 }
 
 fn renderableAgentBlock(block: AgentBlockWire) bool {
@@ -1011,6 +1108,7 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_turn_status = .idle;
     model.agent_error_len = 0;
     model.agent_permission_in_flight_session_id = 0;
+    clearGenUiArtifact(model);
 }
 
 fn setAgentError(model: *Model, message: []const u8) void {
@@ -1215,6 +1313,48 @@ pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize
     return 1;
 }
 
+pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize {
+    var count = terminalPanes(model, out);
+    if (count == out.len) return count;
+    out[count] = if (model.hasGenUiArtifact()) .{
+        .label = genui_view_label,
+        .anchor = genui_view_anchor,
+        .url = model.genUiPreviewUrl(),
+        .reload_token = model.genui_source_revision,
+    } else .{
+        .label = genui_view_label,
+        .frame = geometry.RectF.init(0, 0, 1, 1),
+        .url = "zero://inline",
+    };
+    count += 1;
+    return count;
+}
+
+fn refreshGenUiPreviewUrl(model: *Model) void {
+    if (model.agent_base_url_len == 0 or model.genui_artifact_id_len == 0) {
+        model.genui_preview_url_len = 0;
+        return;
+    }
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse {
+        model.genui_preview_url_len = 0;
+        return;
+    };
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    const artifact_id = model.genui_artifact_id_storage[0..model.genui_artifact_id_len];
+    const url = std.fmt.bufPrint(
+        model.genui_preview_url_storage[0..],
+        "{s}/agent/artifact/{s}/preview?token={s}&session_id={d}#{s}",
+        .{ origin, artifact_id, token, model.active_session_id, artifact_id },
+    ) catch {
+        model.genui_preview_url_len = 0;
+        return;
+    };
+    model.genui_preview_url_len = url.len;
+}
+
 pub fn trustedTerminalUrl(url: []const u8) bool {
     const prefix = terminal_gateway_origin ++ "/?token=";
     if (!std.mem.startsWith(u8, url, prefix)) return false;
@@ -1235,6 +1375,12 @@ pub fn trustedAgentUrl(url: []const u8) bool {
     return trustedGatewayToken(remainder[marker_index + marker.len ..]);
 }
 
+pub fn trustedAgentOrigin(url: []const u8) ?[]const u8 {
+    if (!trustedAgentUrl(url)) return null;
+    const marker_index = std.mem.indexOf(u8, url, "/?token=") orelse return null;
+    return url[0..marker_index];
+}
+
 fn trustedGatewayToken(token: []const u8) bool {
     if (token.len < 32 or token.len > max_gateway_token_bytes) return false;
     for (token) |character| {
@@ -1246,6 +1392,17 @@ fn trustedGatewayToken(token: []const u8) bool {
 pub fn main(init: std.process.Init) !void {
     const terminal_url = init.environ_map.get("HYPER_TERM_TERMINAL_URL") orelse "";
     const agent_url = init.environ_map.get("HYPER_TERM_AGENT_URL") orelse "";
+    var allowed_origins = [_][]const u8{
+        "zero://app",
+        "zero://inline",
+        terminal_gateway_origin,
+        "",
+    };
+    var allowed_origin_count: usize = 3;
+    if (trustedAgentOrigin(agent_url)) |origin| {
+        allowed_origins[allowed_origin_count] = origin;
+        allowed_origin_count += 1;
+    }
     const app_state = try HyperTermApp.create(std.heap.page_allocator, .{
         .name = "hyper-term",
         .scene = shell_scene,
@@ -1256,7 +1413,7 @@ pub fn main(init: std.process.Init) !void {
         .on_appearance = onAppearance,
         .on_chrome = onChrome,
         .view = CompiledHyperTermView.build,
-        .web_panes = terminalPanes,
+        .web_panes = desktopPanes,
         .markup = if (dev_markup_reload)
             .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io }
         else
@@ -1275,7 +1432,7 @@ pub fn main(init: std.process.Init) !void {
         .js_window_api = false,
         .security = .{
             .permissions = &app_permissions,
-            .navigation = .{ .allowed_origins = &.{ "zero://app", "zero://inline", terminal_gateway_origin } },
+            .navigation = .{ .allowed_origins = allowed_origins[0..allowed_origin_count] },
         },
     }, init);
 }

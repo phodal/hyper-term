@@ -39,6 +39,7 @@
                 .views = .{
                     .{ .label = "hyper-term-canvas", .kind = "gpu_surface", .fill = true, .role = "Hyper Term canvas", .accessibility_label = "Hyper Term", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
                     .{ .label = "hyper-term-terminal-view", .kind = "webview", .parent = "hyper-term-canvas", .url = "zero://inline", .x = 0, .y = 0, .width = 1, .height = 1, .layer = 20 },
+                    .{ .label = "hyper-term-genui-view", .kind = "webview", .parent = "hyper-term-canvas", .url = "zero://inline", .x = 0, .y = 0, .width = 1, .height = 1, .layer = 21 },
                 },
             },
         },
