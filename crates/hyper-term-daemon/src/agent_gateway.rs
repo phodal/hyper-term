@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Query, State};
+use axum::extract::{Path as RoutePath, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
 };
@@ -18,7 +18,7 @@ use hyper_term_drivers::{
     CodexAppServerConfig, CodexMcpServerConfig, DriverState, ExternalRequestId, sha256_file,
 };
 use hyper_term_protocol::{
-    BlockDocument, BlockId, MessageRole, OperationAction, OperationId, OperationKind,
+    ArtifactId, BlockDocument, BlockId, MessageRole, OperationAction, OperationId, OperationKind,
     PermissionDecision, RiskClass, TaskId,
 };
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,9 @@ const COMPLETE_TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_AGENT_MESSAGE_BYTES: usize = 256 * 1024;
 const AGENT_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
+const PREVIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const MAX_PREVIEW_SHELL_BYTES: u64 = 4 * 1024 * 1024;
+const ARTIFACT_BOOTSTRAP_MARKER: &str = "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->";
 
 #[derive(Clone)]
 pub struct AgentGatewayConfig {
@@ -58,6 +61,7 @@ pub struct AgentGenUiRuntimeConfig {
     pub runtime_version: String,
     pub compiler_script: PathBuf,
     pub compiler_wasm: PathBuf,
+    pub preview_shell: PathBuf,
     pub compiler_version: String,
 }
 
@@ -116,6 +120,7 @@ pub enum AgentGatewayError {
 struct AgentGatewayRuntime {
     config: Arc<AgentGatewayConfig>,
     sessions: Arc<Mutex<HashMap<u16, Arc<AgentSession>>>>,
+    preview_shell: Option<Arc<str>>,
 }
 
 struct AgentSession {
@@ -225,13 +230,22 @@ pub async fn spawn_agent_gateway(
         runtime.deno_executable = canonical_runtime_asset(&runtime.deno_executable)?;
         runtime.compiler_script = canonical_runtime_asset(&runtime.compiler_script)?;
         runtime.compiler_wasm = canonical_runtime_asset(&runtime.compiler_wasm)?;
+        runtime.preview_shell = canonical_runtime_asset(&runtime.preview_shell)?;
     }
+
+    let preview_shell = config
+        .genui_runtime
+        .as_ref()
+        .map(|runtime| read_preview_shell(&runtime.preview_shell))
+        .transpose()?
+        .map(Arc::<str>::from);
 
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
     let runtime = AgentGatewayRuntime {
         config: Arc::new(config),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        preview_shell,
     };
     let router = Router::new()
         .route(
@@ -242,6 +256,14 @@ pub async fn spawn_agent_gateway(
         )
         .route("/agent/session/turn", post(start_turn))
         .route("/agent/session/permission", post(decide_permission))
+        .route(
+            "/agent/artifact/{artifact_id}/preview",
+            get(preview_artifact),
+        )
+        .route(
+            "/agent/artifact/{artifact_id}/source-map",
+            get(artifact_source_map),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(MAX_PROMPT_BYTES))
         .with_state(runtime.clone());
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -314,6 +336,65 @@ async fn snapshot_session(
         Err(_) => status_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Agent session snapshot failed",
+        ),
+    }
+}
+
+async fn preview_artifact(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    match runtime.preview_document(session_id, artifact_id) {
+        Ok(document) => secure_response_with_csp(
+            StatusCode::OK,
+            "text/html; charset=utf-8",
+            Body::from(document),
+            PREVIEW_CSP,
+        ),
+        Err(SessionError::NotFound | SessionError::ArtifactUnavailable) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact preview is unavailable")
+        }
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Artifact preview could not be rendered",
+        ),
+    }
+}
+
+async fn artifact_source_map(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    match runtime.artifact_source_map(session_id, artifact_id) {
+        Ok(source_map) => secure_response(
+            StatusCode::OK,
+            "application/json; charset=utf-8",
+            Body::from(source_map),
+        ),
+        Err(SessionError::NotFound | SessionError::ArtifactUnavailable) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact source map is unavailable")
+        }
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Artifact source map could not be read",
         ),
     }
 }
@@ -430,6 +511,7 @@ enum SessionError {
     StalePermission,
     UnsafeApproval,
     Driver,
+    ArtifactUnavailable,
 }
 
 impl AgentGatewayRuntime {
@@ -517,6 +599,37 @@ impl AgentGatewayRuntime {
             error,
             document,
         })
+    }
+
+    fn preview_document(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+    ) -> Result<String, SessionError> {
+        let session = self.session(session_id)?;
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| SessionError::ArtifactUnavailable)?;
+        let shell = self
+            .preview_shell
+            .as_deref()
+            .ok_or(SessionError::ArtifactUnavailable)?;
+        render_preview_document(shell, &artifact).map_err(|_| SessionError::ArtifactUnavailable)
+    }
+
+    fn artifact_source_map(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+    ) -> Result<String, SessionError> {
+        let session = self.session(session_id)?;
+        self.config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map(|artifact| artifact.source_map)
+            .map_err(|_| SessionError::ArtifactUnavailable)
     }
 
     fn submit_turn(
@@ -789,6 +902,58 @@ fn canonical_runtime_asset(path: &std::path::Path) -> Result<PathBuf, AgentGatew
     })
 }
 
+fn read_preview_shell(path: &std::path::Path) -> Result<String, AgentGatewayError> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_PREVIEW_SHELL_BYTES {
+        return Err(AgentGatewayError::InvalidGenUiRuntime(
+            "preview shell is not a bounded regular file".into(),
+        ));
+    }
+    let shell = std::fs::read_to_string(path)?;
+    if shell.matches(ARTIFACT_BOOTSTRAP_MARKER).count() != 1
+        || !shell.contains("hyper_term_preview_boot")
+    {
+        return Err(AgentGatewayError::InvalidGenUiRuntime(
+            "preview shell is missing its bootstrap contract".into(),
+        ));
+    }
+    Ok(shell)
+}
+
+fn parse_artifact_id(value: &str) -> Option<ArtifactId> {
+    value.parse::<uuid::Uuid>().ok().map(ArtifactId::from)
+}
+
+fn render_preview_document(
+    shell: &str,
+    artifact: &crate::artifact_store::StoredGenUiArtifact,
+) -> Result<String, serde_json::Error> {
+    #[derive(Serialize)]
+    struct BootstrapArtifact<'a> {
+        artifact_id: String,
+        source_revision: u64,
+        content_digest: &'a str,
+        bundle: &'a str,
+        css: &'a str,
+    }
+    let bootstrap = BootstrapArtifact {
+        artifact_id: artifact.metadata.artifact_id.to_string(),
+        source_revision: artifact.metadata.source_revision,
+        content_digest: &artifact.metadata.content_digest,
+        bundle: &artifact.bundle,
+        css: &artifact.css,
+    };
+    let json = serde_json::to_string(&bootstrap)?
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
+    Ok(shell.replacen(
+        ARTIFACT_BOOTSTRAP_MARKER,
+        &format!("<script>globalThis.__HYPER_BOOTSTRAP_ARTIFACT__={json};</script>"),
+        1,
+    ))
+}
+
 fn allowable_brokered_mcp_operation(operation: &hyper_term_core::OperationRecord) -> bool {
     if operation.kind != OperationKind::McpTool || operation.risk != RiskClass::ReadOnly {
         return false;
@@ -1044,12 +1209,21 @@ fn status_response(status: StatusCode, message: &'static str) -> Response {
 }
 
 fn secure_response(status: StatusCode, content_type: &'static str, body: Body) -> Response {
+    secure_response_with_csp(status, content_type, body, AGENT_CSP)
+}
+
+fn secure_response_with_csp(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Body,
+    csp: &'static str,
+) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(AGENT_CSP));
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(csp));
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
@@ -1075,6 +1249,35 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    #[test]
+    fn preview_bootstrap_is_inline_escaped_and_keeps_the_runtime_capsule() {
+        let artifact_id = ArtifactId::new();
+        let stored = crate::artifact_store::StoredGenUiArtifact {
+            metadata: hyper_term_protocol::AcceptedGenUiArtifact {
+                artifact_id,
+                source_revision: 3,
+                entrypoint: "/App.tsx".into(),
+                content_digest: "a".repeat(64),
+                compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                    name: "esbuild-wasm".into(),
+                    version: "0.28.1".into(),
+                },
+            },
+            bundle: "globalThis.value='</script><script>bad()'".into(),
+            css: "main::after{content:'<&>'}".into(),
+            source_map: "{}".into(),
+        };
+        let shell = format!(
+            "<html><head>{ARTIFACT_BOOTSTRAP_MARKER}<script>hyper_term_preview_boot</script></head></html>"
+        );
+        let document = render_preview_document(&shell, &stored).unwrap();
+        assert!(!document.contains("</script><script>bad()"));
+        assert!(document.contains("\\u003c/script\\u003e\\u003cscript\\u003ebad()"));
+        assert!(document.contains(&artifact_id.to_string()));
+        assert!(document.contains("hyper_term_preview_boot"));
+        assert!(!document.contains(ARTIFACT_BOOTSTRAP_MARKER));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn authenticated_session_streams_a_turn_into_the_block_document() {
@@ -1420,10 +1623,16 @@ mod tests {
         let deno = temporary.path().join("deno");
         let script = temporary.path().join("genui-compiler.js");
         let wasm = temporary.path().join("esbuild.wasm");
+        let preview = temporary.path().join("genui-preview.html");
         std::fs::write(&mcp, "mcp").expect("mcp");
         std::fs::write(&deno, "deno").expect("deno");
         std::fs::write(&script, "compiler").expect("compiler");
         std::fs::write(&wasm, "wasm").expect("wasm");
+        std::fs::write(
+            &preview,
+            "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->hyper_term_preview_boot",
+        )
+        .expect("preview");
         let runtime = AgentGatewayRuntime {
             config: Arc::new(AgentGatewayConfig {
                 bind: "127.0.0.1:0".parse().expect("bind"),
@@ -1439,11 +1648,13 @@ mod tests {
                     runtime_version: "2.9.3".into(),
                     compiler_script: script,
                     compiler_wasm: wasm,
+                    preview_shell: preview,
                     compiler_version: "0.28.1".into(),
                 }),
                 control_socket: temporary.path().join("hyperd.sock"),
             }),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            preview_shell: None,
         };
         let session_root = state_directory.join("agents/session-7");
         let config = runtime

@@ -2,12 +2,16 @@ const sourceHtml = new URL(
   "../apps/workbench/genui/preview.html",
   import.meta.url,
 );
+const target = Deno.args[0] ?? "workbench";
+if (!/^[a-z0-9_-]+$/.test(target)) {
+  throw new Error("preview target must be a bounded build directory name");
+}
 const outputHtml = new URL(
-  "../dist/workbench/genui/preview.html",
+  `../dist/${target}/genui/preview.html`,
   import.meta.url,
 );
 const shellBundle = new URL(
-  "../dist/workbench/genui/preview-shell.js",
+  `../dist/${target}/genui/preview-shell.js`,
   import.meta.url,
 );
 const marker = "<!-- HYPER_TERM_PREVIEW_SHELL -->";

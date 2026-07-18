@@ -21,6 +21,9 @@ declare global {
   var __HYPER_JSX_RUNTIME__: typeof JsxRuntime;
   var __HYPER_JSX_DEV_RUNTIME__: typeof JsxDevRuntime;
   var __HYPER_MOUNT__: (component: React.ComponentType) => void;
+  var __HYPER_BOOTSTRAP_ARTIFACT__:
+    | RenderArtifactMessage["artifact"]
+    | undefined;
 }
 
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
@@ -46,6 +49,16 @@ globalThis.addEventListener("message", (event: MessageEvent<unknown>) => {
 });
 
 report("hyper_term_preview_boot");
+if (globalThis.__HYPER_BOOTSTRAP_ARTIFACT__) {
+  const artifact = globalThis.__HYPER_BOOTSTRAP_ARTIFACT__;
+  globalThis.__HYPER_BOOTSTRAP_ARTIFACT__ = undefined;
+  void render({
+    type: "hyper_term_render_artifact",
+    schema_version: 1,
+    channel_token: artifact.artifact_id,
+    artifact,
+  });
+}
 
 async function render(message: RenderArtifactMessage): Promise<void> {
   const { artifact } = message;

@@ -49,7 +49,7 @@ if [[ ! -x "$deno_runtime" ]]; then
   echo "pinned Deno runtime is missing: $deno_runtime" >&2
   exit 1
 fi
-for runtime_asset in genui-compiler.js esbuild.wasm build-manifest.json; do
+for runtime_asset in genui-compiler.js esbuild.wasm genui/preview.html build-manifest.json; do
   if [[ ! -f "$genui_runtime_assets/$runtime_asset" ]]; then
     echo "GenUI runtime asset is missing: $genui_runtime_assets/$runtime_asset" >&2
     exit 1
@@ -75,7 +75,8 @@ if [[ ! -x "$packaged_supervisor" \
 fi
 if [[ ! -x "$packaged_runtime/deno" \
   || ! -f "$packaged_runtime/genui-compiler.js" \
-  || ! -f "$packaged_runtime/esbuild.wasm" ]]; then
+  || ! -f "$packaged_runtime/esbuild.wasm" \
+  || ! -f "$packaged_runtime/genui/preview.html" ]]; then
   echo "assembled app is missing the brokered GenUI runtime" >&2
   exit 1
 fi

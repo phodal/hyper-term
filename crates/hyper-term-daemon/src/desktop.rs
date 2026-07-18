@@ -48,6 +48,7 @@ fn run() -> Result<i32, String> {
              --deno-runtime PATH       Pinned Deno executable for brokered Agent tools\n  \
              --genui-script PATH       Bundled GenUI compiler service\n  \
              --genui-wasm PATH         Pinned esbuild-wasm compiler binary\n  \
+             --genui-preview PATH      Bundled isolated GenUI preview capsule\n  \
              -h, --help                Show this help"
         );
         return Ok(0);
@@ -106,6 +107,7 @@ fn run() -> Result<i32, String> {
                     runtime_version: "2.9.3".into(),
                     compiler_script: runtime.compiler_script.clone(),
                     compiler_wasm: runtime.compiler_wasm.clone(),
+                    preview_shell: runtime.preview_shell.clone(),
                     compiler_version: "0.28.1".into(),
                 }),
             control_socket,
@@ -175,6 +177,7 @@ struct Options {
     deno_runtime: Option<PathBuf>,
     genui_script: Option<PathBuf>,
     genui_wasm: Option<PathBuf>,
+    genui_preview: Option<PathBuf>,
     help: bool,
 }
 
@@ -208,6 +211,9 @@ impl Options {
                 Some("--genui-wasm") => {
                     options.genui_wasm = Some(required_path(&mut arguments, "--genui-wasm")?);
                 }
+                Some("--genui-preview") => {
+                    options.genui_preview = Some(required_path(&mut arguments, "--genui-preview")?);
+                }
                 Some("-h" | "--help") => options.help = true,
                 Some(other) => return Err(format!("unknown argument: {other}")),
                 None => return Err("desktop arguments must be valid UTF-8 option names".into()),
@@ -222,8 +228,10 @@ impl Options {
             .and_then(Path::parent)
             .ok_or_else(|| "desktop executable is not inside a macOS bundle layout".to_owned())?;
         let runtime_resources = contents.join("Resources/runtime");
-        let explicit_runtime =
-            self.deno_runtime.is_some() || self.genui_script.is_some() || self.genui_wasm.is_some();
+        let explicit_runtime = self.deno_runtime.is_some()
+            || self.genui_script.is_some()
+            || self.genui_wasm.is_some()
+            || self.genui_preview.is_some();
         let deno_executable = self
             .deno_runtime
             .unwrap_or_else(|| runtime_resources.join("deno"));
@@ -233,13 +241,19 @@ impl Options {
         let compiler_wasm = self
             .genui_wasm
             .unwrap_or_else(|| runtime_resources.join("esbuild.wasm"));
-        let complete_runtime =
-            deno_executable.is_file() && compiler_script.is_file() && compiler_wasm.is_file();
+        let preview_shell = self
+            .genui_preview
+            .unwrap_or_else(|| runtime_resources.join("genui/preview.html"));
+        let complete_runtime = deno_executable.is_file()
+            && compiler_script.is_file()
+            && compiler_wasm.is_file()
+            && preview_shell.is_file();
         let genui_runtime =
             (explicit_runtime || complete_runtime).then_some(ResolvedGenUiRuntime {
                 deno_executable,
                 compiler_script,
                 compiler_wasm,
+                preview_shell,
             });
         Ok(ResolvedOptions {
             ui: self
@@ -286,6 +300,7 @@ struct ResolvedGenUiRuntime {
     deno_executable: PathBuf,
     compiler_script: PathBuf,
     compiler_wasm: PathBuf,
+    preview_shell: PathBuf,
 }
 
 impl ResolvedOptions {
@@ -319,7 +334,11 @@ impl ResolvedOptions {
         }
         if let Some(runtime) = &self.genui_runtime {
             validate_executable(&runtime.deno_executable)?;
-            for asset in [&runtime.compiler_script, &runtime.compiler_wasm] {
+            for asset in [
+                &runtime.compiler_script,
+                &runtime.compiler_wasm,
+                &runtime.preview_shell,
+            ] {
                 if !asset.is_absolute() || !asset.is_file() {
                     return Err(format!(
                         "GenUI runtime asset is unavailable: {}",
@@ -444,6 +463,8 @@ mod tests {
             "/tmp/genui.js".into(),
             "--genui-wasm".into(),
             "/tmp/esbuild.wasm".into(),
+            "--genui-preview".into(),
+            "/tmp/genui-preview.html".into(),
         ])
         .expect("options");
         assert_eq!(options.ui, Some(PathBuf::from("/tmp/hyper-term-ui")));
@@ -458,6 +479,10 @@ mod tests {
         assert_eq!(options.deno_runtime, Some(PathBuf::from("/tmp/deno")));
         assert_eq!(options.genui_script, Some(PathBuf::from("/tmp/genui.js")));
         assert_eq!(options.genui_wasm, Some(PathBuf::from("/tmp/esbuild.wasm")));
+        assert_eq!(
+            options.genui_preview,
+            Some(PathBuf::from("/tmp/genui-preview.html"))
+        );
     }
 
     #[test]

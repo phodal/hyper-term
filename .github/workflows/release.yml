@@ -268,6 +268,7 @@ jobs:
             | grep -F "Hyper Term brokered MCP connector"
           test -x "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/deno"
           test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/genui-compiler.js"
+          test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/genui/preview.html"
           test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/esbuild.wasm"
 
       - name: Select release signing mode

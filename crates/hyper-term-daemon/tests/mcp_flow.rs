@@ -354,6 +354,17 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
             .len(),
         64
     );
+    assert_eq!(
+        result["result"]["structuredContent"]["accepted_by"],
+        "rust_host"
+    );
+    assert_eq!(
+        result["result"]["structuredContent"]["artifact_id"]
+            .as_str()
+            .unwrap()
+            .len(),
+        36
+    );
     assert!(
         result["result"]["structuredContent"]["bundle"]
             .as_str()
@@ -377,6 +388,22 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
                     } if *id == operation_id && executor == "hyper-term-mcp"
                 )
             })
+    );
+    assert!(
+        state
+            .block_snapshot(task_id)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| matches!(
+                &block.payload,
+                BlockPayload::Artifact { artifact }
+                    if artifact.source_revision == 1
+                        && artifact.content_digest
+                            == result["result"]["structuredContent"]["content_digest"]
+                                .as_str()
+                                .unwrap()
+            ))
     );
 
     client_io.shutdown(Shutdown::Write).unwrap();

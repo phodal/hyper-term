@@ -1,4 +1,8 @@
-import type { BlockDocument, BlockEnvelope } from "./protocol.ts";
+import {
+  BLOCK_SCHEMA_VERSION,
+  type BlockDocument,
+  type BlockEnvelope,
+} from "./protocol.ts";
 
 const taskId = "019f-demo-task";
 
@@ -11,7 +15,7 @@ function block(
   attention: BlockEnvelope["attention"] = "none",
 ): BlockEnvelope {
   return {
-    schema_version: 1,
+    schema_version: BLOCK_SCHEMA_VERSION,
     block_id: id,
     block_revision: 1,
     document_revision: order,
@@ -29,7 +33,7 @@ function block(
 }
 
 export const sampleDocument: BlockDocument = {
-  schema_version: 1,
+  schema_version: BLOCK_SCHEMA_VERSION,
   task_id: taskId,
   revision: 8,
   semantic_digest: "demo-snapshot",

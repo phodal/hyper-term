@@ -1,10 +1,14 @@
 import { assertEquals, assertThrows } from "@std/assert";
 import { applyBlockPatch } from "./block-store.ts";
-import type { BlockDocument, BlockEnvelope } from "./protocol.ts";
+import {
+  BLOCK_SCHEMA_VERSION,
+  type BlockDocument,
+  type BlockEnvelope,
+} from "./protocol.ts";
 
 function messageBlock(): BlockEnvelope {
   return {
-    schema_version: 1,
+    schema_version: BLOCK_SCHEMA_VERSION,
     block_id: "message-1",
     block_revision: 1,
     document_revision: 1,
@@ -23,7 +27,7 @@ function messageBlock(): BlockEnvelope {
 
 function document(): BlockDocument {
   return {
-    schema_version: 1,
+    schema_version: BLOCK_SCHEMA_VERSION,
     task_id: "task-1",
     revision: 1,
     semantic_digest: "from-rust",

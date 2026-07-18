@@ -104,7 +104,8 @@ if [[ ! -f "$hyper_staging_app/Contents/Resources/terminal/index.html" ]]; then
 fi
 if [[ ! -x "$hyper_staging_app/Contents/Resources/runtime/deno" \
   || ! -f "$hyper_staging_app/Contents/Resources/runtime/genui-compiler.js" \
-  || ! -f "$hyper_staging_app/Contents/Resources/runtime/esbuild.wasm" ]]; then
+  || ! -f "$hyper_staging_app/Contents/Resources/runtime/esbuild.wasm" \
+  || ! -f "$hyper_staging_app/Contents/Resources/runtime/genui/preview.html" ]]; then
   echo "packaged brokered GenUI runtime is unavailable" >&2
   exit 1
 fi

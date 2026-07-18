@@ -157,6 +157,26 @@ function BlockCard({
             </div>
           </div>
         )}
+        {payload.type === "artifact" && (
+          <div className="receipt-panel">
+            <span className="receipt-icon">◇</span>
+            <div>
+              <strong>Accepted isolated artifact</strong>
+              <p>
+                source r{String(
+                  (payload.artifact as Record<string, unknown>)
+                    ?.source_revision,
+                )}
+              </p>
+              <code>
+                {String(
+                  (payload.artifact as Record<string, unknown>)
+                    ?.content_digest,
+                ).slice(0, 16)}…
+              </code>
+            </div>
+          </div>
+        )}
         {payload.type === "terminal" && (
           <div className="terminal-surface">
             <div className="terminal-title">
@@ -232,6 +252,7 @@ function labelFor(kind: BlockEnvelope["kind"]): string {
     operation: "Operation",
     approval: "Attention required",
     receipt: "Execution receipt",
+    artifact: "Agentic UI artifact",
     terminal: "Terminal",
     review: "Evidence",
     diagnostic: "Diagnostic",

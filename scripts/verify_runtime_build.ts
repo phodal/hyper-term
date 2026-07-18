@@ -1,5 +1,5 @@
 const root = new URL("../dist/runtime/", import.meta.url);
-const required = ["genui-compiler.js", "esbuild.wasm"];
+const required = ["genui-compiler.js", "esbuild.wasm", "genui/preview.html"];
 const files: Array<{ path: string; bytes: number; sha256: string }> = [];
 
 for (const path of required) {
@@ -12,6 +12,17 @@ for (const path of required) {
     bytes: bytes.byteLength,
     sha256: toHex(await crypto.subtle.digest("SHA-256", bytes)),
   });
+  if (
+    path === "genui/preview.html" &&
+    (!new TextDecoder().decode(bytes).includes(
+      "HYPER_TERM_ARTIFACT_BOOTSTRAP",
+    ) ||
+      !new TextDecoder().decode(bytes).includes("hyper_term_preview_boot"))
+  ) {
+    throw new Error(
+      "runtime preview capsule is missing its bootstrap contract",
+    );
+  }
 }
 await Deno.writeTextFile(
   new URL("build-manifest.json", root),
