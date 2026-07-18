@@ -284,7 +284,10 @@ binary digest with a cleared environment, negotiates app-server v2 over bounded
 JSONL, and turns command/file approval requests into inert
 `AgentEffectProposal` values. Only a matching, revisioned Rust operation
 authorization can produce the external approval response; persistent policy
-choices are not forwarded as one-turn wire approvals.
+choices are not forwarded as one-turn wire approvals. The Native Agent surface
+now renders trusted Operation and Approval Blocks and can safely reject or
+cancel a pending Codex proposal. Allow remains unavailable until the Rust-owned
+sandbox can enforce the exact effect; UI approval alone is not containment.
 
 The real installed-binary handshake is available as an ignored integration
 test. It uses an isolated `CODEX_HOME`, so it does not read the user's normal

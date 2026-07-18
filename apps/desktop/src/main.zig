@@ -26,8 +26,10 @@ const agent_url_capacity: usize = 256;
 const max_gateway_token_bytes: usize = 128;
 const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
 const agent_effect_url_capacity: usize = agent_url_capacity + 64;
-const max_agent_messages: usize = 12;
-const max_agent_message_bytes: usize = 8 * 1024;
+const max_agent_blocks: usize = 16;
+const max_agent_block_bytes: usize = 8 * 1024;
+const max_agent_operation_id_bytes: usize = 36;
+const max_agent_operation_kind_bytes: usize = 96;
 const max_agent_error_bytes: usize = 512;
 const max_agent_prompt_bytes: usize = 16 * 1024;
 const terminal_close_effect_key_base: u64 = 0x4854_4300;
@@ -36,6 +38,7 @@ const agent_close_effect_key_base: u64 = 0x4854_4200;
 pub const agent_turn_effect_key_base: u64 = 0x4854_4400;
 pub const agent_snapshot_effect_key_base: u64 = 0x4854_4500;
 pub const agent_poll_timer_key_base: u64 = 0x4854_4600;
+pub const agent_permission_effect_key_base: u64 = 0x4854_4700;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -109,19 +112,52 @@ pub const AgentTurnStatus = enum {
 
 pub const AgentMessageRole = enum { user, agent, system, thought };
 
-pub const AgentMessageView = struct {
-    id: u16 = 0,
-    role: AgentMessageRole = .agent,
-    text_storage: [max_agent_message_bytes]u8 = [_]u8{0} ** max_agent_message_bytes,
-    text_len: usize = 0,
-    truncated: bool = false,
+pub const AgentBlockKind = enum { message, operation, approval };
 
-    pub fn text(message: *const AgentMessageView) []const u8 {
-        return message.text_storage[0..message.text_len];
+pub const AgentRisk = enum {
+    read_only,
+    workspace_write,
+    external_effect,
+    destructive,
+    unknown,
+};
+
+pub const AgentOperationState = enum {
+    proposed,
+    policy_check,
+    waiting_human,
+    authorized,
+    dispatching,
+    succeeded,
+    failed,
+    cancelled,
+    unknown_execution,
+};
+
+pub const AgentDecision = enum { none, reject_once, cancelled, other };
+
+pub const AgentBlockView = struct {
+    id: u64 = 0,
+    kind: AgentBlockKind = .message,
+    role: AgentMessageRole = .agent,
+    content_storage: [max_agent_block_bytes]u8 = [_]u8{0} ** max_agent_block_bytes,
+    content_len: usize = 0,
+    truncated: bool = false,
+    operation_id_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
+    operation_id_len: usize = 0,
+    operation_kind_storage: [max_agent_operation_kind_bytes]u8 = [_]u8{0} ** max_agent_operation_kind_bytes,
+    operation_kind_len: usize = 0,
+    operation_revision: u64 = 0,
+    risk: AgentRisk = .unknown,
+    state: AgentOperationState = .proposed,
+    decision: AgentDecision = .none,
+
+    pub fn content(block: *const AgentBlockView) []const u8 {
+        return block.content_storage[0..block.content_len];
     }
 
-    pub fn roleLabel(message: *const AgentMessageView) []const u8 {
-        return switch (message.role) {
+    pub fn roleLabel(block: *const AgentBlockView) []const u8 {
+        return switch (block.role) {
             .user => "You",
             .agent => "Agent",
             .system => "System",
@@ -129,8 +165,74 @@ pub const AgentMessageView = struct {
         };
     }
 
-    pub fn isUser(message: *const AgentMessageView) bool {
-        return message.role == .user;
+    pub fn isMessage(block: *const AgentBlockView) bool {
+        return block.kind == .message;
+    }
+
+    pub fn isUserMessage(block: *const AgentBlockView) bool {
+        return block.kind == .message and block.role == .user;
+    }
+
+    pub fn isOperation(block: *const AgentBlockView) bool {
+        return block.kind == .operation;
+    }
+
+    pub fn isApproval(block: *const AgentBlockView) bool {
+        return block.kind == .approval;
+    }
+
+    pub fn isApprovalPending(block: *const AgentBlockView) bool {
+        return block.kind == .approval and block.decision == .none;
+    }
+
+    pub fn operationId(block: *const AgentBlockView) []const u8 {
+        return block.operation_id_storage[0..block.operation_id_len];
+    }
+
+    pub fn operationKindLabel(block: *const AgentBlockView) []const u8 {
+        return block.operation_kind_storage[0..block.operation_kind_len];
+    }
+
+    pub fn riskLabel(block: *const AgentBlockView) []const u8 {
+        return switch (block.risk) {
+            .read_only => "read only",
+            .workspace_write => "workspace write",
+            .external_effect => "external effect",
+            .destructive => "destructive",
+            .unknown => "unknown risk",
+        };
+    }
+
+    pub fn stateLabel(block: *const AgentBlockView) []const u8 {
+        return switch (block.state) {
+            .proposed => "proposed",
+            .policy_check => "policy check",
+            .waiting_human => "waiting for you",
+            .authorized => "authorized",
+            .dispatching => "dispatching",
+            .succeeded => "succeeded",
+            .failed => "failed",
+            .cancelled => "cancelled",
+            .unknown_execution => "execution unknown",
+        };
+    }
+
+    pub fn approvalTitle(block: *const AgentBlockView) []const u8 {
+        return switch (block.decision) {
+            .none => "Approval required",
+            .reject_once => "Request rejected",
+            .cancelled => "Request cancelled",
+            .other => "Approval resolved",
+        };
+    }
+
+    pub fn decisionLabel(block: *const AgentBlockView) []const u8 {
+        return switch (block.decision) {
+            .none => "pending",
+            .reject_once => "rejected once",
+            .cancelled => "cancelled",
+            .other => "resolved",
+        };
     }
 };
 
@@ -166,14 +268,15 @@ pub const Model = struct {
     agent_base_url_storage: [agent_url_capacity]u8 = [_]u8{0} ** agent_url_capacity,
     agent_base_url_len: usize = 0,
     agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
-    agent_messages: [max_agent_messages]AgentMessageView = [_]AgentMessageView{.{}} ** max_agent_messages,
-    agent_message_count: usize = 0,
+    agent_blocks: [max_agent_blocks]AgentBlockView = [_]AgentBlockView{.{}} ** max_agent_blocks,
+    agent_block_count: usize = 0,
     agent_history_clipped: bool = false,
     agent_projection_session_id: u8 = 0,
     agent_turn_status: AgentTurnStatus = .idle,
     agent_error_storage: [max_agent_error_bytes]u8 = [_]u8{0} ** max_agent_error_bytes,
     agent_error_len: usize = 0,
     agent_snapshot_in_flight_session_id: u8 = 0,
+    agent_permission_in_flight_session_id: u8 = 0,
 
     /// Read by update, token, and derived-binding code rather than bound
     /// directly by the declarative view.
@@ -191,13 +294,14 @@ pub const Model = struct {
         "agent_base_url_storage",
         "agent_base_url_len",
         "agent_composer_buffer",
-        "agent_messages",
-        "agent_message_count",
+        "agent_blocks",
+        "agent_block_count",
         "agent_projection_session_id",
         "agent_turn_status",
         "agent_error_storage",
         "agent_error_len",
         "agent_snapshot_in_flight_session_id",
+        "agent_permission_in_flight_session_id",
         "terminalReady",
         "terminalUrl",
         "agentError",
@@ -287,12 +391,16 @@ pub const Model = struct {
             model.agent_turn_status == .waiting_approval;
     }
 
-    pub fn agentMessages(model: *const Model) []const AgentMessageView {
-        return model.agent_messages[0..model.agent_message_count];
+    pub fn agentBlocks(model: *const Model) []const AgentBlockView {
+        return model.agent_blocks[0..model.agent_block_count];
     }
 
-    pub fn hasAgentMessages(model: *const Model) bool {
-        return model.agent_message_count > 0;
+    pub fn hasAgentBlocks(model: *const Model) bool {
+        return model.agent_block_count > 0;
+    }
+
+    pub fn agentPermissionBusy(model: *const Model) bool {
+        return model.agent_permission_in_flight_session_id != 0;
     }
 
     pub fn agentError(model: *const Model) []const u8 {
@@ -315,6 +423,9 @@ pub const Msg = union(enum) {
     send_agent_prompt,
     agent_turn_started: native_sdk.EffectResponse,
     agent_snapshot_received: native_sdk.EffectResponse,
+    reject_agent_effect: []const u8,
+    cancel_agent_effect: []const u8,
+    agent_permission_decided: native_sdk.EffectResponse,
     agent_poll: native_sdk.EffectTimer,
     agent_split_resized: f32,
     system_appearance: struct {
@@ -325,7 +436,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_poll", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_permission_decided", "agent_poll", "system_appearance", "chrome_changed" };
 };
 
 const dev_markup_reload = builtin.mode == .Debug;
@@ -363,6 +474,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
+        .reject_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "reject_once", fx),
+        .cancel_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "cancelled", fx),
+        .agent_permission_decided => |response| applyAgentPermissionResponse(model, response, fx),
         .agent_poll => |timer| {
             if (timer.outcome == .fired) requestActiveAgentSnapshot(model, fx);
         },
@@ -414,6 +528,10 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     if (session.mode == .agent) {
         requestAgentClose(model, session_id, fx);
         fx.cancelTimer(agent_poll_timer_key_base + session_id);
+        fx.cancel(agent_permission_effect_key_base + session_id);
+        if (model.agent_permission_in_flight_session_id == session_id) {
+            model.agent_permission_in_flight_session_id = 0;
+        }
     }
 
     if (model.session_count == 1) {
@@ -492,6 +610,19 @@ fn writeAgentTurnUrl(model: *const Model, session_id: u8, storage: []u8) ?[]cons
     ) catch null;
 }
 
+fn writeAgentPermissionUrl(model: *const Model, session_id: u8, storage: []u8) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(
+        storage,
+        "{s}/agent/session/permission?token={s}&session_id={d}",
+        .{ origin, token, session_id },
+    ) catch null;
+}
+
 fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
     if (response.key <= agent_start_effect_key_base) return;
     const raw_session_id = response.key - agent_start_effect_key_base;
@@ -541,6 +672,52 @@ fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, fx
     requestAgentSnapshot(model, session_id, fx);
 }
 
+fn requestAgentPermission(model: *Model, operation_id: []const u8, decision: []const u8, fx: *Effects) void {
+    if (model.agent_permission_in_flight_session_id != 0 or
+        !validOperationId(operation_id)) return;
+    const block = for (model.agentBlocks()) |*candidate| {
+        if (candidate.isApprovalPending() and
+            std.mem.eql(u8, candidate.operationId(), operation_id)) break candidate;
+    } else return;
+    if (block.operation_revision == 0) return;
+    const session = model.activeSession();
+    if (session.mode != .agent or session.agent_connection != .ready) return;
+    var url_storage: [agent_effect_url_capacity + 16]u8 = undefined;
+    const request_url = writeAgentPermissionUrl(model, session.id, url_storage[0..]) orelse return;
+    var body_storage: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(
+        body_storage[0..],
+        "{{\"operation_id\":\"{s}\",\"expected_revision\":{d},\"decision\":\"{s}\"}}",
+        .{ block.operationId(), block.operation_revision, decision },
+    ) catch return;
+    fx.fetch(.{
+        .key = agent_permission_effect_key_base + session.id,
+        .method = .POST,
+        .url = request_url,
+        .body = body,
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_permission_decided),
+    });
+    model.agent_permission_in_flight_session_id = session.id;
+    model.agent_error_len = 0;
+}
+
+fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    const session_id = effectSessionId(response.key, agent_permission_effect_key_base) orelse return;
+    if (model.agent_permission_in_flight_session_id == session_id) {
+        model.agent_permission_in_flight_session_id = 0;
+    }
+    if (session_id != model.active_session_id) return;
+    const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
+    if (!accepted) {
+        model.agent_turn_status = .waiting_approval;
+        setAgentError(model, "Permission decision was not accepted; refresh before retrying");
+        return;
+    }
+    model.agent_turn_status = .running;
+    requestAgentSnapshot(model, session_id, fx);
+}
+
 fn requestActiveAgentSnapshot(model: *Model, fx: *Effects) void {
     const session = model.activeSession();
     if (session.mode == .agent and session.agent_connection == .ready) {
@@ -570,11 +747,22 @@ const AgentSnapshotWire = struct {
 };
 
 const AgentBlockWire = struct {
+    block_id: ?[]const u8 = null,
+    block_revision: u64 = 0,
     kind: []const u8,
+    trust_class: ?[]const u8 = null,
     payload: struct {
-        @"type": []const u8,
+        type: []const u8,
         role: ?[]const u8 = null,
         text: ?[]const u8 = null,
+        operation_id: ?[]const u8 = null,
+        operation_revision: ?u64 = null,
+        kind: ?std.json.Value = null,
+        summary: ?[]const u8 = null,
+        risk: ?[]const u8 = null,
+        state: ?[]const u8 = null,
+        prompt: ?[]const u8 = null,
+        decision: ?[]const u8 = null,
     },
 };
 
@@ -603,46 +791,184 @@ fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse
         return;
     };
     defer parsed.deinit();
-    projectAgentMessages(model, parsed.value.document.blocks);
+    projectAgentBlocks(model, parsed.value.document.blocks);
     model.agent_turn_status = parseAgentTurnStatus(parsed.value.status);
     if (parsed.value.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
     if (model.agent_turn_status == .running) scheduleAgentPoll(session_id, fx);
 }
 
-fn projectAgentMessages(model: *Model, blocks: []const AgentBlockWire) void {
-    for (&model.agent_messages) |*message| message.* = .{};
-    model.agent_message_count = 0;
-    var message_total: usize = 0;
+fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
+    for (&model.agent_blocks) |*block| block.* = .{};
+    model.agent_block_count = 0;
+    var block_total: usize = 0;
     for (blocks) |block| {
-        if (std.mem.eql(u8, block.kind, "message") and
-            std.mem.eql(u8, block.payload.@"type", "message") and
-            block.payload.role != null and block.payload.text != null)
-        {
-            message_total += 1;
-        }
+        if (renderableAgentBlock(block)) block_total += 1;
     }
-    var skip = message_total -| max_agent_messages;
+    var skip = block_total -| max_agent_blocks;
     model.agent_history_clipped = skip > 0;
-    for (blocks) |block| {
-        if (!std.mem.eql(u8, block.kind, "message") or
-            !std.mem.eql(u8, block.payload.@"type", "message")) continue;
-        const role_text = block.payload.role orelse continue;
-        const text_value = block.payload.text orelse continue;
+    for (blocks, 0..) |block, block_index| {
+        if (!renderableAgentBlock(block)) continue;
         if (skip > 0) {
             skip -= 1;
             continue;
         }
-        if (model.agent_message_count == max_agent_messages) break;
-        const slot = &model.agent_messages[model.agent_message_count];
-        slot.id = @intCast(model.agent_message_count + 1);
-        slot.role = parseAgentMessageRole(role_text);
-        const text_len = utf8BoundedLength(text_value, slot.text_storage.len);
-        @memcpy(slot.text_storage[0..text_len], text_value[0..text_len]);
-        slot.text_len = text_len;
-        slot.truncated = text_len < text_value.len;
-        model.agent_message_count += 1;
+        if (model.agent_block_count == max_agent_blocks) break;
+        const view = &model.agent_blocks[model.agent_block_count];
+        view.id = stableAgentBlockId(block.block_id, block_index);
+        if (std.mem.eql(u8, block.kind, "message")) {
+            view.kind = .message;
+            view.role = parseAgentMessageRole(block.payload.role.?);
+            copyAgentBlockContent(view, block.payload.text.?);
+        } else if (std.mem.eql(u8, block.kind, "operation")) {
+            projectOperationBlock(view, block);
+        } else {
+            projectApprovalBlock(view, block, blocks);
+        }
+        model.agent_block_count += 1;
     }
     model.agent_projection_session_id = model.active_session_id;
+}
+
+fn renderableAgentBlock(block: AgentBlockWire) bool {
+    if (std.mem.eql(u8, block.kind, "message")) {
+        return std.mem.eql(u8, block.payload.type, "message") and
+            block.payload.role != null and block.payload.text != null;
+    }
+    const trusted = block.trust_class != null and
+        std.mem.eql(u8, block.trust_class.?, "trusted_chrome");
+    if (!trusted or block.payload.operation_id == null or
+        !validOperationId(block.payload.operation_id.?)) return false;
+    if (std.mem.eql(u8, block.kind, "operation")) {
+        return std.mem.eql(u8, block.payload.type, "operation") and
+            block.payload.summary != null and block.payload.risk != null and
+            block.payload.state != null;
+    }
+    if (std.mem.eql(u8, block.kind, "approval")) {
+        return std.mem.eql(u8, block.payload.type, "approval") and
+            block.payload.prompt != null and block.payload.operation_revision != null;
+    }
+    return false;
+}
+
+fn projectOperationBlock(view: *AgentBlockView, block: AgentBlockWire) void {
+    view.kind = .operation;
+    copyAgentBlockContent(view, block.payload.summary.?);
+    copyOperationId(view, block.payload.operation_id.?);
+    copyOperationKind(view, operationKindLabel(block.payload.kind));
+    view.risk = parseAgentRisk(block.payload.risk.?);
+    view.state = parseAgentOperationState(block.payload.state.?);
+}
+
+fn projectApprovalBlock(
+    view: *AgentBlockView,
+    block: AgentBlockWire,
+    blocks: []const AgentBlockWire,
+) void {
+    view.kind = .approval;
+    copyAgentBlockContent(view, block.payload.prompt.?);
+    copyOperationId(view, block.payload.operation_id.?);
+    view.operation_revision = block.payload.operation_revision.?;
+    view.decision = parseAgentDecision(block.payload.decision);
+    view.state = if (view.decision == .none) .waiting_human else .cancelled;
+    view.risk = .external_effect;
+    copyOperationKind(view, "Agent effect");
+    for (blocks) |candidate| {
+        if (!renderableAgentBlock(candidate) or
+            !std.mem.eql(u8, candidate.kind, "operation") or
+            candidate.payload.operation_id == null or
+            !std.mem.eql(u8, candidate.payload.operation_id.?, block.payload.operation_id.?)) continue;
+        if (candidate.payload.kind) |kind| copyOperationKind(view, operationKindLabel(kind));
+        if (candidate.payload.risk) |risk| view.risk = parseAgentRisk(risk);
+        if (candidate.payload.state) |state| view.state = parseAgentOperationState(state);
+        break;
+    }
+}
+
+fn stableAgentBlockId(block_id: ?[]const u8, fallback_index: usize) u64 {
+    const value = if (block_id) |id|
+        std.hash.Wyhash.hash(0, id) & std.math.maxInt(i64)
+    else
+        fallback_index + 1;
+    return if (value == 0) fallback_index + 1 else value;
+}
+
+fn copyAgentBlockContent(view: *AgentBlockView, value: []const u8) void {
+    const length = utf8BoundedLength(value, view.content_storage.len);
+    @memcpy(view.content_storage[0..length], value[0..length]);
+    view.content_len = length;
+    view.truncated = length < value.len;
+}
+
+fn copyOperationId(view: *AgentBlockView, value: []const u8) void {
+    const length = @min(value.len, view.operation_id_storage.len);
+    @memcpy(view.operation_id_storage[0..length], value[0..length]);
+    view.operation_id_len = length;
+}
+
+fn copyOperationKind(view: *AgentBlockView, value: []const u8) void {
+    const length = utf8BoundedLength(value, view.operation_kind_storage.len);
+    @memcpy(view.operation_kind_storage[0..length], value[0..length]);
+    view.operation_kind_len = length;
+}
+
+fn operationKindLabel(value: ?std.json.Value) []const u8 {
+    const kind = value orelse return "Agent effect";
+    const raw = switch (kind) {
+        .string => |text| text,
+        .object => |object| object_value: {
+            const other = object.get("other") orelse break :object_value "Agent effect";
+            break :object_value switch (other) {
+                .string => |text| text,
+                else => "Agent effect",
+            };
+        },
+        else => return "Agent effect",
+    };
+    if (std.mem.eql(u8, raw, "codex_shell")) return "Codex shell request";
+    if (std.mem.eql(u8, raw, "file_edit")) return "Workspace edit";
+    if (std.mem.eql(u8, raw, "agent_tool")) return "Agent tool";
+    if (std.mem.eql(u8, raw, "mcp_tool")) return "MCP tool";
+    if (std.mem.eql(u8, raw, "computer_use")) return "Computer Use";
+    if (std.mem.eql(u8, raw, "artifact_build")) return "Artifact build";
+    if (std.mem.eql(u8, raw, "shell")) return "Shell command";
+    return raw;
+}
+
+fn validOperationId(value: []const u8) bool {
+    if (value.len != max_agent_operation_id_bytes) return false;
+    for (value, 0..) |byte, index| {
+        if (index == 8 or index == 13 or index == 18 or index == 23) {
+            if (byte != '-') return false;
+        } else if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+fn parseAgentRisk(value: []const u8) AgentRisk {
+    if (std.mem.eql(u8, value, "read_only")) return .read_only;
+    if (std.mem.eql(u8, value, "workspace_write")) return .workspace_write;
+    if (std.mem.eql(u8, value, "external_effect")) return .external_effect;
+    if (std.mem.eql(u8, value, "destructive")) return .destructive;
+    return .unknown;
+}
+
+fn parseAgentOperationState(value: []const u8) AgentOperationState {
+    if (std.mem.eql(u8, value, "policy_check")) return .policy_check;
+    if (std.mem.eql(u8, value, "waiting_human")) return .waiting_human;
+    if (std.mem.eql(u8, value, "authorized")) return .authorized;
+    if (std.mem.eql(u8, value, "dispatching")) return .dispatching;
+    if (std.mem.eql(u8, value, "succeeded")) return .succeeded;
+    if (std.mem.eql(u8, value, "failed")) return .failed;
+    if (std.mem.eql(u8, value, "cancelled")) return .cancelled;
+    if (std.mem.eql(u8, value, "unknown_execution")) return .unknown_execution;
+    return .proposed;
+}
+
+fn parseAgentDecision(value: ?[]const u8) AgentDecision {
+    const decision = value orelse return .none;
+    if (std.mem.eql(u8, decision, "reject_once")) return .reject_once;
+    if (std.mem.eql(u8, decision, "cancelled")) return .cancelled;
+    return .other;
 }
 
 fn parseAgentMessageRole(value: []const u8) AgentMessageRole {
@@ -677,12 +1003,13 @@ fn effectSessionId(key: u64, base: u64) ?u8 {
 }
 
 fn resetAgentProjection(model: *Model, session_id: u8) void {
-    for (&model.agent_messages) |*message| message.* = .{};
-    model.agent_message_count = 0;
+    for (&model.agent_blocks) |*block| block.* = .{};
+    model.agent_block_count = 0;
     model.agent_history_clipped = false;
     model.agent_projection_session_id = session_id;
     model.agent_turn_status = .idle;
     model.agent_error_len = 0;
+    model.agent_permission_in_flight_session_id = 0;
 }
 
 fn setAgentError(model: *Model, message: []const u8) void {

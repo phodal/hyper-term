@@ -75,39 +75,84 @@
         <separator />
         <scroll grow="1" label="Agent blocks">
           <column gap="12" padding="12">
-            <if test="{hasAgentMessages}">
-              <for each="agentMessages" key="id" as="message">
-                <if test="{message.isUser}">
-                  <row>
-                    <spacer grow="1" />
-                    <bubble>
-                      <column gap="5" padding="10">
-                        <text foreground="text_muted">{message.roleLabel}</text>
-                        <text wrap="true">{message.text}</text>
-                        <if test="{message.truncated}">
-                          <text foreground="warning">Message clipped to 8 KiB in this view.</text>
+            <if test="{hasAgentBlocks}">
+              <for each="agentBlocks" key="id" as="block">
+                <if test="{block.isMessage}">
+                  <if test="{block.isUserMessage}">
+                    <row>
+                      <spacer grow="1" />
+                      <bubble>
+                        <column gap="5" padding="10">
+                          <text foreground="text_muted">{block.roleLabel}</text>
+                          <text wrap="true">{block.content}</text>
+                          <if test="{block.truncated}">
+                            <text foreground="warning">Block clipped to 8 KiB in this view.</text>
+                          </if>
+                        </column>
+                      </bubble>
+                    </row>
+                  </if>
+                  <else>
+                    <card>
+                      <column gap="7" padding="11">
+                        <row gap="7" cross="center">
+                          <icon name="circle-dot" width="13" height="13" foreground="accent" />
+                          <text foreground="text_muted">{block.roleLabel}</text>
+                        </row>
+                        <markdown source="{block.content}" />
+                        <if test="{block.truncated}">
+                          <text foreground="warning">Block clipped to 8 KiB in this view.</text>
                         </if>
                       </column>
-                    </bubble>
-                  </row>
+                    </card>
+                  </else>
                 </if>
                 <else>
-                  <card>
-                    <column gap="7" padding="11">
-                      <row gap="7" cross="center">
-                        <icon name="circle-dot" width="13" height="13" foreground="accent" />
-                        <text foreground="text_muted">{message.roleLabel}</text>
-                      </row>
-                      <markdown source="{message.text}" />
-                      <if test="{message.truncated}">
-                        <text foreground="warning">Message clipped to 8 KiB in this view.</text>
-                      </if>
-                    </column>
-                  </card>
+                  <if test="{block.isOperation}">
+                    <card>
+                      <column gap="8" padding="11">
+                        <row gap="7" cross="center">
+                          <icon name="wrench" width="14" height="14" foreground="info" />
+                          <text grow="1"><span weight="medium">Operation</span></text>
+                        </row>
+                        <text wrap="true" foreground="text_muted">{block.operationKindLabel} · {block.stateLabel} · {block.riskLabel}</text>
+                        <text wrap="true">{block.content}</text>
+                        <text foreground="text_muted"><span mono="true">{block.operationId}</span></text>
+                      </column>
+                    </card>
+                  </if>
+                  <else>
+                    <card border-color="warning">
+                      <column gap="9" padding="11">
+                        <row gap="7" cross="center">
+                          <icon name="alert" width="14" height="14" foreground="warning" />
+                          <text grow="1"><span weight="medium">{block.approvalTitle}</span></text>
+                        </row>
+                        <text wrap="true" foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
+                        <text wrap="true">{block.content}</text>
+                        <text foreground="text_muted"><span mono="true">{block.operationId}</span></text>
+                        <text foreground="text_muted">revision {block.operation_revision}</text>
+                        <if test="{block.isApprovalPending}">
+                          <alert text="Proposal-only safety gate">
+                            <column gap="7" padding="9">
+                              <text wrap="true">Allow is unavailable until the Rust sandbox can enforce this exact effect.</text>
+                              <column gap="7">
+                                <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
+                                <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel request</button>
+                              </column>
+                            </column>
+                          </alert>
+                        </if>
+                        <else>
+                          <text foreground="text_muted">Decision: {block.decisionLabel}</text>
+                        </else>
+                      </column>
+                    </card>
+                  </else>
                 </else>
               </for>
               <if test="{agent_history_clipped}">
-                <text foreground="text_muted">Showing the latest 12 messages.</text>
+                <text foreground="text_muted">Showing the latest 16 Agent blocks.</text>
               </if>
             </if>
             <else>
