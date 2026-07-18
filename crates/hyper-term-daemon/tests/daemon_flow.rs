@@ -11,8 +11,9 @@ use hyper_term_daemon::{DaemonError, DaemonState, spawn_unix_server};
 use hyper_term_protocol::{
     BlockPayload, ClientId, ControlRequest, ControlRequestEnvelope, ControlResponse,
     GenUiArtifactCandidate, GenUiCompilerIdentity, OperationAction, OperationCompletion,
-    OperationKind, OperationState, PermissionDecision, RequestId, RiskClass, TerminalCommand,
-    TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame, read_frame, write_frame,
+    OperationKind, OperationOutcome, OperationState, PermissionDecision, RequestId, RiskClass,
+    TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame, read_frame,
+    write_frame,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -158,7 +159,7 @@ fn terminal_dispatch_requires_permission_and_survives_client_subscription_drop()
                     BlockPayload::OperationReceipt {
                         operation_id,
                         executor,
-                        succeeded: true,
+                        outcome: Some(OperationOutcome::Succeeded),
                         ..
                     } if *operation_id == proposed.operation_id
                         && executor == "sandbox::MacOsSeatbelt"
@@ -379,6 +380,7 @@ fn opaque_tool_dispatch_requires_permission_and_records_its_receipt() {
             OperationCompletion {
                 executor: "hyper-term-mcp".into(),
                 succeeded: true,
+                outcome: Some(OperationOutcome::Succeeded),
                 summary: "Diff review produced one bounded hunk".into(),
                 result_digest: Some("b".repeat(64)),
             },
@@ -402,12 +404,87 @@ fn opaque_tool_dispatch_requires_permission_and_records_its_receipt() {
                     BlockPayload::OperationReceipt {
                         operation_id,
                         executor,
-                        succeeded: true,
+                        outcome: Some(OperationOutcome::Succeeded),
                         ..
                     } if *operation_id == proposed.operation_id && executor == "hyper-term-mcp"
                 )
             })
     );
+}
+
+#[test]
+fn uncertain_tool_completion_is_not_recorded_as_a_definitive_failure() {
+    let directory = tempdir().expect("tempdir");
+    let state = DaemonState::open(directory.path()).expect("open daemon");
+    let task_id = state.create_task("Uncertain MCP tool".into()).unwrap();
+    let proposed = state
+        .propose_operation(
+            task_id,
+            OperationKind::McpTool,
+            OperationAction::Opaque {
+                kind: "hyper_term.genui.compile".into(),
+                payload_digest: "a".repeat(64),
+            },
+            "Compile generated UI".into(),
+            RiskClass::ReadOnly,
+            vec!["genui_compile".into()],
+        )
+        .unwrap();
+    let authorized = state
+        .decide_permission(
+            task_id,
+            proposed.operation_id,
+            proposed.revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let dispatching = state
+        .begin_operation(task_id, proposed.operation_id, authorized.revision)
+        .unwrap();
+
+    let uncertain = state
+        .complete_operation(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision,
+            OperationCompletion {
+                executor: "hyper-term-mcp".into(),
+                succeeded: false,
+                outcome: Some(OperationOutcome::UnknownExecution),
+                summary: "Deno compiler timed out after dispatch".into(),
+                result_digest: Some("b".repeat(64)),
+            },
+        )
+        .unwrap();
+    assert_eq!(uncertain.state, OperationState::UnknownExecution);
+    let snapshot = state.block_snapshot(task_id).unwrap();
+    assert!(snapshot.blocks.iter().any(|block| {
+        block.lifecycle == hyper_term_protocol::BlockLifecycle::UnknownExecution
+            && matches!(
+                block.payload,
+                BlockPayload::OperationReceipt {
+                    operation_id,
+                    outcome: Some(OperationOutcome::UnknownExecution),
+                    ..
+                } if operation_id == proposed.operation_id
+            )
+    }));
+
+    let reconciled = state
+        .complete_operation(
+            task_id,
+            proposed.operation_id,
+            uncertain.revision,
+            OperationCompletion {
+                executor: "hyper-term-reconciler".into(),
+                succeeded: false,
+                outcome: Some(OperationOutcome::Failed),
+                summary: "Evidence proved no artifact was accepted".into(),
+                result_digest: Some("c".repeat(64)),
+            },
+        )
+        .unwrap();
+    assert_eq!(reconciled.state, OperationState::Failed);
 }
 
 #[test]
@@ -483,6 +560,7 @@ fn only_a_valid_dispatching_genui_compile_replaces_the_last_known_good_artifact(
             OperationCompletion {
                 executor: "hyper-term-mcp".into(),
                 succeeded: true,
+                outcome: Some(OperationOutcome::Succeeded),
                 summary: "GenUI artifact accepted".into(),
                 result_digest: Some("b".repeat(64)),
             },
@@ -504,6 +582,7 @@ fn only_a_valid_dispatching_genui_compile_replaces_the_last_known_good_artifact(
             OperationCompletion {
                 executor: "hyper-term-mcp".into(),
                 succeeded: false,
+                outcome: Some(OperationOutcome::Failed),
                 summary: "GenUI artifact rejected".into(),
                 result_digest: Some("c".repeat(64)),
             },

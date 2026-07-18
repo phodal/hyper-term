@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedGenUiArtifact, BLOCK_SCHEMA_VERSION, BlockId, MessageRole, OperationId, OperationKind,
-    OperationState, PermissionDecision, RiskClass, TaskId, TerminalId, TerminalSize,
+    OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId, TerminalId,
+    TerminalSize,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,6 +98,8 @@ pub enum BlockPayload {
         operation_revision: u64,
         executor: String,
         succeeded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<OperationOutcome>,
         summary: String,
         result_digest: Option<String>,
     },

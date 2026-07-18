@@ -404,6 +404,7 @@ fn decode_terminal_snapshot(payload: &[u8]) -> Result<TerminalSnapshotFrame, Wir
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OperationOutcome;
 
     #[test]
     fn binary_terminal_frame_round_trips_without_base64() {
@@ -456,6 +457,7 @@ mod tests {
                 completion: OperationCompletion {
                     executor: "hyper-term-mcp".into(),
                     succeeded: true,
+                    outcome: Some(OperationOutcome::Succeeded),
                     summary: "diff ready".into(),
                     result_digest: Some("a".repeat(64)),
                 },

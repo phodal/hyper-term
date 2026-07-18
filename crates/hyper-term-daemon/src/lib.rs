@@ -19,8 +19,8 @@ use hyper_term_protocol::{
     AcceptedGenUiArtifact, Actor, BlockDocument, BlockId, CapabilityLease, ClientId,
     CompiledSandboxProfile, ControlRequest, ControlRequestEnvelope, ControlResponse,
     ControlResponseEnvelope, DomainEvent, GenUiArtifactCandidate, InputLeaseId, MessageRole,
-    NewEvent, OperationAction, OperationCompletion, OperationId, OperationKind, OperationState,
-    PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, SandboxEnforcement,
+    NewEvent, OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
+    OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, SandboxEnforcement,
     SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime,
     SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy,
     SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId,
@@ -599,7 +599,22 @@ impl DaemonState {
         if !matches!(record.action, OperationAction::Opaque { .. }) {
             return Err(DaemonError::GenericDispatchRequiresOpaqueAction);
         }
-        if record.state != OperationState::Dispatching {
+        let outcome = completion.outcome.unwrap_or(if completion.succeeded {
+            OperationOutcome::Succeeded
+        } else {
+            OperationOutcome::Failed
+        });
+        if completion.outcome.is_some() && completion.succeeded != outcome.succeeded() {
+            return Err(DaemonError::InconsistentOperationOutcome);
+        }
+        let target_state = match outcome {
+            OperationOutcome::Succeeded => OperationState::Succeeded,
+            OperationOutcome::Failed => OperationState::Failed,
+            OperationOutcome::UnknownExecution => OperationState::UnknownExecution,
+        };
+        let resolves_unknown = record.state == OperationState::UnknownExecution
+            && target_state != OperationState::UnknownExecution;
+        if record.state != OperationState::Dispatching && !resolves_unknown {
             return Err(DaemonError::OperationNotDispatching(record.state));
         }
         let executor = bounded_nonempty(completion.executor, 256, "executor")?;
@@ -620,7 +635,8 @@ impl DaemonState {
             payload: DomainEvent::OperationReceipt {
                 operation_revision: expected_revision,
                 executor,
-                succeeded: completion.succeeded,
+                succeeded: outcome.succeeded(),
+                outcome: Some(outcome),
                 summary: summary.clone(),
                 result_digest: completion.result_digest,
             },
@@ -629,11 +645,7 @@ impl DaemonState {
             task_id,
             operation_id,
             expected_revision,
-            if completion.succeeded {
-                OperationState::Succeeded
-            } else {
-                OperationState::Failed
-            },
+            target_state,
             Actor::System,
             Some(summary),
         )
@@ -927,6 +939,13 @@ impl DaemonState {
                 operation_revision,
                 executor: format!("sandbox::{:?}", compiled.backend),
                 succeeded: outcome == SandboxOutcome::Succeeded,
+                outcome: Some(match outcome {
+                    SandboxOutcome::Succeeded => OperationOutcome::Succeeded,
+                    SandboxOutcome::Unknown => OperationOutcome::UnknownExecution,
+                    SandboxOutcome::Failed | SandboxOutcome::Violated | SandboxOutcome::Denied => {
+                        OperationOutcome::Failed
+                    }
+                }),
                 summary: format!(
                     "Agent command finished in an enforced {:?} sandbox with outcome {:?}",
                     compiled.backend, outcome
@@ -2139,6 +2158,8 @@ pub enum DaemonError {
     InvalidBoundedText { label: &'static str, maximum: usize },
     #[error("operation result digest must be a lowercase SHA-256 value")]
     InvalidResultDigest,
+    #[error("operation succeeded flag conflicts with its structured outcome")]
+    InconsistentOperationOutcome,
     #[error("operation kind and action payload do not match")]
     ActionKindMismatch,
     #[error("terminal dispatch only supports an exact shell action")]
@@ -2205,6 +2226,7 @@ impl DaemonError {
             | Self::SandboxLease(_) => "sandbox_error",
             Self::InvalidBoundedText { .. }
             | Self::InvalidResultDigest
+            | Self::InconsistentOperationOutcome
             | Self::EmptyMessage
             | Self::MessageTooLarge(_)
             | Self::ExternalMessageIdTooLarge => "invalid_request",

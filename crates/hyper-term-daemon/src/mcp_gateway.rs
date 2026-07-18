@@ -11,14 +11,14 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, bounded, select};
 use hyper_term_drivers::{
     AgentEffectAuthorization, DenoGenUiCompiler, DenoGenUiConfig, DenoLspClient, DenoLspConfig,
-    ExternalRequestId, GenUiCompileRequest, MAX_MCP_FRAME_BYTES, McpAgentServer,
+    DriverState, ExternalRequestId, GenUiCompileRequest, MAX_MCP_FRAME_BYTES, McpAgentServer,
     McpAuthorizationOutcome, McpServerAction, McpToolCall, McpToolClass, McpToolResult,
     path_to_file_uri,
 };
 use hyper_term_protocol::{
     ControlRequest, ControlResponse, DomainEvent, GenUiArtifactCandidate, OperationAction,
-    OperationCompletion, OperationId, OperationKind, OperationState, PermissionDecision, RiskClass,
-    TaskId, WireFrame,
+    OperationCompletion, OperationId, OperationKind, OperationOutcome, OperationState,
+    PermissionDecision, RiskClass, TaskId, WireFrame,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -360,19 +360,32 @@ impl<'a, W: Write> McpGateway<'a, W> {
                 );
             }
         };
-        let mut result = self.execute_tool(&call);
-        if call.class == McpToolClass::GenUiCompile && !result.is_error {
-            result = self.accept_genui_result(task_id, operation_id, dispatching_revision, result);
+        let mut execution = self.execute_tool(&call);
+        if call.class == McpToolClass::GenUiCompile
+            && execution.outcome == OperationOutcome::Succeeded
+        {
+            execution.result = self.accept_genui_result(
+                task_id,
+                operation_id,
+                dispatching_revision,
+                execution.result,
+            );
+            if execution.result.is_error {
+                execution.outcome = OperationOutcome::Failed;
+            }
         }
+        let result = execution.result;
         let result_digest = sha256_json(&result)?;
-        let succeeded = !result.is_error;
         let completion = OperationCompletion {
             executor: "hyper-term-mcp".into(),
-            succeeded,
-            summary: if succeeded {
-                format!("{} completed", call.name)
-            } else {
-                format!("{} failed", call.name)
+            succeeded: execution.outcome.succeeded(),
+            outcome: Some(execution.outcome),
+            summary: match execution.outcome {
+                OperationOutcome::Succeeded => format!("{} completed", call.name),
+                OperationOutcome::Failed => format!("{} failed", call.name),
+                OperationOutcome::UnknownExecution => {
+                    format!("{} outcome is unknown", call.name)
+                }
             },
             result_digest: Some(result_digest),
         };
@@ -387,10 +400,10 @@ impl<'a, W: Write> McpGateway<'a, W> {
         )? {
             ControlResponse::OperationUpdated { state, .. }
                 if state
-                    == if succeeded {
-                        OperationState::Succeeded
-                    } else {
-                        OperationState::Failed
+                    == match execution.outcome {
+                        OperationOutcome::Succeeded => OperationState::Succeeded,
+                        OperationOutcome::Failed => OperationState::Failed,
+                        OperationOutcome::UnknownExecution => OperationState::UnknownExecution,
                     } => {}
             ControlResponse::Error { code, message } => {
                 return self.fail_authorized_call(
@@ -529,55 +542,100 @@ impl<'a, W: Write> McpGateway<'a, W> {
         Ok(())
     }
 
-    fn execute_tool(&mut self, call: &McpToolCall) -> McpToolResult {
+    fn execute_tool(&mut self, call: &McpToolCall) -> ToolExecution {
         match call.class {
-            McpToolClass::DiffReview => diff_review(&call.arguments),
+            McpToolClass::DiffReview => ToolExecution::definitive(diff_review(&call.arguments)),
             McpToolClass::DenoLspQuery => {
                 if self.deno_lsp.is_none() {
-                    let Some(config) = self.deno_lsp_config.take() else {
-                        return tool_failure("Deno LSP executor is not configured");
+                    let Some(config) = self.deno_lsp_config.clone() else {
+                        return ToolExecution::failed("Deno LSP executor is not configured");
                     };
                     match DenoLspExecutor::launch(config) {
                         Ok(executor) => self.deno_lsp = Some(executor),
                         Err(error) => {
-                            return tool_failure(format!("Deno LSP could not start: {error}"));
+                            return ToolExecution::failed(format!(
+                                "Deno LSP could not start: {error}"
+                            ));
                         }
                     }
                 }
-                match self
-                    .deno_lsp
-                    .as_mut()
-                    .expect("executor was initialized")
-                    .query(&call.arguments)
-                {
-                    Ok(result) => result,
-                    Err(error) => tool_failure(format!("Deno LSP query failed: {error}")),
+                let (result, state) = {
+                    let executor = self.deno_lsp.as_mut().expect("executor was initialized");
+                    let result = executor.query(&call.arguments);
+                    let state = executor.client.state().unwrap_or(DriverState::Failed);
+                    (result, state)
+                };
+                if state.is_terminal() {
+                    self.deno_lsp = None;
                 }
+                ToolExecution::from_driver_result(result, state, "Deno LSP query")
             }
             McpToolClass::GenUiCompile => {
                 if self.deno_genui.is_none() {
-                    let Some(config) = self.deno_genui_config.take() else {
-                        return tool_failure("GenUI compiler executor is not configured");
+                    let Some(config) = self.deno_genui_config.clone() else {
+                        return ToolExecution::failed("GenUI compiler executor is not configured");
                     };
                     match DenoGenUiExecutor::launch(config) {
                         Ok(executor) => self.deno_genui = Some(executor),
                         Err(error) => {
-                            return tool_failure(format!(
+                            return ToolExecution::failed(format!(
                                 "GenUI compiler could not start: {error}"
                             ));
                         }
                     }
                 }
-                match self
-                    .deno_genui
-                    .as_mut()
-                    .expect("executor was initialized")
-                    .compile(&call.arguments)
-                {
-                    Ok(result) => result,
-                    Err(error) => tool_failure(format!("GenUI compile failed: {error}")),
+                let (result, state) = {
+                    let executor = self.deno_genui.as_mut().expect("executor was initialized");
+                    let result = executor.compile(&call.arguments);
+                    let state = executor.compiler.state().unwrap_or(DriverState::Failed);
+                    (result, state)
+                };
+                if state.is_terminal() {
+                    self.deno_genui = None;
                 }
+                ToolExecution::from_driver_result(result, state, "GenUI compile")
             }
+        }
+    }
+}
+
+struct ToolExecution {
+    result: McpToolResult,
+    outcome: OperationOutcome,
+}
+
+impl ToolExecution {
+    fn definitive(result: McpToolResult) -> Self {
+        let outcome = if result.is_error {
+            OperationOutcome::Failed
+        } else {
+            OperationOutcome::Succeeded
+        };
+        Self { result, outcome }
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            result: tool_failure(message),
+            outcome: OperationOutcome::Failed,
+        }
+    }
+
+    fn from_driver_result(
+        result: Result<McpToolResult, String>,
+        state: DriverState,
+        label: &str,
+    ) -> Self {
+        match result {
+            Ok(result) => Self::definitive(result),
+            Err(error) => Self {
+                result: tool_failure(format!("{label} failed: {error}")),
+                outcome: if state == DriverState::UnknownExecution {
+                    OperationOutcome::UnknownExecution
+                } else {
+                    OperationOutcome::Failed
+                },
+            },
         }
     }
 }
@@ -1080,5 +1138,24 @@ mod tests {
         );
         assert!(normalize_genui_entry(Some("../secret.ts")).is_err());
         assert!(normalize_genui_entry(Some("App.txt")).is_err());
+    }
+
+    #[test]
+    fn unknown_driver_execution_is_not_collapsed_into_failure() {
+        let execution = ToolExecution::from_driver_result(
+            Err("deadline exceeded".into()),
+            DriverState::UnknownExecution,
+            "GenUI compile",
+        );
+        assert_eq!(execution.outcome, OperationOutcome::UnknownExecution);
+        assert!(execution.result.is_error);
+        assert!(execution.result.text.contains("deadline exceeded"));
+
+        let failed = ToolExecution::from_driver_result(
+            Err("could not launch".into()),
+            DriverState::Failed,
+            "Deno LSP query",
+        );
+        assert_eq!(failed.outcome, OperationOutcome::Failed);
     }
 }

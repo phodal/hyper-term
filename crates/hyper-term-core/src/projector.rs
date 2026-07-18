@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use hyper_term_protocol::{
     AttentionState, BLOCK_SCHEMA_VERSION, BlockAction, BlockDocument, BlockEnvelope, BlockId,
     BlockKind, BlockLifecycle, BlockOperation, BlockPatch, BlockPayload, DomainEvent,
-    EventEnvelope, OperationState, PermissionDecision, RenderSlot, RiskClass, TaskId, TrustClass,
+    EventEnvelope, OperationOutcome, OperationState, PermissionDecision, RenderSlot, RiskClass,
+    TaskId, TrustClass,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -224,9 +225,15 @@ impl BlockProjector {
                 operation_revision,
                 executor,
                 succeeded,
+                outcome,
                 summary,
                 result_digest,
             } => {
+                let outcome = outcome.unwrap_or(if *succeeded {
+                    OperationOutcome::Succeeded
+                } else {
+                    OperationOutcome::Failed
+                });
                 let operation_id = event
                     .operation_id
                     .ok_or(ProjectorError::MissingOperationId)?;
@@ -240,21 +247,23 @@ impl BlockProjector {
                         operation_id,
                         operation_revision: *operation_revision,
                         executor: executor.clone(),
-                        succeeded: *succeeded,
+                        succeeded: outcome.succeeded(),
+                        outcome: Some(outcome),
                         summary: summary.clone(),
                         result_digest: result_digest.clone(),
                     },
                 );
                 block.trust_class = TrustClass::TrustedChrome;
-                block.lifecycle = if *succeeded {
-                    BlockLifecycle::Succeeded
-                } else {
-                    BlockLifecycle::Failed
+                block.lifecycle = match outcome {
+                    OperationOutcome::Succeeded => BlockLifecycle::Succeeded,
+                    OperationOutcome::Failed => BlockLifecycle::Failed,
+                    OperationOutcome::UnknownExecution => BlockLifecycle::UnknownExecution,
                 };
-                block.attention = if *succeeded {
-                    AttentionState::None
-                } else {
-                    AttentionState::Failed
+                block.attention = match outcome {
+                    OperationOutcome::Succeeded => AttentionState::None,
+                    OperationOutcome::Failed | OperationOutcome::UnknownExecution => {
+                        AttentionState::Failed
+                    }
                 };
                 vec![self.upsert(block, event.sequence)?]
             }

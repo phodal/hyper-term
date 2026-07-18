@@ -75,6 +75,20 @@ pub enum OperationState {
     UnknownExecution,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationOutcome {
+    Succeeded,
+    Failed,
+    UnknownExecution,
+}
+
+impl OperationOutcome {
+    pub fn succeeded(self) -> bool {
+        self == Self::Succeeded
+    }
+}
+
 impl OperationState {
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -98,6 +112,8 @@ pub enum PermissionDecision {
 pub struct OperationCompletion {
     pub executor: String,
     pub succeeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<OperationOutcome>,
     pub summary: String,
     pub result_digest: Option<String>,
 }
@@ -193,6 +209,8 @@ pub enum DomainEvent {
         operation_revision: u64,
         executor: String,
         succeeded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<OperationOutcome>,
         summary: String,
         result_digest: Option<String>,
     },
@@ -280,4 +298,42 @@ pub struct NewEvent {
     pub causation_id: Option<EventId>,
     pub correlation_id: Option<EventId>,
     pub payload: DomainEvent,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn legacy_boolean_receipts_remain_readable_without_an_outcome_field() {
+        let completion: OperationCompletion = serde_json::from_value(json!({
+            "executor": "legacy-mcp",
+            "succeeded": false,
+            "summary": "legacy failure",
+            "result_digest": null
+        }))
+        .unwrap();
+        assert!(!completion.succeeded);
+        assert_eq!(completion.outcome, None);
+
+        let event: DomainEvent = serde_json::from_value(json!({
+            "type": "operation_receipt",
+            "operation_revision": 4,
+            "executor": "legacy-mcp",
+            "succeeded": true,
+            "summary": "legacy success",
+            "result_digest": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            DomainEvent::OperationReceipt {
+                succeeded: true,
+                outcome: None,
+                ..
+            }
+        ));
+    }
 }

@@ -12,7 +12,7 @@ use hyper_term_daemon::{
 };
 use hyper_term_drivers::{DriverFraming, sha256_file};
 use hyper_term_protocol::{
-    BlockPayload, DomainEvent, EventEnvelope, OperationState, PermissionDecision,
+    BlockPayload, DomainEvent, EventEnvelope, OperationOutcome, OperationState, PermissionDecision,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -115,7 +115,7 @@ fn approved_diff_tool_runs_through_mcp_and_leaves_a_receipt() {
             BlockPayload::OperationReceipt {
                 operation_id: id,
                 executor,
-                succeeded: true,
+                outcome: Some(OperationOutcome::Succeeded),
                 result_digest: Some(digest),
                 ..
             } if *id == operation_id && executor == "hyper-term-mcp" && digest.len() == 64
@@ -236,7 +236,7 @@ fn approved_lsp_tool_queries_the_pinned_deno_snapshot() {
                     &block.payload,
                     BlockPayload::OperationReceipt {
                         operation_id: id,
-                        succeeded: true,
+                        outcome: Some(OperationOutcome::Succeeded),
                         ..
                     } if *id == operation_id
                 )
@@ -383,7 +383,7 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
                     BlockPayload::OperationReceipt {
                         operation_id: id,
                         executor,
-                        succeeded: true,
+                        outcome: Some(OperationOutcome::Succeeded),
                         ..
                     } if *id == operation_id && executor == "hyper-term-mcp"
                 )
