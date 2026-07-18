@@ -2,6 +2,12 @@ import React from "react";
 import { createRoot, type Root } from "react-dom/client";
 import * as JsxDevRuntime from "react/jsx-dev-runtime";
 import * as JsxRuntime from "react/jsx-runtime";
+import {
+  boundedRuntimeText,
+  generatedPositionFromStack,
+  MAX_RUNTIME_ERROR_MESSAGE_BYTES,
+  MAX_RUNTIME_ERROR_STACK_BYTES,
+} from "./runtime-error.ts";
 
 interface RenderArtifactMessage {
   type: "hyper_term_render_artifact";
@@ -32,6 +38,12 @@ const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("isolated preview is missing #root");
 let root: Root | undefined;
 let currentModule: string | undefined;
+let activeArtifact:
+  | Pick<
+    RenderArtifactMessage["artifact"],
+    "artifact_id" | "source_revision"
+  >
+  | undefined;
 
 globalThis.__HYPER_REACT__ = React;
 globalThis.__HYPER_JSX_RUNTIME__ = JsxRuntime;
@@ -47,6 +59,15 @@ globalThis.addEventListener("message", (event: MessageEvent<unknown>) => {
   }
   void render(event.data);
 });
+globalThis.addEventListener("error", (event: ErrorEvent) => {
+  reportRuntimeError(event.error ?? event.message);
+});
+globalThis.addEventListener(
+  "unhandledrejection",
+  (event: PromiseRejectionEvent) => {
+    reportRuntimeError(event.reason);
+  },
+);
 
 report("hyper_term_preview_boot");
 if (globalThis.__HYPER_BOOTSTRAP_ARTIFACT__) {
@@ -62,12 +83,17 @@ if (globalThis.__HYPER_BOOTSTRAP_ARTIFACT__) {
 
 async function render(message: RenderArtifactMessage): Promise<void> {
   const { artifact } = message;
+  activeArtifact = {
+    artifact_id: artifact.artifact_id,
+    source_revision: artifact.source_revision,
+  };
   if (
     new TextEncoder().encode(artifact.bundle + artifact.css).byteLength >
       MAX_ARTIFACT_BYTES
   ) {
     report("hyper_term_preview_error", {
       artifact_id: artifact.artifact_id,
+      source_revision: artifact.source_revision,
       message: "accepted artifact exceeds preview bound",
     });
     return;
@@ -77,6 +103,7 @@ async function render(message: RenderArtifactMessage): Promise<void> {
   ) {
     report("hyper_term_preview_error", {
       artifact_id: artifact.artifact_id,
+      source_revision: artifact.source_revision,
       message: "accepted artifact digest changed in transit",
     });
     return;
@@ -97,11 +124,37 @@ async function render(message: RenderArtifactMessage): Promise<void> {
       source_revision: artifact.source_revision,
     });
   } catch (error) {
-    report("hyper_term_preview_error", {
-      artifact_id: artifact.artifact_id,
-      message: error instanceof Error ? error.message : String(error),
-    });
+    reportRuntimeError(error, activeArtifact);
   }
+}
+
+function reportRuntimeError(
+  value: unknown,
+  artifact = activeArtifact,
+): void {
+  if (!artifact) return;
+  const message = boundedRuntimeText(
+    value instanceof Error ? value.message : String(value),
+    MAX_RUNTIME_ERROR_MESSAGE_BYTES,
+  );
+  const stackValue = value && typeof value === "object" && "stack" in value
+    ? (value as { stack?: unknown }).stack
+    : undefined;
+  const stack = typeof stackValue === "string"
+    ? boundedRuntimeText(stackValue, MAX_RUNTIME_ERROR_STACK_BYTES)
+    : undefined;
+  const generated = stack ? generatedPositionFromStack(stack) : undefined;
+  report("hyper_term_preview_error", {
+    ...artifact,
+    message,
+    ...(stack ? { stack } : {}),
+    ...(generated
+      ? {
+        generated_line: generated.line,
+        generated_column: generated.column,
+      }
+      : {}),
+  });
 }
 
 async function sha256(value: string): Promise<string> {

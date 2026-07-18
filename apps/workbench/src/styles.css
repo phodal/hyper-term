@@ -734,6 +734,10 @@ textarea:focus-visible {
     .75fr);
   background: #10130e;
 }
+.studio:has(> .compile-error) {
+  grid-template-rows: auto 34px minmax(150px, .95fr) minmax(48px, auto) auto
+    minmax(130px, .75fr);
+}
 .studio > .studio-header {
   grid-row: 1;
 }
@@ -832,6 +836,23 @@ textarea:focus-visible {
   color: #e9a097;
   font: 9px/1.5 ui-monospace, monospace;
   white-space: pre-wrap;
+}
+.runtime-error {
+  cursor: pointer;
+}
+.runtime-error button {
+  width: 100%;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.runtime-error button strong,
+.runtime-error button span {
+  display: block;
+}
+.runtime-error button strong {
+  margin-bottom: 2px;
+  color: #ffc2ba;
 }
 .preview-header {
   display: flex;

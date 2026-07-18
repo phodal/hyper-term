@@ -2,6 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import type { HyperTermHost } from "../host.ts";
 import type { AcceptedArtifact } from "../protocol.ts";
 import { GenUiCompiler } from "../genui/compiler-client.ts";
+import {
+  mapPreviewRuntimeError,
+  type RuntimeDiagnostic,
+} from "../genui/runtime-diagnostic.ts";
 import { CodeDiff } from "./code-diff.tsx";
 import { CodeEditor } from "./code-editor.tsx";
 
@@ -67,6 +71,10 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
   const [error, setError] = useState<string>();
   const [accepted, setAccepted] = useState<AcceptedArtifact>();
   const [previewRuntime, setPreviewRuntime] = useState("idle");
+  const [runtimeDiagnostic, setRuntimeDiagnostic] = useState<
+    RuntimeDiagnostic
+  >();
+  const [revealRequest, setRevealRequest] = useState(0);
   const [previewBoot, setPreviewBoot] = useState(0);
   const [trace, setTrace] = useState<TraceEntry[]>([]);
   const compiler = useRef<GenUiCompiler | null>(null);
@@ -83,23 +91,59 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
 
   useEffect(() => {
     function receivePreviewEvent(event: MessageEvent) {
+      if (event.source !== previewFrame.current?.contentWindow) return;
       const message = event.data as {
         type?: string;
         message?: string;
+        stack?: string;
         channel_token?: string;
+        artifact_id?: string;
+        source_revision?: number;
+        generated_line?: number;
+        generated_column?: number;
       };
       if (message.channel_token !== previewChannel) return;
       if (message.type === "hyper_term_preview_boot") {
         setPreviewRuntime("booting runtime");
       } else if (message.type === "hyper_term_preview_ready") {
+        if (
+          accepted &&
+          (message.artifact_id !== accepted.artifact_id ||
+            message.source_revision !== accepted.source_revision)
+        ) return;
+        setRuntimeDiagnostic(undefined);
         setPreviewRuntime("ready");
       } else if (message.type === "hyper_term_preview_error") {
-        setPreviewRuntime(`runtime error · ${message.message ?? "unknown"}`);
+        if (
+          !accepted || message.artifact_id !== accepted.artifact_id ||
+          message.source_revision !== accepted.source_revision
+        ) return;
+        const diagnostic = mapPreviewRuntimeError(
+          message,
+          accepted.source_map,
+        );
+        setRuntimeDiagnostic(diagnostic);
+        setPreviewRuntime(
+          diagnostic.original
+            ? `runtime error · ${diagnostic.original.file}:${diagnostic.original.line}:${diagnostic.original.column}`
+            : "runtime error",
+        );
+        setView("code");
+        setTrace((entries) =>
+          [{
+            revision: accepted.source_revision,
+            label: "Preview runtime failed",
+            detail: diagnostic.original
+              ? `${diagnostic.original.file}:${diagnostic.original.line}:${diagnostic.original.column} · ${diagnostic.message}`
+              : diagnostic.message,
+            state: "failed" as const,
+          }, ...entries].slice(0, 8)
+        );
       }
     }
     globalThis.addEventListener("message", receivePreviewEvent);
     return () => globalThis.removeEventListener("message", receivePreviewEvent);
-  }, [previewChannel]);
+  }, [accepted, previewChannel]);
 
   useEffect(() => {
     if (!accepted || previewBoot === 0) return;
@@ -119,6 +163,7 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
   }, [accepted, previewBoot, previewChannel]);
 
   useEffect(() => {
+    setRuntimeDiagnostic(undefined);
     const timer = globalThis.setTimeout(async () => {
       const sourceRevision = ++revision.current;
       const activeCompiler = compiler.current;
@@ -169,6 +214,8 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
     return () => clearTimeout(timer);
   }, [host, source]);
 
+  const runtimeLocation = runtimeDiagnostic?.original;
+
   return (
     <aside className="studio" aria-label="Agentic UI Studio">
       <header className="studio-header">
@@ -197,7 +244,16 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
         <span className="source-revision">source r{revision.current || 1}</span>
       </div>
       <div className="studio-editor">
-        {view === "code" && <CodeEditor value={source} onChange={setSource} />}
+        {view === "code" && (
+          <CodeEditor
+            value={source}
+            onChange={setSource}
+            revealLocation={runtimeLocation?.file === "/App.tsx"
+              ? runtimeLocation
+              : undefined}
+            revealRequest={revealRequest}
+          />
+        )}
         {view === "diff" && (
           <CodeDiff
             original={originalSource}
@@ -207,7 +263,30 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
         )}
         {view === "trace" && <TraceTimeline entries={trace} />}
       </div>
-      {error && <div className="compile-error" role="alert">{error}</div>}
+      {error
+        ? <div className="compile-error" role="alert">{error}</div>
+        : runtimeDiagnostic && (
+          <div
+            className="compile-error runtime-error"
+            role="alert"
+            title={runtimeDiagnostic.stack}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                setView("code");
+                setRevealRequest((request) => request + 1);
+              }}
+            >
+              <strong>
+                Runtime{runtimeLocation
+                  ? ` · ${runtimeLocation.file}:${runtimeLocation.line}:${runtimeLocation.column}`
+                  : ""}
+              </strong>
+              <span>{runtimeDiagnostic.message}</span>
+            </button>
+          </div>
+        )}
       <div className="preview-header">
         <div>
           <span className="eyebrow">Isolated preview</span>

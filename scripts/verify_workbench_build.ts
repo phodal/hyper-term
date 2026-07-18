@@ -35,8 +35,14 @@ for await (const entry of walk(root)) {
   });
 }
 
+const previewContracts = [
+  "hyper_term_preview_boot",
+  "hyper_term_preview_error",
+  "generated_line",
+  "source_revision",
+];
 if (
-  !previewDocument.includes("hyper_term_preview_boot") ||
+  previewContracts.some((contract) => !previewDocument.includes(contract)) ||
   /<script\s+[^>]*src=/i.test(previewDocument)
 ) {
   throw new Error("isolated preview must contain one inline runtime capsule");

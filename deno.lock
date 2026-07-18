@@ -8,6 +8,7 @@
     "npm:@codemirror/merge@6.12.2": "6.12.2",
     "npm:@codemirror/state@6.7.1": "6.7.1",
     "npm:@codemirror/view@6.43.6": "6.43.6",
+    "npm:@jridgewell/trace-mapping@0.3.31": "0.3.31",
     "npm:@types/react-dom@19.2.3": "19.2.3_@types+react@19.2.17",
     "npm:@types/react@19.2.17": "19.2.17",
     "npm:@xterm/addon-fit@0.11.0": "0.11.0",
@@ -117,6 +118,19 @@
         "w3c-keyname"
       ]
     },
+    "@jridgewell/resolve-uri@3.1.2": {
+      "integrity": "sha512-bRISgCIjP20/tbWSPWMEi54QVPRZExkuD9lJL+UIxUKtwVJA8wW1Trb1jMs1RFXo1CBTNZ/5hpC9QvmKWdopKw=="
+    },
+    "@jridgewell/sourcemap-codec@1.5.5": {
+      "integrity": "sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og=="
+    },
+    "@jridgewell/trace-mapping@0.3.31": {
+      "integrity": "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==",
+      "dependencies": [
+        "@jridgewell/resolve-uri",
+        "@jridgewell/sourcemap-codec"
+      ]
+    },
     "@lezer/common@1.5.2": {
       "integrity": "sha512-sxQE460fPZyU3sdc8lafxiPwJHBzZRy/udNFynGQky1SePYBdhkBl1kOagA9uT3pxR8K09bOrmTUqA9wb/PjSQ=="
     },
@@ -211,6 +225,7 @@
       "npm:@codemirror/merge@6.12.2",
       "npm:@codemirror/state@6.7.1",
       "npm:@codemirror/view@6.43.6",
+      "npm:@jridgewell/trace-mapping@0.3.31",
       "npm:@types/react-dom@19.2.3",
       "npm:@types/react@19.2.17",
       "npm:@xterm/addon-fit@0.11.0",
