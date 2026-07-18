@@ -42,8 +42,8 @@ mod web_gateway;
 use artifact_store::{ArtifactStore, ArtifactStoreError, StoredGenUiArtifact};
 
 pub use agent_gateway::{
-    AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle, AgentGenUiRuntimeConfig,
-    spawn_agent_gateway,
+    AcpAgentProviderConfig, AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle,
+    AgentGenUiRuntimeConfig, spawn_agent_gateway,
 };
 #[cfg(unix)]
 pub use client::{ControlClient, ControlClientError};

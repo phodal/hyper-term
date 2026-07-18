@@ -108,6 +108,28 @@ pub const SessionMode = enum {
     agent,
 };
 
+pub const AgentProvider = enum {
+    codex,
+    codex_acp,
+    claude_acp,
+
+    pub fn id(provider: AgentProvider) []const u8 {
+        return switch (provider) {
+            .codex => "codex",
+            .codex_acp => "codex-acp",
+            .claude_acp => "claude-acp",
+        };
+    }
+
+    pub fn label(provider: AgentProvider) []const u8 {
+        return switch (provider) {
+            .codex => "Codex",
+            .codex_acp => "Codex ACP",
+            .claude_acp => "Claude ACP",
+        };
+    }
+};
+
 pub const AgentConnection = enum {
     unavailable,
     connecting,
@@ -261,6 +283,7 @@ pub const Session = struct {
     mode: SessionMode = .terminal,
     title: []const u8 = "zsh",
     icon: []const u8 = "terminal",
+    agent_provider: AgentProvider = .codex,
     agent_connection: AgentConnection = .unavailable,
 
     pub fn closeLabel(session: *const Session, arena: std.mem.Allocator) []const u8 {
@@ -282,6 +305,9 @@ pub const Model = struct {
     session_count: usize = 1,
     active_session_id: u8 = 1,
     next_session_id: u8 = 2,
+    agent_provider_picker_open: bool = false,
+    selected_agent_provider: AgentProvider = .codex,
+    available_agent_providers: u8 = 0,
     terminal_base_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
     terminal_base_url_len: usize = 0,
     terminal_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
@@ -313,6 +339,7 @@ pub const Model = struct {
         "session_slots",
         "session_count",
         "next_session_id",
+        "available_agent_providers",
         "terminal_base_url_storage",
         "terminal_base_url_len",
         "terminal_url_storage",
@@ -377,6 +404,35 @@ pub const Model = struct {
         return model.terminal_url_storage[0..model.terminal_url_len];
     }
 
+    pub fn agentProviderUnavailable(model: *const Model) bool {
+        return model.agent_base_url_len == 0 or model.available_agent_providers == 0;
+    }
+
+    pub fn codexProviderAvailable(model: *const Model) bool {
+        return model.agentProviderAvailable(.codex);
+    }
+
+    pub fn codexAcpProviderAvailable(model: *const Model) bool {
+        return model.agentProviderAvailable(.codex_acp);
+    }
+
+    pub fn claudeAcpProviderAvailable(model: *const Model) bool {
+        return model.agentProviderAvailable(.claude_acp);
+    }
+
+    pub fn agentProviderAvailable(model: *const Model, provider: AgentProvider) bool {
+        return model.available_agent_providers & providerBit(provider) != 0;
+    }
+
+    pub fn agentButtonLabel(model: *const Model) []const u8 {
+        return if (model.agentProviderUnavailable()) "Agent unavailable" else model.selected_agent_provider.label();
+    }
+
+    pub fn activeAgentProviderLabel(model: *const Model) []const u8 {
+        const session = model.activeSession();
+        return if (session.mode == .agent) session.agent_provider.label() else model.selected_agent_provider.label();
+    }
+
     pub fn agentConnectionLabel(model: *const Model) []const u8 {
         if (model.activeSession().agent_connection == .ready) {
             return switch (model.agent_turn_status) {
@@ -397,18 +453,18 @@ pub const Model = struct {
     pub fn agentStatus(model: *const Model) []const u8 {
         if (model.activeSession().agent_connection == .ready) {
             return switch (model.agent_turn_status) {
-                .running => "Codex is responding · BlockDocument streaming",
+                .running => "Agent is responding · BlockDocument streaming",
                 .waiting_approval => "Effect proposed · waiting for Rust permission flow",
                 .failed => if (model.agent_error_len > 0) model.agentError() else "Agent turn failed",
                 .completed => "Turn complete · history journaled locally",
-                else => "Codex app-server ready · type a prompt",
+                else => "Structured Agent ready · type a prompt",
             };
         }
         return switch (model.activeSession().agent_connection) {
-            .unavailable => "Codex unavailable · no command executed",
-            .connecting => "Codex app-server connecting · no command executed",
-            .ready => "Codex app-server ready · permission broker active",
-            .failed => "Codex app-server failed · no command executed",
+            .unavailable => "Agent unavailable · no command executed",
+            .connecting => "Agent connecting · no command executed",
+            .ready => "Structured Agent ready · permission broker active",
+            .failed => "Agent failed · no command executed",
         };
     }
 
@@ -459,6 +515,11 @@ pub const Model = struct {
 pub const Msg = union(enum) {
     choose_terminal,
     choose_agent,
+    toggle_agent_provider_picker,
+    dismiss_agent_provider_picker,
+    choose_codex_agent,
+    choose_codex_acp_agent,
+    choose_claude_acp_agent,
     select_session: u8,
     close_session: u8,
     close_active_session,
@@ -495,11 +556,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .choose_terminal => {
             _ = appendSession(model, .terminal);
         },
-        .choose_agent => {
-            if (appendSession(model, .agent)) |session_id| {
-                requestAgentStart(model, session_id, fx);
-            }
-        },
+        .choose_agent => createAgentSession(model, model.selected_agent_provider, fx),
+        .toggle_agent_provider_picker => model.agent_provider_picker_open = !model.agent_provider_picker_open,
+        .dismiss_agent_provider_picker => model.agent_provider_picker_open = false,
+        .choose_codex_agent => createAgentSession(model, .codex, fx),
+        .choose_codex_acp_agent => createAgentSession(model, .codex_acp, fx),
+        .choose_claude_acp_agent => createAgentSession(model, .claude_acp, fx),
         .select_session => |session_id| {
             const previous = model.active_session_id;
             selectSession(model, session_id);
@@ -544,8 +606,9 @@ fn appendSession(model: *Model, mode: SessionMode) ?u8 {
     model.session_slots[model.session_count] = .{
         .id = session_id,
         .mode = mode,
-        .title = if (mode == .terminal) "zsh" else "Agent",
+        .title = if (mode == .terminal) "zsh" else model.selected_agent_provider.label(),
         .icon = if (mode == .terminal) "terminal" else "circle-dot",
+        .agent_provider = model.selected_agent_provider,
     };
     model.session_count += 1;
     model.active_session_id = session_id;
@@ -553,6 +616,17 @@ fn appendSession(model: *Model, mode: SessionMode) ?u8 {
     if (model.next_session_id == 0) model.next_session_id = 1;
     refreshTerminalUrl(model);
     return session_id;
+}
+
+fn createAgentSession(model: *Model, provider: AgentProvider, fx: *Effects) void {
+    model.agent_provider_picker_open = false;
+    if (model.available_agent_providers != 0 and !model.agentProviderAvailable(provider)) return;
+    model.selected_agent_provider = provider;
+    if (appendSession(model, .agent)) |session_id| {
+        if (model.agent_base_url_len > 0 and model.agentProviderAvailable(provider)) {
+            requestAgentStart(model, session_id, fx);
+        }
+    }
 }
 
 fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
@@ -603,7 +677,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
 
 fn requestAgentStart(model: *Model, session_id: u8, fx: *Effects) void {
     var storage: [agent_effect_url_capacity]u8 = undefined;
-    const request_url = writeAgentSessionUrl(model, session_id, storage[0..]) orelse return;
+    const request_url = writeAgentStartUrl(model, session_id, storage[0..]) orelse return;
     setAgentConnection(model, session_id, .connecting);
     fx.fetch(.{
         .key = agent_start_effect_key_base + session_id,
@@ -612,6 +686,15 @@ fn requestAgentStart(model: *Model, session_id: u8, fx: *Effects) void {
         .timeout_ms = 12_000,
         .on_response = Effects.responseMsg(.agent_session_started),
     });
+}
+
+fn writeAgentStartUrl(model: *const Model, session_id: u8, storage: []u8) ?[]const u8 {
+    const session = for (model.openSessions()) |candidate| {
+        if (candidate.id == session_id and candidate.mode == .agent) break candidate;
+    } else return null;
+    var base_storage: [agent_effect_url_capacity]u8 = undefined;
+    const base = writeAgentSessionUrl(model, session_id, base_storage[0..]) orelse return null;
+    return std.fmt.bufPrint(storage, "{s}&provider={s}", .{ base, session.agent_provider.id() }) catch null;
 }
 
 fn requestAgentClose(model: *const Model, session_id: u8, fx: *Effects) void {
@@ -1299,6 +1382,10 @@ pub fn initialModelWithTerminalUrl(url: []const u8) Model {
 }
 
 pub fn initialModelWithServices(terminal_url: []const u8, agent_url: []const u8) Model {
+    return initialModelWithProviders(terminal_url, agent_url, "codex");
+}
+
+pub fn initialModelWithProviders(terminal_url: []const u8, agent_url: []const u8, providers: []const u8) Model {
     var model = initialModel();
     if (trustedTerminalUrl(terminal_url)) {
         @memcpy(model.terminal_base_url_storage[0..terminal_url.len], terminal_url);
@@ -1308,8 +1395,36 @@ pub fn initialModelWithServices(terminal_url: []const u8, agent_url: []const u8)
     if (trustedAgentUrl(agent_url)) {
         @memcpy(model.agent_base_url_storage[0..agent_url.len], agent_url);
         model.agent_base_url_len = agent_url.len;
+        model.available_agent_providers = parseAgentProviders(providers);
+        model.selected_agent_provider = firstAvailableAgentProvider(model.available_agent_providers) orelse .codex;
     }
     return model;
+}
+
+fn providerBit(provider: AgentProvider) u8 {
+    return switch (provider) {
+        .codex => 1,
+        .codex_acp => 2,
+        .claude_acp => 4,
+    };
+}
+
+fn parseAgentProviders(value: []const u8) u8 {
+    var providers: u8 = 0;
+    var iterator = std.mem.splitScalar(u8, value, ',');
+    while (iterator.next()) |provider| {
+        if (std.mem.eql(u8, provider, "codex")) providers |= providerBit(.codex);
+        if (std.mem.eql(u8, provider, "codex-acp")) providers |= providerBit(.codex_acp);
+        if (std.mem.eql(u8, provider, "claude-acp")) providers |= providerBit(.claude_acp);
+    }
+    return providers;
+}
+
+fn firstAvailableAgentProvider(providers: u8) ?AgentProvider {
+    inline for (.{ AgentProvider.codex, AgentProvider.codex_acp, AgentProvider.claude_acp }) |provider| {
+        if (providers & providerBit(provider) != 0) return provider;
+    }
+    return null;
 }
 
 fn refreshTerminalUrl(model: *Model) void {
@@ -1420,6 +1535,7 @@ fn trustedGatewayToken(token: []const u8) bool {
 pub fn main(init: std.process.Init) !void {
     const terminal_url = init.environ_map.get("HYPER_TERM_TERMINAL_URL") orelse "";
     const agent_url = init.environ_map.get("HYPER_TERM_AGENT_URL") orelse "";
+    const agent_providers = init.environ_map.get("HYPER_TERM_AGENT_PROVIDERS") orelse "";
     var allowed_origins = [_][]const u8{
         "zero://app",
         "zero://inline",
@@ -1449,7 +1565,7 @@ pub fn main(init: std.process.Init) !void {
             null,
     });
     defer app_state.destroy();
-    app_state.model = initialModelWithServices(terminal_url, agent_url);
+    app_state.model = initialModelWithProviders(terminal_url, agent_url, agent_providers);
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "hyper-term",

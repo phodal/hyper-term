@@ -35,6 +35,14 @@ fn findByLabel(widget: canvas.Widget, value: []const u8) ?canvas.Widget {
     return null;
 }
 
+fn findAnyByText(widget: canvas.Widget, value: []const u8) ?canvas.Widget {
+    if (std.mem.eql(u8, widget.text, value)) return widget;
+    for (widget.children) |child| {
+        if (findAnyByText(child, value)) |found| return found;
+    }
+    return null;
+}
+
 fn containsText(widget: canvas.Widget, value: []const u8) bool {
     if (std.mem.indexOf(u8, widget.text, value) != null) return true;
     for (widget.children) |child| {
@@ -85,8 +93,43 @@ test "session bar exposes direct Terminal and Agent creation" {
     try testing.expectEqual(@as(usize, 3), model.openSessions().len);
 
     tree = try buildTree(arena, &model);
-    try testing.expect(containsText(tree.root, "Ask Codex"));
+    try testing.expect(containsText(tree.root, "Ask an Agent"));
     try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) != null);
+}
+
+test "Agent provider picker creates a provider-bound ACP tab" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithProviders(
+        terminal_url,
+        agent_url,
+        "codex,codex-acp,claude-acp",
+    );
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tree = try buildTree(arena, &model);
+    const picker = findByLabel(tree.root, "Choose Agent provider").?;
+    main.update(&model, tree.msgForPointer(picker.id, .up).?, &fx);
+    try testing.expect(model.agent_provider_picker_open);
+
+    tree = try buildTree(arena, &model);
+    const codex_acp = findAnyByText(tree.root, "Codex ACP").?;
+    main.update(&model, tree.msgForPointer(codex_acp.id, .up).?, &fx);
+
+    try testing.expect(!model.agent_provider_picker_open);
+    try testing.expectEqual(main.SessionMode.agent, model.activeSession().mode);
+    try testing.expectEqual(main.AgentProvider.codex_acp, model.activeSession().agent_provider);
+    try testing.expectEqualStrings("Codex ACP", model.activeSession().title);
+    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2&provider=codex-acp",
+        fx.pendingFetchAt(0).?.url,
+    );
 }
 
 test "Agent tabs start the brokered Codex runtime and render readiness" {
@@ -103,7 +146,7 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
     const request = fx.pendingFetchAt(0).?;
     try testing.expectEqual(std.http.Method.POST, request.method);
     try testing.expectEqualStrings(
-        "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2",
+        "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2&provider=codex",
         request.url,
     );
 
@@ -113,7 +156,7 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
         .body = "{\"session_id\":2,\"provider\":\"codex\",\"protocol\":\"codex-app-server-v2\",\"status\":\"ready\"}",
     } }, &fx);
     try testing.expectEqual(main.AgentConnection.ready, model.activeSession().agent_connection);
-    try testing.expectEqualStrings("Codex app-server ready · type a prompt", model.agentStatus());
+    try testing.expectEqualStrings("Structured Agent ready · type a prompt", model.agentStatus());
     try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
     try testing.expectEqual(std.http.Method.GET, fx.pendingFetchAt(1).?.method);
     try testing.expectEqualStrings(
@@ -410,7 +453,7 @@ test "tabs expose close controls and close the active session like a desktop ter
     try testing.expectEqual(@as(u8, 3), model.active_session_id);
 
     var tree = try buildTree(arena, &model);
-    const close_agent = findByLabel(tree.root, "Close Agent 3").?;
+    const close_agent = findByLabel(tree.root, "Close Codex 3").?;
     main.update(&model, tree.msgForPointer(close_agent.id, .up).?, &fx);
     try testing.expectEqual(@as(usize, 2), model.openSessions().len);
     try testing.expectEqual(@as(u8, 2), model.active_session_id);
