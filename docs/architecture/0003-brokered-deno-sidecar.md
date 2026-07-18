@@ -132,10 +132,33 @@ persists the bounded candidate atomically with private permissions, and appends
 only accepted metadata to the journal. A rejected candidate cannot replace the
 previous artifact or acquire a renderer URL.
 
-This closes the basic distribution, framing, and least-Deno-permission spike.
-It does not close this ADR's OS-containment, kill/hang recovery, resource-limit,
-or cross-platform rollback gates. Those remain milestone gates rather than
-being inferred from Deno CLI permissions.
+The Deno LSP and GenUI services now launch through a Rust-compiled macOS
+Seatbelt profile with task lifetime. Before using the wrapper, the supervisor
+recomputes the exact inner command digest and requires the manifest to carry
+the compiled backend and profile digest. The LSP receives a read-only workspace
+snapshot; both services can write only their private cache and scratch roots.
+System runtime roots are readable for the signed executable, while only path
+metadata needed for canonicalization is exposed above approved roots.
+
+An ignored integration test runs the pinned real Deno binary and proves that a
+task profile cannot read an undeclared host file, connect to a loopback listener,
+or spawn `/usr/bin/touch`. Real LSP initialization and requests and a real GenUI
+compile also pass inside their profiles. Deno flags remain defense in depth;
+the test's denial evidence comes from the OS sandbox.
+
+The supervisor now treats a request deadline as a lifecycle boundary. If an
+effect times out, it sends `SIGTERM` and then `SIGKILL` to the complete process
+group, retains `UnknownExecution`, and therefore forbids automatic replay. A
+separate test includes a descendant that ignores `SIGTERM` and proves the group
+is gone before `stop` succeeds. Frames, the event queue, and stderr tail are
+bounded, so a child cannot create an unbounded in-process output buffer.
+
+This closes distribution, framing, least-Deno-permission, macOS task
+containment, and process-group hang/kill slices. It does not yet close memory
+pressure and resident-memory limits, automatic restart without effect replay,
+permission-broker fault injection, non-macOS containment, update rollback, or
+the performance budget. Those remain milestone gates rather than being
+inferred from Deno CLI permissions or the Seatbelt profile alone.
 
 ## Validation gates
 
