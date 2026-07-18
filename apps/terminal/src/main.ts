@@ -10,6 +10,7 @@ import {
   type TerminalWebClientControl,
   type TerminalWebServerControl,
 } from "./protocol.ts";
+import { TerminalConnectionState } from "./connection-state.ts";
 import "./styles.css";
 
 const attachmentStorageKey = "hyper-term.terminal-attachment.v1";
@@ -70,10 +71,9 @@ terminal.focus();
 let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let reconnectAttempt = 0;
-let inputSequence = 1n;
-let resizeGeneration = 0;
 let afterSequence = 0n;
 let attachmentId = readAttachmentId();
+const connectionState = new TerminalConnectionState();
 
 terminal.onData((data) => sendInput(new TextEncoder().encode(data)));
 terminal.onBinary((data) => {
@@ -83,11 +83,10 @@ terminal.onBinary((data) => {
 
 const resizeObserver = new ResizeObserver(() => {
   fit.fit();
-  if (socket?.readyState !== WebSocket.OPEN) return;
-  resizeGeneration += 1;
+  if (!connectionState.canSend(socket?.readyState === WebSocket.OPEN)) return;
   sendControl({
     type: "resize",
-    generation: resizeGeneration,
+    generation: connectionState.takeResizeGeneration(),
     size: terminalSize(),
   });
 });
@@ -109,6 +108,7 @@ function connect(): void {
     globalThis.clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  connectionState.beginConnection();
   setStatus(reconnectAttempt === 0 ? "Connecting…" : "Reconnecting…", true);
   const url = new URL("/terminal", globalThis.location.href);
   url.protocol = globalThis.location.protocol === "https:" ? "wss:" : "ws:";
@@ -131,6 +131,7 @@ function connect(): void {
   });
   socket.addEventListener("message", (event) => receive(event.data));
   socket.addEventListener("close", () => {
+    connectionState.disconnect();
     socket = null;
     scheduleReconnect();
   });
@@ -163,8 +164,10 @@ function receiveControl(message: TerminalWebServerControl): void {
       }
       attachmentId = message.attachment_id;
       writeAttachmentId(attachmentId);
-      inputSequence = BigInt(message.next_input_sequence);
-      resizeGeneration = message.resize_generation;
+      connectionState.acceptReady(
+        message.next_input_sequence,
+        message.resize_generation,
+      );
       setStatus("Connected", false);
       terminal.focus();
       break;
@@ -207,14 +210,18 @@ function receiveBinary(encoded: ArrayBuffer): void {
 }
 
 function sendInput(bytes: Uint8Array): void {
-  if (socket?.readyState !== WebSocket.OPEN) return;
+  if (!connectionState.canSend(socket?.readyState === WebSocket.OPEN)) return;
   for (let offset = 0; offset < bytes.byteLength;) {
     const end = Math.min(
       bytes.byteLength,
       offset + MAX_TERMINAL_WEB_PAYLOAD_BYTES,
     );
-    socket.send(encodeTerminalInput(inputSequence, bytes.slice(offset, end)));
-    inputSequence += 1n;
+    socket?.send(
+      encodeTerminalInput(
+        connectionState.takeInputSequence(),
+        bytes.slice(offset, end),
+      ),
+    );
     offset = end;
   }
 }
