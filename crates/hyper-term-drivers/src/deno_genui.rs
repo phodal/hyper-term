@@ -265,9 +265,11 @@ impl DenoGenUiCompiler {
                 state,
                 stderr: self.process.stderr_tail().unwrap_or_default(),
             }),
-            Err(DriverError::Timeout) => Err(DenoGenUiError::Timeout {
-                request_id: request_id.into(),
-            }),
+            Err(DriverError::Timeout | DriverError::EffectTimedOut { .. }) => {
+                Err(DenoGenUiError::Timeout {
+                    request_id: request_id.into(),
+                })
+            }
             Err(error) => Err(error.into()),
         }
     }

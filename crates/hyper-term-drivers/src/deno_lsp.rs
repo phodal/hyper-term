@@ -107,7 +107,7 @@ impl DenoLspClient {
 
     pub fn initialize(&self, timeout: Duration) -> Result<Value, DenoLspError> {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        self.process.send_json(&json!({
+        if let Err(error) = self.process.send_json(&json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "initialize",
@@ -124,8 +124,17 @@ impl DenoLspClient {
                     "unstable": false
                 }
             }
-        }))?;
-        let response = self.wait_for_response(id, timeout)?;
+        })) {
+            let _ = self.process.stop(Duration::from_millis(100));
+            return Err(error.into());
+        }
+        let response = match self.wait_for_response(id, timeout) {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self.process.stop(Duration::from_millis(100));
+                return Err(error);
+            }
+        };
         self.process.mark_ready()?;
         self.process.send_json(&json!({
             "jsonrpc": "2.0",
@@ -168,8 +177,25 @@ impl DenoLspClient {
         if let Some(params) = params {
             request["params"] = params;
         }
-        self.process.send_json(&request)?;
-        self.wait_for_response(id, timeout)
+        self.process.begin_effect()?;
+        if let Err(error) = self.process.send_json(&request) {
+            let _ = self.process.stop(Duration::from_millis(100));
+            return Err(error.into());
+        }
+        match self.wait_for_response(id, timeout) {
+            Ok(response) => {
+                self.process.finish_effect()?;
+                Ok(response)
+            }
+            Err(error @ DenoLspError::Remote { .. }) => {
+                self.process.finish_effect()?;
+                Err(error)
+            }
+            Err(error) => {
+                let _ = self.process.stop(Duration::from_millis(100));
+                Err(error)
+            }
+        }
     }
 
     pub fn notify(&self, method: &str, params: Value) -> Result<(), DenoLspError> {
@@ -235,7 +261,13 @@ impl DenoLspClient {
             if remaining.is_zero() {
                 return Err(DenoLspError::Timeout { request_id: id });
             }
-            let event = self.process.recv_timeout(remaining)?;
+            let event = match self.process.recv_timeout(remaining) {
+                Ok(event) => event,
+                Err(DriverError::Timeout | DriverError::EffectTimedOut { .. }) => {
+                    return Err(DenoLspError::Timeout { request_id: id });
+                }
+                Err(error) => return Err(error.into()),
+            };
             match event {
                 DriverEvent::Message { ref payload, .. }
                     if server_request_response(payload, &self.workspace_uri).is_some() =>

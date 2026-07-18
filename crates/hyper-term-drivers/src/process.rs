@@ -23,6 +23,7 @@ use crate::{DEFAULT_MAX_DRIVER_FRAME_BYTES, DriverFraming};
 const DRIVER_EVENT_CAPACITY: usize = 256;
 const STDERR_TAIL_BYTES: usize = 64 * 1024;
 const EXIT_AFTER_STDOUT_GRACE: Duration = Duration::from_millis(200);
+const EFFECT_TIMEOUT_GRACE: Duration = Duration::from_millis(100);
 const MAX_SANDBOX_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,6 +107,7 @@ pub struct DriverProcess {
 
 struct DriverShared {
     child: Mutex<Child>,
+    process_group_id: u32,
     state: Mutex<DriverState>,
     stderr: Mutex<VecDeque<u8>>,
     effect_in_flight: AtomicBool,
@@ -153,8 +155,10 @@ impl DriverProcess {
             .stderr
             .take()
             .ok_or(DriverError::MissingPipe("stderr"))?;
+        let process_group_id = child.id();
         let shared = Arc::new(DriverShared {
             child: Mutex::new(child),
+            process_group_id,
             state: Mutex::new(DriverState::Starting),
             stderr: Mutex::new(VecDeque::with_capacity(STDERR_TAIL_BYTES)),
             effect_in_flight: AtomicBool::new(false),
@@ -235,12 +239,17 @@ impl DriverProcess {
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<DriverEvent, DriverError> {
-        self.events
-            .recv_timeout(timeout)
-            .map_err(|error| match error {
-                RecvTimeoutError::Timeout => DriverError::Timeout,
-                RecvTimeoutError::Disconnected => DriverError::EventStreamClosed,
-            })
+        match self.events.recv_timeout(timeout) {
+            Ok(event) => Ok(event),
+            Err(RecvTimeoutError::Timeout)
+                if self.shared.effect_in_flight.load(Ordering::Acquire) =>
+            {
+                let state = self.stop(EFFECT_TIMEOUT_GRACE)?;
+                Err(DriverError::EffectTimedOut { state })
+            }
+            Err(RecvTimeoutError::Timeout) => Err(DriverError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(DriverError::EventStreamClosed),
+        }
     }
 
     pub fn stderr_tail(&self) -> Result<String, DriverError> {
@@ -255,7 +264,9 @@ impl DriverProcess {
         }
         *lock(&self.shared.state)? = DriverState::Closing;
         lock(&self.input)?.take();
-        let uncertain = self.shared.effect_in_flight.swap(false, Ordering::AcqRel);
+        // Keep the flag set until the protocol reader observes process exit so
+        // its Exited event cannot race this call and incorrectly report Closed.
+        let uncertain = self.shared.effect_in_flight.load(Ordering::Acquire);
         let status = terminate_process(&self.shared, grace)?;
         let final_state = if uncertain {
             DriverState::UnknownExecution
@@ -547,15 +558,37 @@ fn terminate_process(
     shared: &Arc<DriverShared>,
     grace: Duration,
 ) -> Result<Option<ExitStatus>, DriverError> {
-    if let Some(status) = try_wait(shared)? {
-        return Ok(Some(status));
-    }
+    let mut status = try_wait(shared)?;
     signal_process_group(shared, false)?;
-    if let Some(status) = wait_for_exit(shared, grace)? {
-        return Ok(Some(status));
+    let deadline = Instant::now() + grace;
+    loop {
+        if status.is_none() {
+            status = try_wait(shared)?;
+        }
+        if !process_group_exists(shared)? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
     signal_process_group(shared, true)?;
-    wait_for_exit(shared, Duration::from_secs(1))
+    let force_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if status.is_none() {
+            status = try_wait(shared)?;
+        }
+        if !process_group_exists(shared)? {
+            return Ok(status);
+        }
+        if Instant::now() >= force_deadline {
+            return Err(DriverError::ProcessGroupDidNotExit {
+                process_group_id: shared.process_group_id,
+            });
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn try_wait(shared: &Arc<DriverShared>) -> Result<Option<ExitStatus>, DriverError> {
@@ -580,7 +613,7 @@ fn wait_for_exit(
 
 #[cfg(unix)]
 fn signal_process_group(shared: &Arc<DriverShared>, force: bool) -> Result<(), DriverError> {
-    let pid = lock(&shared.child)?.id() as i32;
+    let pid = shared.process_group_id as i32;
     let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
     // SAFETY: the child is launched as the leader of its own process group and
     // `pid` was returned by `std::process::Child`. No borrowed memory crosses FFI.
@@ -596,10 +629,31 @@ fn signal_process_group(shared: &Arc<DriverShared>, force: bool) -> Result<(), D
     }
 }
 
+#[cfg(unix)]
+fn process_group_exists(shared: &Arc<DriverShared>) -> Result<bool, DriverError> {
+    // Signal 0 performs existence and permission checking without delivering a
+    // signal. The group ID is reserved while any group member still exists.
+    let result = unsafe { libc::killpg(shared.process_group_id as i32, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error.into()),
+    }
+}
+
 #[cfg(not(unix))]
 fn signal_process_group(shared: &Arc<DriverShared>, _force: bool) -> Result<(), DriverError> {
     lock(&shared.child)?.kill()?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn process_group_exists(shared: &Arc<DriverShared>) -> Result<bool, DriverError> {
+    Ok(try_wait(shared)?.is_none())
 }
 
 fn validate_spec(spec: &DriverSpec) -> Result<(), DriverError> {
@@ -711,6 +765,8 @@ pub enum DriverError {
     InputClosed,
     #[error("driver event stream timed out")]
     Timeout,
+    #[error("driver effect timed out and was terminated in state {state:?}")]
+    EffectTimedOut { state: DriverState },
     #[error("driver event stream closed")]
     EventStreamClosed,
     #[error("driver expected {expected}, but was {actual:?}")]
@@ -720,6 +776,8 @@ pub enum DriverError {
     },
     #[error("driver supervisor lock was poisoned")]
     SupervisorPoisoned,
+    #[error("driver process group {process_group_id} did not exit after SIGKILL")]
+    ProcessGroupDidNotExit { process_group_id: u32 },
 }
 
 #[cfg(all(test, unix))]
@@ -807,6 +865,76 @@ mod tests {
             process.stop(Duration::from_millis(50)).unwrap(),
             DriverState::UnknownExecution
         );
+    }
+
+    #[test]
+    fn timing_out_an_effect_kills_it_and_forbids_automatic_replay() {
+        let temp = TempDir::new().unwrap();
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let process = DriverProcess::spawn(DriverSpec {
+            manifest: manifest(&shell, DriverKind::DenoGenUi),
+            executable: shell,
+            arguments: vec![OsString::from("-c"), OsString::from("sleep 30")],
+            working_directory: temp.path().canonicalize().unwrap(),
+            environment: BTreeMap::new(),
+            sandbox: None,
+            framing: DriverFraming::JsonLines,
+            max_frame_bytes: 1024,
+        })
+        .unwrap();
+        process.mark_ready().unwrap();
+        process.begin_effect().unwrap();
+
+        assert!(matches!(
+            process.recv_timeout(Duration::from_millis(20)),
+            Err(DriverError::EffectTimedOut {
+                state: DriverState::UnknownExecution
+            })
+        ));
+        assert_eq!(process.state().unwrap(), DriverState::UnknownExecution);
+    }
+
+    #[test]
+    fn stop_reaps_descendants_that_ignore_sigterm() {
+        let temp = TempDir::new().unwrap();
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let child_pid_path = temp.path().join("child.pid");
+        let process = DriverProcess::spawn(DriverSpec {
+            manifest: manifest(&shell, DriverKind::AcpAgent),
+            executable: shell,
+            arguments: vec![
+                OsString::from("-c"),
+                OsString::from(
+                    "trap '' TERM; (trap '' TERM; sleep 30) & printf '%s' \"$!\" > \"$CHILD_PID_PATH\"; wait",
+                ),
+            ],
+            working_directory: temp.path().canonicalize().unwrap(),
+            environment: BTreeMap::from([(
+                "CHILD_PID_PATH".into(),
+                child_pid_path.clone().into_os_string(),
+            )]),
+            sandbox: None,
+            framing: DriverFraming::JsonLines,
+            max_frame_bytes: 1024,
+        })
+        .unwrap();
+        let process_group_id = process.shared.process_group_id;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !child_pid_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let child_pid: i32 = std::fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0);
+
+        assert_eq!(
+            process.stop(Duration::from_millis(50)).unwrap(),
+            DriverState::Closed
+        );
+        assert!(!process_group_exists(&process.shared).unwrap());
+        assert_ne!(process_group_id, std::process::id());
     }
 
     #[cfg(target_os = "macos")]
