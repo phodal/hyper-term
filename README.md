@@ -16,7 +16,9 @@ executors and projections of one durable human–AI task model.
 > by Rust, projected as isolated Blocks, and served to a bounded Native WebView
 > pane without replacing the last-known-good revision on failure. Deno LSP and
 > GenUI now run in digest-bound macOS Seatbelt task profiles, and timed-out
-> effects terminate their complete process group without being replayed.
+> effects terminate their complete process group without being replayed. Driver
+> queues and secondary Agent/LSP inboxes have byte budgets, and uncertain MCP
+> outcomes remain visible until evidence reconciles them.
 > Performance, memory-pressure recovery, hostile-artifact, and cross-platform
 > containment gates remain open.
 > Proposed ADRs remain subject to the validation and replacement gates recorded
@@ -277,14 +279,17 @@ authenticated endpoint for future exact-revision debugging.
 
 The Rust `hyper-term-drivers` crate launches the same pinned Deno executable
 with a cleared environment, dedicated cache and scratch roots, bounded framing,
-bounded stderr capture, deadline-triggered process-group shutdown, and an exact
-command-bound macOS Seatbelt profile. The LSP driver receives a read-only,
+an 8 MiB pending-output budget, bounded secondary inboxes and stderr capture,
+deadline-triggered process-group shutdown, and an exact command-bound macOS
+Seatbelt profile. The LSP driver receives a read-only,
 authority-created snapshot. The GenUI driver receives only its digest-pinned
 compiler script and WASM asset. Neither profile has network or child-process
 authority; writes are limited to private cache and scratch roots. Rust waits for
-a versioned ready handshake and re-computes the artifact digest. Ignored
-integration tests exercise real child processes, OS-level denials, and the
-complete MCP approval/receipt path:
+a versioned ready handshake and re-computes the artifact digest. A terminal
+driver is discarded without retrying its call; only a later, separately
+authorized MCP operation may launch a fresh sidecar from the retained immutable
+configuration. Ignored integration tests exercise real child processes,
+OS-level denials, and the complete MCP approval/receipt path:
 
 ```bash
 export HYPER_TERM_DENO_PATH=/absolute/path/to/deno

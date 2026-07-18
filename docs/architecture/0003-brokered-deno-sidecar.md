@@ -151,21 +151,37 @@ effect times out, it sends `SIGTERM` and then `SIGKILL` to the complete process
 group, retains `UnknownExecution`, and therefore forbids automatic replay. A
 separate test includes a descendant that ignores `SIGTERM` and proves the group
 is gone before `stop` succeeds. Frames, the event queue, and stderr tail are
-bounded, so a child cannot create an unbounded in-process output buffer.
+bounded, so a child cannot create an unbounded in-process output buffer. The
+supervisor now enforces an 8 MiB pending-output budget by decoded payload bytes,
+releasing the budget only as events are consumed. The separate Codex and LSP
+inboxes apply the same byte budget after removing events from the supervisor
+queue, closing the queue-to-inbox transfer loophole. A test floods two valid
+frames whose aggregate exceeds the budget and proves fail-closed termination.
+
+MCP execution receipts now distinguish `succeeded`, `failed`, and
+`unknown_execution`. The new outcome is additive: legacy journal records with
+only the boolean `succeeded` field still replay. A timed-out or output-flooded
+effect remains `UnknownExecution` in the operation ledger and Workbench rather
+than being collapsed into a definitive failure. The failed call is never
+retried. Its terminal driver is discarded, while its immutable launch config is
+retained so a later, separately proposed and authorized tool call may start a
+fresh sidecar lazily.
 
 This closes distribution, framing, least-Deno-permission, macOS task
-containment, and process-group hang/kill slices. It does not yet close memory
-pressure and resident-memory limits, automatic restart without effect replay,
-permission-broker fault injection, non-macOS containment, update rollback, or
-the performance budget. Those remain milestone gates rather than being
-inferred from Deno CLI permissions or the Seatbelt profile alone.
+containment, bounded in-process output, process-group hang/kill, and safe lazy
+sidecar replacement slices. It does not yet close OS-enforced resident-memory
+limits, memory-pressure recovery, permission-broker fault injection, non-macOS
+containment, update rollback, or the performance budget. Those remain milestone
+gates rather than being inferred from Deno CLI permissions or the Seatbelt
+profile alone.
 
 ## Validation gates
 
 - Measure cold start, warm request latency, idle CPU, resident memory, and
   installer-size delta on every supported target.
-- Kill, hang, and memory-pressure the sidecar; the Rust kernel and PTYs must
-  remain healthy and the sidecar must recover without replaying effects.
+- Keep kill, hang, output-flood, and uncertain-outcome regression probes green;
+  memory-pressure the sidecar and prove the Rust kernel and PTYs remain healthy
+  without replaying effects.
 - Verify allow, deny, malformed, reordered, disconnected, and unavailable
   permission-broker cases fail closed.
 - Prove commands supporting `--cached-only --frozen` work with all network
