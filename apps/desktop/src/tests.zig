@@ -468,6 +468,24 @@ test "native menu commands map to explicit tab lifecycles" {
     try testing.expect(main.command("hyper-term.new-session") == null);
 }
 
+test "macOS canvas shortcuts preserve terminal and Agent tab lifecycles" {
+    const command = canvas.WidgetKeyboardModifiers{ .super = true };
+    const shifted_command = canvas.WidgetKeyboardModifiers{ .shift = true, .super = true };
+
+    const terminal = main.onKey(.{ .phase = .key_down, .key = "t", .modifiers = command }) orelse
+        return error.TestUnexpectedResult;
+    const agent = main.onKey(.{ .phase = .key_down, .key = "n", .modifiers = shifted_command }) orelse
+        return error.TestUnexpectedResult;
+    const close = main.onKey(.{ .phase = .key_down, .key = "w", .modifiers = command }) orelse
+        return error.TestUnexpectedResult;
+
+    try testing.expect(terminal == .choose_terminal);
+    try testing.expect(agent == .choose_agent);
+    try testing.expect(close == .close_active_session);
+    try testing.expect(main.onKey(.{ .phase = .key_down, .key = "w", .modifiers = .{ .control = true } }) == null);
+    try testing.expect(main.onKey(.{ .phase = .key_up, .key = "w", .modifiers = command }) == null);
+}
+
 test "compiled and hot-reload markup produce the same root" {
     var model = main.initialModel();
     model.session_slots[0].mode = .agent;
@@ -518,6 +536,7 @@ test "high contrast defers to the Native SDK accessible register" {
         .density = .compact,
     });
     try testing.expectEqualDeep(expected.colors, actual.colors);
+    try testing.expect(actual.controls.tabs_indicator == .underline);
 }
 
 test "terminal web pane accepts only the authenticated fixed loopback shape" {

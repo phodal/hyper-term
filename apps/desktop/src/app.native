@@ -7,15 +7,17 @@
       <icon name="terminal" width="15" height="15" foreground="accent" />
       <text><span weight="medium">Hyper Term</span></text>
       <separator height="16" />
-      <tabs gap="0" grow="1" label="Open sessions">
+      <tabs gap="4" grow="1" label="Open sessions">
         <for each="openSessions" key="id" as="session">
-          <button size="sm" selected="{session.id == active_session_id}" icon="{session.icon}" on-press="select_session:{session.id}">
+          <button size="sm" selected="{session.id == active_session_id}" on-press="select_session:{session.id}">
             {session.title} {session.id}
             <context-menu>
               <menu-item on-press="close_session:{session.id}">Close Tab</menu-item>
             </context-menu>
           </button>
-          <toggle-button size="sm" variant="ghost" icon="x" on-toggle="close_session:{session.id}" label="{session.closeLabel}"></toggle-button>
+          <if test="{session.id == active_session_id}">
+            <toggle-button size="sm" variant="ghost" icon="x" on-toggle="close_session:{session.id}" label="{session.closeLabel}"></toggle-button>
+          </if>
         </for>
       </tabs>
     </row>

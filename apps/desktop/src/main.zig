@@ -1169,6 +1169,28 @@ pub fn command(name: []const u8) ?Msg {
     return null;
 }
 
+/// Canvas-level fallback for macOS application shortcuts. The AppKit menu
+/// monitor remains the primary path; this keeps the same lifecycle available
+/// when a retained-canvas host injects a key event directly (including the
+/// Native SDK automation harness). Control-only chords remain available to
+/// zsh and terminal applications.
+pub fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
+    if (keyboard.phase != .key_down or
+        !keyboard.modifiers.super or
+        keyboard.modifiers.control or
+        keyboard.modifiers.alt)
+    {
+        return null;
+    }
+    if (keyboard.modifiers.shift) {
+        if (std.ascii.eqlIgnoreCase(keyboard.key, "n")) return .choose_agent;
+        return null;
+    }
+    if (std.ascii.eqlIgnoreCase(keyboard.key, "t")) return .choose_terminal;
+    if (std.ascii.eqlIgnoreCase(keyboard.key, "w")) return .close_active_session;
+    return null;
+}
+
 pub fn onAppearance(appearance: native_sdk.Appearance) ?Msg {
     return .{ .system_appearance = .{
         .scheme = switch (appearance.color_scheme) {
@@ -1188,12 +1210,15 @@ pub fn onChrome(chrome: native_sdk.WindowChrome) ?Msg {
 pub fn hyperTermTokens(model: *const Model) canvas.DesignTokens {
     const contrast: canvas.ColorContrast = if (model.high_contrast) .high else .standard;
     if (model.high_contrast) {
-        return canvas.DesignTokens.theme(.{
+        var tokens = canvas.DesignTokens.theme(.{
             .color_scheme = model.system_scheme,
             .contrast = contrast,
             .density = .compact,
             .reduce_motion = model.reduce_motion,
         });
+        tokens.controls.tabs_indicator = .underline;
+        tokens.metrics.tabs_gap = 4;
+        return tokens;
     }
 
     var tokens = canvas.DesignTokens.theme(.{
@@ -1255,6 +1280,8 @@ pub fn hyperTermTokens(model: *const Model) canvas.DesignTokens {
     tokens.typography.display_size = 40;
     tokens.spacing = .{ .xs = 4, .sm = 8, .md = 12, .lg = 16, .xl = 24 };
     tokens.radius = .{ .sm = 4, .md = 6, .lg = 8, .xl = 12 };
+    tokens.controls.tabs_indicator = .underline;
+    tokens.metrics.tabs_gap = 4;
     return tokens;
 }
 
@@ -1410,6 +1437,7 @@ pub fn main(init: std.process.Init) !void {
         .update_fx = update,
         .tokens_fn = hyperTermTokens,
         .on_command = command,
+        .on_key = onKey,
         .on_appearance = onAppearance,
         .on_chrome = onChrome,
         .view = CompiledHyperTermView.build,
