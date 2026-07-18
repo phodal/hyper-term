@@ -12,6 +12,7 @@
         .{ .id = "hyper-term.new-session", .key = "n", .modifiers = .{"primary"} },
         .{ .id = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
         .{ .id = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },
+        .{ .id = "hyper-term.close-session", .key = "w", .modifiers = .{"primary"} },
     },
     .menus = .{
         .{
@@ -21,6 +22,8 @@
                 .{ .separator = true },
                 .{ .label = "New Terminal", .command = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
                 .{ .label = "New Agent Session", .command = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },
+                .{ .separator = true },
+                .{ .label = "Close Tab", .command = "hyper-term.close-session", .key = "w", .modifiers = .{"primary"} },
             },
         },
     },

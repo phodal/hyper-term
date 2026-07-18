@@ -7,22 +7,25 @@
       <icon name="terminal" width="15" height="15" foreground="accent" />
       <text><span weight="medium">Hyper Term</span></text>
       <separator height="16" />
-      <tabs gap="2" label="Open sessions">
+      <row gap="3" cross="center" label="Open sessions">
         <for each="openSessions" key="id" as="session">
-          <button size="sm" variant="ghost" selected="{session.id == active_session_id}" icon="terminal" on-press="select_session:{session.id}" label="{session.accessibility_label}">{session.title} {session.id}</button>
+          <row gap="0" cross="center" background="surface_subtle">
+            <button size="sm" variant="ghost" selected="{session.id == active_session_id}" icon="{session.icon}" on-press="select_session:{session.id}" role="tab" label="{session.accessibility_label}">{session.title} {session.id}</button>
+            <button size="sm" variant="ghost" icon="x" on-press="close_session:{session.id}" label="{session.close_label}"></button>
+          </row>
         </for>
-      </tabs>
+      </row>
     </row>
-    <badge variant="secondary">{modeLabel}</badge>
-    <stack>
-      <button size="sm" variant="outline" icon="plus" on-press="new_session" label="New session">New</button>
-      <if test="{new_session_open}">
-        <dropdown-menu anchor="below" anchor-alignment="end" on-dismiss="dismiss_new_session" label="New session choices">
-          <menu-item icon="terminal" on-press="choose_terminal">Terminal · zsh</menu-item>
-          <menu-item icon="circle-dot" on-press="choose_agent">Agent · ACP / MCP</menu-item>
-        </dropdown-menu>
-      </if>
-    </stack>
+    <if test="{new_session_open}">
+      <row gap="4" cross="center" label="Choose new session type">
+        <button size="sm" variant="outline" icon="terminal" on-press="choose_terminal" label="New Terminal session">Terminal</button>
+        <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" label="New Agent session">Agent</button>
+        <button size="sm" variant="ghost" icon="x" on-press="dismiss_new_session" label="Cancel new session"></button>
+      </row>
+    </if>
+    <else>
+      <button size="sm" variant="outline" icon="plus" on-press="new_session" label="Choose new Terminal or Agent session">New</button>
+    </else>
     <spacer width="{chrome_trailing}" />
   </row>
   <separator />

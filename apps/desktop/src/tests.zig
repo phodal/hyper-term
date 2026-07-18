@@ -73,7 +73,7 @@ test "New Session explicitly selects Terminal or Agent" {
     try testing.expect(model.new_session_open);
 
     tree = try buildTree(arena, &model);
-    const agent_item = findByText(tree.root, .menu_item, "Agent · ACP / MCP").?;
+    const agent_item = findByText(tree.root, .button, "Agent").?;
     main.update(&model, tree.msgForPointer(agent_item.id, .up).?, &fx);
     try testing.expectEqual(main.SessionMode.agent, model.activeSession().mode);
     try testing.expectEqual(@as(usize, 2), model.openSessions().len);
@@ -82,6 +82,60 @@ test "New Session explicitly selects Terminal or Agent" {
     tree = try buildTree(arena, &model);
     try testing.expect(containsText(tree.root, "Native Block surface"));
     try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) != null);
+}
+
+test "tabs expose close controls and close the active session like a desktop terminal" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    var model = main.initialModel();
+    main.update(&model, .choose_terminal, &fx);
+    main.update(&model, .choose_agent, &fx);
+    try testing.expectEqual(@as(u8, 3), model.active_session_id);
+
+    var tree = try buildTree(arena, &model);
+    const close_agent = findByLabel(tree.root, "Close Agent session").?;
+    main.update(&model, tree.msgForPointer(close_agent.id, .up).?, &fx);
+    try testing.expectEqual(@as(usize, 2), model.openSessions().len);
+    try testing.expectEqual(@as(u8, 2), model.active_session_id);
+
+    main.update(&model, .{ .close_session = 1 }, &fx);
+    try testing.expectEqual(@as(usize, 1), model.openSessions().len);
+    try testing.expectEqual(@as(u8, 2), model.active_session_id);
+
+    main.update(&model, .close_active_session, &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().close_count);
+    try testing.expectEqualStrings("main", fx.windowActionState().lastLabel());
+}
+
+test "closing an inactive tab preserves the active session" {
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    var model = main.initialModel();
+    main.update(&model, .choose_terminal, &fx);
+    main.update(&model, .choose_agent, &fx);
+    main.update(&model, .{ .select_session = 2 }, &fx);
+    main.update(&model, .{ .close_session = 1 }, &fx);
+
+    try testing.expectEqual(@as(usize, 2), model.openSessions().len);
+    try testing.expectEqual(@as(u8, 2), model.active_session_id);
+    try testing.expectEqual(@as(u8, 2), model.openSessions()[0].id);
+    try testing.expectEqual(@as(u8, 3), model.openSessions()[1].id);
+}
+
+test "Command-W maps to the active tab lifecycle" {
+    const msg = main.command("hyper-term.close-session") orelse return error.TestUnexpectedResult;
+    switch (msg) {
+        .close_active_session => {},
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "compiled and hot-reload markup produce the same root" {

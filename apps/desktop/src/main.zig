@@ -81,7 +81,9 @@ pub const Session = struct {
     id: u8 = 0,
     mode: SessionMode = .terminal,
     title: []const u8 = "zsh",
+    icon: []const u8 = "terminal",
     accessibility_label: []const u8 = "Terminal session",
+    close_label: []const u8 = "Close Terminal session",
 };
 
 pub const Model = struct {
@@ -136,13 +138,6 @@ pub const Model = struct {
         return model.activeSession().mode == .terminal;
     }
 
-    pub fn modeLabel(model: *const Model) []const u8 {
-        return switch (model.activeSession().mode) {
-            .terminal => "Terminal",
-            .agent => "Agent",
-        };
-    }
-
     pub fn terminalReady(model: *const Model) bool {
         return model.terminal_url_len > 0;
     }
@@ -173,6 +168,8 @@ pub const Msg = union(enum) {
     choose_terminal,
     choose_agent,
     select_session: u8,
+    close_session: u8,
+    close_active_session,
     agent_split_resized: f32,
     system_appearance: struct {
         scheme: canvas.ColorScheme,
@@ -182,14 +179,14 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "system_appearance", "chrome_changed" };
 };
 
 const dev_markup_reload = builtin.mode == .Debug;
 pub const HyperTermApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = dev_markup_reload });
 pub const Effects = HyperTermApp.Effects;
 
-pub fn update(model: *Model, msg: Msg, _: *Effects) void {
+pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .new_session => model.new_session_open = true,
         .dismiss_new_session => model.new_session_open = false,
@@ -202,6 +199,8 @@ pub fn update(model: *Model, msg: Msg, _: *Effects) void {
             model.new_session_open = false;
         },
         .select_session => |session_id| selectSession(model, session_id),
+        .close_session => |session_id| closeSession(model, session_id, fx),
+        .close_active_session => closeSession(model, model.active_session_id, fx),
         .agent_split_resized => |fraction| model.agent_split = std.math.clamp(fraction, 0.48, 0.76),
         .system_appearance => |appearance| {
             model.system_scheme = appearance.scheme;
@@ -223,12 +222,45 @@ fn appendSession(model: *Model, mode: SessionMode) void {
         .id = session_id,
         .mode = mode,
         .title = if (mode == .terminal) "zsh" else "Agent",
+        .icon = if (mode == .terminal) "terminal" else "circle-dot",
         .accessibility_label = if (mode == .terminal) "Terminal session" else "Agent session",
+        .close_label = if (mode == .terminal) "Close Terminal session" else "Close Agent session",
     };
     model.session_count += 1;
     model.active_session_id = session_id;
     model.next_session_id +%= 1;
     if (model.next_session_id == 0) model.next_session_id = 1;
+    refreshTerminalUrl(model);
+}
+
+fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
+    var closing_index: ?usize = null;
+    for (model.openSessions(), 0..) |session, index| {
+        if (session.id == session_id) {
+            closing_index = index;
+            break;
+        }
+    }
+    const index = closing_index orelse return;
+
+    if (model.session_count == 1) {
+        fx.closeWindow("main");
+        return;
+    }
+
+    if (model.active_session_id == session_id) {
+        model.active_session_id = if (index + 1 < model.session_count)
+            model.session_slots[index + 1].id
+        else
+            model.session_slots[index - 1].id;
+    }
+
+    var cursor = index;
+    while (cursor + 1 < model.session_count) : (cursor += 1) {
+        model.session_slots[cursor] = model.session_slots[cursor + 1];
+    }
+    model.session_count -= 1;
+    model.session_slots[model.session_count] = .{};
     refreshTerminalUrl(model);
 }
 
@@ -246,6 +278,7 @@ pub fn command(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "hyper-term.new-session")) return .new_session;
     if (std.mem.eql(u8, name, "hyper-term.new-terminal")) return .choose_terminal;
     if (std.mem.eql(u8, name, "hyper-term.new-agent")) return .choose_agent;
+    if (std.mem.eql(u8, name, "hyper-term.close-session")) return .close_active_session;
     return null;
 }
 
