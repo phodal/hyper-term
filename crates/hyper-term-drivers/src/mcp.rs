@@ -492,7 +492,11 @@ fn tool_definitions(enabled: &[McpToolClass]) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "source": {"type": "string", "maxLength": 262144},
-                    "entry": {"type": "string", "maxLength": 256}
+                    "entry": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "description": "Optional virtual TS/JS module path; defaults to /App.tsx"
+                    }
                 },
                 "required": ["source"],
                 "additionalProperties": false
@@ -578,6 +582,18 @@ fn validate_arguments(class: McpToolClass, arguments: &Value) -> Result<(), Stri
         McpToolClass::GenUiCompile => {
             required_bounded_string(object, "source", 262_144)?;
             optional_bounded_string(object, "entry", 256)?;
+            if let Some(entry) = object.get("entry").and_then(Value::as_str) {
+                let normalized = entry.strip_prefix('/').unwrap_or(entry);
+                if entry.contains('\\')
+                    || entry.contains("..")
+                    || normalized.is_empty()
+                    || ![".tsx", ".ts", ".jsx", ".js"]
+                        .iter()
+                        .any(|extension| normalized.ends_with(extension))
+                {
+                    return Err("entry must be a bounded virtual TS/JS module path".into());
+                }
+            }
             reject_extra(object, &["source", "entry"])
         }
         McpToolClass::DenoLspQuery => {

@@ -43,7 +43,10 @@ pub use agent_gateway::{
 #[cfg(unix)]
 pub use client::{ControlClient, ControlClientError};
 #[cfg(unix)]
-pub use mcp_gateway::{DenoMcpExecutorConfig, McpGatewayError, McpStdioConfig, run_mcp_stdio};
+pub use mcp_gateway::{
+    DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig, McpGatewayError, McpStdioConfig,
+    run_mcp_stdio,
+};
 pub use web_gateway::{
     TerminalGatewayConfig, TerminalGatewayError, TerminalGatewayHandle, spawn_terminal_gateway,
 };

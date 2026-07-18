@@ -7,9 +7,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hyper_term_daemon::{
-    DaemonState, DenoMcpExecutorConfig, McpStdioConfig, run_mcp_stdio, spawn_unix_server,
+    DaemonState, DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig, McpStdioConfig, run_mcp_stdio,
+    spawn_unix_server,
 };
-use hyper_term_drivers::DriverFraming;
+use hyper_term_drivers::{DriverFraming, sha256_file};
 use hyper_term_protocol::{
     BlockPayload, DomainEvent, EventEnvelope, OperationState, PermissionDecision,
 };
@@ -238,6 +239,142 @@ fn approved_lsp_tool_queries_the_pinned_deno_snapshot() {
                         succeeded: true,
                         ..
                     } if *id == operation_id
+                )
+            })
+    );
+
+    client_io.shutdown(Shutdown::Write).unwrap();
+    gateway.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore = "requires HYPER_TERM_DENO_PATH, HYPER_TERM_DENO_SHA256, and built GenUI runtime assets"]
+fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("hyperd.sock");
+    let state_directory = directory.path().join("state");
+    let cache = directory.path().join("deno-cache");
+    let scratch = directory.path().join("deno-scratch");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let compiler_script = root.join("dist/runtime/genui-compiler.js");
+    let compiler_wasm = root.join("dist/runtime/esbuild.wasm");
+    let state = DaemonState::open(&state_directory).unwrap();
+    let agent_task_id = state.create_task("Codex Agent GenUI".into()).unwrap();
+    let _server = spawn_unix_server(&socket, state.clone()).unwrap();
+    let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
+    client_io
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let gateway_input = gateway_io.try_clone().unwrap();
+    let deno = std::path::PathBuf::from(
+        std::env::var_os("HYPER_TERM_DENO_PATH").expect("HYPER_TERM_DENO_PATH"),
+    )
+    .canonicalize()
+    .unwrap();
+    let config = McpStdioConfig::new(socket.canonicalize().unwrap(), true)
+        .unwrap()
+        .with_task(agent_task_id)
+        .with_deno_genui(DenoGenUiMcpExecutorConfig {
+            executable: deno,
+            executable_sha256: std::env::var("HYPER_TERM_DENO_SHA256")
+                .expect("HYPER_TERM_DENO_SHA256"),
+            runtime_version: "2.9.3".into(),
+            compiler_script_sha256: sha256_file(&compiler_script).unwrap(),
+            compiler_script,
+            compiler_wasm_sha256: sha256_file(&compiler_wasm).unwrap(),
+            compiler_wasm,
+            compiler_version: "0.28.1".into(),
+            cache_directory: cache,
+            scratch_directory: scratch,
+        })
+        .unwrap();
+    let gateway = thread::spawn(move || run_mcp_stdio(config, gateway_input, &mut gateway_io));
+    let mut output = BufReader::new(client_io.try_clone().unwrap());
+
+    send(
+        &mut client_io,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "genui-test", "version": "1"}
+            }
+        }),
+    );
+    send(
+        &mut client_io,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    send(
+        &mut client_io,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "hyper_term.genui.compile",
+                "arguments": {
+                    "source": "export default function App(){ return <main data-brokered=\"true\">Ready</main>; }",
+                    "entry": "App.tsx"
+                }
+            }
+        }),
+    );
+    let initialized = receive_id(&mut output, 1);
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    let (task_id, operation_id, waiting_revision) = wait_for_permission(&state_directory);
+    assert_eq!(task_id, agent_task_id);
+    state
+        .decide_permission(
+            task_id,
+            operation_id,
+            waiting_revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+
+    let result = receive_id(&mut output, 9);
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert_eq!(
+        result["result"]["structuredContent"]["compiler"]["version"],
+        "0.28.1"
+    );
+    assert_eq!(
+        result["result"]["structuredContent"]["content_digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(
+        result["result"]["structuredContent"]["bundle"]
+            .as_str()
+            .unwrap()
+            .contains("data-brokered")
+    );
+    assert!(
+        state
+            .block_snapshot(task_id)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| {
+                matches!(
+                    &block.payload,
+                    BlockPayload::OperationReceipt {
+                        operation_id: id,
+                        executor,
+                        succeeded: true,
+                        ..
+                    } if *id == operation_id && executor == "hyper-term-mcp"
                 )
             })
     );

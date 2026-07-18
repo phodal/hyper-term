@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufReader, Read, Write};
@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, bounded, select};
 use hyper_term_drivers::{
-    AgentEffectAuthorization, DenoLspClient, DenoLspConfig, ExternalRequestId, MAX_MCP_FRAME_BYTES,
-    McpAgentServer, McpAuthorizationOutcome, McpServerAction, McpToolCall, McpToolClass,
-    McpToolResult, path_to_file_uri,
+    AgentEffectAuthorization, DenoGenUiCompiler, DenoGenUiConfig, DenoLspClient, DenoLspConfig,
+    ExternalRequestId, GenUiCompileRequest, MAX_MCP_FRAME_BYTES, McpAgentServer,
+    McpAuthorizationOutcome, McpServerAction, McpToolCall, McpToolClass, McpToolResult,
+    path_to_file_uri,
 };
 use hyper_term_protocol::{
     ControlRequest, ControlResponse, DomainEvent, OperationAction, OperationCompletion,
@@ -43,10 +44,25 @@ pub struct DenoMcpExecutorConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct DenoGenUiMcpExecutorConfig {
+    pub executable: PathBuf,
+    pub executable_sha256: String,
+    pub runtime_version: String,
+    pub compiler_script: PathBuf,
+    pub compiler_script_sha256: String,
+    pub compiler_wasm: PathBuf,
+    pub compiler_wasm_sha256: String,
+    pub compiler_version: String,
+    pub cache_directory: PathBuf,
+    pub scratch_directory: PathBuf,
+}
+
+#[derive(Clone, Debug)]
 pub struct McpStdioConfig {
     socket: PathBuf,
     task_id: Option<TaskId>,
     deno_lsp: Option<DenoMcpExecutorConfig>,
+    deno_genui: Option<DenoGenUiMcpExecutorConfig>,
 }
 
 impl McpStdioConfig {
@@ -61,6 +77,7 @@ impl McpStdioConfig {
             socket,
             task_id: None,
             deno_lsp: None,
+            deno_genui: None,
         })
     }
 
@@ -81,6 +98,30 @@ impl McpStdioConfig {
             return Err(McpGatewayError::InvalidDenoManifest);
         }
         self.deno_lsp = Some(config);
+        Ok(self)
+    }
+
+    pub fn with_deno_genui(
+        mut self,
+        config: DenoGenUiMcpExecutorConfig,
+    ) -> Result<Self, McpGatewayError> {
+        if !config.executable.is_absolute()
+            || !config.compiler_script.is_absolute()
+            || !config.compiler_wasm.is_absolute()
+            || !config.cache_directory.is_absolute()
+            || !config.scratch_directory.is_absolute()
+        {
+            return Err(McpGatewayError::DenoPathsMustBeAbsolute);
+        }
+        if config.runtime_version.is_empty()
+            || config.compiler_version.is_empty()
+            || !is_sha256(&config.executable_sha256)
+            || !is_sha256(&config.compiler_script_sha256)
+            || !is_sha256(&config.compiler_wasm_sha256)
+        {
+            return Err(McpGatewayError::InvalidDenoManifest);
+        }
+        self.deno_genui = Some(config);
         Ok(self)
     }
 }
@@ -135,6 +176,8 @@ struct McpGateway<'a, W> {
     server: McpAgentServer,
     deno_lsp_config: Option<DenoMcpExecutorConfig>,
     deno_lsp: Option<DenoLspExecutor>,
+    deno_genui_config: Option<DenoGenUiMcpExecutorConfig>,
+    deno_genui: Option<DenoGenUiExecutor>,
     task_id: Option<TaskId>,
     pending: HashMap<OperationId, PendingAuthorityCall>,
 }
@@ -145,12 +188,17 @@ impl<'a, W: Write> McpGateway<'a, W> {
         if config.deno_lsp.is_some() {
             tools.push(McpToolClass::DenoLspQuery);
         }
+        if config.deno_genui.is_some() {
+            tools.push(McpToolClass::GenUiCompile);
+        }
         Self {
             socket: config.socket,
             output,
             server: McpAgentServer::with_tools(Uuid::new_v4(), tools),
             deno_lsp_config: config.deno_lsp,
             deno_lsp: None,
+            deno_genui_config: config.deno_genui,
+            deno_genui: None,
             task_id: config.task_id,
             pending: HashMap::new(),
         }
@@ -452,7 +500,30 @@ impl<'a, W: Write> McpGateway<'a, W> {
                     Err(error) => tool_failure(format!("Deno LSP query failed: {error}")),
                 }
             }
-            McpToolClass::GenUiCompile => tool_failure("GenUI compiler executor is not configured"),
+            McpToolClass::GenUiCompile => {
+                if self.deno_genui.is_none() {
+                    let Some(config) = self.deno_genui_config.take() else {
+                        return tool_failure("GenUI compiler executor is not configured");
+                    };
+                    match DenoGenUiExecutor::launch(config) {
+                        Ok(executor) => self.deno_genui = Some(executor),
+                        Err(error) => {
+                            return tool_failure(format!(
+                                "GenUI compiler could not start: {error}"
+                            ));
+                        }
+                    }
+                }
+                match self
+                    .deno_genui
+                    .as_mut()
+                    .expect("executor was initialized")
+                    .compile(&call.arguments)
+                {
+                    Ok(result) => result,
+                    Err(error) => tool_failure(format!("GenUI compile failed: {error}")),
+                }
+            }
         }
     }
 }
@@ -499,6 +570,90 @@ struct DenoLspExecutor {
     client: DenoLspClient,
     workspace_snapshot: PathBuf,
     opened_documents: HashMap<PathBuf, i32>,
+}
+
+struct DenoGenUiExecutor {
+    compiler: DenoGenUiCompiler,
+    next_source_revision: u64,
+}
+
+impl DenoGenUiExecutor {
+    fn launch(config: DenoGenUiMcpExecutorConfig) -> Result<Self, String> {
+        let compiler = DenoGenUiCompiler::launch(
+            DenoGenUiConfig {
+                executable: config.executable,
+                executable_sha256: config.executable_sha256,
+                runtime_version: config.runtime_version,
+                compiler_script: config.compiler_script,
+                compiler_script_sha256: config.compiler_script_sha256,
+                compiler_wasm: config.compiler_wasm,
+                compiler_wasm_sha256: config.compiler_wasm_sha256,
+                compiler_version: config.compiler_version,
+                cache_directory: config.cache_directory,
+                scratch_directory: config.scratch_directory,
+            },
+            Duration::from_secs(10),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            compiler,
+            next_source_revision: 1,
+        })
+    }
+
+    fn compile(&mut self, arguments: &Value) -> Result<McpToolResult, String> {
+        let source = arguments["source"]
+            .as_str()
+            .ok_or_else(|| "source is missing".to_owned())?;
+        let entrypoint = normalize_genui_entry(arguments.get("entry").and_then(Value::as_str))?;
+        let source_revision = self.next_source_revision;
+        self.next_source_revision = self
+            .next_source_revision
+            .checked_add(1)
+            .ok_or_else(|| "GenUI source revision exhausted".to_owned())?;
+        let candidate = self
+            .compiler
+            .compile(
+                GenUiCompileRequest {
+                    source_revision,
+                    entrypoint: entrypoint.clone(),
+                    files: BTreeMap::from([(entrypoint, source.to_owned())]),
+                },
+                Duration::from_secs(15),
+            )
+            .map_err(|error| error.to_string())?;
+        let structured = serde_json::to_value(&candidate).map_err(|error| error.to_string())?;
+        Ok(McpToolResult::success(
+            format!(
+                "Compiled GenUI revision {} with {} {} (artifact {}).",
+                candidate.source_revision,
+                candidate.compiler.name,
+                candidate.compiler.version,
+                candidate.content_digest
+            ),
+            Some(structured),
+        ))
+    }
+}
+
+fn normalize_genui_entry(entry: Option<&str>) -> Result<String, String> {
+    let entry = entry
+        .filter(|value| !value.is_empty())
+        .unwrap_or("/App.tsx");
+    let entry = if entry.starts_with('/') {
+        entry.to_owned()
+    } else {
+        format!("/{entry}")
+    };
+    if entry.contains('\\')
+        || entry.contains("..")
+        || ![".tsx", ".ts", ".jsx", ".js"]
+            .iter()
+            .any(|extension| entry.ends_with(extension))
+    {
+        return Err("entry must be a bounded virtual TS/JS module path".into());
+    }
+    Ok(entry)
 }
 
 impl DenoLspExecutor {
@@ -860,5 +1015,16 @@ mod tests {
             McpStdioConfig::new(PathBuf::from("/tmp/hyperd.sock"), false),
             Err(McpGatewayError::AgentModeRequired)
         ));
+    }
+
+    #[test]
+    fn genui_entry_is_normalized_to_a_bounded_virtual_module() {
+        assert_eq!(normalize_genui_entry(None).unwrap(), "/App.tsx");
+        assert_eq!(
+            normalize_genui_entry(Some("Panel.tsx")).unwrap(),
+            "/Panel.tsx"
+        );
+        assert!(normalize_genui_entry(Some("../secret.ts")).is_err());
+        assert!(normalize_genui_entry(Some("App.txt")).is_err());
     }
 }
