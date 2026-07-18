@@ -1,0 +1,88 @@
+<!-- Hyper Term product shell. This native view is trusted application code.
+     Agent-authored content enters later as versioned Block data, never markup. -->
+<column background="background">
+  <row gap="8" padding="10" height="{titlebar_height}" cross="center" background="surface" window-drag="true" label="Session bar">
+    <spacer width="{chrome_leading}" />
+    <row gap="7" cross="center" grow="1">
+      <icon name="terminal" width="15" height="15" foreground="accent" />
+      <text><span weight="medium">Hyper Term</span></text>
+      <separator height="16" />
+      <tabs gap="2" label="Open sessions">
+        <button size="sm" variant="ghost" selected="true" icon="terminal" label="{sessionA11yLabel}">{sessionTitle}</button>
+      </tabs>
+    </row>
+    <badge variant="secondary">{modeLabel}</badge>
+    <stack>
+      <button size="sm" variant="outline" icon="plus" on-press="new_session" label="New session">New</button>
+      <if test="{new_session_open}">
+        <dropdown-menu anchor="below" anchor-alignment="end" on-dismiss="dismiss_new_session" label="New session choices">
+          <menu-item icon="terminal" on-press="choose_terminal">Terminal · zsh</menu-item>
+          <menu-item icon="circle-dot" on-press="choose_agent">Agent · ACP / MCP</menu-item>
+        </dropdown-menu>
+      </if>
+    </stack>
+    <spacer width="{chrome_trailing}" />
+  </row>
+  <separator />
+
+  <if test="{isTerminal}">
+    <column grow="1" background="background" label="Terminal session">
+      <scroll grow="1" overscroll="none" label="Terminal transcript">
+        <column gap="5" padding="16">
+          <text foreground="text_muted"><span mono="true">Last login: Fri Jul 18 on ttys001</span></text>
+          <text><span mono="true" foreground="accent">phodal@mac</span> <span mono="true" foreground="text_muted">~/ai/hyper-term</span> <span mono="true">%</span></text>
+          <text foreground="text_muted"><span mono="true"># Native terminal surface will attach to the ordered Rust PTY plane.</span></text>
+          <text><span mono="true" foreground="accent">phodal@mac</span> <span mono="true" foreground="text_muted">~/ai/hyper-term</span> <span mono="true">%</span> <span mono="true" foreground="accent">_</span></text>
+        </column>
+      </scroll>
+      <status-bar>zsh · hyperd disconnected · native renderer prototype</status-bar>
+    </column>
+  </if>
+  <else>
+    <split value="{agent_split}" on-resize="agent_split_resized" resize-duration="120" resize-easing="standard" grow="1">
+      <column min-width="400" background="background" label="Agent terminal">
+        <row gap="8" padding="8" cross="center" background="surface_subtle">
+          <badge variant="secondary">zsh</badge>
+          <text grow="1" foreground="text_muted">Terminal</text>
+          <badge variant="destructive">offline</badge>
+        </row>
+        <scroll grow="1" overscroll="none" label="Agent terminal transcript">
+          <column gap="5" padding="16">
+            <text><span mono="true" foreground="accent">phodal@mac</span> <span mono="true" foreground="text_muted">~/ai/hyper-term</span> <span mono="true">% codex</span></text>
+            <text foreground="text_muted"><span mono="true">Waiting for the brokered ACP driver and Rust PTY stream…</span></text>
+            <text><span mono="true" foreground="accent">_</span></text>
+          </column>
+        </scroll>
+        <status-bar>terminal plane · ordered · reconnectable</status-bar>
+      </column>
+
+      <column min-width="300" background="surface" label="Agent workspace">
+        <row gap="8" padding="10" cross="center">
+          <icon name="circle-dot" width="14" height="14" foreground="accent" />
+          <text grow="1"><span weight="medium">Agent</span></text>
+          <badge variant="secondary">ACP</badge>
+        </row>
+        <separator />
+        <scroll grow="1" label="Agent blocks">
+          <column gap="10" padding="12">
+            <card>
+              <column gap="8" padding="12">
+                <row gap="8" cross="center">
+                  <icon name="info" width="14" height="14" foreground="info" />
+                  <text><span weight="medium">Native Block surface</span></text>
+                </row>
+                <text wrap="true" foreground="text_muted">Messages, plans, tools, approvals, diffs, Computer Use evidence, and generated UI will render here from the Rust BlockDocument.</text>
+              </column>
+            </card>
+            <timeline gap="4" label="Agent plan">
+              <timeline-item title="Connect hyperd" description="Authenticate the local control and terminal planes." meta="pending" variant="secondary" />
+              <timeline-item title="Start ACP session" description="Launch Codex or Claude through the permission broker." meta="pending" variant="secondary" />
+              <timeline-item title="Mount Agentic UI" description="Lease a bounded WebView Block only when requested." meta="pending" variant="secondary" connector="false" />
+            </timeline>
+          </column>
+        </scroll>
+        <status-bar>agent runtime disconnected · no command executed</status-bar>
+      </column>
+    </split>
+  </else>
+</column>

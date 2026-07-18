@@ -1,0 +1,53 @@
+.{
+    .id = "dev.hyperterm.desktop",
+    .name = "hyper-term",
+    .display_name = "Hyper Term",
+    .description = "A terminal-first native shell for brokered AI workflows.",
+    .version = "0.1.0",
+    .icons = .{"assets/icon.png"},
+    .platforms = .{"macos"},
+    .permissions = .{ "view", "command" },
+    .capabilities = .{ "native_views", "gpu_surfaces", "menus", "shortcuts" },
+    .shortcuts = .{
+        .{ .id = "hyper-term.new-session", .key = "n", .modifiers = .{"primary"} },
+        .{ .id = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
+        .{ .id = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },
+    },
+    .menus = .{
+        .{
+            .title = "Shell",
+            .items = .{
+                .{ .label = "New Session…", .command = "hyper-term.new-session", .key = "n", .modifiers = .{"primary"} },
+                .{ .separator = true },
+                .{ .label = "New Terminal", .command = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
+                .{ .label = "New Agent Session", .command = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },
+            },
+        },
+    },
+    .shell = .{
+        .windows = .{
+            .{
+                .label = "main",
+                .title = "Hyper Term",
+                .width = 1180,
+                .height = 760,
+                .min_width = 840,
+                .min_height = 520,
+                .restore_state = true,
+                .restore_policy = "clamp_to_visible_screen",
+                .titlebar = "hidden_inset_tall",
+                .views = .{
+                    .{ .label = "hyper-term-canvas", .kind = "gpu_surface", .fill = true, .role = "Hyper Term canvas", .accessibility_label = "Hyper Term", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                },
+            },
+        },
+    },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{"zero://app"},
+            .external_links = .{ .action = "deny" },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+}
