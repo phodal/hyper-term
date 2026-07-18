@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-18
-- Amended: 2026-07-19 (explicit Terminal and Agent tab actions)
+- Amended: 2026-07-19 (explicit tabs and isolated Agentic UI pane)
 - Supersedes the product-shell decision in:
   [ADR 0012](0012-native-sdk-renderer-spike.md)
 - Depends on: [ADR 0002](0002-runtime-authority-boundaries.md),
@@ -108,6 +108,24 @@ surface. Native SDK maturity, cross-platform CPU rendering, packaging, signing,
 and update support remain release risks. The replacement gates and benchmark
 matrix in ADR 0012 still apply; acceptance of this ADR chooses the direction,
 not an exemption from those gates.
+
+## Implementation evidence (2026-07-19)
+
+The macOS shell now starts in one selected `zsh 1` tab and exposes separate
+`New Terminal tab` and `New Agent tab` actions. Every tab has a close button and
+context-menu action. The Native menu and shortcut table bind primary-W to the
+same `hyper-term.close-session` command. Native automation created a real Agent
+tab, observed the terminal-plus-Agent workspace, invoked that shortcut, and
+proved the Agent tab and workspace were removed while `zsh 1` became selected.
+
+Agent mode also owns a second system WebView for the current accepted Agentic UI
+artifact. The compositor derives its URL from a validated isolated Artifact
+Block, uses the artifact source revision as a reload token, and collapses it to
+1-by-1 when inactive or absent. Native strict checks, 20 renderer tests,
+minimum-window and text-expansion layout sweeps, semantic snapshots, and a Metal
+canvas screenshot pass. Native automation cannot capture a child system
+WebView, so authenticated HTTP tests and browser verification separately prove
+the compiled React preview capsule.
 
 ## Rejected alternatives
 

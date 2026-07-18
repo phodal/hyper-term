@@ -295,6 +295,23 @@ The cost is another versioned schema, adapter fixtures, patch protocol, renderer
 registry, and resource store. Native and WebView renderers must pass semantic
 equivalence tests even when their pixels differ.
 
+## Implementation evidence (2026-07-19)
+
+Block schema version 2 adds the first real `ArtifactBlock` projection. The Block
+contains the accepted ID, source revision, entrypoint, compiler identity, and
+content digest; bundle, CSS, and source-map bytes remain in the Rust-owned
+resource store. One stable task-derived block ID is upserted for each accepted
+revision, so a candidate or compiler failure cannot displace the prior block.
+
+The Native adapter accepts only the `artifact` kind with
+`trust_class=isolated_artifact` and validated metadata. It converts the current
+Agent session's Block into an authenticated local preview URL and leases a
+dedicated system WebView aligned to the Agentic UI slot. Inactive terminal and
+artifact WebViews collapse to a 1-by-1 inline surface. Projection tests, the
+authenticated HTTP fixture, browser capsule verification, and Native semantic
+automation cover this initial route; pooled multi-block eviction and stale
+renderer-lease tests remain open.
+
 ## Validation gates
 
 - Golden ACP fixtures for every negotiated version produce the same canonical

@@ -112,6 +112,34 @@ new registry component or an explicit elevated artifact profile.
 - **Allow arbitrary remote modules during compile or render.** The same source
   revision could produce different behavior and bypass dependency approval.
 
+## Implementation evidence (2026-07-19)
+
+Protocol version 5 and Block schema version 2 carry an `ArtifactAccepted` event
+and an `isolated_artifact` Block containing accepted metadata only. The daemon
+accepts a `GenUiArtifactCandidate` only for the exact revision of a dispatching
+`hyper_term.genui.compile` operation. It revalidates bounded fields and digests,
+writes bundle, CSS, and source map to an atomic private `0600` file, and verifies
+every journal-referenced artifact again when reopening its state directory.
+
+The projector keeps one stable artifact Block per task. A newer accepted event
+revises that Block; an invalid candidate emits no accepted event and leaves the
+last-known-good artifact and file intact. Integration tests cover acceptance,
+rejection, restart validation, and projection after reopen.
+
+The Agent gateway exposes task-bound preview and source-map endpoints only after
+session authentication. It refuses stale artifact IDs, sends `no-store`, and
+serves the preview capsule with a CSP whose `connect-src` is `none`. The Native
+SDK compositor maps only a validated `isolated_artifact` Block into its dedicated
+WebView pane; the pane has no native bridge. A browser run of the same compiled
+capsule rendered an interactive React artifact without framework or console
+errors, while a Native automation run proved Terminal/Agent tab switching and
+the bounded pane layout.
+
+This closes the first accepted-artifact and last-known-good delivery slice. It
+does not yet close the complete hostile-artifact matrix, runtime error to exact
+source navigation, action/trace protocol, resource budgets, or accessibility
+gates below.
+
 ## Validation gates
 
 - Attempt native API, network, popup, clipboard, cross-origin, and oversized

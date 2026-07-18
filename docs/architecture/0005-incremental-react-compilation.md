@@ -164,7 +164,15 @@ path. Deno is the approved cold-path verifier exposed through MCP; Rust checks
 the request/response revision, compiler identity, output bounds, and digest
 before the result becomes a receipt.
 
-This proves backend parity on a real single-file React compile. Incremental
-slice invalidation, stale cancellation, last-known-good acceptance in the Rust
-artifact store, source-mapped runtime navigation, and the stated p95 benchmarks
+The cold-path receipt now remains provisional until the daemon accepts the
+candidate for the exact dispatching operation. The Rust artifact store and
+Block projector preserve one last-known-good accepted artifact across a rejected
+candidate and daemon restart. An authenticated preview shell renders only that
+current artifact, while source-map bytes remain behind a separate task-bound
+endpoint.
+
+This proves backend parity on a real single-file React compile and closes the
+first last-known-good acceptance/delivery slice. Incremental declaration-slice
+invalidation, stale cancellation across concurrent compiles, source-mapped
+runtime navigation, hostile-runtime recovery, and the stated p95 benchmarks
 remain open gates.

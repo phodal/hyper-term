@@ -125,6 +125,13 @@ returned artifact digest. The packaged macOS app carries and signs all three
 runtime files; a signed-bundle probe compiles successfully with network, write,
 run, FFI, and workspace access absent.
 
+The compiler response remains a candidate. The MCP gateway must submit it to a
+separate daemon control request bound to the exact authorized operation and
+revision. Rust accepts only a dispatching `hyper_term.genui.compile` operation,
+persists the bounded candidate atomically with private permissions, and appends
+only accepted metadata to the journal. A rejected candidate cannot replace the
+previous artifact or acquire a renderer URL.
+
 This closes the basic distribution, framing, and least-Deno-permission spike.
 It does not close this ADR's OS-containment, kill/hang recovery, resource-limit,
 or cross-platform rollback gates. Those remain milestone gates rather than
