@@ -15,6 +15,7 @@ rust-version = "1.95"
 version = "0.1.0"
 
 [workspace.dependencies]
+agent-client-protocol = "1.2.0"
 anyhow = "1.0"
 axum = { version = "0.8.9", features = ["ws"] }
 crossbeam-channel = "0.5.15"

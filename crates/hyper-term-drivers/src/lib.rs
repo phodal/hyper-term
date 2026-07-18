@@ -1,5 +1,6 @@
 //! Rust-owned supervision and bounded transports for external tooling.
 
+mod acp;
 mod agent;
 mod codec;
 mod codex;
@@ -9,6 +10,7 @@ mod deno_lsp;
 mod mcp;
 mod process;
 
+pub use acp::*;
 pub use agent::*;
 pub use codec::*;
 pub use codex::*;

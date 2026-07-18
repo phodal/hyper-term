@@ -73,6 +73,12 @@ pub enum AgentDriverEvent {
         turn_id: String,
         text: String,
     },
+    ThoughtDelta {
+        sequence: u64,
+        thread_id: String,
+        turn_id: String,
+        text: String,
+    },
     EffectProposed {
         sequence: u64,
         proposal: AgentEffectProposal,
