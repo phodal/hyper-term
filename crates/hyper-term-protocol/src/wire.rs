@@ -4,14 +4,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    BlockDocument, BlockPatch, ClientId, EventEnvelope, InputLeaseId, OperationAction,
-    OperationCompletion, OperationId, OperationKind, OperationState, PROTOCOL_VERSION,
-    PermissionDecision, RequestId, RiskClass, TaskId, TerminalId, TerminalSize,
+    AcceptedGenUiArtifact, BlockDocument, BlockPatch, ClientId, EventEnvelope,
+    GenUiArtifactCandidate, InputLeaseId, OperationAction, OperationCompletion, OperationId,
+    OperationKind, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass,
+    TaskId, TerminalId, TerminalSize,
 };
 
 const MAGIC: [u8; 4] = *b"HTRM";
 const HEADER_LEN: usize = 12;
-pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_CONTROL_FRAME_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_TERMINAL_FRAME_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +79,12 @@ pub enum ControlRequest {
         expected_revision: u64,
         completion: OperationCompletion,
     },
+    AcceptGenUiArtifact {
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        candidate: GenUiArtifactCandidate,
+    },
     DispatchTerminal {
         task_id: TaskId,
         operation_id: OperationId,
@@ -133,6 +140,9 @@ pub enum ControlResponse {
         operation_id: OperationId,
         revision: u64,
         state: OperationState,
+    },
+    GenUiArtifactAccepted {
+        artifact: AcceptedGenUiArtifact,
     },
     TerminalCreated {
         terminal_id: TerminalId,

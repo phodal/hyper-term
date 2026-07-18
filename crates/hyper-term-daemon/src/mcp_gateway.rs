@@ -16,8 +16,9 @@ use hyper_term_drivers::{
     path_to_file_uri,
 };
 use hyper_term_protocol::{
-    ControlRequest, ControlResponse, DomainEvent, OperationAction, OperationCompletion,
-    OperationId, OperationKind, OperationState, PermissionDecision, RiskClass, TaskId, WireFrame,
+    ControlRequest, ControlResponse, DomainEvent, GenUiArtifactCandidate, OperationAction,
+    OperationCompletion, OperationId, OperationKind, OperationState, PermissionDecision, RiskClass,
+    TaskId, WireFrame,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -359,7 +360,10 @@ impl<'a, W: Write> McpGateway<'a, W> {
                 );
             }
         };
-        let result = self.execute_tool(&call);
+        let mut result = self.execute_tool(&call);
+        if call.class == McpToolClass::GenUiCompile && !result.is_error {
+            result = self.accept_genui_result(task_id, operation_id, dispatching_revision, result);
+        }
         let result_digest = sha256_json(&result)?;
         let succeeded = !result.is_error;
         let completion = OperationCompletion {
@@ -406,6 +410,56 @@ impl<'a, W: Write> McpGateway<'a, W> {
         let response = self.server.complete_tool(&pending.request_id, result)?;
         self.pending.remove(&operation_id);
         self.write_response(&response)
+    }
+
+    fn accept_genui_result(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        dispatching_revision: u64,
+        mut result: McpToolResult,
+    ) -> McpToolResult {
+        let candidate = match result
+            .structured_content
+            .clone()
+            .and_then(|value| serde_json::from_value::<GenUiArtifactCandidate>(value).ok())
+        {
+            Some(candidate) => candidate,
+            None => return tool_failure("GenUI compiler returned an invalid artifact candidate"),
+        };
+        let accepted = match authority_request(
+            &self.socket,
+            ControlRequest::AcceptGenUiArtifact {
+                task_id,
+                operation_id,
+                expected_revision: dispatching_revision,
+                candidate,
+            },
+        ) {
+            Ok(ControlResponse::GenUiArtifactAccepted { artifact }) => artifact,
+            Ok(response) => {
+                return tool_failure(format!(
+                    "permission broker returned an unexpected artifact response: {response:?}"
+                ));
+            }
+            Err(error) => {
+                return tool_failure(format!(
+                    "permission broker rejected the GenUI artifact: {error}"
+                ));
+            }
+        };
+        if let Some(Value::Object(structured)) = result.structured_content.as_mut() {
+            structured.insert(
+                "artifact_id".into(),
+                Value::String(accepted.artifact_id.to_string()),
+            );
+            structured.insert("accepted_by".into(), Value::String("rust_host".into()));
+        }
+        result.text = format!(
+            "Accepted GenUI revision {} as artifact {} ({}).",
+            accepted.source_revision, accepted.artifact_id, accepted.content_digest
+        );
+        result
     }
 
     fn reject_cancelled(&mut self, operation_id: OperationId) -> Result<(), McpGatewayError> {

@@ -16,26 +16,30 @@ use hyper_term_core::{
     TerminalSupervisor, UserShellConfig,
 };
 use hyper_term_protocol::{
-    Actor, BlockDocument, BlockId, CapabilityLease, ClientId, CompiledSandboxProfile,
-    ControlRequest, ControlRequestEnvelope, ControlResponse, ControlResponseEnvelope, DomainEvent,
-    InputLeaseId, MessageRole, NewEvent, OperationAction, OperationCompletion, OperationId,
-    OperationKind, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass,
-    SandboxEnforcement, SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId,
-    SandboxLifetime, SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule,
-    SandboxProcessPolicy, SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame,
-    TerminalId, TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame,
-    read_frame, write_frame,
+    AcceptedGenUiArtifact, Actor, BlockDocument, BlockId, CapabilityLease, ClientId,
+    CompiledSandboxProfile, ControlRequest, ControlRequestEnvelope, ControlResponse,
+    ControlResponseEnvelope, DomainEvent, GenUiArtifactCandidate, InputLeaseId, MessageRole,
+    NewEvent, OperationAction, OperationCompletion, OperationId, OperationKind, OperationState,
+    PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, SandboxEnforcement,
+    SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime,
+    SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy,
+    SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId,
+    TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame, read_frame,
+    write_frame,
 };
 use hyper_term_sandbox::MacOsSeatbeltLauncher;
 use thiserror::Error;
 use uuid::Uuid;
 
 mod agent_gateway;
+mod artifact_store;
 #[cfg(unix)]
 mod client;
 #[cfg(unix)]
 mod mcp_gateway;
 mod web_gateway;
+
+use artifact_store::{ArtifactStore, ArtifactStoreError, StoredGenUiArtifact};
 
 pub use agent_gateway::{
     AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle, AgentGenUiRuntimeConfig,
@@ -75,6 +79,7 @@ struct DaemonInner {
     authorized_sandboxes: Mutex<HashMap<OperationId, AuthorizedSandbox>>,
     sandbox_executions: Mutex<HashMap<TerminalId, SandboxExecutionContext>>,
     state_directory: PathBuf,
+    artifacts: ArtifactStore,
     scratch_root: PathBuf,
 }
 
@@ -139,6 +144,7 @@ impl DaemonState {
     ) -> Result<Self, DaemonError> {
         fs::create_dir_all(state_directory.as_ref())?;
         let state_directory = fs::canonicalize(state_directory.as_ref())?;
+        let artifacts = ArtifactStore::open(&state_directory)?;
         let journal = JsonlJournal::open(state_directory.join("events.jsonl"))?;
         let mut operations = OperationReducer::default();
         let mut projectors = HashMap::new();
@@ -157,6 +163,9 @@ impl DaemonState {
                 .entry(event.task_id)
                 .or_insert_with(|| BlockProjector::new(event.task_id))
                 .apply(event)?;
+            if let DomainEvent::ArtifactAccepted { artifact } = &event.payload {
+                artifacts.read(artifact)?;
+            }
         }
 
         let instance_id = Uuid::new_v4();
@@ -184,6 +193,7 @@ impl DaemonState {
                 authorized_sandboxes: Mutex::new(HashMap::new()),
                 sandbox_executions: Mutex::new(HashMap::new()),
                 state_directory,
+                artifacts,
                 scratch_root,
             }),
         };
@@ -627,6 +637,69 @@ impl DaemonState {
             Actor::System,
             Some(summary),
         )
+    }
+
+    pub fn accept_genui_artifact(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        candidate: GenUiArtifactCandidate,
+    ) -> Result<AcceptedGenUiArtifact, DaemonError> {
+        let record = self.operation(operation_id)?;
+        validate_operation_scope(&record, task_id, expected_revision)?;
+        if record.state != OperationState::Dispatching {
+            return Err(DaemonError::OperationNotDispatching(record.state));
+        }
+        if record.kind != OperationKind::McpTool
+            || !matches!(
+                &record.action,
+                OperationAction::Opaque { kind, .. } if kind == "hyper_term.genui.compile"
+            )
+        {
+            return Err(DaemonError::ArtifactAcceptanceRequiresGenUiCompile);
+        }
+        let accepted = self.inner.artifacts.persist(candidate)?;
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: Some(operation_id),
+            causation_id: None,
+            correlation_id: None,
+            payload: DomainEvent::ArtifactAccepted {
+                artifact: accepted.clone(),
+            },
+        })?;
+        Ok(accepted)
+    }
+
+    pub(crate) fn active_genui_artifact(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<AcceptedGenUiArtifact>, DaemonError> {
+        self.require_task(task_id)?;
+        let authority = lock(&self.inner.authority)?;
+        Ok(authority.journal.all().iter().rev().find_map(|event| {
+            if event.task_id != task_id {
+                return None;
+            }
+            match &event.payload {
+                DomainEvent::ArtifactAccepted { artifact } => Some(artifact.clone()),
+                _ => None,
+            }
+        }))
+    }
+
+    pub(crate) fn read_active_genui_artifact(
+        &self,
+        task_id: TaskId,
+        artifact_id: hyper_term_protocol::ArtifactId,
+    ) -> Result<StoredGenUiArtifact, DaemonError> {
+        let accepted = self
+            .active_genui_artifact(task_id)?
+            .filter(|artifact| artifact.artifact_id == artifact_id)
+            .ok_or(DaemonError::ArtifactNotActive(artifact_id))?;
+        self.inner.artifacts.read(&accepted).map_err(Into::into)
     }
 
     pub fn dispatch_terminal(
@@ -1856,6 +1929,14 @@ mod unix_server {
                     revision: record.revision,
                     state: record.state,
                 }),
+            ControlRequest::AcceptGenUiArtifact {
+                task_id,
+                operation_id,
+                expected_revision,
+                candidate,
+            } => state
+                .accept_genui_artifact(task_id, operation_id, expected_revision, candidate)
+                .map(|artifact| ControlResponse::GenUiArtifactAccepted { artifact }),
             ControlRequest::DispatchTerminal {
                 task_id,
                 operation_id,
@@ -2018,6 +2099,8 @@ pub enum DaemonError {
     SandboxLease(#[from] SandboxLeaseError),
     #[error(transparent)]
     Wire(#[from] WireError),
+    #[error("artifact store rejected the candidate: {0}")]
+    ArtifactStore(String),
     #[error("daemon state lock is poisoned")]
     LockPoisoned,
     #[error("task title must not be empty")]
@@ -2048,6 +2131,10 @@ pub enum DaemonError {
     OperationNotDispatching(OperationState),
     #[error("generic dispatch accepts only opaque operation actions")]
     GenericDispatchRequiresOpaqueAction,
+    #[error("artifact acceptance requires the dispatching hyper_term.genui.compile operation")]
+    ArtifactAcceptanceRequiresGenUiCompile,
+    #[error("artifact {0} is not the task's current accepted artifact")]
+    ArtifactNotActive(hyper_term_protocol::ArtifactId),
     #[error("{label} must contain between 1 and {maximum} bytes")]
     InvalidBoundedText { label: &'static str, maximum: usize },
     #[error("operation result digest must be a lowercase SHA-256 value")]
@@ -2104,7 +2191,10 @@ impl DaemonError {
             Self::OperationNotDispatching(_) => "operation_not_dispatching",
             Self::ActionKindMismatch
             | Self::UnsupportedTerminalAction
-            | Self::GenericDispatchRequiresOpaqueAction => "unsupported_action",
+            | Self::GenericDispatchRequiresOpaqueAction
+            | Self::ArtifactAcceptanceRequiresGenUiCompile => "unsupported_action",
+            Self::ArtifactNotActive(_) => "artifact_not_active",
+            Self::ArtifactStore(_) => "artifact_error",
             Self::SandboxWorkingDirectoryRequired
             | Self::InvalidSandboxWorkingDirectory { .. }
             | Self::WorkspaceInsideDaemonState => "invalid_sandbox_workspace",
@@ -2125,5 +2215,11 @@ impl DaemonError {
             Self::UnsafeSocketPath(_) | Self::SocketInUse(_) => "socket_error",
             _ => "daemon_error",
         }
+    }
+}
+
+impl From<ArtifactStoreError> for DaemonError {
+    fn from(error: ArtifactStoreError) -> Self {
+        Self::ArtifactStore(error.to_string())
     }
 }

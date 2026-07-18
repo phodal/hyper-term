@@ -10,10 +10,11 @@ use hyper_term_core::{TerminalEvent, TerminalReplay};
 use hyper_term_daemon::{DaemonError, DaemonState, spawn_unix_server};
 use hyper_term_protocol::{
     BlockPayload, ClientId, ControlRequest, ControlRequestEnvelope, ControlResponse,
-    OperationAction, OperationCompletion, OperationKind, OperationState, PermissionDecision,
-    RequestId, RiskClass, TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize,
-    WireFrame, read_frame, write_frame,
+    GenUiArtifactCandidate, GenUiCompilerIdentity, OperationAction, OperationCompletion,
+    OperationKind, OperationState, PermissionDecision, RequestId, RiskClass, TerminalCommand,
+    TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame, read_frame, write_frame,
 };
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 #[cfg(target_os = "macos")]
@@ -406,6 +407,134 @@ fn opaque_tool_dispatch_requires_permission_and_records_its_receipt() {
                     } if *operation_id == proposed.operation_id && executor == "hyper-term-mcp"
                 )
             })
+    );
+}
+
+#[test]
+fn only_a_valid_dispatching_genui_compile_replaces_the_last_known_good_artifact() {
+    let directory = tempdir().expect("tempdir");
+    let state_path = directory.path().join("state");
+    let state = DaemonState::open(&state_path).expect("open daemon");
+    let task_id = state.create_task("Agentic UI".into()).unwrap();
+
+    let dispatch = |state: &DaemonState| {
+        let proposed = state
+            .propose_operation(
+                task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.genui.compile".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                "Compile bounded Agentic UI".into(),
+                RiskClass::ReadOnly,
+                vec!["genui_compile".into()],
+            )
+            .unwrap();
+        let authorized = state
+            .decide_permission(
+                task_id,
+                proposed.operation_id,
+                proposed.revision,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap();
+        state
+            .begin_operation(task_id, proposed.operation_id, authorized.revision)
+            .unwrap()
+    };
+    let candidate = |revision, bundle: &str| {
+        let mut digest = Sha256::new();
+        digest.update(bundle.as_bytes());
+        GenUiArtifactCandidate {
+            schema_version: 1,
+            source_revision: revision,
+            entrypoint: "/App.tsx".into(),
+            bundle: bundle.into(),
+            css: String::new(),
+            source_map: "{}".into(),
+            content_digest: digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            compiler: GenUiCompilerIdentity {
+                name: "esbuild-wasm".into(),
+                version: "0.28.1".into(),
+            },
+            diagnostics: Vec::new(),
+        }
+    };
+
+    let first = dispatch(&state);
+    let accepted = state
+        .accept_genui_artifact(
+            task_id,
+            first.operation_id,
+            first.revision,
+            candidate(1, "last-good"),
+        )
+        .unwrap();
+    state
+        .complete_operation(
+            task_id,
+            first.operation_id,
+            first.revision,
+            OperationCompletion {
+                executor: "hyper-term-mcp".into(),
+                succeeded: true,
+                summary: "GenUI artifact accepted".into(),
+                result_digest: Some("b".repeat(64)),
+            },
+        )
+        .unwrap();
+
+    let second = dispatch(&state);
+    let mut invalid = candidate(2, "broken");
+    invalid.content_digest = "0".repeat(64);
+    assert!(matches!(
+        state.accept_genui_artifact(task_id, second.operation_id, second.revision, invalid),
+        Err(DaemonError::ArtifactStore(_))
+    ));
+    state
+        .complete_operation(
+            task_id,
+            second.operation_id,
+            second.revision,
+            OperationCompletion {
+                executor: "hyper-term-mcp".into(),
+                succeeded: false,
+                summary: "GenUI artifact rejected".into(),
+                result_digest: Some("c".repeat(64)),
+            },
+        )
+        .unwrap();
+
+    let snapshot = state.block_snapshot(task_id).unwrap();
+    let artifacts = snapshot
+        .blocks
+        .iter()
+        .filter_map(|block| match &block.payload {
+            BlockPayload::Artifact { artifact } => Some(artifact),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].artifact_id, accepted.artifact_id);
+    assert_eq!(artifacts[0].source_revision, 1);
+    drop(state);
+
+    let reopened = DaemonState::open(&state_path).expect("reopen validates accepted artifact");
+    assert!(
+        reopened
+            .block_snapshot(task_id)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| matches!(
+                &block.payload,
+                BlockPayload::Artifact { artifact } if artifact.artifact_id == accepted.artifact_id
+            ))
     );
 }
 
