@@ -45,6 +45,7 @@ pub struct DenoMcpExecutorConfig {
 #[derive(Clone, Debug)]
 pub struct McpStdioConfig {
     socket: PathBuf,
+    task_id: Option<TaskId>,
     deno_lsp: Option<DenoMcpExecutorConfig>,
 }
 
@@ -58,8 +59,14 @@ impl McpStdioConfig {
         }
         Ok(Self {
             socket,
+            task_id: None,
             deno_lsp: None,
         })
+    }
+
+    pub fn with_task(mut self, task_id: TaskId) -> Self {
+        self.task_id = Some(task_id);
+        self
     }
 
     pub fn with_deno_lsp(mut self, config: DenoMcpExecutorConfig) -> Result<Self, McpGatewayError> {
@@ -144,7 +151,7 @@ impl<'a, W: Write> McpGateway<'a, W> {
             server: McpAgentServer::with_tools(Uuid::new_v4(), tools),
             deno_lsp_config: config.deno_lsp,
             deno_lsp: None,
-            task_id: None,
+            task_id: config.task_id,
             pending: HashMap::new(),
         }
     }

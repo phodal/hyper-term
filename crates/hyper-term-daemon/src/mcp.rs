@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use hyper_term_daemon::{DenoMcpExecutorConfig, McpStdioConfig, run_mcp_stdio};
+use hyper_term_protocol::TaskId;
+use uuid::Uuid;
 
 fn main() {
     if let Err(error) = run() {
@@ -14,9 +16,10 @@ fn run() -> Result<(), String> {
     if options.help {
         println!(
             "Hyper Term brokered MCP connector\n\n\
-             Usage: hyper-term-mcp --agent-mode --socket PATH\n\n\
+             Usage: hyper-term-mcp --agent-mode --socket PATH [--task-id UUID]\n\n\
              Options:\n  --agent-mode   Required capability fence\n  \
              --socket PATH  hyperd Unix control socket\n  \
+             --task-id UUID  Bind tool operations to an existing Agent task\n  \
              --deno PATH    Enable Deno LSP with this pinned executable\n  \
              --deno-sha256 DIGEST  Expected Deno executable digest\n  \
              --workspace-snapshot PATH  Authority-created read snapshot\n  \
@@ -31,6 +34,9 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "--socket is required".to_owned())?;
     let mut config =
         McpStdioConfig::new(socket, options.agent_mode).map_err(|error| error.to_string())?;
+    if let Some(task_id) = options.task_id {
+        config = config.with_task(task_id);
+    }
     let deno_values = [
         options.deno.is_some(),
         options.deno_sha256.is_some(),
@@ -59,6 +65,7 @@ fn run() -> Result<(), String> {
 
 struct Options {
     socket: Option<PathBuf>,
+    task_id: Option<TaskId>,
     agent_mode: bool,
     deno: Option<PathBuf>,
     deno_sha256: Option<String>,
@@ -73,6 +80,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             socket: None,
+            task_id: None,
             agent_mode: false,
             deno: None,
             deno_sha256: None,
@@ -97,6 +105,12 @@ impl Options {
                             .next()
                             .ok_or_else(|| "--socket requires a path".to_owned())?,
                     ));
+                }
+                "--task-id" => {
+                    let value = required(&mut arguments, "--task-id")?;
+                    let value = Uuid::parse_str(&value)
+                        .map_err(|_| "--task-id requires a UUID".to_owned())?;
+                    options.task_id = Some(TaskId::from_uuid(value));
                 }
                 "--agent-mode" => options.agent_mode = true,
                 "--deno" => {
@@ -150,5 +164,19 @@ mod tests {
         .unwrap();
         assert!(options.agent_mode);
         assert_eq!(options.socket, Some(PathBuf::from("/tmp/hyperd.sock")));
+    }
+
+    #[test]
+    fn task_id_is_parsed_as_a_typed_agent_task() {
+        let id = Uuid::new_v4();
+        let options = Options::parse([
+            "--agent-mode".into(),
+            "--socket".into(),
+            "/tmp/hyperd.sock".into(),
+            "--task-id".into(),
+            id.to_string(),
+        ])
+        .unwrap();
+        assert_eq!(options.task_id, Some(TaskId::from_uuid(id)));
     }
 }

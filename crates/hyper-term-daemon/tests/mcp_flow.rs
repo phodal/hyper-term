@@ -22,13 +22,16 @@ fn approved_diff_tool_runs_through_mcp_and_leaves_a_receipt() {
     let socket = directory.path().join("hyperd.sock");
     let state_directory = directory.path().join("state");
     let state = DaemonState::open(&state_directory).unwrap();
+    let agent_task_id = state.create_task("Codex Agent session 1".into()).unwrap();
     let _server = spawn_unix_server(&socket, state.clone()).unwrap();
     let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
     client_io
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
     let gateway_input = gateway_io.try_clone().unwrap();
-    let config = McpStdioConfig::new(socket.canonicalize().unwrap(), true).unwrap();
+    let config = McpStdioConfig::new(socket.canonicalize().unwrap(), true)
+        .unwrap()
+        .with_task(agent_task_id);
     let gateway = thread::spawn(move || run_mcp_stdio(config, gateway_input, &mut gateway_io));
     let mut output = BufReader::new(client_io.try_clone().unwrap());
 
@@ -68,6 +71,7 @@ fn approved_diff_tool_runs_through_mcp_and_leaves_a_receipt() {
     assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
 
     let (task_id, operation_id, waiting_revision) = wait_for_permission(&state_directory);
+    assert_eq!(task_id, agent_task_id);
     let authorized = state
         .decide_permission(
             task_id,

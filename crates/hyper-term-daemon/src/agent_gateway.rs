@@ -345,7 +345,7 @@ async fn decide_permission(
         }
     };
     let result =
-        tokio::task::spawn_blocking(move || runtime.reject_effect(session_id, request)).await;
+        tokio::task::spawn_blocking(move || runtime.decide_effect(session_id, request)).await;
     match result {
         Ok(Ok(response)) => json_response(StatusCode::ACCEPTED, &response),
         Ok(Err(SessionError::NotFound)) => {
@@ -437,7 +437,12 @@ impl AgentGatewayRuntime {
             .state_directory
             .join("agents")
             .join(format!("session-{session_id}"));
-        let brokered_mcp_server = self.mcp_config().transpose()?;
+        let task_id = self
+            .config
+            .daemon
+            .create_task(format!("Codex Agent session {session_id}"))
+            .map_err(|_| StartError::Driver)?;
+        let brokered_mcp_server = self.mcp_config(task_id).transpose()?;
         let client = CodexAppServerClient::launch(CodexAppServerConfig {
             executable,
             executable_sha256,
@@ -454,11 +459,6 @@ impl AgentGatewayRuntime {
             .map_err(|_| StartError::Driver)?;
         let thread_id = client
             .start_thread(INITIALIZE_TIMEOUT)
-            .map_err(|_| StartError::Driver)?;
-        let task_id = self
-            .config
-            .daemon
-            .create_task(format!("Codex Agent session {session_id}"))
             .map_err(|_| StartError::Driver)?;
         let session = Arc::new(AgentSession {
             client: Arc::new(client),
@@ -544,14 +544,16 @@ impl AgentGatewayRuntime {
         })
     }
 
-    fn reject_effect(
+    fn decide_effect(
         &self,
         session_id: u16,
         request: AgentPermissionRequest,
     ) -> Result<AgentTurnResponse, SessionError> {
         if !matches!(
             request.decision,
-            PermissionDecision::RejectOnce | PermissionDecision::Cancelled
+            PermissionDecision::AllowOnce
+                | PermissionDecision::RejectOnce
+                | PermissionDecision::Cancelled
         ) {
             return Err(SessionError::UnsafeApproval);
         }
@@ -560,11 +562,50 @@ impl AgentGatewayRuntime {
             .pending_effect
             .lock()
             .map_err(|_| SessionError::Lock)?;
-        let effect = pending.clone().ok_or(SessionError::NoPendingEffect)?;
-        if effect.operation_id != request.operation_id
-            || effect.operation_revision != request.expected_revision
-        {
-            return Err(SessionError::StalePermission);
+        let effect = pending
+            .as_ref()
+            .filter(|effect| {
+                effect.operation_id == request.operation_id
+                    && effect.operation_revision == request.expected_revision
+            })
+            .cloned();
+        if effect.is_none() {
+            drop(pending);
+            let operation = self
+                .config
+                .daemon
+                .operation(request.operation_id)
+                .map_err(|_| SessionError::NoPendingEffect)?;
+            if operation.task_id != session.task_id
+                || operation.revision != request.expected_revision
+                || operation.state != hyper_term_protocol::OperationState::WaitingHuman
+            {
+                return Err(SessionError::StalePermission);
+            }
+            if request.decision == PermissionDecision::AllowOnce
+                && !allowable_brokered_mcp_operation(&operation)
+            {
+                return Err(SessionError::UnsafeApproval);
+            }
+            self.config
+                .daemon
+                .decide_permission(
+                    session.task_id,
+                    request.operation_id,
+                    request.expected_revision,
+                    request.decision,
+                )
+                .map_err(|_| SessionError::StalePermission)?;
+            let status = session
+                .progress
+                .lock()
+                .map_err(|_| SessionError::Lock)?
+                .status;
+            return Ok(AgentTurnResponse { session_id, status });
+        }
+        let effect = effect.expect("checked pending effect");
+        if request.decision == PermissionDecision::AllowOnce {
+            return Err(SessionError::UnsafeApproval);
         }
         let decided = self
             .config
@@ -630,7 +671,7 @@ impl AgentGatewayRuntime {
             .ok_or(SessionError::NotFound)
     }
 
-    fn mcp_config(&self) -> Option<Result<CodexMcpServerConfig, StartError>> {
+    fn mcp_config(&self, task_id: TaskId) -> Option<Result<CodexMcpServerConfig, StartError>> {
         let executable = match self.config.mcp_executable.as_ref()?.canonicalize() {
             Ok(executable) => executable,
             Err(_) => return Some(Err(StartError::Driver)),
@@ -646,6 +687,8 @@ impl AgentGatewayRuntime {
                 "--agent-mode".into(),
                 "--socket".into(),
                 self.config.control_socket.clone().into_os_string(),
+                "--task-id".into(),
+                task_id.to_string().into(),
             ],
         }))
     }
@@ -668,6 +711,19 @@ impl AgentGatewayRuntime {
             let _ = session.client.close();
         }
     }
+}
+
+fn allowable_brokered_mcp_operation(operation: &hyper_term_core::OperationRecord) -> bool {
+    if operation.kind != OperationKind::McpTool || operation.risk != RiskClass::ReadOnly {
+        return false;
+    }
+    let OperationAction::Opaque { kind, .. } = &operation.action else {
+        return false;
+    };
+    matches!(
+        kind.as_str(),
+        "hyper_term.diff.review" | "hyper_term.lsp.query" | "hyper_term.genui.compile"
+    )
 }
 
 fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
@@ -1166,6 +1222,110 @@ mod tests {
             block["payload"]["role"] == "agent"
                 && block["payload"]["text"] == "The command was rejected."
         }));
+
+        gateway.shutdown().await.expect("shutdown gateway");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_known_read_only_mcp_operations_can_be_allowed_from_agent_chrome() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        let state = temporary.path().join("gateway-state");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).expect("daemon");
+        let fake_codex = temporary.path().join("codex");
+        std::fs::write(
+            &fake_codex,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake-codex\"}}' ;;\n    *'\"method\":\"thread/start\"'*) printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-mcp\"}}}' ;;\n  esac\ndone\n",
+        )
+        .expect("fake Codex");
+        let mut permissions = std::fs::metadata(&fake_codex)
+            .expect("fake Codex metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).expect("fake Codex executable");
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            token: token.clone(),
+            workspace,
+            state_directory: state,
+            daemon: daemon.clone(),
+            codex_executable: Some(fake_codex),
+            codex_auth_file: None,
+            mcp_executable: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .expect("agent gateway");
+
+        let (status, body) = request(gateway.address(), &token, 5, "POST").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let response: serde_json::Value = serde_json::from_slice(&body).expect("start response");
+        let task_id = TaskId::from_uuid(
+            uuid::Uuid::parse_str(response["task_id"].as_str().expect("task id"))
+                .expect("task UUID"),
+        );
+        let mcp = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.diff.review".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                "Build a bounded diff review".into(),
+                RiskClass::ReadOnly,
+                vec!["diff_review".into()],
+            )
+            .expect("MCP proposal");
+        let allow = serde_json::json!({
+            "operation_id": mcp.operation_id,
+            "expected_revision": mcp.revision,
+            "decision": "allow_once"
+        });
+        let (status, _) = request_path(
+            gateway.address(),
+            &format!("/agent/session/permission?token={token}&session_id=5"),
+            "POST",
+            &serde_json::to_vec(&allow).expect("allow decision"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16());
+        assert_eq!(
+            daemon
+                .operation(mcp.operation_id)
+                .expect("MCP operation")
+                .state,
+            hyper_term_protocol::OperationState::Authorized
+        );
+
+        let opaque = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::Other("codex_shell".into()),
+                OperationAction::Opaque {
+                    kind: "item/commandExecution/requestApproval".into(),
+                    payload_digest: "b".repeat(64),
+                },
+                "touch forbidden".into(),
+                RiskClass::ExternalEffect,
+                vec!["shell".into()],
+            )
+            .expect("opaque proposal");
+        let unsafe_allow = serde_json::json!({
+            "operation_id": opaque.operation_id,
+            "expected_revision": opaque.revision,
+            "decision": "allow_once"
+        });
+        let (status, _) = request_path(
+            gateway.address(),
+            &format!("/agent/session/permission?token={token}&session_id=5"),
+            "POST",
+            &serde_json::to_vec(&unsafe_allow).expect("unsafe allow decision"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
 
         gateway.shutdown().await.expect("shutdown gateway");
     }

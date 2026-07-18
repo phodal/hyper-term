@@ -185,6 +185,12 @@ pub const AgentBlockView = struct {
         return block.kind == .approval and block.decision == .none;
     }
 
+    pub fn canAllowOnce(block: *const AgentBlockView) bool {
+        return block.isApprovalPending() and
+            block.risk == .read_only and
+            std.mem.eql(u8, block.operationKindLabel(), "MCP tool");
+    }
+
     pub fn operationId(block: *const AgentBlockView) []const u8 {
         return block.operation_id_storage[0..block.operation_id_len];
     }
@@ -423,6 +429,7 @@ pub const Msg = union(enum) {
     agent_turn_started: native_sdk.EffectResponse,
     agent_snapshot_received: native_sdk.EffectResponse,
     reject_agent_effect: []const u8,
+    allow_agent_effect: []const u8,
     cancel_agent_effect: []const u8,
     agent_permission_decided: native_sdk.EffectResponse,
     agent_poll: native_sdk.EffectTimer,
@@ -470,6 +477,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
         .reject_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "reject_once", fx),
+        .allow_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "allow_once", fx),
         .cancel_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "cancelled", fx),
         .agent_permission_decided => |response| applyAgentPermissionResponse(model, response, fx),
         .agent_poll => |timer| {

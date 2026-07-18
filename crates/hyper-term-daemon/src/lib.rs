@@ -1330,7 +1330,10 @@ impl DaemonState {
         self.operation(operation_id)
     }
 
-    fn operation(&self, operation_id: OperationId) -> Result<OperationRecord, DaemonError> {
+    pub(crate) fn operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<OperationRecord, DaemonError> {
         lock(&self.inner.authority)?
             .operations
             .get(operation_id)
