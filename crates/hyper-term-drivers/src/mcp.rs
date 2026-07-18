@@ -115,6 +115,8 @@ impl McpAgentServer {
             "ping" => Ok(id.map(|id| McpServerAction::Response(rpc_result(id, json!({}))))),
             "tools/list" => self.list_tools(id, message.get("params")),
             "tools/call" => self.call_tool(id, message.get("params")),
+            "resources/list" => self.empty_inventory(id, "resources"),
+            "resources/templates/list" => self.empty_inventory(id, "resourceTemplates"),
             _ => {
                 Ok(id
                     .map(|id| McpServerAction::Response(rpc_error(id, -32601, "method not found"))))
@@ -203,6 +205,25 @@ impl McpAgentServer {
             .remove(request_id)
             .ok_or(McpServerError::UnknownToolCall)?;
         tool_result(&pending.call.request_id, result)
+    }
+
+    pub fn fail_tool(
+        &mut self,
+        request_id: &ExternalRequestId,
+        message: impl Into<String>,
+    ) -> Result<Value, McpServerError> {
+        let pending = self
+            .pending
+            .remove(request_id)
+            .ok_or(McpServerError::UnknownToolCall)?;
+        tool_result(
+            &pending.call.request_id,
+            McpToolResult {
+                text: message.into(),
+                structured_content: None,
+                is_error: true,
+            },
+        )
     }
 
     fn initialize(
@@ -386,6 +407,23 @@ impl McpAgentServer {
             },
         );
         Ok(Some(McpServerAction::ToolProposed(Box::new(call))))
+    }
+
+    fn empty_inventory(
+        &self,
+        id: Option<ExternalRequestId>,
+        field: &'static str,
+    ) -> Result<Option<McpServerAction>, McpServerError> {
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        if self.lifecycle != McpLifecycle::Ready {
+            return Ok(Some(not_ready(id)));
+        }
+        Ok(Some(McpServerAction::Response(rpc_result(
+            id,
+            json!({(field): []}),
+        ))))
     }
 }
 
@@ -866,5 +904,52 @@ mod tests {
             panic!("expected not-ready response");
         };
         assert_eq!(response["error"]["code"], -32002);
+    }
+
+    #[test]
+    fn broker_failure_finishes_a_pending_call_without_authorization() {
+        let mut server = initialized_server();
+        let Some(McpServerAction::ToolProposed(call)) = server
+            .receive(json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "hyper_term.diff.review",
+                    "arguments": {"before": "a", "after": "b"}
+                }
+            }))
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        let response = server
+            .fail_tool(&call.request_id, "permission broker unavailable")
+            .unwrap();
+        assert_eq!(response["id"], 11);
+        assert_eq!(response["result"]["isError"], true);
+        assert!(server.pending_calls().is_empty());
+    }
+
+    #[test]
+    fn codex_inventory_probes_receive_empty_resource_lists() {
+        let mut server = initialized_server();
+        for (id, method, field) in [
+            (20, "resources/list", "resources"),
+            (21, "resources/templates/list", "resourceTemplates"),
+        ] {
+            let Some(McpServerAction::Response(response)) = server
+                .receive(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": {}
+                }))
+                .unwrap()
+            else {
+                panic!("expected resource inventory response");
+            };
+            assert_eq!(response["result"][field], json!([]));
+        }
     }
 }
