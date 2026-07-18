@@ -130,15 +130,18 @@ The Agent gateway exposes task-bound preview and source-map endpoints only after
 session authentication. It refuses stale artifact IDs, sends `no-store`, and
 serves the preview capsule with a CSP whose `connect-src` is `none`. The Native
 SDK compositor maps only a validated `isolated_artifact` Block into its dedicated
-WebView pane; the pane has no native bridge. A browser run of the same compiled
-capsule rendered an interactive React artifact without framework or console
-errors, while a Native automation run proved Terminal/Agent tab switching and
-the bounded pane layout.
+WebView pane; the pane has no native bridge. The current bounded source map is
+injected into the preview capsule, retained outside artifact globals, and used
+to render source-mapped runtime failures inside the isolated WebView itself. A
+browser run of the same compiled capsule rendered an interactive React artifact,
+mapped an intentional failure back to `/App.tsx`, and recovered after editing,
+while a Native automation run proved Terminal/Agent tab switching and the
+bounded pane layout.
 
-This closes the first accepted-artifact and last-known-good delivery slice. It
-does not yet close the complete hostile-artifact matrix, runtime error to exact
-source navigation, action/trace protocol, resource budgets, or accessibility
-gates below.
+This closes the first accepted-artifact, last-known-good delivery, and initial
+runtime-error mapping slices. It does not yet close the complete hostile-artifact
+matrix, multi-file editor navigation, action/trace protocol, resource budgets,
+or accessibility gates below.
 
 ## Validation gates
 

@@ -274,8 +274,11 @@ approved MCP GenUI operation
 Bundle, CSS, and source-map bytes stay in the private content store rather than
 the journal or Block control plane. The Agent gateway serves only the current
 artifact for the authenticated session's task; a stale artifact ID returns 404.
-The preview response uses a network-closed CSP, and the source map has a separate
-authenticated endpoint for future exact-revision debugging.
+The preview response uses a network-closed CSP. Rust injects the current bounded
+source map into the authenticated preview capsule, which maps runtime failures
+to their virtual source and renders a local diagnostic overlay without opening
+a Native SDK bridge. The same map remains available through a separate
+authenticated endpoint for the trusted editor.
 
 The Rust `hyper-term-drivers` crate launches the same pinned Deno executable
 with a cleared environment, dedicated cache and scratch roots, bounded framing,

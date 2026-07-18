@@ -12,12 +12,19 @@ for (const path of required) {
     bytes: bytes.byteLength,
     sha256: toHex(await crypto.subtle.digest("SHA-256", bytes)),
   });
+  const text = path === "genui/preview.html"
+    ? new TextDecoder().decode(bytes)
+    : "";
+  const previewContracts = [
+    "HYPER_TERM_ARTIFACT_BOOTSTRAP",
+    "hyper_term_preview_boot",
+    "hyper_term_preview_error",
+    "source_map",
+    'id="runtime-error"',
+  ];
   if (
     path === "genui/preview.html" &&
-    (!new TextDecoder().decode(bytes).includes(
-      "HYPER_TERM_ARTIFACT_BOOTSTRAP",
-    ) ||
-      !new TextDecoder().decode(bytes).includes("hyper_term_preview_boot"))
+    previewContracts.some((contract) => !text.includes(contract))
   ) {
     throw new Error(
       "runtime preview capsule is missing its bootstrap contract",

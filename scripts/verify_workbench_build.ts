@@ -40,6 +40,7 @@ const previewContracts = [
   "hyper_term_preview_error",
   "generated_line",
   "source_revision",
+  'id="runtime-error"',
 ];
 if (
   previewContracts.some((contract) => !previewDocument.includes(contract)) ||

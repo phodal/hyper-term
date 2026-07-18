@@ -935,6 +935,7 @@ fn render_preview_document(
         content_digest: &'a str,
         bundle: &'a str,
         css: &'a str,
+        source_map: &'a str,
     }
     let bootstrap = BootstrapArtifact {
         artifact_id: artifact.metadata.artifact_id.to_string(),
@@ -942,6 +943,7 @@ fn render_preview_document(
         content_digest: &artifact.metadata.content_digest,
         bundle: &artifact.bundle,
         css: &artifact.css,
+        source_map: &artifact.source_map,
     };
     let json = serde_json::to_string(&bootstrap)?
         .replace('<', "\\u003c")
@@ -1277,6 +1279,7 @@ mod tests {
         assert!(document.contains("\\u003c/script\\u003e\\u003cscript\\u003ebad()"));
         assert!(document.contains(&artifact_id.to_string()));
         assert!(document.contains("hyper_term_preview_boot"));
+        assert!(document.contains("\"source_map\":\"{}\""));
         assert!(!document.contains(ARTIFACT_BOOTSTRAP_MARKER));
     }
 

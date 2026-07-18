@@ -8,6 +8,10 @@ import {
   MAX_RUNTIME_ERROR_MESSAGE_BYTES,
   MAX_RUNTIME_ERROR_STACK_BYTES,
 } from "./runtime-error.ts";
+import {
+  mapPreviewRuntimeError,
+  MAX_RUNTIME_SOURCE_MAP_BYTES,
+} from "../src/genui/runtime-diagnostic.ts";
 
 interface RenderArtifactMessage {
   type: "hyper_term_render_artifact";
@@ -19,6 +23,7 @@ interface RenderArtifactMessage {
     content_digest: string;
     bundle: string;
     css: string;
+    source_map: string;
   };
 }
 
@@ -34,16 +39,22 @@ declare global {
 
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 const channelToken = location.hash.slice(1);
-const rootElement = document.getElementById("root");
-if (!rootElement) throw new Error("isolated preview is missing #root");
+const rootElement = requiredElement("root");
+const runtimeErrorElement = requiredElement("runtime-error");
 let root: Root | undefined;
 let currentModule: string | undefined;
 let activeArtifact:
   | Pick<
     RenderArtifactMessage["artifact"],
-    "artifact_id" | "source_revision"
+    "artifact_id" | "source_revision" | "source_map"
   >
   | undefined;
+
+function requiredElement(id: string): HTMLElement {
+  const element = document.getElementById(id);
+  if (!element) throw new Error(`isolated preview is missing #${id}`);
+  return element;
+}
 
 globalThis.__HYPER_REACT__ = React;
 globalThis.__HYPER_JSX_RUNTIME__ = JsxRuntime;
@@ -83,14 +94,19 @@ if (globalThis.__HYPER_BOOTSTRAP_ARTIFACT__) {
 
 async function render(message: RenderArtifactMessage): Promise<void> {
   const { artifact } = message;
+  clearRuntimeError();
   activeArtifact = {
     artifact_id: artifact.artifact_id,
     source_revision: artifact.source_revision,
+    source_map: artifact.source_map,
   };
   if (
     new TextEncoder().encode(artifact.bundle + artifact.css).byteLength >
-      MAX_ARTIFACT_BYTES
+      MAX_ARTIFACT_BYTES ||
+    new TextEncoder().encode(artifact.source_map).byteLength >
+      MAX_RUNTIME_SOURCE_MAP_BYTES
   ) {
+    showRuntimeError("accepted artifact exceeds preview bound");
     report("hyper_term_preview_error", {
       artifact_id: artifact.artifact_id,
       source_revision: artifact.source_revision,
@@ -101,6 +117,7 @@ async function render(message: RenderArtifactMessage): Promise<void> {
   if (
     await sha256(artifact.bundle + artifact.css) !== artifact.content_digest
   ) {
+    showRuntimeError("accepted artifact digest changed in transit");
     report("hyper_term_preview_error", {
       artifact_id: artifact.artifact_id,
       source_revision: artifact.source_revision,
@@ -144,14 +161,32 @@ function reportRuntimeError(
     ? boundedRuntimeText(stackValue, MAX_RUNTIME_ERROR_STACK_BYTES)
     : undefined;
   const generated = stack ? generatedPositionFromStack(stack) : undefined;
-  report("hyper_term_preview_error", {
-    ...artifact,
+  const diagnostic = mapPreviewRuntimeError({
     message,
-    ...(stack ? { stack } : {}),
+    stack,
+    generated_line: generated?.line,
+    generated_column: generated?.column,
+  }, artifact.source_map);
+  showRuntimeError(
+    diagnostic.message,
+    diagnostic.original ?? diagnostic.generated,
+  );
+  report("hyper_term_preview_error", {
+    artifact_id: artifact.artifact_id,
+    source_revision: artifact.source_revision,
+    message: diagnostic.message,
+    ...(diagnostic.stack ? { stack: diagnostic.stack } : {}),
     ...(generated
       ? {
         generated_line: generated.line,
         generated_column: generated.column,
+      }
+      : {}),
+    ...(diagnostic.original
+      ? {
+        original_file: diagnostic.original.file,
+        original_line: diagnostic.original.line,
+        original_column: diagnostic.original.column,
       }
       : {}),
   });
@@ -175,7 +210,8 @@ function isRenderMessage(value: unknown): value is RenderArtifactMessage {
     message.channel_token === channelToken &&
     typeof message.artifact?.artifact_id === "string" &&
     typeof message.artifact.bundle === "string" &&
-    typeof message.artifact.css === "string";
+    typeof message.artifact.css === "string" &&
+    typeof message.artifact.source_map === "string";
 }
 
 function report(type: string, detail: Record<string, unknown> = {}): void {
@@ -183,4 +219,23 @@ function report(type: string, detail: Record<string, unknown> = {}): void {
     { type, schema_version: 1, channel_token: channelToken, ...detail },
     "*",
   );
+}
+
+function clearRuntimeError(): void {
+  runtimeErrorElement.hidden = true;
+  runtimeErrorElement.textContent = "";
+}
+
+function showRuntimeError(
+  message: string,
+  location?: { file?: string; line: number; column: number },
+): void {
+  const locationText = location
+    ? `${
+      location.file ?? "generated bundle"
+    }:${location.line}:${location.column}`
+    : "location unavailable";
+  runtimeErrorElement.textContent =
+    `Runtime error\n${locationText}\n${message}`;
+  runtimeErrorElement.hidden = false;
 }

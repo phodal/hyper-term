@@ -158,6 +158,7 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
         content_digest: accepted.content_digest,
         bundle: accepted.bundle,
         css: accepted.css,
+        source_map: accepted.source_map,
       },
     }, "*");
   }, [accepted, previewBoot, previewChannel]);
