@@ -20,6 +20,8 @@
     "@codemirror/merge": "npm:@codemirror/merge@6.12.2",
     "@codemirror/state": "npm:@codemirror/state@6.7.1",
     "@codemirror/view": "npm:@codemirror/view@6.43.6",
+    "@xterm/addon-fit": "npm:@xterm/addon-fit@0.11.0",
+    "@xterm/xterm": "npm:@xterm/xterm@6.0.0",
     "codemirror": "npm:codemirror@6.0.2",
     "esbuild-wasm": "npm:esbuild-wasm@0.28.1",
     "react": "npm:react@19.2.7",
@@ -28,12 +30,15 @@
     "react/jsx-runtime": "npm:react@19.2.7/jsx-runtime"
   },
   "tasks": {
-    "check": "deno fmt --check apps scripts deno.json runtime/deno-manifest.json && deno lint apps scripts && deno check apps/workbench/src/main.tsx apps/workbench/src/genui/compiler.worker.ts apps/workbench/genui/preview-shell.ts scripts/*.ts",
+    "check": "deno fmt --check apps scripts deno.json runtime/deno-manifest.json && deno lint apps scripts && deno check apps/terminal/src/main.ts apps/workbench/src/main.tsx apps/workbench/src/genui/compiler.worker.ts apps/workbench/genui/preview-shell.ts scripts/*.ts",
     "test": "deno test --allow-read=.",
     "clean:workbench": "deno run --allow-write=dist scripts/clean_workbench.ts",
+    "clean:terminal": "deno run --allow-write=dist scripts/clean_terminal.ts",
+    "build:terminal": "deno task clean:terminal && deno bundle --platform=browser --sourcemap=linked --outdir=dist/terminal apps/terminal/index.html && deno run --allow-read=dist/terminal --allow-write=dist/terminal scripts/verify_terminal_build.ts",
+    "build:terminal:watch": "deno bundle --watch --platform=browser --sourcemap=linked --outdir=dist/terminal apps/terminal/index.html",
     "build:workbench": "deno task clean:workbench && deno bundle --platform=browser --sourcemap=linked --outdir=dist/workbench apps/workbench/index.html && deno bundle --platform=browser --sourcemap=linked --output=dist/workbench/compiler.worker.js apps/workbench/src/genui/compiler.worker.ts && deno bundle --platform=browser --sourcemap=inline --output=dist/workbench/genui/preview-shell.js apps/workbench/genui/preview-shell.ts && deno run --allow-read=apps/workbench/genui,dist/workbench/genui --allow-write=dist/workbench/genui scripts/inline_preview_shell.ts && deno run --allow-read --allow-write=dist/workbench scripts/copy_esbuild_wasm.ts && deno run --allow-read=dist/workbench --allow-write=dist/workbench scripts/verify_workbench_build.ts",
     "build:workbench:watch": "deno bundle --watch --platform=browser --sourcemap=linked --outdir=dist/workbench apps/workbench/index.html",
-    "build": "deno task build:workbench",
+    "build": "deno task build:terminal && deno task build:workbench",
     "verify:runtime": "deno run --allow-read=runtime scripts/verify_deno_runtime.ts"
   },
   "exclude": ["dist", ".tools", ".deno-cache", "target"]

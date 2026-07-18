@@ -1,0 +1,66 @@
+:root {
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  background: #0d0f0b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#terminal {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  position: relative;
+  background: #0d0f0b;
+}
+
+#terminal {
+  padding: 8px 10px 10px;
+}
+
+#terminal .xterm {
+  height: 100%;
+}
+
+#terminal .xterm-viewport {
+  overscroll-behavior: contain;
+  scrollbar-color: #46513a transparent;
+  scrollbar-width: thin;
+}
+
+#connection-status {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  max-width: min(480px, calc(100% - 24px));
+  padding: 5px 8px;
+  border: 1px solid #293024;
+  border-radius: 4px;
+  opacity: 0;
+  color: #e6e9dd;
+  background: rgb(24 28 21 / 94%);
+  font: 600 11px/1.3 Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+  pointer-events: none;
+  transform: translateY(3px);
+  transition: opacity 100ms ease, transform 100ms ease;
+}
+
+#connection-status[data-visible] {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #connection-status {
+    transition: none;
+  }
+}

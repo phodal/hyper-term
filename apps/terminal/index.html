@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Hyper Term</title>
+    <script type="module" src="./src/main.ts"></script>
+  </head>
+  <body>
+    <main id="terminal" aria-label="Terminal"></main>
+    <div id="connection-status" role="status" aria-live="polite">
+      Connecting…
+    </div>
+  </body>
+</html>
