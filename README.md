@@ -116,16 +116,33 @@ when its failure, reconnect, security, and evidence gates pass.
 | Milestone | Outcome | Exit gates |
 | --- | --- | --- |
 | **M0 — Architecture baseline** | Review the twelve ADRs, freeze the first `EventEnvelope`, Task/Run/Operation, `BlockDocument`, `UiIntent`, terminal-stream, and artifact schemas. | Proposed ADRs are accepted, revised, or explicitly deferred; golden protocol fixtures and benchmark workloads are specified before implementation. |
-| **M1 — Durable Rust kernel (current)** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | Killing and reconnecting a client does not kill the PTY or duplicate an uncertain effect; resize/output ordering, process trees, cancellation, and recovery have tests. |
-| **M2 — Agent control loop and Block workbench** | Add raw PTY agent compatibility, one ACP v1 adapter, an MCP host behind the broker, `BlockProjector`, attention reducer, and a minimal Tauri reference client built as static Deno assets. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; WebView failure loses no canonical state. |
+| **M1 — Durable Rust kernel (current)** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | A direct user terminal resolves the configured login shell without renderer-supplied executables; zsh login/interactive mode, UTF-8, truecolor, foreground-job `Ctrl-C`, resize/output ordering, reconnect, cancellation, and recovery have tests and release probes. |
+| **M2 — Agent control loop and Block workbench** | Add raw PTY agent compatibility, one ACP v1 adapter, an MCP host behind the broker, `BlockProjector`, attention reducer, and renderer-independent Workbench assets built by Deno. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; renderer failure loses no canonical state. |
 | **M3 — Agentic UI and local debugging (risk spike active)** | Add the brokered Deno tool runtime, persistent `esbuild-wasm` compilation, versioned UI IR/React artifacts, trusted editor adapters, isolated previews, source maps, and semantic Time Travel. | A broken generated UI keeps its last-known-good artifact, maps errors to its source revision, and replays without Shell, network, MCP, or Computer Use effects. |
 | **M4 — Computer Use, voice, and attention** | Implement observe–act–verify drivers, explicit capability and focus leases, before/after evidence, voice briefs, push-to-talk steering, local pause/takeover controls, and semantic notifications. | Stale observations and lease conflicts are rejected; every action has actor, target, capability, receipt, and result; voice never directly approves a consequential effect. |
-| **M5 — Native renderer bake-off** | Compare the Tauri baseline with a macOS-first Native SDK client using the same Block protocol: native common blocks, a terminal surface experiment, and bounded trusted/isolated WebView islands. | Startup, key-to-present, burst throughput, 100k-block virtualization, CJK/IME/accessibility, crash recovery, focus, and cross-platform gates justify either adoption or rejection in a new ADR. |
+| **M5 — Native desktop product shell** | Use Native SDK as the default macOS host for the ordinary terminal surface and common blocks, with bounded Web/WASM islands for generated UI and previews. | Startup, key-to-present, burst throughput, 100k-block virtualization, CJK/IME/accessibility, responsive layout, crash recovery, focus, and a shared Native/Web design-token contract pass on the packaged app. |
 | **M6 — Distribution and ecosystem** | Add signed/updatable desktop packages, SSH/remote sessions, provider adapters, extension manifests, policy profiles, import/export, diagnostics, and a stable compatibility contract. | Reproducible builds, migration/rollback, supply-chain verification, least-privilege defaults, recovery drills, and supported-platform matrices are release-ready. |
 
-The native renderer is deliberately late. Renderer work must not delay the
-durable task model, permission boundary, structured agent loop, or compatibility
-PTY path.
+Native SDK is the default desktop host target. Renderer work must still preserve
+the durable task model, permission boundary, structured agent loop, and ordinary
+PTY path instead of moving machine authority into UI code.
+
+## Traditional Terminal contract
+
+Hyper Term must first be a fast, ordinary terminal. Creating a default terminal
+is an explicit human action, so it opens the authority-selected user login shell
+without creating an AI operation. The client may choose only an absolute working
+directory and terminal size; it cannot supply a program, arguments, or
+environment. Rust resolves and validates the shell, owns the controlling PTY,
+sets `TERM=xterm-256color` and truecolor metadata, orders output before exit,
+handles input leases and resize generations, and keeps replay available after a
+client reconnects.
+
+Agent, Block, transcript, and evidence consumers subscribe outside the PTY hot
+path. They may fall behind or request a snapshot; they may not delay keyboard
+input, shell echo, or native presentation. The first machine-readable release
+baseline is recorded in
+[Terminal core release baseline](docs/benchmarks/terminal-core-baseline-2026-07-18.md).
 
 ## Architecture decisions
 

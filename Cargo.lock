@@ -181,6 +181,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "hyper-term-protocol",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",

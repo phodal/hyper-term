@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use hyper_term_core::{
     BlockProjector, JournalError, JsonlJournal, OperationError, OperationRecord, OperationReducer,
     ProjectorError, TerminalConfig, TerminalError, TerminalEvent, TerminalReplay,
-    TerminalSessionHandle, TerminalSubscription, TerminalSupervisor,
+    TerminalSessionHandle, TerminalSubscription, TerminalSupervisor, UserShellConfig,
 };
 use hyper_term_protocol::{
     Actor, BlockDocument, ClientId, ControlRequest, ControlRequestEnvelope, ControlResponse,
@@ -48,7 +48,13 @@ struct AuthorityState {
 }
 
 #[derive(Clone, Copy)]
-struct TerminalContext {
+enum TerminalContext {
+    Operation(OperationTerminalContext),
+    UserShell,
+}
+
+#[derive(Clone, Copy)]
+struct OperationTerminalContext {
     task_id: TaskId,
     operation_id: OperationId,
 }
@@ -277,10 +283,10 @@ impl DaemonState {
         let subscription = session.subscribe(0);
         lock(&self.inner.terminal_contexts)?.insert(
             terminal_id,
-            TerminalContext {
+            TerminalContext::Operation(OperationTerminalContext {
                 task_id,
                 operation_id,
-            },
+            }),
         );
         if let Err(error) = self.record(NewEvent {
             task_id,
@@ -303,6 +309,39 @@ impl DaemonState {
         thread::Builder::new()
             .name(format!("hyperd-terminal-{terminal_id}"))
             .spawn(move || daemon.monitor_terminal(session, subscription, terminal_id))?;
+        Ok(terminal_id)
+    }
+
+    /// Opens the user's configured login shell as a direct human terminal.
+    /// The wire request cannot provide a program, arguments, or environment;
+    /// those remain an authority-side decision and do not represent an AI
+    /// operation requiring the effect permission pipeline.
+    pub fn open_user_shell(
+        &self,
+        cwd: Option<PathBuf>,
+        size: TerminalSize,
+    ) -> Result<TerminalId, DaemonError> {
+        let shell = UserShellConfig {
+            cwd,
+            ..UserShellConfig::default()
+        };
+        let session =
+            self.inner
+                .terminals
+                .spawn_user_shell(&shell, &size, TerminalConfig::default())?;
+        let terminal_id = session.id();
+        let subscription = session.subscribe(0);
+        lock(&self.inner.terminal_contexts)?.insert(terminal_id, TerminalContext::UserShell);
+
+        let daemon = self.clone();
+        if let Err(error) = thread::Builder::new()
+            .name(format!("hyperd-user-shell-{terminal_id}"))
+            .spawn(move || daemon.monitor_terminal(session, subscription, terminal_id))
+        {
+            let _ = self.inner.terminals.close(terminal_id);
+            lock(&self.inner.terminal_contexts)?.remove(&terminal_id);
+            return Err(error.into());
+        }
         Ok(terminal_id)
     }
 
@@ -329,18 +368,20 @@ impl DaemonState {
             .get(terminal_id)?
             .resize(generation, &size)?;
         let context = self.terminal_context(terminal_id)?;
-        self.record(NewEvent {
-            task_id: context.task_id,
-            run_id: None,
-            operation_id: Some(context.operation_id),
-            causation_id: None,
-            correlation_id: None,
-            payload: DomainEvent::TerminalResized {
-                terminal_id,
-                generation,
-                size,
-            },
-        })?;
+        if let TerminalContext::Operation(context) = context {
+            self.record(NewEvent {
+                task_id: context.task_id,
+                run_id: None,
+                operation_id: Some(context.operation_id),
+                causation_id: None,
+                correlation_id: None,
+                payload: DomainEvent::TerminalResized {
+                    terminal_id,
+                    generation,
+                    size,
+                },
+            })?;
+        }
         Ok(())
     }
 
@@ -463,22 +504,37 @@ impl DaemonState {
         let Ok(context) = self.terminal_context(terminal_id) else {
             return;
         };
+        let operation_context = match context {
+            TerminalContext::Operation(context) => Some(context),
+            TerminalContext::UserShell => None,
+        };
         let mut observation = OutputObservation::default();
         match subscription.replay {
             TerminalReplay::Chunks(chunks) => {
                 for chunk in chunks {
-                    observation.observe(chunk.sequence, chunk.bytes.len() as u64);
-                    self.flush_observation_if_needed(context, terminal_id, &mut observation, false);
+                    if let Some(context) = operation_context {
+                        observation.observe(chunk.sequence, chunk.bytes.len() as u64);
+                        self.flush_observation_if_needed(
+                            context,
+                            terminal_id,
+                            &mut observation,
+                            false,
+                        );
+                    }
                 }
             }
             TerminalReplay::SnapshotRequired(snapshot) => {
-                observation.observe_snapshot(&snapshot);
-                self.flush_observation_if_needed(context, terminal_id, &mut observation, true);
+                if let Some(context) = operation_context {
+                    observation.observe_snapshot(&snapshot);
+                    self.flush_observation_if_needed(context, terminal_id, &mut observation, true);
+                }
             }
         }
 
         if let Some(exit) = subscription.exit {
-            self.flush_observation_if_needed(context, terminal_id, &mut observation, true);
+            if let Some(context) = operation_context {
+                self.flush_observation_if_needed(context, terminal_id, &mut observation, true);
+            }
             self.finalize_terminal(context, terminal_id, exit.exit_code);
             return;
         }
@@ -486,34 +542,57 @@ impl DaemonState {
         loop {
             match subscription.receiver.recv() {
                 Ok(TerminalEvent::Output(chunk)) => {
-                    observation.observe(chunk.sequence, chunk.bytes.len() as u64);
-                    self.flush_observation_if_needed(context, terminal_id, &mut observation, false);
+                    if let Some(context) = operation_context {
+                        observation.observe(chunk.sequence, chunk.bytes.len() as u64);
+                        self.flush_observation_if_needed(
+                            context,
+                            terminal_id,
+                            &mut observation,
+                            false,
+                        );
+                    }
                 }
                 Ok(TerminalEvent::Exited(exit)) => {
-                    self.flush_observation_if_needed(context, terminal_id, &mut observation, true);
+                    if let Some(context) = operation_context {
+                        self.flush_observation_if_needed(
+                            context,
+                            terminal_id,
+                            &mut observation,
+                            true,
+                        );
+                    }
                     self.finalize_terminal(context, terminal_id, exit.exit_code);
                     break;
                 }
                 Ok(TerminalEvent::Fault(message)) => {
-                    let _ = self.record(NewEvent {
-                        task_id: context.task_id,
-                        run_id: None,
-                        operation_id: Some(context.operation_id),
-                        causation_id: None,
-                        correlation_id: None,
-                        payload: DomainEvent::Diagnostic {
-                            code: "pty_read_fault".into(),
-                            message,
-                        },
-                    });
+                    if let Some(context) = operation_context {
+                        let _ = self.record(NewEvent {
+                            task_id: context.task_id,
+                            run_id: None,
+                            operation_id: Some(context.operation_id),
+                            causation_id: None,
+                            correlation_id: None,
+                            payload: DomainEvent::Diagnostic {
+                                code: "pty_read_fault".into(),
+                                message,
+                            },
+                        });
+                    }
                 }
                 Err(_) => {
                     let snapshot = session.snapshot();
-                    observation.observe_snapshot(&snapshot);
-                    self.flush_observation_if_needed(context, terminal_id, &mut observation, true);
+                    if let Some(context) = operation_context {
+                        observation.observe_snapshot(&snapshot);
+                        self.flush_observation_if_needed(
+                            context,
+                            terminal_id,
+                            &mut observation,
+                            true,
+                        );
+                    }
                     if let Some(exit) = snapshot.exit {
                         self.finalize_terminal(context, terminal_id, exit.exit_code);
-                    } else {
+                    } else if let Some(context) = operation_context {
                         let _ = self.transition_current(
                             context,
                             OperationState::UnknownExecution,
@@ -528,7 +607,7 @@ impl DaemonState {
 
     fn flush_observation_if_needed(
         &self,
-        context: TerminalContext,
+        context: OperationTerminalContext,
         terminal_id: TerminalId,
         observation: &mut OutputObservation,
         force: bool,
@@ -566,28 +645,30 @@ impl DaemonState {
         terminal_id: TerminalId,
         exit_code: Option<u32>,
     ) {
-        let _ = self.record(NewEvent {
-            task_id: context.task_id,
-            run_id: None,
-            operation_id: Some(context.operation_id),
-            causation_id: None,
-            correlation_id: None,
-            payload: DomainEvent::TerminalExited {
-                terminal_id,
-                exit_code,
-            },
-        });
         let cancelled = lock(&self.inner.cancelled_terminals)
             .map(|mut terminals| terminals.remove(&terminal_id))
             .unwrap_or(false);
-        let target = if cancelled {
-            OperationState::Cancelled
-        } else if exit_code == Some(0) {
-            OperationState::Succeeded
-        } else {
-            OperationState::Failed
-        };
-        let _ = self.transition_current(context, target, "PTY exited");
+        if let TerminalContext::Operation(context) = context {
+            let _ = self.record(NewEvent {
+                task_id: context.task_id,
+                run_id: None,
+                operation_id: Some(context.operation_id),
+                causation_id: None,
+                correlation_id: None,
+                payload: DomainEvent::TerminalExited {
+                    terminal_id,
+                    exit_code,
+                },
+            });
+            let target = if cancelled {
+                OperationState::Cancelled
+            } else if exit_code == Some(0) {
+                OperationState::Succeeded
+            } else {
+                OperationState::Failed
+            };
+            let _ = self.transition_current(context, target, "PTY exited");
+        }
         if let Ok(mut contexts) = lock(&self.inner.terminal_contexts) {
             contexts.remove(&terminal_id);
         }
@@ -598,7 +679,7 @@ impl DaemonState {
 
     fn transition_current(
         &self,
-        context: TerminalContext,
+        context: OperationTerminalContext,
         target: OperationState,
         reason: &str,
     ) -> Result<(), DaemonError> {
@@ -1107,6 +1188,9 @@ mod unix_server {
             } => state
                 .dispatch_terminal(task_id, operation_id, expected_revision, size)
                 .map(|terminal_id| ControlResponse::TerminalCreated { terminal_id }),
+            ControlRequest::OpenUserShell { cwd, size } => state
+                .open_user_shell(cwd, size)
+                .map(|terminal_id| ControlResponse::TerminalCreated { terminal_id }),
             ControlRequest::ResizeTerminal {
                 terminal_id,
                 generation,
@@ -1278,7 +1362,7 @@ pub enum DaemonError {
     ActionKindMismatch,
     #[error("terminal dispatch only supports an exact shell action")]
     UnsupportedTerminalAction,
-    #[error("terminal {0} has no operation context")]
+    #[error("terminal {0} has no active daemon context")]
     TerminalContextMissing(TerminalId),
     #[error("terminal {0} already has an input lease")]
     InputLeaseHeld(TerminalId),

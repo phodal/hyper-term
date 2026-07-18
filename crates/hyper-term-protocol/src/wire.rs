@@ -73,6 +73,10 @@ pub enum ControlRequest {
         expected_revision: u64,
         size: TerminalSize,
     },
+    OpenUserShell {
+        cwd: Option<std::path::PathBuf>,
+        size: TerminalSize,
+    },
     SubscribeTerminal {
         terminal_id: TerminalId,
         after_sequence: u64,
@@ -418,6 +422,20 @@ mod tests {
         write_frame(&mut bytes, &original).expect("encode");
         let decoded = read_frame(bytes.as_slice()).expect("decode");
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn user_shell_request_cannot_choose_a_program_or_environment() {
+        let request = ControlRequest::OpenUserShell {
+            cwd: Some(std::path::PathBuf::from("/tmp/project")),
+            size: TerminalSize::default(),
+        };
+        let value = serde_json::to_value(request).expect("serialize user shell request");
+        assert_eq!(value["type"], "open_user_shell");
+        assert_eq!(value["cwd"], "/tmp/project");
+        assert!(value.get("program").is_none());
+        assert!(value.get("args").is_none());
+        assert!(value.get("env").is_none());
     }
 
     #[test]

@@ -232,6 +232,78 @@ fn unix_client_can_reconnect_and_replay_terminal_output() {
 }
 
 #[test]
+fn unix_client_opens_the_authority_selected_user_shell() {
+    let directory = tempdir().expect("tempdir");
+    let socket = directory.path().join("hyperd.sock");
+    let working_directory = directory.path().join("project");
+    std::fs::create_dir(&working_directory).expect("create shell cwd");
+    let state = DaemonState::open(directory.path().join("state")).unwrap();
+    let _server = spawn_unix_server(&socket, state).expect("spawn server");
+
+    let mut client = Client::connect(&socket);
+    let terminal_id = match client.request(ControlRequest::OpenUserShell {
+        cwd: Some(working_directory.clone()),
+        size: TerminalSize::default(),
+    }) {
+        ControlResponse::TerminalCreated { terminal_id } => terminal_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert!(matches!(
+        client.request(ControlRequest::ResizeTerminal {
+            terminal_id,
+            generation: 1,
+            size: TerminalSize {
+                rows: 40,
+                cols: 120,
+                ..TerminalSize::default()
+            },
+        }),
+        ControlResponse::Ack
+    ));
+    let lease_id = match client.request(ControlRequest::AcquireInputLease {
+        terminal_id,
+        client_id: client.client_id,
+    }) {
+        ControlResponse::InputLeaseGranted { lease_id, .. } => lease_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    match client.request(ControlRequest::SubscribeTerminal {
+        terminal_id,
+        after_sequence: 0,
+    }) {
+        ControlResponse::TerminalSubscribed { .. } => {}
+        response => panic!("unexpected response: {response:?}"),
+    }
+    client.send_input(TerminalInputFrame {
+        terminal_id,
+        lease_id,
+        sequence: 1,
+        bytes: b"printf '__HYPER_USER_SHELL__:%s:%s:%s\\n' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\"; pwd; exit\n".to_vec(),
+    });
+
+    let mut output = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "user shell output timed out");
+        match client.read() {
+            WireFrame::TerminalOutput(frame) if frame.terminal_id == terminal_id => {
+                output.extend(frame.bytes);
+            }
+            WireFrame::TerminalSnapshot(snapshot) if snapshot.terminal_id == terminal_id => {
+                output.extend(snapshot.bytes);
+            }
+            _ => {}
+        }
+        let text = String::from_utf8_lossy(&output);
+        if text.contains("__HYPER_USER_SHELL__:xterm-256color:truecolor:HyperTerm")
+            && text.contains(&working_directory.display().to_string())
+        {
+            break;
+        }
+    }
+}
+
+#[test]
 fn terminal_input_requires_the_active_client_lease() {
     let directory = tempdir().expect("tempdir");
     let state = DaemonState::open(directory.path()).expect("open daemon");
@@ -295,6 +367,7 @@ fn terminal_input_requires_the_active_client_lease() {
 
 struct Client {
     stream: UnixStream,
+    client_id: ClientId,
 }
 
 impl Client {
@@ -310,9 +383,10 @@ impl Client {
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-        let mut client = Self { stream };
+        let client_id = ClientId::new();
+        let mut client = Self { stream, client_id };
         let response = client.request(ControlRequest::Hello {
-            client_id: ClientId::new(),
+            client_id,
             protocol_version: hyper_term_protocol::PROTOCOL_VERSION,
         });
         assert!(matches!(response, ControlResponse::Welcome { .. }));
@@ -340,5 +414,9 @@ impl Client {
 
     fn read(&mut self) -> WireFrame {
         read_frame(&mut self.stream).expect("read frame")
+    }
+
+    fn send_input(&mut self, frame: TerminalInputFrame) {
+        write_frame(&mut self.stream, &WireFrame::TerminalInput(frame)).expect("write input");
     }
 }

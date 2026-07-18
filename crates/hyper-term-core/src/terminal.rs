@@ -1,5 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
@@ -10,6 +11,50 @@ use thiserror::Error;
 
 const READER_CHUNK_BYTES: usize = 16 * 1024;
 const SUBSCRIBER_QUEUE_CHUNKS: usize = 256;
+
+const USER_SHELL_TERM: &str = "xterm-256color";
+const USER_SHELL_COLORTERM: &str = "truecolor";
+const USER_SHELL_TERM_PROGRAM: &str = "HyperTerm";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UserShellConfig {
+    /// An authority-owned override for tests or a future settings service.
+    /// This field is deliberately absent from the renderer wire protocol.
+    pub shell: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
+    pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserShellProfile {
+    pub program: PathBuf,
+    pub cwd: Option<PathBuf>,
+    pub login: bool,
+}
+
+impl UserShellConfig {
+    pub fn resolved_profile(&self) -> Result<UserShellProfile, TerminalError> {
+        validate_working_directory(self.cwd.as_deref())?;
+
+        let program = if let Some(program) = &self.shell {
+            validate_shell_program(program)?;
+            program.clone()
+        } else {
+            let mut builder = CommandBuilder::new_default_prog();
+            apply_user_environment(&mut builder, self, None);
+            let program = PathBuf::from(builder.get_shell());
+            validate_shell_program(&program)?;
+            program
+        };
+
+        let login = self.shell.is_none() || !login_arguments(&program).is_empty();
+        Ok(UserShellProfile {
+            program,
+            cwd: self.cwd.clone(),
+            login,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalChunk {
@@ -158,7 +203,6 @@ impl TerminalSupervisor {
             return Err(TerminalError::EmptyProgram);
         }
 
-        let pair = native_pty_system().openpty(to_pty_size(size))?;
         let mut builder = CommandBuilder::new(&command.program);
         builder.args(&command.args);
         if let Some(cwd) = &command.cwd {
@@ -168,11 +212,50 @@ impl TerminalSupervisor {
             builder.env(key, value);
         }
 
+        self.spawn_builder(builder, size, config)
+    }
+
+    pub fn spawn_user_shell(
+        &self,
+        user_shell: &UserShellConfig,
+        size: &TerminalSize,
+        config: TerminalConfig,
+    ) -> Result<TerminalSessionHandle, TerminalError> {
+        let profile = user_shell.resolved_profile()?;
+        let mut builder = if user_shell.shell.is_some() {
+            let mut builder = CommandBuilder::new(&profile.program);
+            builder.args(login_arguments(&profile.program));
+            builder
+        } else {
+            // portable-pty resolves the passwd/$SHELL default and gives it a
+            // login argv[0]. With no command and a controlling PTY, zsh and
+            // other normal Unix shells enter interactive mode themselves.
+            CommandBuilder::new_default_prog()
+        };
+        if let Some(cwd) = &profile.cwd {
+            builder.cwd(cwd);
+        }
+        apply_user_environment(&mut builder, user_shell, Some(&profile.program));
+
+        self.spawn_builder(builder, size, config)
+    }
+
+    fn spawn_builder(
+        &self,
+        builder: CommandBuilder,
+        size: &TerminalSize,
+        config: TerminalConfig,
+    ) -> Result<TerminalSessionHandle, TerminalError> {
+        size.validate().map_err(TerminalError::InvalidSize)?;
+        let pair = native_pty_system().openpty(to_pty_size(size))?;
+
         let mut child = pair.slave.spawn_command(builder)?;
         let process_id = child.process_id();
         let killer = child.clone_killer();
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
+        #[cfg(unix)]
+        let reader_poll_fd = pair.master.as_raw_fd();
         let terminal_id = TerminalId::new();
         let replay = Arc::new(TerminalReplayBuffer::new(
             terminal_id,
@@ -193,16 +276,36 @@ impl TerminalSupervisor {
         };
 
         let reader_replay = Arc::clone(&replay);
-        thread::Builder::new()
+        let reader_thread = thread::Builder::new()
             .name(format!("terminal-reader-{terminal_id}"))
             .spawn(move || {
                 let mut buffer = vec![0_u8; READER_CHUNK_BYTES];
+                let mut buffered = 0;
                 loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(length) => reader_replay.publish_output(&buffer[..length]),
+                    match reader.read(&mut buffer[buffered..]) {
+                        Ok(0) => {
+                            if buffered > 0 {
+                                reader_replay.publish_output(&buffer[..buffered]);
+                            }
+                            break;
+                        }
+                        Ok(length) => {
+                            buffered += length;
+                            #[cfg(unix)]
+                            let can_coalesce =
+                                buffered < buffer.len() && pty_has_pending_output(reader_poll_fd);
+                            #[cfg(not(unix))]
+                            let can_coalesce = false;
+                            if buffered == buffer.len() || !can_coalesce {
+                                reader_replay.publish_output(&buffer[..buffered]);
+                                buffered = 0;
+                            }
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(error) => {
+                            if buffered > 0 {
+                                reader_replay.publish_output(&buffer[..buffered]);
+                            }
                             reader_replay.publish_fault(format!("PTY read failed: {error}"));
                             break;
                         }
@@ -213,17 +316,26 @@ impl TerminalSupervisor {
         let waiter_replay = Arc::clone(&replay);
         thread::Builder::new()
             .name(format!("terminal-wait-{terminal_id}"))
-            .spawn(move || match child.wait() {
-                Ok(status) => waiter_replay.publish_exit(TerminalExit {
-                    exit_code: Some(status.exit_code()),
-                    signal: status.signal().map(str::to_owned),
-                }),
-                Err(error) => {
-                    waiter_replay.publish_fault(format!("PTY wait failed: {error}"));
-                    waiter_replay.publish_exit(TerminalExit {
-                        exit_code: None,
-                        signal: None,
-                    });
+            .spawn(move || {
+                let status = child.wait();
+                // The process can report exit before the PTY master has read
+                // its final bytes. Join the reader so Exited is a true stream
+                // barrier and reconnecting clients never miss the tail.
+                if reader_thread.join().is_err() {
+                    waiter_replay.publish_fault("PTY reader thread panicked".into());
+                }
+                match status {
+                    Ok(status) => waiter_replay.publish_exit(TerminalExit {
+                        exit_code: Some(status.exit_code()),
+                        signal: status.signal().map(str::to_owned),
+                    }),
+                    Err(error) => {
+                        waiter_replay.publish_fault(format!("PTY wait failed: {error}"));
+                        waiter_replay.publish_exit(TerminalExit {
+                            exit_code: None,
+                            signal: None,
+                        });
+                    }
                 }
             })?;
 
@@ -242,6 +354,87 @@ impl TerminalSupervisor {
     pub fn close(&self, terminal_id: TerminalId) -> Result<(), TerminalError> {
         self.get(terminal_id)?.close()
     }
+}
+
+fn apply_user_environment(
+    builder: &mut CommandBuilder,
+    user_shell: &UserShellConfig,
+    explicit_program: Option<&Path>,
+) {
+    for (key, value) in &user_shell.environment {
+        builder.env(key, value);
+    }
+    if let Some(program) = explicit_program {
+        builder.env("SHELL", program);
+    }
+    // These are terminal capabilities, not arbitrary renderer-controlled env.
+    // Apply them last so a caller cannot accidentally downgrade the contract.
+    builder.env("TERM", USER_SHELL_TERM);
+    builder.env("COLORTERM", USER_SHELL_COLORTERM);
+    builder.env("TERM_PROGRAM", USER_SHELL_TERM_PROGRAM);
+    builder.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    builder.env("HYPER_TERM", "1");
+}
+
+fn login_arguments(program: &Path) -> &'static [&'static str] {
+    match program.file_name().and_then(|name| name.to_str()) {
+        Some("fish") => &["--login"],
+        Some("zsh" | "bash" | "sh" | "dash" | "ksh" | "mksh" | "csh" | "tcsh") => &["-l"],
+        _ => &[],
+    }
+}
+
+fn validate_working_directory(cwd: Option<&Path>) -> Result<(), TerminalError> {
+    let Some(cwd) = cwd else {
+        return Ok(());
+    };
+    if !cwd.is_absolute() {
+        return Err(TerminalError::WorkingDirectoryNotAbsolute(cwd.to_owned()));
+    }
+    if !cwd.is_dir() {
+        return Err(TerminalError::InvalidWorkingDirectory(cwd.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_shell_program(program: &Path) -> Result<(), TerminalError> {
+    if !program.is_absolute() {
+        return Err(TerminalError::ShellPathNotAbsolute(program.to_owned()));
+    }
+    let metadata = std::fs::metadata(program)
+        .map_err(|_| TerminalError::ShellNotExecutable(program.to_owned()))?;
+    if !metadata.is_file() || !is_executable(&metadata) {
+        return Err(TerminalError::ShellNotExecutable(program.to_owned()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn pty_has_pending_output(file_descriptor: Option<portable_pty::unix::RawFd>) -> bool {
+    let Some(file_descriptor) = file_descriptor else {
+        return false;
+    };
+    let mut descriptor = libc::pollfd {
+        fd: file_descriptor,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // The descriptor belongs to the master PTY retained by TerminalSession
+    // for at least as long as this reader thread. A zero-timeout poll only
+    // asks whether another read can be coalesced without adding input latency.
+    unsafe { libc::poll(&mut descriptor, 1, 0) > 0 && descriptor.revents & libc::POLLIN != 0 }
 }
 
 struct TerminalReplayBuffer {
@@ -400,6 +593,14 @@ pub enum TerminalError {
     Pty(#[from] anyhow::Error),
     #[error("terminal command program is empty")]
     EmptyProgram,
+    #[error("user shell path must be absolute: {0}")]
+    ShellPathNotAbsolute(PathBuf),
+    #[error("user shell is missing, not a file, or not executable: {0}")]
+    ShellNotExecutable(PathBuf),
+    #[error("terminal working directory must be absolute: {0}")]
+    WorkingDirectoryNotAbsolute(PathBuf),
+    #[error("terminal working directory does not exist or is not a directory: {0}")]
+    InvalidWorkingDirectory(PathBuf),
     #[error("invalid terminal size: {0}")]
     InvalidSize(&'static str),
     #[error("terminal {0} does not exist")]
@@ -420,6 +621,26 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    fn wait_for_tail(session: &TerminalSessionHandle, marker: &[u8], timeout: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snapshot = session.snapshot();
+            if snapshot
+                .tail
+                .windows(marker.len())
+                .any(|window| window == marker)
+            {
+                return snapshot.tail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal marker did not arrive; tail={:?}",
+                String::from_utf8_lossy(&snapshot.tail)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     fn shell(script: &str) -> TerminalCommand {
         TerminalCommand {
@@ -475,6 +696,46 @@ mod tests {
     }
 
     #[test]
+    fn exit_event_is_a_barrier_after_the_final_pty_bytes() {
+        const OUTPUT_BYTES: usize = 1024 * 1024;
+        let supervisor = TerminalSupervisor::default();
+        let session = supervisor
+            .spawn(
+                &TerminalCommand {
+                    program: "/usr/bin/head".into(),
+                    args: vec!["-c".into(), OUTPUT_BYTES.to_string(), "/dev/zero".into()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+                &TerminalSize::default(),
+                TerminalConfig::default(),
+            )
+            .expect("spawn burst PTY");
+        let subscription = session.subscribe(0);
+        let mut observed_bytes = match subscription.replay {
+            TerminalReplay::Chunks(chunks) => {
+                chunks.iter().map(|chunk| chunk.bytes.len()).sum::<usize>()
+            }
+            TerminalReplay::SnapshotRequired(snapshot) => snapshot.total_bytes as usize,
+        };
+        if subscription.exit.is_none() {
+            loop {
+                match subscription
+                    .receiver
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("terminal event")
+                {
+                    TerminalEvent::Output(chunk) => observed_bytes += chunk.bytes.len(),
+                    TerminalEvent::Exited(_) => break,
+                    TerminalEvent::Fault(message) => panic!("terminal fault: {message}"),
+                }
+            }
+        }
+        assert_eq!(observed_bytes, OUTPUT_BYTES);
+        assert_eq!(session.snapshot().total_bytes as usize, OUTPUT_BYTES);
+    }
+
+    #[test]
     fn dropping_a_client_subscription_does_not_kill_the_pty() {
         let supervisor = TerminalSupervisor::default();
         let session = supervisor
@@ -516,5 +777,101 @@ mod tests {
             Err(TerminalError::StaleResizeGeneration { .. })
         ));
         session.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_zsh_is_login_interactive_truecolor_and_utf8_capable() {
+        let zsh = PathBuf::from("/bin/zsh");
+        if !zsh.exists() {
+            return;
+        }
+        let home = tempfile::tempdir().expect("temporary shell home");
+        let mut environment = BTreeMap::new();
+        environment.insert("HOME".into(), home.path().display().to_string());
+        environment.insert("ZDOTDIR".into(), home.path().display().to_string());
+        environment.insert("TERM".into(), "dumb".into());
+        let config = UserShellConfig {
+            shell: Some(zsh.clone()),
+            cwd: Some(home.path().to_owned()),
+            environment,
+        };
+        let profile = config.resolved_profile().expect("resolve zsh");
+        assert_eq!(profile.program, zsh);
+        assert!(profile.login);
+
+        let supervisor = TerminalSupervisor::default();
+        let session = supervisor
+            .spawn_user_shell(&config, &TerminalSize::default(), TerminalConfig::default())
+            .expect("spawn zsh");
+        session
+            .write_input(
+                1,
+                b"if [[ -o login && -o interactive ]]; then print -r -- '__HYPER_ZSH__:login:interactive:'$TERM':'$COLORTERM':'$TERM_PROGRAM':\xE4\xB8\xAD\xE6\x96\x87'; else print -r -- '__HYPER_ZSH__:wrong-mode'; fi; exit\n",
+            )
+            .expect("write zsh probe");
+        let expected = b"__HYPER_ZSH__:login:interactive:xterm-256color:truecolor:HyperTerm:\xE4\xB8\xAD\xE6\x96\x87";
+        let output = wait_for_tail(&session, expected, Duration::from_secs(5));
+        assert!(
+            output
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "unexpected zsh probe output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_c_interrupts_a_foreground_job_without_killing_zsh() {
+        let zsh = PathBuf::from("/bin/zsh");
+        if !zsh.exists() {
+            return;
+        }
+        let home = tempfile::tempdir().expect("temporary shell home");
+        let config = UserShellConfig {
+            shell: Some(zsh),
+            cwd: Some(home.path().to_owned()),
+            environment: BTreeMap::from([
+                ("HOME".into(), home.path().display().to_string()),
+                ("ZDOTDIR".into(), home.path().display().to_string()),
+            ]),
+        };
+        let supervisor = TerminalSupervisor::default();
+        let session = supervisor
+            .spawn_user_shell(&config, &TerminalSize::default(), TerminalConfig::default())
+            .expect("spawn zsh");
+        session
+            .write_input(1, b"print -r -- '__HYPER_'READY'__'\n")
+            .unwrap();
+        wait_for_tail(&session, b"__HYPER_READY__", Duration::from_secs(5));
+        session.write_input(2, b"sleep 5\n").unwrap();
+        thread::sleep(Duration::from_millis(150));
+        session.write_input(3, b"\x03").unwrap();
+        session
+            .write_input(4, b"print -r -- '__HYPER_AFTER_'SIGINT'__'; exit\n")
+            .unwrap();
+        wait_for_tail(&session, b"__HYPER_AFTER_SIGINT__", Duration::from_secs(3));
+    }
+
+    #[test]
+    fn user_shell_rejects_renderer_ambiguous_paths() {
+        let relative = UserShellConfig {
+            cwd: Some(PathBuf::from("relative-project")),
+            ..UserShellConfig::default()
+        };
+        assert!(matches!(
+            relative.resolved_profile(),
+            Err(TerminalError::WorkingDirectoryNotAbsolute(_))
+        ));
+
+        let relative_shell = UserShellConfig {
+            shell: Some(PathBuf::from("zsh")),
+            ..UserShellConfig::default()
+        };
+        assert!(matches!(
+            relative_shell.resolved_profile(),
+            Err(TerminalError::ShellPathNotAbsolute(_))
+        ));
     }
 }
