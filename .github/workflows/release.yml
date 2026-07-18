@@ -328,16 +328,18 @@ jobs:
             "$RUNNER_TEMP/hyper-term-signing.keychain-db" \
             | grep -F "$APPLE_SIGNING_IDENTITY"
           app="$RUNNER_TEMP/Hyper Term.app"
-          while IFS= read -r executable; do
-            if file -b "$executable" | grep -q "Mach-O"; then
-              codesign \
-                --force \
-                --options runtime \
-                --timestamp \
-                --sign "$APPLE_SIGNING_IDENTITY" \
-                "$executable"
-            fi
-          done < <(find "$app/Contents" -type f -perm -111 | sort)
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$app/Contents/MacOS/hyper-term-ui"
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$app/Contents/MacOS/hyper-term"
           codesign \
             --force \
             --options runtime \
@@ -352,11 +354,16 @@ jobs:
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/Hyper Term.app"
-          while IFS= read -r executable; do
-            if file -b "$executable" | grep -q "Mach-O"; then
-              codesign --force --options runtime --sign - "$executable"
-            fi
-          done < <(find "$app/Contents" -type f -perm -111 | sort)
+          codesign \
+            --force \
+            --options runtime \
+            --sign - \
+            "$app/Contents/MacOS/hyper-term-ui"
+          codesign \
+            --force \
+            --options runtime \
+            --sign - \
+            "$app/Contents/MacOS/hyper-term"
           codesign --force --options runtime --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
 
