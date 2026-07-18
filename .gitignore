@@ -5,6 +5,9 @@
 target/
 node_modules/
 dist/
+.tools/
+.deno-cache/
+.hyper-term/
 
 *.log
 *.tmp

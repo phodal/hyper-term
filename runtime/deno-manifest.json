@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "runtime": "deno",
+  "version": "2.9.3",
+  "tool_protocol_version": 1,
+  "release_identity": "github:denoland/deno@v2.9.3",
+  "apple_signing_identity": "Developer ID Application: Deno Land Inc. (2H4KBF436B)",
+  "artifacts": [
+    {
+      "target": "aarch64-apple-darwin",
+      "archive": "deno-aarch64-apple-darwin.zip",
+      "sha256": "1b2972f7ceb6df28d9600eab18d423bebb9aa18db02f01d7eb37a5b501482203",
+      "url": "https://github.com/denoland/deno/releases/download/v2.9.3/deno-aarch64-apple-darwin.zip"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "archive": "deno-x86_64-apple-darwin.zip",
+      "sha256": "cff2bce236fde0952aac62a5699464c46901b4eb1e61d0caffbb33d556e098c1",
+      "url": "https://github.com/denoland/deno/releases/download/v2.9.3/deno-x86_64-apple-darwin.zip"
+    }
+  ]
+}

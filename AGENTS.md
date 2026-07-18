@@ -13,4 +13,7 @@
 - Use ordered channels for PTY output; do not emit one frontend event per byte or character.
 - Keep context capture explicit, size bounded, and local unless the user chooses a provider.
 - Add a test for every protocol or lifecycle change.
-- Run `pnpm check` and `pnpm test` before handing off a change.
+- Run `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo test --workspace` for Rust changes.
+- Run `deno task check`, `deno task test`, and `deno task build:workbench` for
+  Workbench changes. This repository intentionally has no Vite or pnpm build.

@@ -5,11 +5,13 @@ not a terminal with a chat sidebar. It treats Shell, structured agents,
 Computer Use, MCP tools, editors, browsers, and generated interfaces as
 executors and projections of one durable human–AI task model.
 
-> **Repository status:** M1 implementation is in progress. The disposable
-> Vite/Tauri prototype has been removed; the repository now contains the first
-> renderer-independent Rust protocol, journal, operation reducer, Block
-> projector, and PTY supervision slice. Proposed ADRs remain subject to the
-> validation and replacement gates recorded in each decision.
+> **Repository status:** M1 implementation and the first M3 risk spike are in
+> progress. The disposable Vite/Tauri prototype has been removed. The
+> repository now contains a renderer-independent Rust protocol, journal,
+> operation reducer, Block projector, reconnectable PTY daemon, and a
+> terminal-first React Workbench built directly by pinned Deno. Proposed ADRs
+> remain subject to the validation and replacement gates recorded in each
+> decision.
 
 ## Product thesis
 
@@ -116,7 +118,7 @@ when its failure, reconnect, security, and evidence gates pass.
 | **M0 — Architecture baseline** | Review the twelve ADRs, freeze the first `EventEnvelope`, Task/Run/Operation, `BlockDocument`, `UiIntent`, terminal-stream, and artifact schemas. | Proposed ADRs are accepted, revised, or explicitly deferred; golden protocol fixtures and benchmark workloads are specified before implementation. |
 | **M1 — Durable Rust kernel (current)** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | Killing and reconnecting a client does not kill the PTY or duplicate an uncertain effect; resize/output ordering, process trees, cancellation, and recovery have tests. |
 | **M2 — Agent control loop and Block workbench** | Add raw PTY agent compatibility, one ACP v1 adapter, an MCP host behind the broker, `BlockProjector`, attention reducer, and a minimal Tauri reference client built as static Deno assets. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; WebView failure loses no canonical state. |
-| **M3 — Agentic UI and local debugging** | Add the brokered Deno tool runtime, persistent `esbuild-wasm` compilation, versioned UI IR/React artifacts, trusted editor adapters, isolated previews, source maps, and semantic Time Travel. | A broken generated UI keeps its last-known-good artifact, maps errors to its source revision, and replays without Shell, network, MCP, or Computer Use effects. |
+| **M3 — Agentic UI and local debugging (risk spike active)** | Add the brokered Deno tool runtime, persistent `esbuild-wasm` compilation, versioned UI IR/React artifacts, trusted editor adapters, isolated previews, source maps, and semantic Time Travel. | A broken generated UI keeps its last-known-good artifact, maps errors to its source revision, and replays without Shell, network, MCP, or Computer Use effects. |
 | **M4 — Computer Use, voice, and attention** | Implement observe–act–verify drivers, explicit capability and focus leases, before/after evidence, voice briefs, push-to-talk steering, local pause/takeover controls, and semantic notifications. | Stale observations and lease conflicts are rejected; every action has actor, target, capability, receipt, and result; voice never directly approves a consequential effect. |
 | **M5 — Native renderer bake-off** | Compare the Tauri baseline with a macOS-first Native SDK client using the same Block protocol: native common blocks, a terminal surface experiment, and bounded trusted/isolated WebView islands. | Startup, key-to-present, burst throughput, 100k-block virtualization, CJK/IME/accessibility, crash recovery, focus, and cross-platform gates justify either adoption or rejection in a new ADR. |
 | **M6 — Distribution and ecosystem** | Add signed/updatable desktop packages, SSH/remote sessions, provider adapters, extension manifests, policy profiles, import/export, diagnostics, and a stable compatibility contract. | Reproducible builds, migration/rollback, supply-chain verification, least-privilege defaults, recovery drills, and supported-platform matrices are release-ready. |
@@ -170,7 +172,10 @@ AGENTS.md              contributor and safety rules
 Cargo.toml             Rust workspace definition
 crates/hyper-term-protocol/  versioned events, blocks, and wire frames
 crates/hyper-term-core/      journal, reducers, projections, and PTY ownership
-crates/hyper-term-daemon/    out-of-process control-kernel host (in progress)
+crates/hyper-term-daemon/    permissioned, reconnectable control-kernel host
+apps/workbench/         terminal-first React Block workbench and isolated GenUI
+runtime/                pinned supervised-runtime manifests
+scripts/                Deno build and supply-chain verification tools
 docs/architecture/     numbered architecture decisions
 docs/research/         dated product and implementation evidence
 ```
@@ -195,6 +200,30 @@ cargo run -p hyper-term-daemon --bin hyperd -- \
 JSON frames; PTY input, output, and snapshots use separate bounded binary
 frames. A client must complete `Hello`, receive exact-operation authorization,
 and acquire the terminal input lease before it can write to a PTY.
+
+## Develop the Deno Workbench
+
+The Workbench is a static browser artifact. It has no Vite dev server, Node.js
+runtime, or renderer-side machine authority. Deno resolves the frozen lockfile
+and bundles React, CodeMirror, the compiler Worker, and the isolated preview
+shell. Generated UI source is compiled by a persistent `esbuild-wasm` Worker
+against an explicit, size-bounded virtual filesystem.
+
+Use Deno `2.9.3`, pinned in `runtime/deno-manifest.json`:
+
+```bash
+deno task verify:runtime
+deno task check
+deno task test
+deno task build:workbench
+python3 -m http.server 4173 --bind 127.0.0.1 --directory dist/workbench
+```
+
+The preview iframe keeps an opaque sandbox origin. Its trusted runtime capsule
+is inlined at build time, accepts only channel-bound accepted artifacts, checks
+their SHA-256 digest again, and denies network access. A failed compile updates
+diagnostics and Time Travel history without replacing the last-known-good
+artifact.
 
 ## License
 

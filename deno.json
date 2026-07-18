@@ -1,0 +1,40 @@
+{
+  "lock": {
+    "path": "./deno.lock",
+    "frozen": true
+  },
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "react",
+    "lib": ["dom", "dom.iterable", "es2024", "deno.ns"],
+    "strict": true,
+    "types": [
+      "npm:@types/react@19.2.17",
+      "npm:@types/react-dom@19.2.3"
+    ]
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@1.0.19",
+    "@std/path": "jsr:@std/path@1.1.4",
+    "@codemirror/lang-javascript": "npm:@codemirror/lang-javascript@6.2.5",
+    "@codemirror/merge": "npm:@codemirror/merge@6.12.2",
+    "@codemirror/state": "npm:@codemirror/state@6.7.1",
+    "@codemirror/view": "npm:@codemirror/view@6.43.6",
+    "codemirror": "npm:codemirror@6.0.2",
+    "esbuild-wasm": "npm:esbuild-wasm@0.28.1",
+    "react": "npm:react@19.2.7",
+    "react-dom/client": "npm:react-dom@19.2.7/client",
+    "react/jsx-dev-runtime": "npm:react@19.2.7/jsx-dev-runtime",
+    "react/jsx-runtime": "npm:react@19.2.7/jsx-runtime"
+  },
+  "tasks": {
+    "check": "deno fmt --check apps scripts deno.json runtime/deno-manifest.json && deno lint apps scripts && deno check apps/workbench/src/main.tsx apps/workbench/src/genui/compiler.worker.ts apps/workbench/genui/preview-shell.ts scripts/*.ts",
+    "test": "deno test --allow-read=.",
+    "clean:workbench": "deno run --allow-write=dist scripts/clean_workbench.ts",
+    "build:workbench": "deno task clean:workbench && deno bundle --platform=browser --sourcemap=linked --outdir=dist/workbench apps/workbench/index.html && deno bundle --platform=browser --sourcemap=linked --output=dist/workbench/compiler.worker.js apps/workbench/src/genui/compiler.worker.ts && deno bundle --platform=browser --sourcemap=inline --output=dist/workbench/genui/preview-shell.js apps/workbench/genui/preview-shell.ts && deno run --allow-read=apps/workbench/genui,dist/workbench/genui --allow-write=dist/workbench/genui scripts/inline_preview_shell.ts && deno run --allow-read --allow-write=dist/workbench scripts/copy_esbuild_wasm.ts && deno run --allow-read=dist/workbench --allow-write=dist/workbench scripts/verify_workbench_build.ts",
+    "build:workbench:watch": "deno bundle --watch --platform=browser --sourcemap=linked --outdir=dist/workbench apps/workbench/index.html",
+    "build": "deno task build:workbench",
+    "verify:runtime": "deno run --allow-read=runtime scripts/verify_deno_runtime.ts"
+  },
+  "exclude": ["dist", ".tools", ".deno-cache", "target"]
+}
