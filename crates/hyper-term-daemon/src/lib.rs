@@ -38,7 +38,8 @@ mod mcp_gateway;
 mod web_gateway;
 
 pub use agent_gateway::{
-    AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle, spawn_agent_gateway,
+    AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle, AgentGenUiRuntimeConfig,
+    spawn_agent_gateway,
 };
 #[cfg(unix)]
 pub use client::{ControlClient, ControlClientError};

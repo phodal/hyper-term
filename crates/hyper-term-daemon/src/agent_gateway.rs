@@ -48,7 +48,17 @@ pub struct AgentGatewayConfig {
     pub codex_executable: Option<PathBuf>,
     pub codex_auth_file: Option<PathBuf>,
     pub mcp_executable: Option<PathBuf>,
+    pub genui_runtime: Option<AgentGenUiRuntimeConfig>,
     pub control_socket: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentGenUiRuntimeConfig {
+    pub deno_executable: PathBuf,
+    pub runtime_version: String,
+    pub compiler_script: PathBuf,
+    pub compiler_wasm: PathBuf,
+    pub compiler_version: String,
 }
 
 pub struct AgentGatewayHandle {
@@ -94,6 +104,8 @@ pub enum AgentGatewayError {
     InvalidWorkspace(PathBuf),
     #[error("agent gateway state directory is invalid: {0}")]
     InvalidStateDirectory(PathBuf),
+    #[error("agent gateway GenUI runtime is invalid: {0}")]
+    InvalidGenUiRuntime(String),
     #[error("agent gateway I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("agent gateway task failed: {0}")]
@@ -204,6 +216,16 @@ pub async fn spawn_agent_gateway(
         .state_directory
         .canonicalize()
         .map_err(|_| AgentGatewayError::InvalidStateDirectory(config.state_directory.clone()))?;
+    if let Some(runtime) = config.genui_runtime.as_mut() {
+        if runtime.runtime_version.is_empty() || runtime.compiler_version.is_empty() {
+            return Err(AgentGatewayError::InvalidGenUiRuntime(
+                "runtime and compiler versions are required".into(),
+            ));
+        }
+        runtime.deno_executable = canonical_runtime_asset(&runtime.deno_executable)?;
+        runtime.compiler_script = canonical_runtime_asset(&runtime.compiler_script)?;
+        runtime.compiler_wasm = canonical_runtime_asset(&runtime.compiler_wasm)?;
+    }
 
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
@@ -442,7 +464,7 @@ impl AgentGatewayRuntime {
             .daemon
             .create_task(format!("Codex Agent session {session_id}"))
             .map_err(|_| StartError::Driver)?;
-        let brokered_mcp_server = self.mcp_config(task_id).transpose()?;
+        let brokered_mcp_server = self.mcp_config(task_id, &session_root).transpose()?;
         let client = CodexAppServerClient::launch(CodexAppServerConfig {
             executable,
             executable_sha256,
@@ -671,7 +693,11 @@ impl AgentGatewayRuntime {
             .ok_or(SessionError::NotFound)
     }
 
-    fn mcp_config(&self, task_id: TaskId) -> Option<Result<CodexMcpServerConfig, StartError>> {
+    fn mcp_config(
+        &self,
+        task_id: TaskId,
+        session_root: &std::path::Path,
+    ) -> Option<Result<CodexMcpServerConfig, StartError>> {
         let executable = match self.config.mcp_executable.as_ref()?.canonicalize() {
             Ok(executable) => executable,
             Err(_) => return Some(Err(StartError::Driver)),
@@ -680,16 +706,54 @@ impl AgentGatewayRuntime {
             Ok(digest) => digest,
             Err(_) => return Some(Err(StartError::Driver)),
         };
+        let mut arguments = vec![
+            "--agent-mode".into(),
+            "--socket".into(),
+            self.config.control_socket.clone().into_os_string(),
+            "--task-id".into(),
+            task_id.to_string().into(),
+        ];
+        if let Some(runtime) = &self.config.genui_runtime {
+            let deno_sha256 = match sha256_file(&runtime.deno_executable) {
+                Ok(digest) => digest,
+                Err(_) => return Some(Err(StartError::Driver)),
+            };
+            let script_sha256 = match sha256_file(&runtime.compiler_script) {
+                Ok(digest) => digest,
+                Err(_) => return Some(Err(StartError::Driver)),
+            };
+            let wasm_sha256 = match sha256_file(&runtime.compiler_wasm) {
+                Ok(digest) => digest,
+                Err(_) => return Some(Err(StartError::Driver)),
+            };
+            let deno_root = session_root.join("deno-genui");
+            arguments.extend([
+                "--deno".into(),
+                runtime.deno_executable.clone().into_os_string(),
+                "--deno-sha256".into(),
+                deno_sha256.into(),
+                "--deno-version".into(),
+                runtime.runtime_version.clone().into(),
+                "--deno-cache".into(),
+                deno_root.join("cache").into_os_string(),
+                "--deno-scratch".into(),
+                deno_root.join("scratch").into_os_string(),
+                "--genui-script".into(),
+                runtime.compiler_script.clone().into_os_string(),
+                "--genui-script-sha256".into(),
+                script_sha256.into(),
+                "--genui-wasm".into(),
+                runtime.compiler_wasm.clone().into_os_string(),
+                "--genui-wasm-sha256".into(),
+                wasm_sha256.into(),
+                "--genui-compiler-version".into(),
+                runtime.compiler_version.clone().into(),
+            ]);
+        }
         Some(Ok(CodexMcpServerConfig {
             executable,
             executable_sha256: digest,
-            arguments: vec![
-                "--agent-mode".into(),
-                "--socket".into(),
-                self.config.control_socket.clone().into_os_string(),
-                "--task-id".into(),
-                task_id.to_string().into(),
-            ],
+            arguments,
         }))
     }
 
@@ -711,6 +775,18 @@ impl AgentGatewayRuntime {
             let _ = session.client.close();
         }
     }
+}
+
+fn canonical_runtime_asset(path: &std::path::Path) -> Result<PathBuf, AgentGatewayError> {
+    if !path.is_absolute() {
+        return Err(AgentGatewayError::InvalidGenUiRuntime(format!(
+            "asset path must be absolute: {}",
+            path.display()
+        )));
+    }
+    path.canonicalize().map_err(|error| {
+        AgentGatewayError::InvalidGenUiRuntime(format!("{}: {error}", path.display()))
+    })
 }
 
 fn allowable_brokered_mcp_operation(operation: &hyper_term_core::OperationRecord) -> bool {
@@ -1028,6 +1104,7 @@ mod tests {
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             mcp_executable: None,
+            genui_runtime: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -1111,6 +1188,7 @@ mod tests {
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             mcp_executable: None,
+            genui_runtime: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -1254,6 +1332,7 @@ mod tests {
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             mcp_executable: None,
+            genui_runtime: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -1328,6 +1407,59 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
 
         gateway.shutdown().await.expect("shutdown gateway");
+    }
+
+    #[test]
+    fn brokered_mcp_receives_pinned_genui_runtime_arguments() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        let state_directory = temporary.path().join("gateway-state");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&state_directory).expect("state directory");
+        let mcp = temporary.path().join("hyper-term-mcp");
+        let deno = temporary.path().join("deno");
+        let script = temporary.path().join("genui-compiler.js");
+        let wasm = temporary.path().join("esbuild.wasm");
+        std::fs::write(&mcp, "mcp").expect("mcp");
+        std::fs::write(&deno, "deno").expect("deno");
+        std::fs::write(&script, "compiler").expect("compiler");
+        std::fs::write(&wasm, "wasm").expect("wasm");
+        let runtime = AgentGatewayRuntime {
+            config: Arc::new(AgentGatewayConfig {
+                bind: "127.0.0.1:0".parse().expect("bind"),
+                token: "0123456789abcdef0123456789abcdef".into(),
+                workspace: workspace.canonicalize().unwrap(),
+                state_directory: state_directory.canonicalize().unwrap(),
+                daemon: DaemonState::open(temporary.path().join("daemon-state")).unwrap(),
+                codex_executable: None,
+                codex_auth_file: None,
+                mcp_executable: Some(mcp),
+                genui_runtime: Some(AgentGenUiRuntimeConfig {
+                    deno_executable: deno,
+                    runtime_version: "2.9.3".into(),
+                    compiler_script: script,
+                    compiler_wasm: wasm,
+                    compiler_version: "0.28.1".into(),
+                }),
+                control_socket: temporary.path().join("hyperd.sock"),
+            }),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let session_root = state_directory.join("agents/session-7");
+        let config = runtime
+            .mcp_config(TaskId::new(), &session_root)
+            .expect("MCP configured")
+            .expect("valid MCP config");
+        let arguments = config
+            .arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(arguments.contains(&std::borrow::Cow::Borrowed("--genui-script")));
+        assert!(arguments.contains(&std::borrow::Cow::Borrowed("--genui-wasm")));
+        assert!(arguments.contains(&std::borrow::Cow::Borrowed("--deno-sha256")));
+        assert!(arguments.iter().any(|argument| argument.len() == 64));
+        assert!(config.arguments.len() <= 32);
     }
 
     async fn request(
