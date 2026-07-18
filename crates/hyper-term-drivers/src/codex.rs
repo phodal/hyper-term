@@ -40,6 +40,9 @@ pub struct CodexAppServerConfig {
     pub workspace: PathBuf,
     pub codex_home: PathBuf,
     pub scratch_directory: PathBuf,
+    /// The only credential material admitted into the isolated Codex home.
+    /// On Unix this is staged as a private symlink after ownership and mode checks.
+    pub auth_file: Option<PathBuf>,
     pub brokered_mcp_server: Option<CodexMcpServerConfig>,
 }
 
@@ -49,6 +52,8 @@ pub struct CodexAppServerClient {
     request_gate: Mutex<()>,
     inbox: Mutex<VecDeque<DriverEvent>>,
     pending: Mutex<HashMap<ExternalRequestId, AgentEffectProposal>>,
+    workspace: String,
+    staged_auth_file: Option<PathBuf>,
 }
 
 impl CodexAppServerClient {
@@ -64,8 +69,15 @@ impl CodexAppServerClient {
         fs::create_dir_all(&config.codex_home)?;
         fs::create_dir_all(&config.scratch_directory)?;
         let workspace = config.workspace.canonicalize()?;
+        let workspace_text = workspace
+            .to_str()
+            .ok_or_else(|| {
+                CodexAdapterError::InvalidConfig("Codex workspace path is not UTF-8".into())
+            })?
+            .to_owned();
         let codex_home = config.codex_home.canonicalize()?;
         let scratch = config.scratch_directory.canonicalize()?;
+        let staged_auth_file = stage_auth_file(config.auth_file.as_ref(), &codex_home)?;
         let environment = BTreeMap::from([
             ("CODEX_HOME".into(), codex_home.into_os_string()),
             ("HOME".into(), scratch.clone().into_os_string()),
@@ -75,7 +87,7 @@ impl CodexAppServerClient {
             ("TMPDIR".into(), scratch.into_os_string()),
         ]);
         let arguments = codex_arguments(config.brokered_mcp_server.as_ref())?;
-        let process = DriverProcess::spawn(DriverSpec {
+        let process = match DriverProcess::spawn(DriverSpec {
             manifest: DriverManifest {
                 driver_id: Uuid::new_v4(),
                 kind: DriverKind::CodexAppServer,
@@ -97,13 +109,21 @@ impl CodexAppServerClient {
             environment,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: CODEX_FRAME_BYTES,
-        })?;
+        }) {
+            Ok(process) => process,
+            Err(error) => {
+                remove_staged_auth_file(staged_auth_file.as_ref());
+                return Err(error.into());
+            }
+        };
         Ok(Self {
             process,
             next_request_id: AtomicU64::new(1),
             request_gate: Mutex::new(()),
             inbox: Mutex::new(VecDeque::new()),
             pending: Mutex::new(HashMap::new()),
+            workspace: workspace_text,
+            staged_auth_file,
         })
     }
 
@@ -135,6 +155,72 @@ impl CodexAppServerClient {
             DriverEvent::ProtocolError { message } => Err(CodexAdapterError::Protocol(message)),
             DriverEvent::Exited { code, state } => Ok(AgentDriverEvent::Exited { code, state }),
         }
+    }
+
+    pub fn start_thread(&self, timeout: Duration) -> Result<String, CodexAdapterError> {
+        let response = self.request_raw(
+            "thread/start",
+            json!({
+                "cwd": self.workspace,
+                "approvalPolicy": "on-request",
+                "sandbox": "read-only",
+                "ephemeral": false,
+                "historyMode": "paginated"
+            }),
+            timeout,
+        )?;
+        response
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CodexAdapterError::InvalidMessage("thread/start returned no thread id".into())
+            })
+            .and_then(|value| bounded(value.to_owned(), 4096))
+    }
+
+    pub fn start_turn(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<String, CodexAdapterError> {
+        let thread_id = bounded(thread_id.to_owned(), 4096)?;
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(CodexAdapterError::InvalidMessage(
+                "turn prompt must not be empty".into(),
+            ));
+        }
+        let prompt = bounded(prompt.to_owned(), 16 * 1024)?;
+        self.process.begin_effect()?;
+        let response = self.request_raw(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{
+                    "type": "text",
+                    "text": prompt,
+                    "text_elements": []
+                }]
+            }),
+            timeout,
+        );
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if self.process.state()? == DriverState::Busy {
+                    self.process.finish_effect()?;
+                }
+                return Err(error);
+            }
+        };
+        response
+            .pointer("/result/turn/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CodexAdapterError::InvalidMessage("turn/start returned no turn id".into())
+            })
+            .and_then(|value| bounded(value.to_owned(), 4096))
     }
 
     pub fn resolve_effect(
@@ -194,7 +280,9 @@ impl CodexAppServerClient {
     }
 
     pub fn close(&self) -> Result<DriverState, CodexAdapterError> {
-        Ok(self.process.stop(Duration::from_millis(250))?)
+        let state = self.process.stop(Duration::from_millis(250))?;
+        remove_staged_auth_file(self.staged_auth_file.as_ref());
+        Ok(state)
     }
 
     fn request_raw(
@@ -315,6 +403,71 @@ impl CodexAppServerClient {
                 payload_sha256: sha256_value(&payload)?,
             }),
         }
+    }
+}
+
+impl Drop for CodexAppServerClient {
+    fn drop(&mut self) {
+        remove_staged_auth_file(self.staged_auth_file.as_ref());
+    }
+}
+
+#[cfg(unix)]
+fn stage_auth_file(
+    source: Option<&PathBuf>,
+    codex_home: &std::path::Path,
+) -> Result<Option<PathBuf>, CodexAdapterError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let source = source.canonicalize()?;
+    let metadata = fs::metadata(&source)?;
+    if !metadata.is_file() {
+        return Err(CodexAdapterError::InvalidConfig(
+            "Codex auth source is not a regular file".into(),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(CodexAdapterError::InvalidConfig(
+            "Codex auth source is not owned by the current user".into(),
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(CodexAdapterError::InvalidConfig(
+            "Codex auth source must not be accessible by group or other users".into(),
+        ));
+    }
+    let target = codex_home.join("auth.json");
+    if let Ok(existing) = fs::symlink_metadata(&target) {
+        if !existing.file_type().is_symlink() {
+            return Err(CodexAdapterError::InvalidConfig(
+                "isolated Codex home already contains a non-symlink auth.json".into(),
+            ));
+        }
+        fs::remove_file(&target)?;
+    }
+    symlink(source, &target)?;
+    Ok(Some(target))
+}
+
+#[cfg(not(unix))]
+fn stage_auth_file(
+    source: Option<&PathBuf>,
+    _codex_home: &std::path::Path,
+) -> Result<Option<PathBuf>, CodexAdapterError> {
+    if source.is_some() {
+        return Err(CodexAdapterError::InvalidConfig(
+            "Codex auth staging currently requires Unix".into(),
+        ));
+    }
+    Ok(None)
+}
+
+fn remove_staged_auth_file(path: Option<&PathBuf>) {
+    if let Some(path) = path {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -530,6 +683,7 @@ pub enum CodexAdapterError {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use super::*;
@@ -611,5 +765,41 @@ mod tests {
             result,
             Err(CodexAdapterError::McpExecutableDigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn isolated_auth_staging_accepts_only_private_user_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let codex_home = temporary.path().join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let auth = temporary.path().join("auth.json");
+        fs::write(&auth, "{}").unwrap();
+
+        let mut permissions = fs::metadata(&auth).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&auth, permissions).unwrap();
+        assert!(matches!(
+            stage_auth_file(Some(&auth), &codex_home),
+            Err(CodexAdapterError::InvalidConfig(_))
+        ));
+
+        let mut permissions = fs::metadata(&auth).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&auth, permissions).unwrap();
+        let staged = stage_auth_file(Some(&auth), &codex_home)
+            .unwrap()
+            .expect("staged auth");
+        assert!(
+            fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::canonicalize(&staged).unwrap(),
+            fs::canonicalize(&auth).unwrap()
+        );
+        remove_staged_auth_file(Some(&staged));
+        assert!(!staged.exists());
     }
 }

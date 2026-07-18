@@ -13,12 +13,12 @@ use hyper_term_core::{
     TerminalSessionHandle, TerminalSubscription, TerminalSupervisor, UserShellConfig,
 };
 use hyper_term_protocol::{
-    Actor, BlockDocument, ClientId, ControlRequest, ControlRequestEnvelope, ControlResponse,
-    ControlResponseEnvelope, DomainEvent, InputLeaseId, NewEvent, OperationAction,
-    OperationCompletion, OperationId, OperationKind, OperationState, PROTOCOL_VERSION,
-    PermissionDecision, RequestId, RiskClass, TaskId, TerminalDataFrame, TerminalId,
-    TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame, read_frame,
-    write_frame,
+    Actor, BlockDocument, BlockId, ClientId, ControlRequest, ControlRequestEnvelope,
+    ControlResponse, ControlResponseEnvelope, DomainEvent, InputLeaseId, MessageRole, NewEvent,
+    OperationAction, OperationCompletion, OperationId, OperationKind, OperationState,
+    PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, TaskId, TerminalDataFrame,
+    TerminalId, TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame,
+    read_frame, write_frame,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -147,6 +147,42 @@ impl DaemonState {
             payload: DomainEvent::TaskCreated { title },
         })?;
         Ok(task_id)
+    }
+
+    pub fn append_message(
+        &self,
+        task_id: TaskId,
+        block_id: BlockId,
+        role: MessageRole,
+        external_message_id: Option<String>,
+        text: String,
+    ) -> Result<(), DaemonError> {
+        self.require_task(task_id)?;
+        if text.is_empty() {
+            return Err(DaemonError::EmptyMessage);
+        }
+        if text.len() > 64 * 1024 {
+            return Err(DaemonError::MessageTooLarge(text.len()));
+        }
+        if external_message_id
+            .as_ref()
+            .is_some_and(|value| value.len() > 4096)
+        {
+            return Err(DaemonError::ExternalMessageIdTooLarge);
+        }
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: None,
+            causation_id: None,
+            correlation_id: None,
+            payload: DomainEvent::MessageAppended {
+                block_id,
+                role,
+                external_message_id,
+                text,
+            },
+        })
     }
 
     pub fn propose_operation(
@@ -1480,6 +1516,12 @@ pub enum DaemonError {
     LockPoisoned,
     #[error("task title must not be empty")]
     EmptyTaskTitle,
+    #[error("message text must not be empty")]
+    EmptyMessage,
+    #[error("message text contains {0} bytes and exceeds the 65536-byte event bound")]
+    MessageTooLarge(usize),
+    #[error("external message id exceeds the 4096-byte bound")]
+    ExternalMessageIdTooLarge,
     #[error("task {0} does not exist")]
     TaskNotFound(TaskId),
     #[error("task {0} appears more than once in the journal")]
@@ -1541,7 +1583,11 @@ impl DaemonError {
             Self::ActionKindMismatch
             | Self::UnsupportedTerminalAction
             | Self::GenericDispatchRequiresOpaqueAction => "unsupported_action",
-            Self::InvalidBoundedText { .. } | Self::InvalidResultDigest => "invalid_request",
+            Self::InvalidBoundedText { .. }
+            | Self::InvalidResultDigest
+            | Self::EmptyMessage
+            | Self::MessageTooLarge(_)
+            | Self::ExternalMessageIdTooLarge => "invalid_request",
             Self::InputLeaseHeld(_) => "input_lease_held",
             Self::InputLeaseMissing(_) | Self::InputLeaseMismatch(_) => "input_lease_mismatch",
             Self::ClientIdentityMismatch => "client_identity_mismatch",

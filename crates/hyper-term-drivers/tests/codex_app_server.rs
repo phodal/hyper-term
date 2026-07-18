@@ -25,6 +25,7 @@ fn installed_codex_app_server_completes_an_isolated_initialize() {
         workspace: workspace.path().canonicalize().unwrap(),
         codex_home: codex_home.path().canonicalize().unwrap(),
         scratch_directory: scratch.path().canonicalize().unwrap(),
+        auth_file: None,
         brokered_mcp_server: None,
     })
     .unwrap();

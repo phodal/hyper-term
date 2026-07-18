@@ -2,19 +2,23 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 use hyper_term_drivers::{
-    CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig, DriverState, sha256_file,
+    AgentDriverEvent, AgentEffectKind, CodexAppServerClient, CodexAppServerConfig,
+    CodexMcpServerConfig, DriverState, sha256_file,
+};
+use hyper_term_protocol::{
+    BlockDocument, BlockId, MessageRole, OperationAction, OperationKind, RiskClass, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,9 +26,15 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::DaemonState;
+
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const START_TURN_TIMEOUT: Duration = Duration::from_secs(10);
+const COMPLETE_TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_PROMPT_BYTES: usize = 16 * 1024;
+const MAX_AGENT_MESSAGE_BYTES: usize = 256 * 1024;
 const AGENT_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
 
 #[derive(Clone)]
@@ -33,7 +43,9 @@ pub struct AgentGatewayConfig {
     pub token: String,
     pub workspace: PathBuf,
     pub state_directory: PathBuf,
+    pub daemon: DaemonState,
     pub codex_executable: Option<PathBuf>,
+    pub codex_auth_file: Option<PathBuf>,
     pub mcp_executable: Option<PathBuf>,
     pub control_socket: PathBuf,
 }
@@ -90,7 +102,30 @@ pub enum AgentGatewayError {
 #[derive(Clone)]
 struct AgentGatewayRuntime {
     config: Arc<AgentGatewayConfig>,
-    sessions: Arc<Mutex<HashMap<u16, Arc<CodexAppServerClient>>>>,
+    sessions: Arc<Mutex<HashMap<u16, Arc<AgentSession>>>>,
+}
+
+struct AgentSession {
+    client: Arc<CodexAppServerClient>,
+    task_id: TaskId,
+    thread_id: String,
+    progress: Mutex<AgentProgress>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentStatus {
+    Ready,
+    Running,
+    Completed,
+    WaitingApproval,
+    Failed,
+}
+
+struct AgentProgress {
+    status: AgentStatus,
+    turn_id: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +140,23 @@ struct AgentSessionResponse {
     provider: &'static str,
     protocol: &'static str,
     status: &'static str,
+    task_id: TaskId,
+    thread_id: String,
+}
+
+#[derive(Serialize)]
+struct AgentSnapshotResponse {
+    session_id: u16,
+    status: AgentStatus,
+    turn_id: Option<String>,
+    error: Option<String>,
+    document: BlockDocument,
+}
+
+#[derive(Serialize)]
+struct AgentTurnResponse {
+    session_id: u16,
+    status: AgentStatus,
 }
 
 pub async fn spawn_agent_gateway(
@@ -133,7 +185,14 @@ pub async fn spawn_agent_gateway(
         sessions: Arc::new(Mutex::new(HashMap::new())),
     };
     let router = Router::new()
-        .route("/agent/session", post(start_session).delete(close_session))
+        .route(
+            "/agent/session",
+            get(snapshot_session)
+                .post(start_session)
+                .delete(close_session),
+        )
+        .route("/agent/session/turn", post(start_turn))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_PROMPT_BYTES))
         .with_state(runtime.clone());
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -189,6 +248,59 @@ async fn close_session(
     )
 }
 
+async fn snapshot_session(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    match runtime.snapshot(session_id) {
+        Ok(snapshot) => json_response(StatusCode::OK, &snapshot),
+        Err(SessionError::NotFound) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Agent session snapshot failed",
+        ),
+    }
+}
+
+async fn start_turn(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let prompt = match String::from_utf8(body.to_vec()) {
+        Ok(prompt) if !prompt.trim().is_empty() => prompt,
+        _ => return status_response(StatusCode::BAD_REQUEST, "Agent prompt is invalid"),
+    };
+    match runtime.submit_turn(session_id, prompt) {
+        Ok(response) => json_response(StatusCode::ACCEPTED, &response),
+        Err(SessionError::NotFound) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Err(SessionError::Busy) => status_response(
+            StatusCode::CONFLICT,
+            "Agent session already has an active turn",
+        ),
+        Err(SessionError::PromptTooLarge) => status_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Agent prompt exceeds its bound",
+        ),
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Agent turn could not be started",
+        ),
+    }
+}
+
 fn authorize(
     runtime: &AgentGatewayRuntime,
     query: &AgentSessionQuery,
@@ -219,13 +331,23 @@ enum StartError {
     Driver,
 }
 
+#[derive(Debug)]
+enum SessionError {
+    NotFound,
+    Busy,
+    PromptTooLarge,
+    Lock,
+    Daemon,
+    Thread,
+}
+
 impl AgentGatewayRuntime {
     fn start_codex(&self, session_id: u16) -> Result<AgentSessionResponse, StartError> {
         let mut sessions = self.sessions.lock().map_err(|_| StartError::Lock)?;
         if let Some(session) = sessions.get(&session_id) {
-            return match session.state().map_err(|_| StartError::Driver)? {
+            return match session.client.state().map_err(|_| StartError::Driver)? {
                 DriverState::Ready | DriverState::Busy | DriverState::Waiting => {
-                    Ok(ready_response(session_id))
+                    Ok(ready_response(session_id, session))
                 }
                 _ => Err(StartError::Driver),
             };
@@ -254,14 +376,111 @@ impl AgentGatewayRuntime {
             workspace: self.config.workspace.clone(),
             codex_home: session_root.join("codex-home"),
             scratch_directory: session_root.join("scratch"),
+            auth_file: self.config.codex_auth_file.clone(),
             brokered_mcp_server,
         })
         .map_err(|_| StartError::Driver)?;
         client
             .initialize(INITIALIZE_TIMEOUT)
             .map_err(|_| StartError::Driver)?;
-        sessions.insert(session_id, Arc::new(client));
-        Ok(ready_response(session_id))
+        let thread_id = client
+            .start_thread(INITIALIZE_TIMEOUT)
+            .map_err(|_| StartError::Driver)?;
+        let task_id = self
+            .config
+            .daemon
+            .create_task(format!("Codex Agent session {session_id}"))
+            .map_err(|_| StartError::Driver)?;
+        let session = Arc::new(AgentSession {
+            client: Arc::new(client),
+            task_id,
+            thread_id,
+            progress: Mutex::new(AgentProgress {
+                status: AgentStatus::Ready,
+                turn_id: None,
+                error: None,
+            }),
+        });
+        let response = ready_response(session_id, &session);
+        sessions.insert(session_id, session);
+        Ok(response)
+    }
+
+    fn snapshot(&self, session_id: u16) -> Result<AgentSnapshotResponse, SessionError> {
+        let session = self.session(session_id)?;
+        let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
+        let status = progress.status;
+        let turn_id = progress.turn_id.clone();
+        let error = progress.error.clone();
+        drop(progress);
+        let document = self
+            .config
+            .daemon
+            .block_snapshot(session.task_id)
+            .map_err(|_| SessionError::Daemon)?;
+        Ok(AgentSnapshotResponse {
+            session_id,
+            status,
+            turn_id,
+            error,
+            document,
+        })
+    }
+
+    fn submit_turn(
+        &self,
+        session_id: u16,
+        prompt: String,
+    ) -> Result<AgentTurnResponse, SessionError> {
+        let prompt = prompt.trim().to_owned();
+        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+            return Err(SessionError::PromptTooLarge);
+        }
+        let session = self.session(session_id)?;
+        {
+            let mut progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
+            if matches!(
+                progress.status,
+                AgentStatus::Running | AgentStatus::WaitingApproval
+            ) {
+                return Err(SessionError::Busy);
+            }
+            progress.status = AgentStatus::Running;
+            progress.turn_id = None;
+            progress.error = None;
+        }
+        self.config
+            .daemon
+            .append_message(
+                session.task_id,
+                BlockId::new(),
+                MessageRole::User,
+                None,
+                prompt.clone(),
+            )
+            .map_err(|_| SessionError::Daemon)?;
+        let daemon = self.config.daemon.clone();
+        let worker_session = Arc::clone(&session);
+        std::thread::Builder::new()
+            .name(format!("hyper-term-agent-{session_id}"))
+            .spawn(move || run_turn(worker_session, daemon, prompt))
+            .map_err(|_| {
+                set_progress_failed(&session, "Agent turn worker could not start");
+                SessionError::Thread
+            })?;
+        Ok(AgentTurnResponse {
+            session_id,
+            status: AgentStatus::Running,
+        })
+    }
+
+    fn session(&self, session_id: u16) -> Result<Arc<AgentSession>, SessionError> {
+        self.sessions
+            .lock()
+            .map_err(|_| SessionError::Lock)?
+            .get(&session_id)
+            .cloned()
+            .ok_or(SessionError::NotFound)
     }
 
     fn mcp_config(&self) -> Option<Result<CodexMcpServerConfig, StartError>> {
@@ -288,7 +507,7 @@ impl AgentGatewayRuntime {
         if let Ok(mut sessions) = self.sessions.lock()
             && let Some(session) = sessions.remove(&session_id)
         {
-            let _ = session.close();
+            let _ = session.client.close();
         }
     }
 
@@ -299,17 +518,189 @@ impl AgentGatewayRuntime {
             Vec::new()
         };
         for session in sessions {
-            let _ = session.close();
+            let _ = session.client.close();
         }
     }
 }
 
-fn ready_response(session_id: u16) -> AgentSessionResponse {
+fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
+    let turn_id = match session
+        .client
+        .start_turn(&session.thread_id, &prompt, START_TURN_TIMEOUT)
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            set_progress_failed(&session, &bounded_error(&error.to_string()));
+            return;
+        }
+    };
+    if let Ok(mut progress) = session.progress.lock() {
+        progress.turn_id = Some(turn_id.clone());
+    } else {
+        let _ = session.client.close();
+        return;
+    }
+
+    let agent_block_id = BlockId::new();
+    let plan_block_id = BlockId::new();
+    let mut agent_message_bytes = 0_usize;
+    let mut plan_bytes = 0_usize;
+    let deadline = Instant::now() + COMPLETE_TURN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            set_progress_failed(&session, "Agent turn exceeded its five-minute bound");
+            let _ = session.client.close();
+            return;
+        }
+        let event = match session.client.next_event(remaining) {
+            Ok(event) => event,
+            Err(error) => {
+                set_progress_failed(&session, &bounded_error(&error.to_string()));
+                return;
+            }
+        };
+        match event {
+            AgentDriverEvent::MessageDelta {
+                thread_id,
+                turn_id: event_turn_id,
+                text,
+                ..
+            } if thread_id == session.thread_id && event_turn_id == turn_id => {
+                if text.is_empty() {
+                    continue;
+                }
+                agent_message_bytes = match agent_message_bytes.checked_add(text.len()) {
+                    Some(total) if total <= MAX_AGENT_MESSAGE_BYTES => total,
+                    _ => {
+                        set_progress_failed(&session, "Agent response exceeded its 256 KiB bound");
+                        let _ = session.client.close();
+                        return;
+                    }
+                };
+                if daemon
+                    .append_message(
+                        session.task_id,
+                        agent_block_id,
+                        MessageRole::Agent,
+                        Some(turn_id.clone()),
+                        text,
+                    )
+                    .is_err()
+                {
+                    set_progress_failed(&session, "Agent response could not be journaled");
+                    let _ = session.client.close();
+                    return;
+                }
+            }
+            AgentDriverEvent::PlanDelta {
+                thread_id,
+                turn_id: event_turn_id,
+                text,
+                ..
+            } if thread_id == session.thread_id && event_turn_id == turn_id => {
+                if text.is_empty() {
+                    continue;
+                }
+                plan_bytes = match plan_bytes.checked_add(text.len()) {
+                    Some(total) if total <= MAX_AGENT_MESSAGE_BYTES => total,
+                    _ => continue,
+                };
+                let _ = daemon.append_message(
+                    session.task_id,
+                    plan_block_id,
+                    MessageRole::Thought,
+                    Some(turn_id.clone()),
+                    text,
+                );
+            }
+            AgentDriverEvent::EffectProposed { proposal, .. } => {
+                let (kind, risk) = operation_kind_and_risk(proposal.kind);
+                if daemon
+                    .propose_operation(
+                        session.task_id,
+                        kind,
+                        OperationAction::Opaque {
+                            kind: proposal.method,
+                            payload_digest: proposal.payload_sha256,
+                        },
+                        proposal.summary,
+                        risk,
+                        proposal.required_capabilities,
+                    )
+                    .is_err()
+                {
+                    set_progress_failed(&session, "Agent effect proposal could not be journaled");
+                    return;
+                }
+                if let Ok(mut progress) = session.progress.lock() {
+                    progress.status = AgentStatus::WaitingApproval;
+                }
+                return;
+            }
+            AgentDriverEvent::TurnCompleted {
+                thread_id,
+                turn_id: event_turn_id,
+                status,
+                ..
+            } if thread_id == session.thread_id
+                && event_turn_id
+                    .as_deref()
+                    .is_none_or(|value| value == turn_id) =>
+            {
+                if status.as_deref() == Some("failed") {
+                    set_progress_failed(&session, "Codex reported a failed turn");
+                } else if let Ok(mut progress) = session.progress.lock() {
+                    progress.status = AgentStatus::Completed;
+                    progress.error = None;
+                }
+                return;
+            }
+            AgentDriverEvent::Exited { .. } => {
+                set_progress_failed(&session, "Codex exited before the turn completed");
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn operation_kind_and_risk(kind: AgentEffectKind) -> (OperationKind, RiskClass) {
+    match kind {
+        AgentEffectKind::Shell => (OperationKind::Shell, RiskClass::ExternalEffect),
+        AgentEffectKind::WorkspaceEdit => (OperationKind::FileEdit, RiskClass::WorkspaceWrite),
+        AgentEffectKind::Tool => (OperationKind::AgentTool, RiskClass::ExternalEffect),
+        AgentEffectKind::ComputerUse => (OperationKind::ComputerUse, RiskClass::ExternalEffect),
+        AgentEffectKind::Opaque => (
+            OperationKind::Other("codex_effect".into()),
+            RiskClass::ExternalEffect,
+        ),
+    }
+}
+
+fn set_progress_failed(session: &AgentSession, message: &str) {
+    if let Ok(mut progress) = session.progress.lock() {
+        progress.status = AgentStatus::Failed;
+        progress.error = Some(bounded_error(message));
+    }
+}
+
+fn bounded_error(message: &str) -> String {
+    let mut end = message.len().min(512);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_owned()
+}
+
+fn ready_response(session_id: u16, session: &AgentSession) -> AgentSessionResponse {
     AgentSessionResponse {
         session_id,
         provider: "codex",
         protocol: "codex-app-server-v2",
         status: "ready",
+        task_id: session.task_id,
+        thread_id: session.thread_id.clone(),
     }
 }
 
@@ -361,15 +752,16 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn authenticated_start_initializes_and_closes_a_pinned_codex_adapter() {
+    async fn authenticated_session_streams_a_turn_into_the_block_document() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
-        let state = temporary.path().join("state");
+        let state = temporary.path().join("gateway-state");
         std::fs::create_dir_all(&workspace).expect("workspace");
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).expect("daemon");
         let fake_codex = temporary.path().join("codex");
         std::fs::write(
             &fake_codex,
-            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake-codex\"}}' ;;\n  esac\ndone\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake-codex\"}}' ;;\n    *'\"method\":\"thread/start\"'*) printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-3\"}}}' ;;\n    *'\"method\":\"turn/start\"'*)\n      printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'\n      printf '%s\\n' '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-3\",\"turnId\":\"turn-1\",\"itemId\":\"message-1\",\"delta\":\"Hyper Term \"}}'\n      printf '%s\\n' '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-3\",\"turnId\":\"turn-1\",\"itemId\":\"message-1\",\"delta\":\"Agent is live.\"}}'\n      printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-3\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}' ;;\n  esac\ndone\n",
         )
         .expect("fake Codex");
         let mut permissions = std::fs::metadata(&fake_codex)
@@ -383,7 +775,9 @@ mod tests {
             token: token.clone(),
             workspace,
             state_directory: state,
+            daemon,
             codex_executable: Some(fake_codex),
+            codex_auth_file: None,
             mcp_executable: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
@@ -400,6 +794,38 @@ mod tests {
         assert_eq!(response["provider"], "codex");
         assert_eq!(response["protocol"], "codex-app-server-v2");
         assert_eq!(response["status"], "ready");
+        assert_eq!(response["thread_id"], "thread-3");
+
+        let (status, body) = request_path(
+            gateway.address(),
+            &format!("/agent/session/turn?token={token}&session_id=3"),
+            "POST",
+            b"Reply with the live marker",
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
+
+        let snapshot = loop {
+            let (status, body) = request(gateway.address(), &token, 3, "GET").await;
+            assert_eq!(status, StatusCode::OK.as_u16());
+            let snapshot: serde_json::Value =
+                serde_json::from_slice(&body).expect("snapshot response");
+            if snapshot["status"] == "completed" {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let blocks = snapshot["document"]["blocks"]
+            .as_array()
+            .expect("snapshot blocks");
+        assert!(blocks.iter().any(|block| {
+            block["payload"]["role"] == "user"
+                && block["payload"]["text"] == "Reply with the live marker"
+        }));
+        assert!(blocks.iter().any(|block| {
+            block["payload"]["role"] == "agent"
+                && block["payload"]["text"] == "Hyper Term Agent is live."
+        }));
 
         assert_eq!(
             request(gateway.address(), &token, 3, "DELETE").await.0,
@@ -414,16 +840,36 @@ mod tests {
         session_id: u16,
         method: &str,
     ) -> (u16, Vec<u8>) {
+        request_path(
+            address,
+            &format!("/agent/session?token={token}&session_id={session_id}"),
+            method,
+            b"",
+        )
+        .await
+    }
+
+    async fn request_path(
+        address: SocketAddr,
+        path: &str,
+        method: &str,
+        body: &[u8],
+    ) -> (u16, Vec<u8>) {
         let mut stream = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect agent gateway");
         let request = format!(
-            "{method} /agent/session?token={token}&session_id={session_id} HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
         );
         stream
             .write_all(request.as_bytes())
             .await
             .expect("write agent request");
+        stream
+            .write_all(body)
+            .await
+            .expect("write agent request body");
         let mut response = Vec::new();
         stream
             .read_to_end(&mut response)

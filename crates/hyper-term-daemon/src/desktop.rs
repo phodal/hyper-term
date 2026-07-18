@@ -44,6 +44,7 @@ fn run() -> Result<i32, String> {
              --state-dir PATH          Durable Hyper Term state\n  \
              --shell-cwd PATH          Initial directory for new shells\n  \
              --codex PATH              Codex executable for Agent sessions\n  \
+             --codex-auth PATH         Private Codex auth.json for isolated Agent sessions\n  \
              -h, --help                Show this help"
         );
         return Ok(0);
@@ -81,7 +82,7 @@ fn run() -> Result<i32, String> {
                 token: terminal_token.clone(),
                 default_cwd: Some(resolved.shell_cwd.clone()),
             },
-            daemon,
+            daemon.clone(),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -90,7 +91,9 @@ fn run() -> Result<i32, String> {
             token: agent_token.clone(),
             workspace: resolved.shell_cwd.clone(),
             state_directory: resolved.state_directory.join("agent-runtime"),
+            daemon: daemon.clone(),
             codex_executable: resolved.codex.clone(),
+            codex_auth_file: resolved.codex_auth.clone(),
             mcp_executable: resolved.mcp.clone(),
             control_socket,
         })
@@ -155,6 +158,7 @@ struct Options {
     state_directory: Option<PathBuf>,
     shell_cwd: Option<PathBuf>,
     codex: Option<PathBuf>,
+    codex_auth: Option<PathBuf>,
     help: bool,
 }
 
@@ -176,6 +180,9 @@ impl Options {
                     options.shell_cwd = Some(required_path(&mut arguments, "--shell-cwd")?);
                 }
                 Some("--codex") => options.codex = Some(required_path(&mut arguments, "--codex")?),
+                Some("--codex-auth") => {
+                    options.codex_auth = Some(required_path(&mut arguments, "--codex-auth")?);
+                }
                 Some("-h" | "--help") => options.help = true,
                 Some(other) => return Err(format!("unknown argument: {other}")),
                 None => return Err("desktop arguments must be valid UTF-8 option names".into()),
@@ -201,6 +208,10 @@ impl Options {
                 .unwrap_or_else(|| default_state_directory(home)),
             shell_cwd: self.shell_cwd.unwrap_or_else(|| home.to_owned()),
             codex: self.codex.or_else(|| find_executable("codex")),
+            codex_auth: self.codex_auth.or_else(|| {
+                let candidate = home.join(".codex/auth.json");
+                candidate.is_file().then_some(candidate)
+            }),
             mcp: executable
                 .with_file_name("hyper-term-mcp")
                 .is_file()
@@ -216,6 +227,7 @@ struct ResolvedOptions {
     state_directory: PathBuf,
     shell_cwd: PathBuf,
     codex: Option<PathBuf>,
+    codex_auth: Option<PathBuf>,
     mcp: Option<PathBuf>,
 }
 
@@ -236,6 +248,14 @@ impl ResolvedOptions {
         }
         if let Some(codex) = &self.codex {
             validate_executable(codex)?;
+        }
+        if let Some(codex_auth) = &self.codex_auth
+            && (!codex_auth.is_absolute() || !codex_auth.is_file())
+        {
+            return Err(format!(
+                "Codex auth file is unavailable: {}",
+                codex_auth.display()
+            ));
         }
         if let Some(mcp) = &self.mcp {
             validate_executable(mcp)?;
@@ -333,6 +353,8 @@ mod tests {
             "/tmp".into(),
             "--codex".into(),
             "/tmp/codex".into(),
+            "--codex-auth".into(),
+            "/tmp/auth.json".into(),
         ])
         .expect("options");
         assert_eq!(options.ui, Some(PathBuf::from("/tmp/hyper-term-ui")));
@@ -343,6 +365,7 @@ mod tests {
         assert_eq!(options.state_directory, Some(PathBuf::from("/tmp/state")));
         assert_eq!(options.shell_cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(options.codex, Some(PathBuf::from("/tmp/codex")));
+        assert_eq!(options.codex_auth, Some(PathBuf::from("/tmp/auth.json")));
     }
 
     #[test]
