@@ -214,6 +214,7 @@ jobs:
             --release \
             --package hyper-term-daemon \
             --bin hyper-term-desktop \
+            --bin hyper-term-mcp \
             --target "$RUST_TARGET"
 
       - name: Build and package unsigned Native app
@@ -237,9 +238,12 @@ jobs:
           ./scripts/assemble_macos_app.sh \
             "$RUNNER_TEMP/Hyper Term.app" \
             "target/$RUST_TARGET/release/hyper-term-desktop" \
+            "target/$RUST_TARGET/release/hyper-term-mcp" \
             dist/terminal
           "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term" --help \
             | grep -F "Hyper Term desktop host"
+          "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term-mcp" --help \
+            | grep -F "Hyper Term brokered MCP connector"
 
       - name: Select release signing mode
         shell: bash
@@ -339,6 +343,12 @@ jobs:
             --options runtime \
             --timestamp \
             --sign "$APPLE_SIGNING_IDENTITY" \
+            "$app/Contents/MacOS/hyper-term-mcp"
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" \
             "$app/Contents/MacOS/hyper-term"
           codesign \
             --force \
@@ -359,6 +369,11 @@ jobs:
             --options runtime \
             --sign - \
             "$app/Contents/MacOS/hyper-term-ui"
+          codesign \
+            --force \
+            --options runtime \
+            --sign - \
+            "$app/Contents/MacOS/hyper-term-mcp"
           codesign \
             --force \
             --options runtime \

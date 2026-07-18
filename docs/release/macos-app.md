@@ -12,6 +12,7 @@ The final bundle contains:
 
 - `Contents/MacOS/hyper-term`: the Rust desktop supervisor and PTY authority;
 - `Contents/MacOS/hyper-term-ui`: the Native SDK window and renderer;
+- `Contents/MacOS/hyper-term-mcp`: the Agent-mode-only, brokered stdio MCP connector;
 - `Contents/Resources/terminal`: the built terminal WebView assets.
 
 Native SDK first creates an unsigned `.app`. The workflow then composes the

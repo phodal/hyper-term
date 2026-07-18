@@ -43,7 +43,12 @@ cd "$hyper_repo_root"
 "$hyper_deno" task check
 "$hyper_deno" task test
 "$hyper_deno" task build:terminal
-cargo build --locked --release --package hyper-term-daemon --bin hyper-term-desktop
+cargo build \
+  --locked \
+  --release \
+  --package hyper-term-daemon \
+  --bin hyper-term-desktop \
+  --bin hyper-term-mcp
 
 cd "$hyper_repo_root/apps/desktop"
 native check --strict
@@ -64,12 +69,16 @@ mv \
 install -m 0755 \
   "$hyper_repo_root/target/release/hyper-term-desktop" \
   "$hyper_staging_app/Contents/MacOS/hyper-term"
+install -m 0755 \
+  "$hyper_repo_root/target/release/hyper-term-mcp" \
+  "$hyper_staging_app/Contents/MacOS/hyper-term-mcp"
 mkdir -p "$hyper_staging_app/Contents/Resources/terminal"
 cp -R \
   "$hyper_repo_root/dist/terminal/." \
   "$hyper_staging_app/Contents/Resources/terminal/"
 
 codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term-ui"
+codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term-mcp"
 codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term"
 codesign --force --deep --sign - "$hyper_staging_app"
 codesign --verify --deep --strict "$hyper_staging_app"
@@ -82,6 +91,10 @@ if [[ $hyper_bundle_executable != hyper-term ]]; then
 fi
 if [[ ! -x "$hyper_staging_app/Contents/MacOS/hyper-term-ui" ]]; then
   echo "packaged Native renderer is unavailable" >&2
+  exit 1
+fi
+if [[ ! -x "$hyper_staging_app/Contents/MacOS/hyper-term-mcp" ]]; then
+  echo "packaged MCP connector is unavailable" >&2
   exit 1
 fi
 if [[ ! -f "$hyper_staging_app/Contents/Resources/terminal/index.html" ]]; then
