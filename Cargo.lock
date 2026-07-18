@@ -478,6 +478,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-term-sandbox"
+version = "0.1.0"
+dependencies = [
+ "hyper-term-core",
+ "hyper-term-protocol",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hyper-util"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

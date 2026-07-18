@@ -4,6 +4,7 @@ members = [
   "crates/hyper-term-core",
   "crates/hyper-term-daemon",
   "crates/hyper-term-drivers",
+  "crates/hyper-term-sandbox",
 ]
 resolver = "3"
 

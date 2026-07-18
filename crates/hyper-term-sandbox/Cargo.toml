@@ -1,0 +1,15 @@
+[package]
+name = "hyper-term-sandbox"
+description = "Fail-closed operating-system sandbox backends for Hyper Term Agent operations"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+hyper-term-core = { path = "../hyper-term-core" }
+hyper-term-protocol = { path = "../hyper-term-protocol" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
