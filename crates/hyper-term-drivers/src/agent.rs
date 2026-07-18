@@ -10,6 +10,7 @@ pub enum StructuredAgentProtocol {
     Acp,
     CodexAppServerV2,
     ClaudeStreamJson,
+    Mcp20251125,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
