@@ -26,6 +26,7 @@ const EXIT_AFTER_STDOUT_GRACE: Duration = Duration::from_millis(200);
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
     DenoLsp,
+    DenoGenUi,
     AcpAgent,
     CodexAppServer,
     ClaudeStreamJson,
