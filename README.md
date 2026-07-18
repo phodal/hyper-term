@@ -256,6 +256,22 @@ HYPER_TERM_DENO_SHA256=<manifest-executable-sha256> \
 cargo test -p hyper-term-drivers --test deno_lsp -- --ignored
 ```
 
+## Release the macOS application
+
+Pushing a version tag such as `v0.1.0`, or manually dispatching the
+`Release Hyper Term` workflow for an existing tag, validates the Rust, Deno, and
+Native SDK layers and builds complete Apple Silicon and Intel applications. The
+release archives contain the Rust desktop supervisor, Native SDK renderer, and
+terminal WebView assets in one `.app` bundle. Stable releases are Developer ID
+signed and notarized; unsigned RC pipeline tests are labelled explicitly.
+
+The stable part of the tag must match the Cargo workspace and
+`apps/desktop/app.zon` versions. Configure the protected `Release` GitHub
+environment with the Apple signing and App Store Connect API secrets before
+creating a tag. See
+[the macOS release guide](docs/release/macos-app.md) for the bundle layout and
+required secrets.
+
 ## Structured agent adapters
 
 ACP, Codex app-server, Claude stream-json, and opaque PTY agents are separate

@@ -1,0 +1,452 @@
+name: Release Hyper Term
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to publish
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NATIVE_SDK_VERSION: 0.5.3
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    name: Validate release source
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Verify tag and application versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must match vX.Y.Z or vX.Y.Z-suffix: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          python3 - "$RELEASE_TAG" <<'PY'
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          release_tag = sys.argv[1]
+          with open("Cargo.toml", "rb") as source:
+              cargo_version = tomllib.load(source)["workspace"]["package"]["version"]
+          manifest = pathlib.Path("apps/desktop/app.zon").read_text()
+          match = re.search(r'\.version\s*=\s*"([^"]+)"', manifest)
+          if match is None:
+              raise SystemExit("apps/desktop/app.zon does not declare .version")
+          native_version = match.group(1)
+          release_version = release_tag.removeprefix("v")
+          application_version = release_version.split("-", 1)[0]
+          if cargo_version != application_version or native_version != application_version:
+              raise SystemExit(
+                  f"release {release_version} expects application version "
+                  f"{application_version}, but found Cargo {cargo_version} "
+                  f"and Native app {native_version}"
+              )
+          PY
+
+      - name: Install pinned Deno
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.9.3
+
+      - name: Install pinned Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Install verified Native SDK CLI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_ASSET: native-sdk-darwin-arm64
+        run: |
+          set -euo pipefail
+          cli_dir="$RUNNER_TEMP/native-sdk"
+          bin_dir="$RUNNER_TEMP/native-sdk-bin"
+          mkdir -p "$cli_dir" "$bin_dir"
+          gh release download "v$NATIVE_SDK_VERSION" \
+            --repo vercel-labs/native \
+            --pattern "$NATIVE_ASSET" \
+            --pattern CHECKSUMS.txt \
+            --dir "$cli_dir"
+          grep -E "[[:space:]]+$NATIVE_ASSET$" "$cli_dir/CHECKSUMS.txt" \
+            | (cd "$cli_dir" && shasum -a 256 -c -)
+          install -m 0755 "$cli_dir/$NATIVE_ASSET" "$bin_dir/native"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+      - name: Run Rust release gates
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+      - name: Run Deno release gates
+        run: |
+          deno task verify:runtime
+          deno task check
+          deno task test
+          deno task build:terminal
+          deno task build:workbench
+
+      - name: Run Native SDK release gates
+        working-directory: apps/desktop
+        run: |
+          native check --strict
+          native test
+          native build --release=fast
+
+      - name: Upload verified terminal renderer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: terminal-renderer
+          path: dist/terminal
+          if-no-files-found: error
+          retention-days: 7
+
+  package-macos:
+    name: Package macOS ${{ matrix.arch }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    environment: Release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            rust_target: aarch64-apple-darwin
+            native_asset: native-sdk-darwin-arm64
+          - runner: macos-15-intel
+            arch: x64
+            rust_target: x86_64-apple-darwin
+            native_asset: native-sdk-darwin-x64
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Install pinned Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Install verified Native SDK CLI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_ASSET: ${{ matrix.native_asset }}
+        run: |
+          set -euo pipefail
+          cli_dir="$RUNNER_TEMP/native-sdk"
+          bin_dir="$RUNNER_TEMP/native-sdk-bin"
+          mkdir -p "$cli_dir" "$bin_dir"
+          gh release download "v$NATIVE_SDK_VERSION" \
+            --repo vercel-labs/native \
+            --pattern "$NATIVE_ASSET" \
+            --pattern CHECKSUMS.txt \
+            --dir "$cli_dir"
+          grep -E "[[:space:]]+$NATIVE_ASSET$" "$cli_dir/CHECKSUMS.txt" \
+            | (cd "$cli_dir" && shasum -a 256 -c -)
+          install -m 0755 "$cli_dir/$NATIVE_ASSET" "$bin_dir/native"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+      - name: Download verified terminal renderer
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: terminal-renderer
+          path: dist/terminal
+
+      - name: Build Rust desktop supervisor
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          rustup target add "$RUST_TARGET"
+          cargo build \
+            --locked \
+            --release \
+            --package hyper-term-daemon \
+            --bin hyper-term-desktop \
+            --target "$RUST_TARGET"
+
+      - name: Build and package unsigned Native app
+        shell: bash
+        working-directory: apps/desktop
+        run: |
+          set -euo pipefail
+          native build --release=fast
+          native package \
+            --target macos \
+            --binary zig-out/bin/hyper-term \
+            --output "$RUNNER_TEMP/Hyper Term.app" \
+            --signing none
+
+      - name: Assemble the complete Terminal application
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          ./scripts/assemble_macos_app.sh \
+            "$RUNNER_TEMP/Hyper Term.app" \
+            "target/$RUST_TARGET/release/hyper-term-desktop" \
+            dist/terminal
+          "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term" --help \
+            | grep -F "Hyper Term desktop host"
+
+      - name: Select release signing mode
+        shell: bash
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$APPLE_CERTIFICATE_P12" \
+            && -n "$APPLE_CERTIFICATE_PASSWORD" \
+            && -n "$APPLE_SIGNING_IDENTITY" \
+            && -n "$APPLE_TEAM_ID" \
+            && -n "$APPLE_API_KEY_ID" \
+            && -n "$APPLE_API_ISSUER_ID" \
+            && -n "$APPLE_API_PRIVATE_KEY" ]]; then
+            echo "SIGNING_MODE=developer-id" >> "$GITHUB_ENV"
+            echo "SIGNING_SUFFIX=" >> "$GITHUB_ENV"
+          elif [[ "$RELEASE_TAG" == *-* ]]; then
+            echo "Apple release secrets are absent; producing an explicitly unsigned pre-release"
+            echo "SIGNING_MODE=adhoc" >> "$GITHUB_ENV"
+            echo "SIGNING_SUFFIX=-unsigned" >> "$GITHUB_ENV"
+          else
+            echo "stable releases require every Apple signing and notarization secret" >&2
+            exit 1
+          fi
+
+      - name: Import Developer ID certificate
+        if: env.SIGNING_MODE == 'developer-id'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_CERTIFICATE_P12:?APPLE_CERTIFICATE_P12 is required}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?APPLE_CERTIFICATE_PASSWORD is required}"
+          export CERTIFICATE_PATH="$RUNNER_TEMP/hyper-term-certificate.p12"
+          export KEYCHAIN_PATH="$RUNNER_TEMP/hyper-term-signing.keychain-db"
+          export KEYCHAIN_PASSWORD
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          python3 - <<'PY'
+          import base64
+          import os
+          import pathlib
+
+          pathlib.Path(os.environ["CERTIFICATE_PATH"]).write_bytes(
+              base64.b64decode(os.environ["APPLE_CERTIFICATE_P12"], validate=True)
+          )
+          PY
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign the complete application
+        if: env.SIGNING_MODE == 'developer-id'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY is required}"
+          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
+          if [[ "$APPLE_SIGNING_IDENTITY" != *"($APPLE_TEAM_ID)"* ]]; then
+            echo "signing identity does not contain Apple team $APPLE_TEAM_ID" >&2
+            exit 1
+          fi
+          security find-identity \
+            -v \
+            -p codesigning \
+            "$RUNNER_TEMP/hyper-term-signing.keychain-db" \
+            | grep -F "$APPLE_SIGNING_IDENTITY"
+          app="$RUNNER_TEMP/Hyper Term.app"
+          while IFS= read -r executable; do
+            if file -b "$executable" | grep -q "Mach-O"; then
+              codesign \
+                --force \
+                --options runtime \
+                --timestamp \
+                --sign "$APPLE_SIGNING_IDENTITY" \
+                "$executable"
+            fi
+          done < <(find "$app/Contents" -type f -perm -111 | sort)
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      - name: Ad-hoc sign the pre-release application
+        if: env.SIGNING_MODE == 'adhoc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/Hyper Term.app"
+          while IFS= read -r executable; do
+            if file -b "$executable" | grep -q "Mach-O"; then
+              codesign --force --options runtime --sign - "$executable"
+            fi
+          done < <(find "$app/Contents" -type f -perm -111 | sort)
+          codesign --force --options runtime --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      - name: Notarize and staple the application
+        if: env.SIGNING_MODE == 'developer-id'
+        shell: bash
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_API_ISSUER_ID:?APPLE_API_ISSUER_ID is required}"
+          : "${APPLE_API_KEY_ID:?APPLE_API_KEY_ID is required}"
+          : "${APPLE_API_PRIVATE_KEY:?APPLE_API_PRIVATE_KEY is required}"
+          export API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          python3 - <<'PY'
+          import base64
+          import os
+          import pathlib
+
+          pathlib.Path(os.environ["API_KEY_PATH"]).write_bytes(
+              base64.b64decode(os.environ["APPLE_API_PRIVATE_KEY"], validate=True)
+          )
+          PY
+          app="$RUNNER_TEMP/Hyper Term.app"
+          submission="$RUNNER_TEMP/Hyper-Term-notarization.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$submission"
+          xcrun notarytool submit "$submission" \
+            --key "$API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+
+      - name: Create release archive
+        shell: bash
+        env:
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          mkdir -p dist/release
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/Hyper Term.app" \
+            "dist/release/Hyper-Term-${version}-macos-${RELEASE_ARCH}${SIGNING_SUFFIX}.zip"
+
+      - name: Upload signed and notarized application
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hyper-term-macos-${{ matrix.arch }}
+          path: dist/release/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/hyper-term-signing.keychain-db" 2>/dev/null || true
+          rm -f \
+            "$RUNNER_TEMP/hyper-term-certificate.p12" \
+            "$RUNNER_TEMP/AuthKey.p8"
+
+  publish:
+    name: Publish GitHub Release
+    needs: package-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download application archives
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: hyper-term-macos-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum -- *.zip > SHA256SUMS
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=(release-assets/*.zip release-assets/SHA256SUMS)
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload \
+              "$RELEASE_TAG" \
+              "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            release_flags=()
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create \
+              "$RELEASE_TAG" \
+              "${assets[@]}" \
+              --generate-notes \
+              --title "Hyper Term $RELEASE_TAG" \
+              --verify-tag \
+              "${release_flags[@]}" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
