@@ -2,8 +2,9 @@
 //!
 //! Zig owns presentation state only. PTYs, process lifecycle, transcripts,
 //! permissions, files, and agent runtimes remain behind the Rust `hyperd`
-//! boundary. The placeholder terminal surface in this first native slice is
-//! deliberately disconnected instead of spawning a second, unbrokered shell.
+//! boundary. A child system WebView may render terminal cells, but its bytes
+//! travel directly over hyperd's authenticated terminal plane; this Zig host
+//! has no JavaScript bridge and never spawns a shell.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -16,6 +17,9 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 pub const canvas_label = "hyper-term-canvas";
+pub const terminal_view_label = "hyper-term-terminal-view";
+pub const terminal_view_anchor = "Terminal viewport";
+pub const terminal_gateway_origin = "http://127.0.0.1:47437";
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -26,19 +30,32 @@ const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
     native_sdk.security.permission_view,
 };
-const shell_views = [_]native_sdk.ShellView{.{
-    .label = canvas_label,
-    .kind = .gpu_surface,
-    .fill = true,
-    .role = "Hyper Term canvas",
-    .accessibility_label = "Hyper Term",
-    .gpu_backend = .metal,
-    .gpu_pixel_format = .bgra8_unorm,
-    .gpu_present_mode = .timer,
-    .gpu_alpha_mode = .@"opaque",
-    .gpu_color_space = .srgb,
-    .gpu_vsync = true,
-}};
+const shell_views = [_]native_sdk.ShellView{
+    .{
+        .label = canvas_label,
+        .kind = .gpu_surface,
+        .fill = true,
+        .role = "Hyper Term canvas",
+        .accessibility_label = "Hyper Term",
+        .gpu_backend = .metal,
+        .gpu_pixel_format = .bgra8_unorm,
+        .gpu_present_mode = .timer,
+        .gpu_alpha_mode = .@"opaque",
+        .gpu_color_space = .srgb,
+        .gpu_vsync = true,
+    },
+    .{
+        .label = terminal_view_label,
+        .kind = .webview,
+        .parent = canvas_label,
+        .url = "zero://inline",
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+        .layer = 20,
+    },
+};
 const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
     .title = "Hyper Term",
@@ -67,10 +84,11 @@ pub const Model = struct {
     chrome_trailing: f32 = 0,
     titlebar_height: f32 = titlebar_natural_height,
     agent_split: f32 = 0.64,
+    terminal_url: []const u8 = "",
 
     /// Read by update, token, and derived-binding code rather than bound
     /// directly by the declarative view.
-    pub const view_unbound = .{ "mode", "system_scheme", "high_contrast", "reduce_motion" };
+    pub const view_unbound = .{ "mode", "system_scheme", "high_contrast", "reduce_motion", "terminal_url", "terminalReady" };
 
     pub fn isTerminal(model: *const Model) bool {
         return model.mode == .terminal;
@@ -95,6 +113,25 @@ pub const Model = struct {
             .terminal => "Current Terminal session",
             .agent => "Current Agent session",
         };
+    }
+
+    pub fn terminalReady(model: *const Model) bool {
+        return model.terminal_url.len > 0;
+    }
+
+    pub fn terminalDisconnected(model: *const Model) bool {
+        return !model.terminalReady();
+    }
+
+    pub fn terminalConnectionLabel(model: *const Model) []const u8 {
+        return if (model.terminalReady()) "connected" else "offline";
+    }
+
+    pub fn terminalStatus(model: *const Model) []const u8 {
+        return if (model.terminalReady())
+            "zsh · ordered Rust PTY plane"
+        else
+            "zsh · hyperd disconnected";
     }
 };
 
@@ -249,11 +286,39 @@ pub fn initialModel() Model {
     return .{};
 }
 
+pub fn initialModelWithTerminalUrl(url: []const u8) Model {
+    var model = initialModel();
+    if (trustedTerminalUrl(url)) model.terminal_url = url;
+    return model;
+}
+
+pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize {
+    if (!model.terminalReady() or out.len == 0) return 0;
+    out[0] = .{
+        .label = terminal_view_label,
+        .anchor = terminal_view_anchor,
+        .url = model.terminal_url,
+    };
+    return 1;
+}
+
+pub fn trustedTerminalUrl(url: []const u8) bool {
+    const prefix = terminal_gateway_origin ++ "/?token=";
+    if (!std.mem.startsWith(u8, url, prefix)) return false;
+    const token = url[prefix.len..];
+    if (token.len < 32) return false;
+    for (token) |character| {
+        if (!std.ascii.isAlphanumeric(character) and character != '-' and character != '_') return false;
+    }
+    return true;
+}
+
 pub fn main(init: std.process.Init) !void {
     const app_state = try std.heap.page_allocator.create(HyperTermApp);
     defer std.heap.page_allocator.destroy(app_state);
 
-    app_state.* = HyperTermApp.init(std.heap.page_allocator, initialModel(), .{
+    const terminal_url = init.environ_map.get("HYPER_TERM_TERMINAL_URL") orelse "";
+    app_state.* = HyperTermApp.init(std.heap.page_allocator, initialModelWithTerminalUrl(terminal_url), .{
         .name = "hyper-term",
         .scene = shell_scene,
         .canvas_label = canvas_label,
@@ -263,6 +328,7 @@ pub fn main(init: std.process.Init) !void {
         .on_appearance = onAppearance,
         .on_chrome = onChrome,
         .view = CompiledHyperTermView.build,
+        .web_panes = terminalPanes,
         .markup = if (dev_markup_reload)
             .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io }
         else
@@ -280,7 +346,7 @@ pub fn main(init: std.process.Init) !void {
         .js_window_api = false,
         .security = .{
             .permissions = &app_permissions,
-            .navigation = .{ .allowed_origins = &.{"zero://app"} },
+            .navigation = .{ .allowed_origins = &.{ "zero://app", "zero://inline", terminal_gateway_origin } },
         },
     }, init);
 }

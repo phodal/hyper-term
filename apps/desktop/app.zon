@@ -7,7 +7,7 @@
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
     .permissions = .{ "view", "command" },
-    .capabilities = .{ "native_views", "gpu_surfaces", "menus", "shortcuts" },
+    .capabilities = .{ "native_views", "gpu_surfaces", "webview", "menus", "shortcuts" },
     .shortcuts = .{
         .{ .id = "hyper-term.new-session", .key = "n", .modifiers = .{"primary"} },
         .{ .id = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
@@ -38,13 +38,14 @@
                 .titlebar = "hidden_inset_tall",
                 .views = .{
                     .{ .label = "hyper-term-canvas", .kind = "gpu_surface", .fill = true, .role = "Hyper Term canvas", .accessibility_label = "Hyper Term", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                    .{ .label = "hyper-term-terminal-view", .kind = "webview", .parent = "hyper-term-canvas", .url = "zero://inline", .x = 0, .y = 0, .width = 1, .height = 1, .layer = 20 },
                 },
             },
         },
     },
     .security = .{
         .navigation = .{
-            .allowed_origins = .{"zero://app"},
+            .allowed_origins = .{ "zero://app", "zero://inline", "http://127.0.0.1:47437" },
             .external_links = .{ .action = "deny" },
         },
     },

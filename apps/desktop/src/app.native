@@ -27,15 +27,17 @@
 
   <if test="{isTerminal}">
     <column grow="1" background="background" label="Terminal session">
-      <scroll grow="1" overscroll="none" label="Terminal transcript">
-        <column gap="5" padding="16">
+      <column grow="1" background="background" label="Terminal viewport">
+        <if test="{terminalDisconnected}">
+          <column gap="5" padding="16">
           <text foreground="text_muted"><span mono="true">Last login: Fri Jul 18 on ttys001</span></text>
           <text><span mono="true" foreground="accent">phodal@mac</span> <span mono="true" foreground="text_muted">~/ai/hyper-term</span> <span mono="true">%</span></text>
-          <text foreground="text_muted"><span mono="true"># Native terminal surface will attach to the ordered Rust PTY plane.</span></text>
+          <text foreground="text_muted"><span mono="true"># Start hyperd with the local terminal gateway to attach this session.</span></text>
           <text><span mono="true" foreground="accent">phodal@mac</span> <span mono="true" foreground="text_muted">~/ai/hyper-term</span> <span mono="true">%</span> <span mono="true" foreground="accent">_</span></text>
-        </column>
-      </scroll>
-      <status-bar>zsh · hyperd disconnected · native renderer prototype</status-bar>
+          </column>
+        </if>
+      </column>
+      <status-bar>{terminalStatus}</status-bar>
     </column>
   </if>
   <else>
@@ -44,15 +46,17 @@
         <row gap="8" padding="8" cross="center" background="surface_subtle">
           <badge variant="secondary">zsh</badge>
           <text grow="1" foreground="text_muted">Terminal</text>
-          <badge variant="destructive">offline</badge>
+          <badge variant="secondary">{terminalConnectionLabel}</badge>
         </row>
-        <scroll grow="1" overscroll="none" label="Agent terminal transcript">
-          <column gap="5" padding="16">
-            <text><span mono="true" foreground="accent">phodal@mac</span> <span mono="true" foreground="text_muted">~/ai/hyper-term</span> <span mono="true">% codex</span></text>
-            <text foreground="text_muted"><span mono="true">Waiting for the brokered ACP driver and Rust PTY stream…</span></text>
-            <text><span mono="true" foreground="accent">_</span></text>
-          </column>
-        </scroll>
+        <column grow="1" background="background" label="Terminal viewport">
+          <if test="{terminalDisconnected}">
+            <column gap="5" padding="16">
+              <text><span mono="true" foreground="accent">phodal@mac</span> <span mono="true" foreground="text_muted">~/ai/hyper-term</span> <span mono="true">% codex</span></text>
+              <text foreground="text_muted"><span mono="true">Waiting for the brokered Rust PTY stream…</span></text>
+              <text><span mono="true" foreground="accent">_</span></text>
+            </column>
+          </if>
+        </column>
         <status-bar>terminal plane · ordered · reconnectable</status-bar>
       </column>
 
