@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    BlockDocument, BlockPatch, ClientId, EventEnvelope, InputLeaseId, OperationAction, OperationId,
-    OperationKind, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass,
-    TaskId, TerminalId, TerminalSize,
+    BlockDocument, BlockPatch, ClientId, EventEnvelope, InputLeaseId, OperationAction,
+    OperationCompletion, OperationId, OperationKind, OperationState, PROTOCOL_VERSION,
+    PermissionDecision, RequestId, RiskClass, TaskId, TerminalId, TerminalSize,
 };
 
 const MAGIC: [u8; 4] = *b"HTRM";
@@ -66,6 +66,17 @@ pub enum ControlRequest {
         operation_id: OperationId,
         expected_revision: u64,
         decision: PermissionDecision,
+    },
+    BeginOperation {
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+    },
+    CompleteOperation {
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        completion: OperationCompletion,
     },
     DispatchTerminal {
         task_id: TaskId,
@@ -422,6 +433,27 @@ mod tests {
         write_frame(&mut bytes, &original).expect("encode");
         let decoded = read_frame(bytes.as_slice()).expect("decode");
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn brokered_operation_completion_round_trips_as_structured_evidence() {
+        let original = WireFrame::Request(ControlRequestEnvelope {
+            request_id: RequestId::new(),
+            request: ControlRequest::CompleteOperation {
+                task_id: TaskId::new(),
+                operation_id: OperationId::new(),
+                expected_revision: 5,
+                completion: OperationCompletion {
+                    executor: "hyper-term-mcp".into(),
+                    succeeded: true,
+                    summary: "diff ready".into(),
+                    result_digest: Some("a".repeat(64)),
+                },
+            },
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &original).expect("encode");
+        assert_eq!(read_frame(bytes.as_slice()).expect("decode"), original);
     }
 
     #[test]

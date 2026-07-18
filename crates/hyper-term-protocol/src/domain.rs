@@ -87,6 +87,14 @@ pub enum PermissionDecision {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OperationCompletion {
+    pub executor: String,
+    pub succeeded: bool,
+    pub summary: String,
+    pub result_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TerminalSize {
     pub cols: u16,
     pub rows: u16,
@@ -172,6 +180,13 @@ pub enum DomainEvent {
         operation_revision: u64,
         decision: PermissionDecision,
         actor: Actor,
+    },
+    OperationReceipt {
+        operation_revision: u64,
+        executor: String,
+        succeeded: bool,
+        summary: String,
+        result_digest: Option<String>,
     },
     TerminalOpened {
         terminal_id: TerminalId,

@@ -220,6 +220,44 @@ impl BlockProjector {
                 block.actions.clear();
                 vec![self.upsert(block, event.sequence)?]
             }
+            DomainEvent::OperationReceipt {
+                operation_revision,
+                executor,
+                succeeded,
+                summary,
+                result_digest,
+            } => {
+                let operation_id = event
+                    .operation_id
+                    .ok_or(ProjectorError::MissingOperationId)?;
+                let block_id = stable_block_id("receipt", operation_id.to_string());
+                let mut block = BlockEnvelope::new(
+                    block_id,
+                    self.task_id,
+                    BlockKind::Receipt,
+                    event.sequence,
+                    BlockPayload::OperationReceipt {
+                        operation_id,
+                        operation_revision: *operation_revision,
+                        executor: executor.clone(),
+                        succeeded: *succeeded,
+                        summary: summary.clone(),
+                        result_digest: result_digest.clone(),
+                    },
+                );
+                block.trust_class = TrustClass::TrustedChrome;
+                block.lifecycle = if *succeeded {
+                    BlockLifecycle::Succeeded
+                } else {
+                    BlockLifecycle::Failed
+                };
+                block.attention = if *succeeded {
+                    AttentionState::None
+                } else {
+                    AttentionState::Failed
+                };
+                vec![self.upsert(block, event.sequence)?]
+            }
             DomainEvent::TerminalOpened {
                 terminal_id,
                 command,

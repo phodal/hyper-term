@@ -140,6 +140,23 @@ function BlockCard({
             </div>
           </div>
         )}
+        {payload.type === "operation_receipt" && (
+          <div className="receipt-panel">
+            <span className="receipt-icon">
+              {payload.succeeded ? "✓" : "!"}
+            </span>
+            <div>
+              <strong>{String(payload.summary)}</strong>
+              <p>
+                {String(payload.executor)} · operation rev{" "}
+                {String(payload.operation_revision)}
+              </p>
+              {typeof payload.result_digest === "string" && (
+                <code>{payload.result_digest.slice(0, 16)}…</code>
+              )}
+            </div>
+          </div>
+        )}
         {payload.type === "terminal" && (
           <div className="terminal-surface">
             <div className="terminal-title">
@@ -214,6 +231,7 @@ function labelFor(kind: BlockEnvelope["kind"]): string {
     message: "Agent",
     operation: "Operation",
     approval: "Attention required",
+    receipt: "Execution receipt",
     terminal: "Terminal",
     review: "Evidence",
     diagnostic: "Diagnostic",

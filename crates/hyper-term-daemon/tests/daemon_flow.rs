@@ -10,9 +10,9 @@ use hyper_term_core::{TerminalEvent, TerminalReplay};
 use hyper_term_daemon::{DaemonError, DaemonState, spawn_unix_server};
 use hyper_term_protocol::{
     BlockPayload, ClientId, ControlRequest, ControlRequestEnvelope, ControlResponse,
-    OperationAction, OperationKind, OperationState, PermissionDecision, RequestId, RiskClass,
-    TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame, read_frame,
-    write_frame,
+    OperationAction, OperationCompletion, OperationKind, OperationState, PermissionDecision,
+    RequestId, RiskClass, TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize,
+    WireFrame, read_frame, write_frame,
 };
 use tempfile::tempdir;
 
@@ -134,6 +134,83 @@ fn terminal_dispatch_requires_permission_and_survives_client_subscription_drop()
     assert_eq!(
         reopened.block_snapshot(task_id).unwrap().semantic_digest,
         digest
+    );
+}
+
+#[test]
+fn opaque_tool_dispatch_requires_permission_and_records_its_receipt() {
+    let directory = tempdir().expect("tempdir");
+    let state = DaemonState::open(directory.path()).expect("open daemon");
+    let task_id = state.create_task("MCP diff review".into()).unwrap();
+    let proposed = state
+        .propose_operation(
+            task_id,
+            OperationKind::McpTool,
+            OperationAction::Opaque {
+                kind: "hyper_term.diff.review".into(),
+                payload_digest: "a".repeat(64),
+            },
+            "Build a bounded diff review".into(),
+            RiskClass::ReadOnly,
+            vec!["diff_review".into()],
+        )
+        .unwrap();
+    assert_eq!(proposed.state, OperationState::WaitingHuman);
+    assert!(matches!(
+        state.begin_operation(task_id, proposed.operation_id, proposed.revision),
+        Err(DaemonError::OperationNotAuthorized(
+            OperationState::WaitingHuman
+        ))
+    ));
+
+    let authorized = state
+        .decide_permission(
+            task_id,
+            proposed.operation_id,
+            proposed.revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let dispatching = state
+        .begin_operation(task_id, proposed.operation_id, authorized.revision)
+        .unwrap();
+    assert_eq!(dispatching.state, OperationState::Dispatching);
+    let completed = state
+        .complete_operation(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision,
+            OperationCompletion {
+                executor: "hyper-term-mcp".into(),
+                succeeded: true,
+                summary: "Diff review produced one bounded hunk".into(),
+                result_digest: Some("b".repeat(64)),
+            },
+        )
+        .unwrap();
+    assert_eq!(completed.state, OperationState::Succeeded);
+
+    let events = std::fs::read_to_string(directory.path().join("events.jsonl")).unwrap();
+    assert!(events.contains("operation_receipt"));
+    assert!(events.contains("hyper-term-mcp"));
+    assert!(events.contains(&"b".repeat(64)));
+    assert!(
+        state
+            .block_snapshot(task_id)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| {
+                matches!(
+                    &block.payload,
+                    BlockPayload::OperationReceipt {
+                        operation_id,
+                        executor,
+                        succeeded: true,
+                        ..
+                    } if *operation_id == proposed.operation_id && executor == "hyper-term-mcp"
+                )
+            })
     );
 }
 

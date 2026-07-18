@@ -5,6 +5,7 @@ export type BlockKind =
   | "message"
   | "operation"
   | "approval"
+  | "receipt"
   | "terminal"
   | "review"
   | "diagnostic";

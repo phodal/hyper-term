@@ -12,6 +12,7 @@ pub enum BlockKind {
     Message,
     Operation,
     Approval,
+    Receipt,
     Terminal,
     Review,
     Diagnostic,
@@ -89,6 +90,14 @@ pub enum BlockPayload {
         prompt: String,
         options: Vec<PermissionDecision>,
         decision: Option<PermissionDecision>,
+    },
+    OperationReceipt {
+        operation_id: OperationId,
+        operation_revision: u64,
+        executor: String,
+        succeeded: bool,
+        summary: String,
+        result_digest: Option<String>,
     },
     Terminal {
         terminal_id: TerminalId,

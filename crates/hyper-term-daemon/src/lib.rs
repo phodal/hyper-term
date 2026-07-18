@@ -14,10 +14,11 @@ use hyper_term_core::{
 };
 use hyper_term_protocol::{
     Actor, BlockDocument, ClientId, ControlRequest, ControlRequestEnvelope, ControlResponse,
-    ControlResponseEnvelope, DomainEvent, InputLeaseId, NewEvent, OperationAction, OperationId,
-    OperationKind, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass,
-    TaskId, TerminalDataFrame, TerminalId, TerminalInputFrame, TerminalSize, TerminalSnapshotFrame,
-    WireError, WireFrame, read_frame, write_frame,
+    ControlResponseEnvelope, DomainEvent, InputLeaseId, NewEvent, OperationAction,
+    OperationCompletion, OperationId, OperationKind, OperationState, PROTOCOL_VERSION,
+    PermissionDecision, RequestId, RiskClass, TaskId, TerminalDataFrame, TerminalId,
+    TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame, read_frame,
+    write_frame,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -239,6 +240,82 @@ impl DaemonState {
             Some(format!("permission decision: {decision:?}")),
         )?;
         self.operation(operation_id)
+    }
+
+    pub fn begin_operation(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+    ) -> Result<OperationRecord, DaemonError> {
+        let record = self.operation(operation_id)?;
+        validate_operation_scope(&record, task_id, expected_revision)?;
+        if !matches!(record.action, OperationAction::Opaque { .. }) {
+            return Err(DaemonError::GenericDispatchRequiresOpaqueAction);
+        }
+        if record.state != OperationState::Authorized {
+            return Err(DaemonError::OperationNotAuthorized(record.state));
+        }
+        self.transition(
+            task_id,
+            operation_id,
+            expected_revision,
+            OperationState::Dispatching,
+            Actor::System,
+            Some("brokered executor accepted the authorized operation".into()),
+        )
+    }
+
+    pub fn complete_operation(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        completion: OperationCompletion,
+    ) -> Result<OperationRecord, DaemonError> {
+        let record = self.operation(operation_id)?;
+        validate_operation_scope(&record, task_id, expected_revision)?;
+        if !matches!(record.action, OperationAction::Opaque { .. }) {
+            return Err(DaemonError::GenericDispatchRequiresOpaqueAction);
+        }
+        if record.state != OperationState::Dispatching {
+            return Err(DaemonError::OperationNotDispatching(record.state));
+        }
+        let executor = bounded_nonempty(completion.executor, 256, "executor")?;
+        let summary = bounded_nonempty(completion.summary, 16 * 1024, "operation receipt summary")?;
+        if completion
+            .result_digest
+            .as_ref()
+            .is_some_and(|digest| !is_sha256(digest))
+        {
+            return Err(DaemonError::InvalidResultDigest);
+        }
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: Some(operation_id),
+            causation_id: None,
+            correlation_id: None,
+            payload: DomainEvent::OperationReceipt {
+                operation_revision: expected_revision,
+                executor,
+                succeeded: completion.succeeded,
+                summary: summary.clone(),
+                result_digest: completion.result_digest,
+            },
+        })?;
+        self.transition(
+            task_id,
+            operation_id,
+            expected_revision,
+            if completion.succeeded {
+                OperationState::Succeeded
+            } else {
+                OperationState::Failed
+            },
+            Actor::System,
+            Some(summary),
+        )
     }
 
     pub fn dispatch_terminal(
@@ -870,6 +947,26 @@ fn validate_operation_scope(
     Ok(())
 }
 
+fn bounded_nonempty(
+    value: String,
+    maximum: usize,
+    label: &'static str,
+) -> Result<String, DaemonError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() || value.len() > maximum {
+        Err(DaemonError::InvalidBoundedText { label, maximum })
+    } else {
+        Ok(value)
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, DaemonError> {
     mutex.lock().map_err(|_| DaemonError::LockPoisoned)
 }
@@ -1186,6 +1283,29 @@ mod unix_server {
                     revision: record.revision,
                     state: record.state,
                 }),
+            ControlRequest::BeginOperation {
+                task_id,
+                operation_id,
+                expected_revision,
+            } => state
+                .begin_operation(task_id, operation_id, expected_revision)
+                .map(|record| ControlResponse::OperationUpdated {
+                    operation_id: record.operation_id,
+                    revision: record.revision,
+                    state: record.state,
+                }),
+            ControlRequest::CompleteOperation {
+                task_id,
+                operation_id,
+                expected_revision,
+                completion,
+            } => state
+                .complete_operation(task_id, operation_id, expected_revision, completion)
+                .map(|record| ControlResponse::OperationUpdated {
+                    operation_id: record.operation_id,
+                    revision: record.revision,
+                    state: record.state,
+                }),
             ControlRequest::DispatchTerminal {
                 task_id,
                 operation_id,
@@ -1364,6 +1484,14 @@ pub enum DaemonError {
     OperationNotWaiting(OperationState),
     #[error("operation is {0:?}, not authorized")]
     OperationNotAuthorized(OperationState),
+    #[error("operation is {0:?}, not dispatching")]
+    OperationNotDispatching(OperationState),
+    #[error("generic dispatch accepts only opaque operation actions")]
+    GenericDispatchRequiresOpaqueAction,
+    #[error("{label} must contain between 1 and {maximum} bytes")]
+    InvalidBoundedText { label: &'static str, maximum: usize },
+    #[error("operation result digest must be a lowercase SHA-256 value")]
+    InvalidResultDigest,
     #[error("operation kind and action payload do not match")]
     ActionKindMismatch,
     #[error("terminal dispatch only supports an exact shell action")]
@@ -1397,7 +1525,11 @@ impl DaemonError {
             Self::StaleOperationRevision { .. } => "stale_operation_revision",
             Self::OperationNotWaiting(_) => "operation_not_waiting",
             Self::OperationNotAuthorized(_) => "operation_not_authorized",
-            Self::ActionKindMismatch | Self::UnsupportedTerminalAction => "unsupported_action",
+            Self::OperationNotDispatching(_) => "operation_not_dispatching",
+            Self::ActionKindMismatch
+            | Self::UnsupportedTerminalAction
+            | Self::GenericDispatchRequiresOpaqueAction => "unsupported_action",
+            Self::InvalidBoundedText { .. } | Self::InvalidResultDigest => "invalid_request",
             Self::InputLeaseHeld(_) => "input_lease_held",
             Self::InputLeaseMissing(_) | Self::InputLeaseMismatch(_) => "input_lease_mismatch",
             Self::ClientIdentityMismatch => "client_identity_mismatch",
