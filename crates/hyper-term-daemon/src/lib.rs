@@ -23,8 +23,12 @@ use hyper_term_protocol::{
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(unix)]
+mod client;
 mod web_gateway;
 
+#[cfg(unix)]
+pub use client::{ControlClient, ControlClientError};
 pub use web_gateway::{
     TerminalGatewayConfig, TerminalGatewayError, TerminalGatewayHandle, spawn_terminal_gateway,
 };
