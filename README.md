@@ -5,9 +5,11 @@ not a terminal with a chat sidebar. It treats Shell, structured agents,
 Computer Use, MCP tools, editors, browsers, and generated interfaces as
 executors and projections of one durable human–AI task model.
 
-> **Repository status:** architecture and research only. The disposable
-> Vite/Tauri prototype has been removed. Production implementation starts only
-> after the proposed ADRs and the first vertical-slice contracts are reviewed.
+> **Repository status:** M1 implementation is in progress. The disposable
+> Vite/Tauri prototype has been removed; the repository now contains the first
+> renderer-independent Rust protocol, journal, operation reducer, Block
+> projector, and PTY supervision slice. Proposed ADRs remain subject to the
+> validation and replacement gates recorded in each decision.
 
 ## Product thesis
 
@@ -111,8 +113,8 @@ when its failure, reconnect, security, and evidence gates pass.
 
 | Milestone | Outcome | Exit gates |
 | --- | --- | --- |
-| **M0 — Architecture baseline (current)** | Review the twelve ADRs, freeze the first `EventEnvelope`, Task/Run/Operation, `BlockDocument`, `UiIntent`, terminal-stream, and artifact schemas. | Proposed ADRs are accepted, revised, or explicitly deferred; golden protocol fixtures and benchmark workloads are specified before implementation. |
-| **M1 — Durable Rust kernel** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | Killing and reconnecting a client does not kill the PTY or duplicate an uncertain effect; resize/output ordering, process trees, cancellation, and recovery have tests. |
+| **M0 — Architecture baseline** | Review the twelve ADRs, freeze the first `EventEnvelope`, Task/Run/Operation, `BlockDocument`, `UiIntent`, terminal-stream, and artifact schemas. | Proposed ADRs are accepted, revised, or explicitly deferred; golden protocol fixtures and benchmark workloads are specified before implementation. |
+| **M1 — Durable Rust kernel (current)** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | Killing and reconnecting a client does not kill the PTY or duplicate an uncertain effect; resize/output ordering, process trees, cancellation, and recovery have tests. |
 | **M2 — Agent control loop and Block workbench** | Add raw PTY agent compatibility, one ACP v1 adapter, an MCP host behind the broker, `BlockProjector`, attention reducer, and a minimal Tauri reference client built as static Deno assets. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; WebView failure loses no canonical state. |
 | **M3 — Agentic UI and local debugging** | Add the brokered Deno tool runtime, persistent `esbuild-wasm` compilation, versioned UI IR/React artifacts, trusted editor adapters, isolated previews, source maps, and semantic Time Travel. | A broken generated UI keeps its last-known-good artifact, maps errors to its source revision, and replays without Shell, network, MCP, or Computer Use effects. |
 | **M4 — Computer Use, voice, and attention** | Implement observe–act–verify drivers, explicit capability and focus leases, before/after evidence, voice briefs, push-to-talk steering, local pause/takeover controls, and semantic notifications. | Stale observations and lease conflicts are rejected; every action has actor, target, capability, receipt, and result; voice never directly approves a consequential effect. |
@@ -165,13 +167,17 @@ before using them for an implementation decision.
 ```text
 README.md              product boundary and roadmap
 AGENTS.md              contributor and safety rules
+Cargo.toml             Rust workspace definition
+crates/hyper-term-protocol/  versioned events, blocks, and wire frames
+crates/hyper-term-core/      journal, reducers, projections, and PTY ownership
+crates/hyper-term-daemon/    out-of-process control-kernel host (in progress)
 docs/architecture/     numbered architecture decisions
 docs/research/         dated product and implementation evidence
 ```
 
-Implementation will return in milestone-sized slices after M0. Every protocol
-or lifecycle change must include tests, and every milestone must preserve the
-Rust authority and renderer-independence boundaries.
+Implementation lands in milestone-sized, independently tested slices. Every
+protocol or lifecycle change must include tests, and every milestone must
+preserve the Rust authority and renderer-independence boundaries.
 
 ## License
 

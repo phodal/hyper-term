@@ -1,0 +1,25 @@
+[package]
+name = "hyper-term-daemon"
+description = "Out-of-process Hyper Term control kernel host"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "hyper_term_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyperd"
+path = "src/main.rs"
+
+[dependencies]
+hyper-term-core = { path = "../hyper-term-core" }
+hyper-term-protocol = { path = "../hyper-term-protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
