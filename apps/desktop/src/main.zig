@@ -241,13 +241,14 @@ pub const Session = struct {
     mode: SessionMode = .terminal,
     title: []const u8 = "zsh",
     icon: []const u8 = "terminal",
-    accessibility_label: []const u8 = "Terminal session",
-    close_label: []const u8 = "Close Terminal session",
     agent_connection: AgentConnection = .unavailable,
+
+    pub fn closeLabel(session: *const Session, arena: std.mem.Allocator) []const u8 {
+        return std.fmt.allocPrint(arena, "Close {s} {d}", .{ session.title, session.id }) catch "Close tab";
+    }
 };
 
 pub const Model = struct {
-    new_session_open: bool = false,
     system_scheme: canvas.ColorScheme = .dark,
     high_contrast: bool = false,
     reduce_motion: bool = false,
@@ -409,8 +410,6 @@ pub const Model = struct {
 };
 
 pub const Msg = union(enum) {
-    new_session,
-    dismiss_new_session,
     choose_terminal,
     choose_agent,
     select_session: u8,
@@ -445,17 +444,13 @@ pub const Effects = HyperTermApp.Effects;
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
-        .new_session => model.new_session_open = true,
-        .dismiss_new_session => model.new_session_open = false,
         .choose_terminal => {
             _ = appendSession(model, .terminal);
-            model.new_session_open = false;
         },
         .choose_agent => {
             if (appendSession(model, .agent)) |session_id| {
                 requestAgentStart(model, session_id, fx);
             }
-            model.new_session_open = false;
         },
         .select_session => |session_id| {
             const previous = model.active_session_id;
@@ -502,8 +497,6 @@ fn appendSession(model: *Model, mode: SessionMode) ?u8 {
         .mode = mode,
         .title = if (mode == .terminal) "zsh" else "Agent",
         .icon = if (mode == .terminal) "terminal" else "circle-dot",
-        .accessibility_label = if (mode == .terminal) "Terminal session" else "Agent session",
-        .close_label = if (mode == .terminal) "Close Terminal session" else "Close Agent session",
     };
     model.session_count += 1;
     model.active_session_id = session_id;
@@ -1064,7 +1057,6 @@ fn selectSession(model: *Model, session_id: u8) void {
 }
 
 pub fn command(name: []const u8) ?Msg {
-    if (std.mem.eql(u8, name, "hyper-term.new-session")) return .new_session;
     if (std.mem.eql(u8, name, "hyper-term.new-terminal")) return .choose_terminal;
     if (std.mem.eql(u8, name, "hyper-term.new-agent")) return .choose_agent;
     if (std.mem.eql(u8, name, "hyper-term.close-session")) return .close_active_session;

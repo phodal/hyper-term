@@ -7,25 +7,22 @@
       <icon name="terminal" width="15" height="15" foreground="accent" />
       <text><span weight="medium">Hyper Term</span></text>
       <separator height="16" />
-      <row gap="3" cross="center" label="Open sessions">
+      <tabs gap="0" grow="1" label="Open sessions">
         <for each="openSessions" key="id" as="session">
-          <row gap="0" cross="center" background="surface_subtle">
-            <button size="sm" variant="ghost" selected="{session.id == active_session_id}" icon="{session.icon}" on-press="select_session:{session.id}" role="tab" label="{session.accessibility_label}">{session.title} {session.id}</button>
-            <button size="sm" variant="ghost" icon="x" on-press="close_session:{session.id}" label="{session.close_label}"></button>
-          </row>
+          <button size="sm" selected="{session.id == active_session_id}" icon="{session.icon}" on-press="select_session:{session.id}">
+            {session.title} {session.id}
+            <context-menu>
+              <menu-item on-press="close_session:{session.id}">Close Tab</menu-item>
+            </context-menu>
+          </button>
+          <toggle-button size="sm" variant="ghost" icon="x" on-toggle="close_session:{session.id}" label="{session.closeLabel}"></toggle-button>
         </for>
-      </row>
+      </tabs>
     </row>
-    <if test="{new_session_open}">
-      <row gap="4" cross="center" label="Choose new session type">
-        <button size="sm" variant="outline" icon="terminal" on-press="choose_terminal" label="New Terminal session">Terminal</button>
-        <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" label="New Agent session">Agent</button>
-        <button size="sm" variant="ghost" icon="x" on-press="dismiss_new_session" label="Cancel new session"></button>
-      </row>
-    </if>
-    <else>
-      <button size="sm" variant="outline" icon="plus" on-press="new_session" label="Choose new Terminal or Agent session">New</button>
-    </else>
+    <button-group gap="0" label="New session">
+      <button size="sm" variant="outline" icon="plus" on-press="choose_terminal" label="New Terminal tab">New</button>
+      <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" label="New Agent tab">Agent</button>
+    </button-group>
     <spacer width="{chrome_trailing}" />
   </row>
   <separator />

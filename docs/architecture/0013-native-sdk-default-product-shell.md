@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-18
+- Amended: 2026-07-19 (explicit Terminal and Agent tab actions)
 - Supersedes the product-shell decision in:
   [ADR 0012](0012-native-sdk-renderer-spike.md)
 - Depends on: [ADR 0002](0002-runtime-authority-boundaries.md),
@@ -22,9 +23,10 @@ model-stream data plane. Selecting it as the product shell therefore does not
 select a terminal renderer and does not move process authority into Zig.
 
 The product requirement has also become clearer. Hyper Term opens as a normal,
-fast Terminal. New Session offers Terminal or Agent. Agent mode composes ACP,
-MCP, generated UI, Computer Use evidence, approvals, editors, and diffs around
-the terminal without making a WebView the application shell.
+fast Terminal. `New` always opens another ordinary Terminal tab; `Agent` is a
+separate, explicit tab action. Agent mode composes ACP, MCP, generated UI,
+Computer Use evidence, approvals, editors, and diffs around the terminal
+without making a WebView the application shell.
 
 ## Decision
 
@@ -54,12 +56,17 @@ SDK commit, and Zig 0.16 toolchain.
 ## Session modes
 
 The initial state is always `Terminal`. It exposes ordinary terminal behavior
-and minimal session chrome. Opening New Session presents two explicit choices:
+and minimal session chrome. The session bar exposes two unambiguous actions:
 
-- `Terminal`: direct user-owned zsh session; no AI operation approval is
+- `New`: direct user-owned zsh session; no AI operation approval is
   required merely to type or run a shell command.
-- `Agent`: a terminal plus a native Block surface for agent messages, plans,
+- `Agent`: an explicit Agent tab containing a terminal plus a native Block
+  surface for agent messages, plans,
   tools, approvals, diffs, artifacts, and Computer Use evidence.
+
+Sessions use native tab semantics. Each tab has an exact close target and a
+context-menu Close action; Command-W closes the active tab. All three paths
+enter the same Rust-owned PTY and Agent cleanup lifecycle.
 
 Changing the visible mode never changes operation authority. A model can
 propose an action, but only the Rust permission broker can authorize and

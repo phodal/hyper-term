@@ -47,7 +47,6 @@ test "default session is an ordinary terminal" {
     var model = main.initialModel();
     try testing.expectEqual(main.SessionMode.terminal, model.activeSession().mode);
     try testing.expectEqual(@as(usize, 1), model.openSessions().len);
-    try testing.expect(!model.new_session_open);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -56,7 +55,7 @@ test "default session is an ordinary terminal" {
     try testing.expect(!containsText(tree.root, "Native Block surface"));
 }
 
-test "New Session explicitly selects Terminal or Agent" {
+test "session bar exposes direct Terminal and Agent creation" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -67,17 +66,23 @@ test "New Session explicitly selects Terminal or Agent" {
 
     var model = main.initialModel();
     var tree = try buildTree(arena, &model);
+    const terminal_tab = findByText(tree.root, .segmented_control, "zsh 1").?;
+    const close_from_menu = tree.msgForContextMenu(terminal_tab.id, 0).?;
+    switch (close_from_menu) {
+        .close_session => |session_id| try testing.expectEqual(@as(u8, 1), session_id),
+        else => return error.TestUnexpectedResult,
+    }
 
-    const new_button = findByText(tree.root, .button, "New").?;
-    main.update(&model, tree.msgForPointer(new_button.id, .up).?, &fx);
-    try testing.expect(model.new_session_open);
+    const terminal_item = findByLabel(tree.root, "New Terminal tab").?;
+    main.update(&model, tree.msgForPointer(terminal_item.id, .up).?, &fx);
+    try testing.expectEqual(main.SessionMode.terminal, model.activeSession().mode);
+    try testing.expectEqual(@as(usize, 2), model.openSessions().len);
 
     tree = try buildTree(arena, &model);
-    const agent_item = findByText(tree.root, .button, "Agent").?;
+    const agent_item = findByLabel(tree.root, "New Agent tab").?;
     main.update(&model, tree.msgForPointer(agent_item.id, .up).?, &fx);
     try testing.expectEqual(main.SessionMode.agent, model.activeSession().mode);
-    try testing.expectEqual(@as(usize, 2), model.openSessions().len);
-    try testing.expect(!model.new_session_open);
+    try testing.expectEqual(@as(usize, 3), model.openSessions().len);
 
     tree = try buildTree(arena, &model);
     try testing.expect(containsText(tree.root, "Ask Codex"));
@@ -311,7 +316,7 @@ test "tabs expose close controls and close the active session like a desktop ter
     try testing.expectEqual(@as(u8, 3), model.active_session_id);
 
     var tree = try buildTree(arena, &model);
-    const close_agent = findByLabel(tree.root, "Close Agent session").?;
+    const close_agent = findByLabel(tree.root, "Close Agent 3").?;
     main.update(&model, tree.msgForPointer(close_agent.id, .up).?, &fx);
     try testing.expectEqual(@as(usize, 2), model.openSessions().len);
     try testing.expectEqual(@as(u8, 2), model.active_session_id);
@@ -349,12 +354,24 @@ test "closing an inactive tab preserves the active session" {
     try testing.expectEqual(@as(u8, 3), model.openSessions()[1].id);
 }
 
-test "Command-W maps to the active tab lifecycle" {
-    const msg = main.command("hyper-term.close-session") orelse return error.TestUnexpectedResult;
-    switch (msg) {
+test "native menu commands map to explicit tab lifecycles" {
+    const terminal = main.command("hyper-term.new-terminal") orelse return error.TestUnexpectedResult;
+    const agent = main.command("hyper-term.new-agent") orelse return error.TestUnexpectedResult;
+    const close = main.command("hyper-term.close-session") orelse return error.TestUnexpectedResult;
+
+    switch (terminal) {
+        .choose_terminal => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (agent) {
+        .choose_agent => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (close) {
         .close_active_session => {},
         else => return error.TestUnexpectedResult,
     }
+    try testing.expect(main.command("hyper-term.new-session") == null);
 }
 
 test "compiled and hot-reload markup produce the same root" {

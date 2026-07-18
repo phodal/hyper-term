@@ -9,7 +9,6 @@
     .permissions = .{ "view", "command", "network" },
     .capabilities = .{ "native_views", "gpu_surfaces", "webview", "menus", "shortcuts", "network" },
     .shortcuts = .{
-        .{ .id = "hyper-term.new-session", .key = "n", .modifiers = .{"primary"} },
         .{ .id = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
         .{ .id = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },
         .{ .id = "hyper-term.close-session", .key = "w", .modifiers = .{"primary"} },
@@ -18,10 +17,8 @@
         .{
             .title = "Shell",
             .items = .{
-                .{ .label = "New Session…", .command = "hyper-term.new-session", .key = "n", .modifiers = .{"primary"} },
-                .{ .separator = true },
-                .{ .label = "New Terminal", .command = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
-                .{ .label = "New Agent Session", .command = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },
+                .{ .label = "New Terminal Tab", .command = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
+                .{ .label = "New Agent Tab", .command = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },
                 .{ .separator = true },
                 .{ .label = "Close Tab", .command = "hyper-term.close-session", .key = "w", .modifiers = .{"primary"} },
             },

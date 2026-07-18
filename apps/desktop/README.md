@@ -1,7 +1,10 @@
 # Hyper Term desktop
 
 This is the macOS-first Native SDK product shell. The default view is a normal
-Terminal; New Session explicitly offers Terminal or Agent mode.
+Terminal. `New` creates another ordinary Terminal tab, while the adjacent
+`Agent` action explicitly creates a brokered Agent tab. Every tab exposes its
+own close control and context-menu action; Command-W closes the active tab
+through the same Rust-owned session lifecycle.
 
 The native chrome, design tokens, mode selection, responsive layout, and Agent
 Block composition remain native. The terminal cell renderer is currently a child
