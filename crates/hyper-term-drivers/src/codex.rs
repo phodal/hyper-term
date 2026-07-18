@@ -164,8 +164,7 @@ impl CodexAppServerClient {
                 "cwd": self.workspace,
                 "approvalPolicy": "on-request",
                 "sandbox": "read-only",
-                "ephemeral": false,
-                "historyMode": "paginated"
+                "ephemeral": false
             }),
             timeout,
         )?;

@@ -5,8 +5,8 @@ use hyper_term_drivers::{CodexAppServerClient, CodexAppServerConfig, DriverState
 use tempfile::TempDir;
 
 #[test]
-#[ignore = "requires HYPER_TERM_CODEX_PATH and HYPER_TERM_CODEX_SHA256"]
-fn installed_codex_app_server_completes_an_isolated_initialize() {
+#[ignore = "requires HYPER_TERM_CODEX_PATH, HYPER_TERM_CODEX_SHA256, and HYPER_TERM_CODEX_AUTH_PATH"]
+fn installed_codex_app_server_starts_an_authenticated_isolated_thread() {
     let codex = PathBuf::from(
         std::env::var_os("HYPER_TERM_CODEX_PATH")
             .expect("HYPER_TERM_CODEX_PATH must select the inspected Codex binary"),
@@ -15,6 +15,10 @@ fn installed_codex_app_server_completes_an_isolated_initialize() {
     .unwrap();
     let digest = std::env::var("HYPER_TERM_CODEX_SHA256")
         .expect("HYPER_TERM_CODEX_SHA256 must identify that exact binary");
+    let auth_file = PathBuf::from(
+        std::env::var_os("HYPER_TERM_CODEX_AUTH_PATH")
+            .expect("HYPER_TERM_CODEX_AUTH_PATH must select a private auth.json"),
+    );
     let workspace = TempDir::new().unwrap();
     let codex_home = TempDir::new().unwrap();
     let scratch = TempDir::new().unwrap();
@@ -25,7 +29,7 @@ fn installed_codex_app_server_completes_an_isolated_initialize() {
         workspace: workspace.path().canonicalize().unwrap(),
         codex_home: codex_home.path().canonicalize().unwrap(),
         scratch_directory: scratch.path().canonicalize().unwrap(),
-        auth_file: None,
+        auth_file: Some(auth_file),
         brokered_mcp_server: None,
     })
     .unwrap();
@@ -38,5 +42,7 @@ fn installed_codex_app_server_completes_an_isolated_initialize() {
     );
     assert_eq!(response["result"]["platformFamily"], "unix");
     assert_eq!(client.state().unwrap(), DriverState::Ready);
+    let thread_id = client.start_thread(Duration::from_secs(10)).unwrap();
+    assert!(!thread_id.is_empty());
     assert_eq!(client.close().unwrap(), DriverState::Closed);
 }
