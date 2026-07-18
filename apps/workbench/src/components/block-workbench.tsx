@@ -84,6 +84,11 @@ function BlockCard({
   submitIntent(intent: UiIntent): Promise<void>;
 }) {
   const payload = block.payload;
+  const receiptOutcome = payload.type === "operation_receipt"
+    ? String(
+      payload.outcome ?? (payload.succeeded ? "succeeded" : "failed"),
+    )
+    : "";
   return (
     <article
       className={`block-card block-${block.kind}`}
@@ -141,9 +146,13 @@ function BlockCard({
           </div>
         )}
         {payload.type === "operation_receipt" && (
-          <div className="receipt-panel">
+          <div className="receipt-panel" data-outcome={receiptOutcome}>
             <span className="receipt-icon">
-              {payload.succeeded ? "✓" : "!"}
+              {receiptOutcome === "succeeded"
+                ? "✓"
+                : receiptOutcome === "unknown_execution"
+                ? "?"
+                : "!"}
             </span>
             <div>
               <strong>{String(payload.summary)}</strong>
@@ -151,6 +160,11 @@ function BlockCard({
                 {String(payload.executor)} · operation rev{" "}
                 {String(payload.operation_revision)}
               </p>
+              {receiptOutcome === "unknown_execution" && (
+                <p className="receipt-warning">
+                  Outcome unknown · review evidence before retrying
+                </p>
+              )}
               {typeof payload.result_digest === "string" && (
                 <code>{payload.result_digest.slice(0, 16)}…</code>
               )}

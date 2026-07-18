@@ -570,6 +570,17 @@ textarea:focus-visible {
   color: var(--acid-soft);
   font-weight: 800;
 }
+.receipt-panel[data-outcome="failed"] .receipt-icon {
+  color: #ff7b72;
+}
+.receipt-panel[data-outcome="unknown_execution"] {
+  border-color: #6f5425;
+  background: #19150d;
+}
+.receipt-panel[data-outcome="unknown_execution"] .receipt-icon,
+.receipt-panel .receipt-warning {
+  color: #f0bd63;
+}
 .receipt-panel strong {
   color: #cdeca0;
   font-size: 11px;
