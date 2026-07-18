@@ -26,6 +26,18 @@ Native renderer. Without that exact local URL the app keeps an honest
 disconnected Terminal placeholder. A future native cell-grid renderer can
 replace the WebView without changing the Rust PTY or reconnect protocol.
 
+Build an ad-hoc signed macOS application from the repository root:
+
+```sh
+./scripts/package_macos_app.sh
+open "dist/macos/Hyper Term.app"
+```
+
+The package keeps `hyper-term` as the Rust-owned bundle entry point and installs
+the Native SDK executable as `hyper-term-ui`. Terminal assets are copied into
+`Contents/Resources/terminal`; no development server or global Node runtime is
+required at launch.
+
 ## Commands
 
 The project is zero-config so it never commits a developer-machine SDK path. Use
