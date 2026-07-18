@@ -239,6 +239,27 @@ HYPER_TERM_DENO_SHA256=<manifest-executable-sha256> \
 cargo test -p hyper-term-drivers --test deno_lsp -- --ignored
 ```
 
+## Structured agent adapters
+
+ACP, Codex app-server, Claude stream-json, and opaque PTY agents are separate
+transports behind one internal `AgentDriverEvent` boundary. They are not treated
+as interchangeable wire protocols. The current Codex adapter launches an exact
+binary digest with a cleared environment, negotiates app-server v2 over bounded
+JSONL, and turns command/file approval requests into inert
+`AgentEffectProposal` values. Only a matching, revisioned Rust operation
+authorization can produce the external approval response; persistent policy
+choices are not forwarded as one-turn wire approvals.
+
+The real installed-binary handshake is available as an ignored integration
+test. It uses an isolated `CODEX_HOME`, so it does not read the user's normal
+Codex profile or perform a model turn:
+
+```bash
+HYPER_TERM_CODEX_PATH=/absolute/path/to/codex \
+HYPER_TERM_CODEX_SHA256=<inspected-executable-sha256> \
+cargo test -p hyper-term-drivers --test codex_app_server -- --ignored
+```
+
 ## License
 
 Apache-2.0. Competitor implementations are research input only; do not copy

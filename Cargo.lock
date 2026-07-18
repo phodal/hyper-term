@@ -207,6 +207,7 @@ name = "hyper-term-drivers"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "hyper-term-protocol",
  "libc",
  "serde",
  "serde_json",
