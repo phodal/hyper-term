@@ -153,6 +153,7 @@ baseline is recorded in
 - [ADR 0003 — Brokered Deno sidecar](docs/architecture/0003-brokered-deno-sidecar.md)
 - [ADR 0008 — License-scoped Warp reuse](docs/architecture/0008-license-scoped-warp-reuse.md)
 - [ADR 0009 — Rust ACP and MCP adapters](docs/architecture/0009-rust-acp-mcp-adapters.md)
+- [ADR 0014 — Rust-owned Coding Agent sandbox](docs/architecture/0014-rust-owned-coding-agent-sandbox.md)
 
 ### Agentic UI and history
 
@@ -166,9 +167,11 @@ baseline is recorded in
 
 - [ADR 0011 — Versioned Block Render document](docs/architecture/0011-versioned-block-render-document.md)
 - [ADR 0012 — Tauri baseline and Native SDK renderer spike](docs/architecture/0012-native-sdk-renderer-spike.md)
+- [ADR 0013 — Native SDK default product shell](docs/architecture/0013-native-sdk-default-product-shell.md)
 
-ADR 0001 is accepted for its historical spike. ADRs 0002–0012 remain proposed
-until M0 review closes their open validation and replacement gates.
+ADR 0001 is accepted for its historical spike, and ADR 0013 is accepted as the
+default product-shell decision. The remaining ADRs are proposed until their
+open validation and replacement gates close.
 
 ## Research baseline
 
