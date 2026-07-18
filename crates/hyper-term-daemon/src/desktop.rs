@@ -14,12 +14,14 @@ use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
 use hyper_term_daemon::{
-    DaemonState, TerminalGatewayConfig, spawn_terminal_gateway, spawn_unix_server,
+    AgentGatewayConfig, DaemonState, TerminalGatewayConfig, spawn_agent_gateway,
+    spawn_terminal_gateway, spawn_unix_server,
 };
 use uuid::Uuid;
 
 const DESKTOP_TERMINAL_ADDRESS: &str = "127.0.0.1:47437";
 const TERMINAL_URL_ENV: &str = "HYPER_TERM_TERMINAL_URL";
+const AGENT_URL_ENV: &str = "HYPER_TERM_AGENT_URL";
 
 fn main() {
     match run() {
@@ -41,6 +43,7 @@ fn run() -> Result<i32, String> {
              --terminal-assets PATH    Built terminal renderer directory\n  \
              --state-dir PATH          Durable Hyper Term state\n  \
              --shell-cwd PATH          Initial directory for new shells\n  \
+             --codex PATH              Codex executable for Agent sessions\n  \
              -h, --help                Show this help"
         );
         return Ok(0);
@@ -58,9 +61,10 @@ fn run() -> Result<i32, String> {
 
     let daemon = DaemonState::open(&resolved.state_directory).map_err(|error| error.to_string())?;
     let control_socket = resolved.state_directory.join("hyperd.sock");
-    let control_server =
-        spawn_unix_server(control_socket, daemon.clone()).map_err(|error| error.to_string())?;
-    let token = desktop_token();
+    let control_server = spawn_unix_server(control_socket.clone(), daemon.clone())
+        .map_err(|error| error.to_string())?;
+    let terminal_token = desktop_token();
+    let agent_token = desktop_token();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("hyper-term-desktop")
@@ -74,19 +78,36 @@ fn run() -> Result<i32, String> {
                     .parse()
                     .expect("desktop terminal address is valid"),
                 assets: resolved.terminal_assets.clone(),
-                token: token.clone(),
+                token: terminal_token.clone(),
                 default_cwd: Some(resolved.shell_cwd.clone()),
             },
             daemon,
         )
         .await
         .map_err(|error| error.to_string())?;
-        let terminal_url = format!("http://{}/?token={token}", gateway.address());
+        let agent_gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().expect("agent loopback bind is valid"),
+            token: agent_token.clone(),
+            workspace: resolved.shell_cwd.clone(),
+            state_directory: resolved.state_directory.join("agent-runtime"),
+            codex_executable: resolved.codex.clone(),
+            mcp_executable: resolved.mcp.clone(),
+            control_socket,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        let terminal_url = format!("http://{}/?token={terminal_token}", gateway.address());
+        let agent_url = format!("http://{}/?token={agent_token}", agent_gateway.address());
         let mut renderer = Command::new(&resolved.ui)
             .env(TERMINAL_URL_ENV, terminal_url)
+            .env(AGENT_URL_ENV, agent_url)
             .spawn()
             .map_err(|error| format!("cannot start native renderer: {error}"))?;
         let status = wait_for_renderer(&mut renderer).await?;
+        agent_gateway
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
         gateway
             .shutdown()
             .await
@@ -133,6 +154,7 @@ struct Options {
     terminal_assets: Option<PathBuf>,
     state_directory: Option<PathBuf>,
     shell_cwd: Option<PathBuf>,
+    codex: Option<PathBuf>,
     help: bool,
 }
 
@@ -153,6 +175,7 @@ impl Options {
                 Some("--shell-cwd") => {
                     options.shell_cwd = Some(required_path(&mut arguments, "--shell-cwd")?);
                 }
+                Some("--codex") => options.codex = Some(required_path(&mut arguments, "--codex")?),
                 Some("-h" | "--help") => options.help = true,
                 Some(other) => return Err(format!("unknown argument: {other}")),
                 None => return Err("desktop arguments must be valid UTF-8 option names".into()),
@@ -177,6 +200,11 @@ impl Options {
                 .state_directory
                 .unwrap_or_else(|| default_state_directory(home)),
             shell_cwd: self.shell_cwd.unwrap_or_else(|| home.to_owned()),
+            codex: self.codex.or_else(|| find_executable("codex")),
+            mcp: executable
+                .with_file_name("hyper-term-mcp")
+                .is_file()
+                .then(|| executable.with_file_name("hyper-term-mcp")),
         })
     }
 }
@@ -187,6 +215,8 @@ struct ResolvedOptions {
     terminal_assets: PathBuf,
     state_directory: PathBuf,
     shell_cwd: PathBuf,
+    codex: Option<PathBuf>,
+    mcp: Option<PathBuf>,
 }
 
 impl ResolvedOptions {
@@ -203,6 +233,12 @@ impl ResolvedOptions {
                 "initial shell directory is not an absolute directory: {}",
                 self.shell_cwd.display()
             ));
+        }
+        if let Some(codex) = &self.codex {
+            validate_executable(codex)?;
+        }
+        if let Some(mcp) = &self.mcp {
+            validate_executable(mcp)?;
         }
         Ok(())
     }
@@ -228,6 +264,20 @@ fn default_state_directory(home: &Path) -> PathBuf {
 
 fn desktop_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+#[cfg(unix)]
+fn find_executable(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH")?
+        .to_string_lossy()
+        .split(':')
+        .map(Path::new)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
 }
 
 #[cfg(unix)]
@@ -281,6 +331,8 @@ mod tests {
             "/tmp/state".into(),
             "--shell-cwd".into(),
             "/tmp".into(),
+            "--codex".into(),
+            "/tmp/codex".into(),
         ])
         .expect("options");
         assert_eq!(options.ui, Some(PathBuf::from("/tmp/hyper-term-ui")));
@@ -290,6 +342,7 @@ mod tests {
         );
         assert_eq!(options.state_directory, Some(PathBuf::from("/tmp/state")));
         assert_eq!(options.shell_cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(options.codex, Some(PathBuf::from("/tmp/codex")));
     }
 
     #[test]

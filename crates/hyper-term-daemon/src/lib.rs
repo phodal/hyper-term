@@ -23,12 +23,16 @@ use hyper_term_protocol::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod agent_gateway;
 #[cfg(unix)]
 mod client;
 #[cfg(unix)]
 mod mcp_gateway;
 mod web_gateway;
 
+pub use agent_gateway::{
+    AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle, spawn_agent_gateway,
+};
 #[cfg(unix)]
 pub use client::{ControlClient, ControlClientError};
 #[cfg(unix)]

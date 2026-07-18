@@ -69,7 +69,8 @@
         <row gap="8" padding="10" cross="center">
           <icon name="circle-dot" width="14" height="14" foreground="accent" />
           <text grow="1"><span weight="medium">Agent</span></text>
-          <badge variant="secondary">ACP</badge>
+          <badge variant="secondary">Codex</badge>
+          <badge variant="secondary">{agentConnectionLabel}</badge>
         </row>
         <separator />
         <scroll grow="1" label="Agent blocks">
@@ -84,13 +85,13 @@
               </column>
             </card>
             <timeline gap="4" label="Agent plan">
-              <timeline-item title="Connect hyperd" description="Authenticate the local control and terminal planes." meta="pending" variant="secondary" />
-              <timeline-item title="Start ACP session" description="Launch Codex or Claude through the permission broker." meta="pending" variant="secondary" />
+              <timeline-item title="Connect hyperd" description="Authenticate the local control and terminal planes." meta="ready" variant="secondary" />
+              <timeline-item title="Start Agent session" description="Launch Codex app-server through the Rust permission broker." meta="{agentConnectionLabel}" variant="secondary" />
               <timeline-item title="Mount Agentic UI" description="Lease a bounded WebView Block only when requested." meta="pending" variant="secondary" connector="false" />
             </timeline>
           </column>
         </scroll>
-        <status-bar>agent runtime disconnected · no command executed</status-bar>
+        <status-bar>{agentStatus}</status-bar>
       </column>
     </split>
   </else>

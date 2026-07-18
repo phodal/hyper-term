@@ -84,6 +84,52 @@ test "New Session explicitly selects Terminal or Agent" {
     try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) != null);
 }
 
+test "Agent tabs start the brokered Codex runtime and render readiness" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    try testing.expectEqual(main.AgentConnection.connecting, model.activeSession().agent_connection);
+    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
+    const request = fx.pendingFetchAt(0).?;
+    try testing.expectEqual(std.http.Method.POST, request.method);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2",
+        request.url,
+    );
+
+    main.update(&model, .{ .agent_session_started = .{
+        .key = main.agent_start_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"session_id\":2,\"provider\":\"codex\",\"protocol\":\"codex-app-server-v2\",\"status\":\"ready\"}",
+    } }, &fx);
+    try testing.expectEqual(main.AgentConnection.ready, model.activeSession().agent_connection);
+    try testing.expectEqualStrings("Codex app-server ready · permission broker active", model.agentStatus());
+}
+
+test "closing an Agent tab closes its PTY and Codex app-server" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    main.update(&model, .{ .close_session = 2 }, &fx);
+    try testing.expectEqual(@as(usize, 3), fx.pendingFetchCount());
+    try testing.expectEqual(std.http.Method.POST, fx.pendingFetchAt(1).?.method);
+    try testing.expectEqual(std.http.Method.DELETE, fx.pendingFetchAt(2).?.method);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2",
+        fx.pendingFetchAt(2).?.url,
+    );
+}
+
 test "tabs expose close controls and close the active session like a desktop terminal" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -214,6 +260,14 @@ test "terminal web pane accepts only the authenticated fixed loopback shape" {
 
     model = main.initialModel();
     try testing.expectEqual(@as(usize, 0), main.terminalPanes(&model, &panes));
+}
+
+test "Agent gateway accepts only an authenticated dynamic loopback shape" {
+    try testing.expect(!main.trustedAgentUrl("https://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789"));
+    try testing.expect(!main.trustedAgentUrl("http://127.0.0.1:0/?token=abcdef0123456789abcdef0123456789"));
+    try testing.expect(!main.trustedAgentUrl("http://127.0.0.1:55321.evil/?token=abcdef0123456789abcdef0123456789"));
+    try testing.expect(!main.trustedAgentUrl("http://127.0.0.1:55321/?token=short"));
+    try testing.expect(main.trustedAgentUrl("http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789"));
 }
 
 test "new terminal tabs switch reconnect namespaces without exceeding the bound" {

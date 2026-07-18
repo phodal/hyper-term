@@ -22,9 +22,13 @@ pub const terminal_view_anchor = "Terminal viewport";
 pub const terminal_gateway_origin = "http://127.0.0.1:47437";
 pub const max_sessions: usize = 8;
 const terminal_url_capacity: usize = 256;
+const agent_url_capacity: usize = 256;
 const max_gateway_token_bytes: usize = 128;
 const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
+const agent_effect_url_capacity: usize = agent_url_capacity + 64;
 const terminal_close_effect_key_base: u64 = 0x4854_4300;
+pub const agent_start_effect_key_base: u64 = 0x4854_4100;
+const agent_close_effect_key_base: u64 = 0x4854_4200;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -80,6 +84,13 @@ pub const SessionMode = enum {
     agent,
 };
 
+pub const AgentConnection = enum {
+    unavailable,
+    connecting,
+    ready,
+    failed,
+};
+
 pub const Session = struct {
     id: u8 = 0,
     mode: SessionMode = .terminal,
@@ -87,6 +98,7 @@ pub const Session = struct {
     icon: []const u8 = "terminal",
     accessibility_label: []const u8 = "Terminal session",
     close_label: []const u8 = "Close Terminal session",
+    agent_connection: AgentConnection = .unavailable,
 };
 
 pub const Model = struct {
@@ -108,6 +120,8 @@ pub const Model = struct {
     terminal_base_url_len: usize = 0,
     terminal_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
     terminal_url_len: usize = 0,
+    agent_base_url_storage: [agent_url_capacity]u8 = [_]u8{0} ** agent_url_capacity,
+    agent_base_url_len: usize = 0,
 
     /// Read by update, token, and derived-binding code rather than bound
     /// directly by the declarative view.
@@ -122,6 +136,8 @@ pub const Model = struct {
         "terminal_base_url_len",
         "terminal_url_storage",
         "terminal_url_len",
+        "agent_base_url_storage",
+        "agent_base_url_len",
         "terminalReady",
         "terminalUrl",
     };
@@ -163,6 +179,24 @@ pub const Model = struct {
     pub fn terminalUrl(model: *const Model) []const u8 {
         return model.terminal_url_storage[0..model.terminal_url_len];
     }
+
+    pub fn agentConnectionLabel(model: *const Model) []const u8 {
+        return switch (model.activeSession().agent_connection) {
+            .unavailable => "unavailable",
+            .connecting => "connecting",
+            .ready => "ready",
+            .failed => "failed",
+        };
+    }
+
+    pub fn agentStatus(model: *const Model) []const u8 {
+        return switch (model.activeSession().agent_connection) {
+            .unavailable => "Codex unavailable · no command executed",
+            .connecting => "Codex app-server connecting · no command executed",
+            .ready => "Codex app-server ready · permission broker active",
+            .failed => "Codex app-server failed · no command executed",
+        };
+    }
 };
 
 pub const Msg = union(enum) {
@@ -174,6 +208,8 @@ pub const Msg = union(enum) {
     close_session: u8,
     close_active_session,
     terminal_session_closed: native_sdk.EffectResponse,
+    agent_session_started: native_sdk.EffectResponse,
+    agent_session_closed: native_sdk.EffectResponse,
     agent_split_resized: f32,
     system_appearance: struct {
         scheme: canvas.ColorScheme,
@@ -183,7 +219,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "system_appearance", "chrome_changed" };
 };
 
 const dev_markup_reload = builtin.mode == .Debug;
@@ -195,17 +231,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .new_session => model.new_session_open = true,
         .dismiss_new_session => model.new_session_open = false,
         .choose_terminal => {
-            appendSession(model, .terminal);
+            _ = appendSession(model, .terminal);
             model.new_session_open = false;
         },
         .choose_agent => {
-            appendSession(model, .agent);
+            if (appendSession(model, .agent)) |session_id| {
+                requestAgentStart(model, session_id, fx);
+            }
             model.new_session_open = false;
         },
         .select_session => |session_id| selectSession(model, session_id),
         .close_session => |session_id| closeSession(model, session_id, fx),
         .close_active_session => closeSession(model, model.active_session_id, fx),
         .terminal_session_closed => {},
+        .agent_session_started => |response| applyAgentStartResponse(model, response),
+        .agent_session_closed => {},
         .agent_split_resized => |fraction| model.agent_split = std.math.clamp(fraction, 0.48, 0.76),
         .system_appearance => |appearance| {
             model.system_scheme = appearance.scheme;
@@ -220,8 +260,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     }
 }
 
-fn appendSession(model: *Model, mode: SessionMode) void {
-    if (model.session_count >= max_sessions) return;
+fn appendSession(model: *Model, mode: SessionMode) ?u8 {
+    if (model.session_count >= max_sessions) return null;
     const session_id = model.next_session_id;
     model.session_slots[model.session_count] = .{
         .id = session_id,
@@ -236,6 +276,7 @@ fn appendSession(model: *Model, mode: SessionMode) void {
     model.next_session_id +%= 1;
     if (model.next_session_id == 0) model.next_session_id = 1;
     refreshTerminalUrl(model);
+    return session_id;
 }
 
 fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
@@ -247,7 +288,9 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         }
     }
     const index = closing_index orelse return;
+    const session = model.session_slots[index];
     requestTerminalClose(model, session_id, fx);
+    if (session.mode == .agent) requestAgentClose(model, session_id, fx);
 
     if (model.session_count == 1) {
         fx.closeWindow("main");
@@ -268,6 +311,65 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     model.session_count -= 1;
     model.session_slots[model.session_count] = .{};
     refreshTerminalUrl(model);
+}
+
+fn requestAgentStart(model: *Model, session_id: u8, fx: *Effects) void {
+    var storage: [agent_effect_url_capacity]u8 = undefined;
+    const request_url = writeAgentSessionUrl(model, session_id, storage[0..]) orelse return;
+    setAgentConnection(model, session_id, .connecting);
+    fx.fetch(.{
+        .key = agent_start_effect_key_base + session_id,
+        .method = .POST,
+        .url = request_url,
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_session_started),
+    });
+}
+
+fn requestAgentClose(model: *const Model, session_id: u8, fx: *Effects) void {
+    var storage: [agent_effect_url_capacity]u8 = undefined;
+    const request_url = writeAgentSessionUrl(model, session_id, storage[0..]) orelse return;
+    fx.fetch(.{
+        .key = agent_close_effect_key_base + session_id,
+        .method = .DELETE,
+        .url = request_url,
+        .timeout_ms = 2_000,
+        .on_response = Effects.responseMsg(.agent_session_closed),
+    });
+}
+
+fn writeAgentSessionUrl(model: *const Model, session_id: u8, storage: []u8) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(
+        storage,
+        "{s}/agent/session?token={s}&session_id={d}",
+        .{ origin, token, session_id },
+    ) catch null;
+}
+
+fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse) void {
+    if (response.key <= agent_start_effect_key_base) return;
+    const raw_session_id = response.key - agent_start_effect_key_base;
+    if (raw_session_id > std.math.maxInt(u8)) return;
+    const session_id: u8 = @intCast(raw_session_id);
+    const ready = response.outcome == .ok and
+        response.status == 200 and
+        !response.truncated and
+        std.mem.indexOf(u8, response.body, "\"status\":\"ready\"") != null;
+    setAgentConnection(model, session_id, if (ready) .ready else .failed);
+}
+
+fn setAgentConnection(model: *Model, session_id: u8, connection: AgentConnection) void {
+    for (model.session_slots[0..model.session_count]) |*session| {
+        if (session.id == session_id and session.mode == .agent) {
+            session.agent_connection = connection;
+            return;
+        }
+    }
 }
 
 fn requestTerminalClose(model: *const Model, session_id: u8, fx: *Effects) void {
@@ -406,11 +508,19 @@ pub fn initialModel() Model {
 }
 
 pub fn initialModelWithTerminalUrl(url: []const u8) Model {
+    return initialModelWithServices(url, "");
+}
+
+pub fn initialModelWithServices(terminal_url: []const u8, agent_url: []const u8) Model {
     var model = initialModel();
-    if (trustedTerminalUrl(url)) {
-        @memcpy(model.terminal_base_url_storage[0..url.len], url);
-        model.terminal_base_url_len = url.len;
+    if (trustedTerminalUrl(terminal_url)) {
+        @memcpy(model.terminal_base_url_storage[0..terminal_url.len], terminal_url);
+        model.terminal_base_url_len = terminal_url.len;
         refreshTerminalUrl(&model);
+    }
+    if (trustedAgentUrl(agent_url)) {
+        @memcpy(model.agent_base_url_storage[0..agent_url.len], agent_url);
+        model.agent_base_url_len = agent_url.len;
     }
     return model;
 }
@@ -448,6 +558,23 @@ pub fn trustedTerminalUrl(url: []const u8) bool {
     const prefix = terminal_gateway_origin ++ "/?token=";
     if (!std.mem.startsWith(u8, url, prefix)) return false;
     const token = url[prefix.len..];
+    return trustedGatewayToken(token);
+}
+
+pub fn trustedAgentUrl(url: []const u8) bool {
+    const prefix = "http://127.0.0.1:";
+    if (!std.mem.startsWith(u8, url, prefix)) return false;
+    const remainder = url[prefix.len..];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, remainder, marker) orelse return false;
+    const port_text = remainder[0..marker_index];
+    if (port_text.len == 0 or port_text.len > 5) return false;
+    const port = std.fmt.parseInt(u16, port_text, 10) catch return false;
+    if (port == 0) return false;
+    return trustedGatewayToken(remainder[marker_index + marker.len ..]);
+}
+
+fn trustedGatewayToken(token: []const u8) bool {
     if (token.len < 32 or token.len > max_gateway_token_bytes) return false;
     for (token) |character| {
         if (!std.ascii.isAlphanumeric(character) and character != '-' and character != '_') return false;
@@ -460,7 +587,8 @@ pub fn main(init: std.process.Init) !void {
     defer std.heap.page_allocator.destroy(app_state);
 
     const terminal_url = init.environ_map.get("HYPER_TERM_TERMINAL_URL") orelse "";
-    app_state.* = HyperTermApp.init(std.heap.page_allocator, initialModelWithTerminalUrl(terminal_url), .{
+    const agent_url = init.environ_map.get("HYPER_TERM_AGENT_URL") orelse "";
+    app_state.* = HyperTermApp.init(std.heap.page_allocator, initialModelWithServices(terminal_url, agent_url), .{
         .name = "hyper-term",
         .scene = shell_scene,
         .canvas_label = canvas_label,
