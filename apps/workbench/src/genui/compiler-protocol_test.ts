@@ -30,3 +30,24 @@ Deno.test("compiler accepts only bounded absolute virtual paths", () => {
     "exceeds",
   );
 });
+
+Deno.test("compiler rejects malformed request envelopes", () => {
+  assertThrows(
+    () =>
+      validateCompileRequest({
+        ...request({ "/App.tsx": "export default 1" }),
+        type: "unknown" as "compile",
+      }),
+    Error,
+    "request type",
+  );
+  assertThrows(
+    () =>
+      validateCompileRequest({
+        ...request({ "/App.tsx": "export default 1" }),
+        request_id: "",
+      }),
+    Error,
+    "request id",
+  );
+});

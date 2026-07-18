@@ -26,11 +26,30 @@ export type CompileResponse =
   };
 
 export function validateCompileRequest(request: CompileRequest): void {
+  if (request.type !== "compile") {
+    throw new Error("compiler request type must be compile");
+  }
+  if (
+    typeof request.request_id !== "string" ||
+    request.request_id.length === 0 ||
+    request.request_id.length > 128
+  ) {
+    throw new Error("compiler request id must contain 1-128 characters");
+  }
   if (
     !Number.isSafeInteger(request.source_revision) ||
     request.source_revision < 1
   ) {
     throw new Error("source revision must be a positive integer");
+  }
+  if (typeof request.entrypoint !== "string") {
+    throw new Error("compiler entrypoint must be a string");
+  }
+  if (
+    typeof request.files !== "object" || request.files === null ||
+    Array.isArray(request.files)
+  ) {
+    throw new Error("compiler files must be a virtual source map");
   }
   const entries = Object.entries(request.files);
   if (entries.length === 0 || entries.length > MAX_SOURCE_FILES) {

@@ -5,8 +5,15 @@ if (!resolved.startsWith("file:")) {
   throw new Error(`esbuild-wasm resolved to an unsupported URL: ${resolved}`);
 }
 
-const destination = fromFileUrl(
-  new URL("../dist/workbench/esbuild.wasm", import.meta.url),
-);
+const target = Deno.args[0];
+const destinationUrl = target === "workbench"
+  ? new URL("../dist/workbench/esbuild.wasm", import.meta.url)
+  : target === "runtime"
+  ? new URL("../dist/runtime/esbuild.wasm", import.meta.url)
+  : null;
+if (destinationUrl === null) {
+  throw new Error("copy_esbuild_wasm target must be workbench or runtime");
+}
+const destination = fromFileUrl(destinationUrl);
 await Deno.mkdir(dirname(destination), { recursive: true });
 await Deno.copyFile(fromFileUrl(resolved), destination);
