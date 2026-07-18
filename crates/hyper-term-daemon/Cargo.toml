@@ -15,9 +15,9 @@ name = "hyperd"
 path = "src/main.rs"
 
 [dependencies]
+crossbeam-channel.workspace = true
 hyper-term-core = { path = "../hyper-term-core" }
 hyper-term-protocol = { path = "../hyper-term-protocol" }
-serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 

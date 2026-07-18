@@ -128,6 +128,9 @@ impl OperationReducer {
                         actual: *operation_revision,
                     });
                 }
+                if record.permission_decision.is_some() {
+                    return Err(OperationError::PermissionAlreadyDecided(operation_id));
+                }
                 record.permission_decision = Some(*decision);
             }
             _ => {}
@@ -137,6 +140,10 @@ impl OperationReducer {
 
     pub fn get(&self, operation_id: OperationId) -> Option<&OperationRecord> {
         self.records.get(&operation_id)
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = &OperationRecord> {
+        self.records.values()
     }
 
     fn record_for_event(&self, event: &EventEnvelope) -> Result<&OperationRecord, OperationError> {
@@ -196,6 +203,8 @@ pub enum OperationError {
     },
     #[error("permission event is invalid while operation is {0:?}")]
     PermissionOutsideWaitingState(OperationState),
+    #[error("permission for operation {0} was already decided")]
+    PermissionAlreadyDecided(OperationId),
 }
 
 #[cfg(test)]
@@ -304,5 +313,70 @@ mod tests {
             ))
             .expect_err("must reject transition");
         assert!(matches!(error, OperationError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn operation_accepts_only_one_permission_decision() {
+        let operation_id = OperationId::new();
+        let mut reducer = OperationReducer::default();
+        for event in [
+            DomainEvent::OperationProposed {
+                revision: 1,
+                kind: OperationKind::Shell,
+                action: OperationAction::Shell {
+                    command: TerminalCommand {
+                        program: "true".into(),
+                        args: vec![],
+                        cwd: None,
+                        env: Default::default(),
+                    },
+                },
+                summary: "run".into(),
+                risk: RiskClass::ReadOnly,
+                required_capabilities: vec!["shell".into()],
+            },
+            DomainEvent::OperationStateChanged {
+                revision: 2,
+                from: OperationState::Proposed,
+                to: OperationState::PolicyCheck,
+                actor: Actor::Policy,
+                reason: None,
+            },
+            DomainEvent::OperationStateChanged {
+                revision: 3,
+                from: OperationState::PolicyCheck,
+                to: OperationState::WaitingHuman,
+                actor: Actor::Policy,
+                reason: None,
+            },
+            DomainEvent::PermissionDecided {
+                operation_revision: 3,
+                decision: PermissionDecision::AllowOnce,
+                actor: Actor::User,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            reducer
+                .apply(&envelope(event.0 as u64 + 1, operation_id, event.1))
+                .unwrap();
+        }
+
+        let error = reducer
+            .apply(&envelope(
+                5,
+                operation_id,
+                DomainEvent::PermissionDecided {
+                    operation_revision: 3,
+                    decision: PermissionDecision::RejectOnce,
+                    actor: Actor::User,
+                },
+            ))
+            .expect_err("a decision cannot be replaced");
+        assert!(matches!(
+            error,
+            OperationError::PermissionAlreadyDecided(id) if id == operation_id
+        ));
     }
 }

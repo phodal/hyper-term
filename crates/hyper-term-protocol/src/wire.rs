@@ -394,6 +394,19 @@ mod tests {
     }
 
     #[test]
+    fn binary_terminal_input_carries_lease_and_sequence() {
+        let original = WireFrame::TerminalInput(TerminalInputFrame {
+            terminal_id: TerminalId::new(),
+            lease_id: InputLeaseId::new(),
+            sequence: 7,
+            bytes: b"cargo test\n".to_vec(),
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &original).expect("encode");
+        assert_eq!(read_frame(bytes.as_slice()).expect("decode"), original);
+    }
+
+    #[test]
     fn control_frame_round_trips_with_a_versioned_shape() {
         let original = WireFrame::Request(ControlRequestEnvelope {
             request_id: RequestId::new(),

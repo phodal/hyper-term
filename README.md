@@ -179,6 +179,23 @@ Implementation lands in milestone-sized, independently tested slices. Every
 protocol or lifecycle change must include tests, and every milestone must
 preserve the Rust authority and renderer-independence boundaries.
 
+## Develop the Rust kernel
+
+The current M1 slice requires the pinned Rust toolchain only:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p hyper-term-daemon --bin hyperd -- \
+  --state-dir .hyper-term \
+  --socket .hyper-term/hyperd.sock
+```
+
+`hyperd` exposes a versioned Unix-socket protocol. Control messages are bounded
+JSON frames; PTY input, output, and snapshots use separate bounded binary
+frames. A client must complete `Hello`, receive exact-operation authorization,
+and acquire the terminal input lease before it can write to a PTY.
+
 ## License
 
 Apache-2.0. Competitor implementations are research input only; do not copy
