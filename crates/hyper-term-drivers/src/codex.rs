@@ -15,12 +15,23 @@ use uuid::Uuid;
 use crate::{
     AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal, DriverError,
     DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
-    ExternalRequestId, StructuredAgentProtocol,
+    ExternalRequestId, StructuredAgentProtocol, sha256_file,
 };
 
 const MAX_PENDING_APPROVALS: usize = 128;
 const MAX_BUFFERED_MESSAGES: usize = 512;
 const CODEX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const HYPER_TERM_MCP_TOOLS: &[&str] = &[
+    "hyper_term.genui.compile",
+    "hyper_term.lsp.query",
+    "hyper_term.diff.review",
+];
+
+pub struct CodexMcpServerConfig {
+    pub executable: PathBuf,
+    pub executable_sha256: String,
+    pub arguments: Vec<OsString>,
+}
 
 pub struct CodexAppServerConfig {
     pub executable: PathBuf,
@@ -29,6 +40,7 @@ pub struct CodexAppServerConfig {
     pub workspace: PathBuf,
     pub codex_home: PathBuf,
     pub scratch_directory: PathBuf,
+    pub brokered_mcp_server: Option<CodexMcpServerConfig>,
 }
 
 pub struct CodexAppServerClient {
@@ -62,6 +74,7 @@ impl CodexAppServerClient {
             ("TERM".into(), OsString::from("dumb")),
             ("TMPDIR".into(), scratch.into_os_string()),
         ]);
+        let arguments = codex_arguments(config.brokered_mcp_server.as_ref())?;
         let process = DriverProcess::spawn(DriverSpec {
             manifest: DriverManifest {
                 driver_id: Uuid::new_v4(),
@@ -79,11 +92,7 @@ impl CodexAppServerClient {
                 permission_profile: "codex-proposal-only-v1".into(),
             },
             executable: config.executable,
-            arguments: vec![
-                OsString::from("app-server"),
-                OsString::from("--stdio"),
-                OsString::from("--strict-config"),
-            ],
+            arguments,
             working_directory: workspace,
             environment,
             framing: DriverFraming::JsonLines,
@@ -309,6 +318,69 @@ impl CodexAppServerClient {
     }
 }
 
+fn codex_arguments(
+    mcp_server: Option<&CodexMcpServerConfig>,
+) -> Result<Vec<OsString>, CodexAdapterError> {
+    let mut arguments = vec![
+        OsString::from("app-server"),
+        OsString::from("--stdio"),
+        OsString::from("--strict-config"),
+    ];
+    let Some(mcp_server) = mcp_server else {
+        return Ok(arguments);
+    };
+    if !mcp_server.executable.is_absolute() {
+        return Err(CodexAdapterError::InvalidConfig(
+            "brokered MCP executable must be absolute".into(),
+        ));
+    }
+    if mcp_server.arguments.len() > 32 {
+        return Err(CodexAdapterError::InvalidConfig(
+            "brokered MCP arguments exceed their bound".into(),
+        ));
+    }
+    let executable = mcp_server.executable.canonicalize()?;
+    let actual_digest = sha256_file(&executable)?;
+    if actual_digest != mcp_server.executable_sha256 {
+        return Err(CodexAdapterError::McpExecutableDigestMismatch {
+            expected: mcp_server.executable_sha256.clone(),
+            actual: actual_digest,
+        });
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        CodexAdapterError::InvalidConfig("brokered MCP executable path is not UTF-8".into())
+    })?;
+    let mcp_arguments = mcp_server
+        .arguments
+        .iter()
+        .map(|argument| {
+            let value = argument.to_str().ok_or_else(|| {
+                CodexAdapterError::InvalidConfig("brokered MCP argument is not UTF-8".into())
+            })?;
+            if value.len() > 16 * 1024 {
+                return Err(CodexAdapterError::InvalidConfig(
+                    "brokered MCP argument exceeds its bound".into(),
+                ));
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, CodexAdapterError>>()?;
+    let executable = serde_json::to_string(executable)?;
+    let mcp_arguments = serde_json::to_string(&mcp_arguments)?;
+    let enabled_tools = serde_json::to_string(HYPER_TERM_MCP_TOOLS)?;
+    for value in [
+        format!("mcp_servers.hyper_term.command={executable}"),
+        format!("mcp_servers.hyper_term.args={mcp_arguments}"),
+        format!("mcp_servers.hyper_term.enabled_tools={enabled_tools}"),
+        "mcp_servers.hyper_term.startup_timeout_sec=5".into(),
+        "mcp_servers.hyper_term.tool_timeout_sec=30".into(),
+    ] {
+        arguments.push(OsString::from("-c"));
+        arguments.push(OsString::from(value));
+    }
+    Ok(arguments)
+}
+
 fn normalize_effect(
     driver_id: Uuid,
     request_id: ExternalRequestId,
@@ -428,6 +500,8 @@ pub enum CodexAdapterError {
     Json(#[from] serde_json::Error),
     #[error("invalid Codex adapter configuration: {0}")]
     InvalidConfig(String),
+    #[error("brokered MCP executable digest mismatch: expected {expected}, got {actual}")]
+    McpExecutableDigestMismatch { expected: String, actual: String },
     #[error("invalid Codex message: {0}")]
     InvalidMessage(String),
     #[error("Codex request {request_id} timed out")]
@@ -456,6 +530,8 @@ pub enum CodexAdapterError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -489,5 +565,51 @@ mod tests {
         });
         assert_eq!(required_string(&params, "threadId").unwrap(), "thread-1");
         assert_eq!(required_string(&params, "delta").unwrap(), "working");
+    }
+
+    #[test]
+    fn brokered_mcp_is_a_private_codex_launch_override() {
+        let executable = Path::new("/usr/bin/true").canonicalize().unwrap();
+        let arguments = codex_arguments(Some(&CodexMcpServerConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            arguments: vec![
+                OsString::from("mcp-stdio"),
+                OsString::from("--agent-socket=/tmp/hyper-term-agent.sock"),
+            ],
+        }))
+        .unwrap();
+        let arguments = arguments
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            &arguments[..3],
+            ["app-server", "--stdio", "--strict-config"]
+        );
+        assert!(arguments.contains(&"mcp_servers.hyper_term.command=\"/usr/bin/true\""));
+        assert!(arguments.iter().any(|value| {
+            value.starts_with("mcp_servers.hyper_term.args=")
+                && value.contains("hyper-term-agent.sock")
+        }));
+        assert!(arguments.iter().any(|value| {
+            value.starts_with("mcp_servers.hyper_term.enabled_tools=")
+                && HYPER_TERM_MCP_TOOLS.iter().all(|tool| value.contains(tool))
+        }));
+    }
+
+    #[test]
+    fn brokered_mcp_binary_is_digest_pinned_before_codex_sees_it() {
+        let executable = Path::new("/usr/bin/true").canonicalize().unwrap();
+        let result = codex_arguments(Some(&CodexMcpServerConfig {
+            executable,
+            executable_sha256: "0".repeat(64),
+            arguments: vec![],
+        }));
+        assert!(matches!(
+            result,
+            Err(CodexAdapterError::McpExecutableDigestMismatch { .. })
+        ));
     }
 }
