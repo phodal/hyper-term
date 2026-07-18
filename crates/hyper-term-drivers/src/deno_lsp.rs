@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::{
     DEFAULT_MAX_DRIVER_FRAME_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
     DriverManifest, DriverProcess, DriverSpec, DriverState,
+    deno_containment::compile_deno_task_sandbox, process::sandbox_permission_profile,
 };
 
 const MAX_BUFFERED_LSP_EVENTS: usize = 512;
@@ -36,7 +37,8 @@ pub struct DenoLspClient {
 
 impl DenoLspClient {
     pub fn launch(config: DenoLspConfig) -> Result<Self, DenoLspError> {
-        if !config.workspace_snapshot.is_absolute()
+        if !config.executable.is_absolute()
+            || !config.workspace_snapshot.is_absolute()
             || !config.cache_directory.is_absolute()
             || !config.scratch_directory.is_absolute()
         {
@@ -51,16 +53,28 @@ impl DenoLspClient {
         let scratch = config.scratch_directory.canonicalize()?;
         let workspace_uri = path_to_file_uri(&workspace)?;
         let environment = BTreeMap::from([
-            ("DENO_DIR".into(), cache.into_os_string()),
+            ("DENO_DIR".into(), cache.clone().into_os_string()),
             ("DENO_NO_PROMPT".into(), OsString::from("1")),
             ("DENO_NO_UPDATE_CHECK".into(), OsString::from("1")),
             ("HOME".into(), scratch.clone().into_os_string()),
             ("NO_COLOR".into(), OsString::from("1")),
-            ("TMPDIR".into(), scratch.into_os_string()),
+            ("TMPDIR".into(), scratch.clone().into_os_string()),
         ]);
+        let arguments = vec![OsString::from("lsp"), OsString::from("--quiet")];
+        let driver_id = Uuid::new_v4();
+        let sandbox = compile_deno_task_sandbox(
+            driver_id,
+            &config.executable,
+            &arguments,
+            &workspace,
+            &environment,
+            [workspace.clone()],
+            [cache, scratch],
+        )?;
+        let permission_profile = sandbox_permission_profile(&sandbox);
         let process = DriverProcess::spawn(DriverSpec {
             manifest: DriverManifest {
-                driver_id: Uuid::new_v4(),
+                driver_id,
                 kind: DriverKind::DenoLsp,
                 implementation_version: config.runtime_version,
                 protocol_version: "lsp-3.17+deno".into(),
@@ -72,12 +86,13 @@ impl DenoLspClient {
                 ],
                 transport: "stdio-content-length".into(),
                 executable_sha256: config.executable_sha256,
-                permission_profile: "deno-lsp-offline-snapshot-v1".into(),
+                permission_profile,
             },
             executable: config.executable,
-            arguments: vec![OsString::from("lsp"), OsString::from("--quiet")],
+            arguments,
             working_directory: workspace,
             environment,
+            sandbox: Some(sandbox),
             framing: DriverFraming::ContentLength,
             max_frame_bytes: DEFAULT_MAX_DRIVER_FRAME_BYTES,
         })?;

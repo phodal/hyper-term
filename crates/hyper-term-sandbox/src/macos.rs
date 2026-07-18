@@ -119,9 +119,12 @@ fn validate_supported_contract(profile: &SandboxProfile) -> Result<(), SandboxEr
             "Seatbelt proxy-only networking is not implemented",
         ));
     }
-    if profile.lifetime != SandboxLifetime::OneOperation {
+    if !matches!(
+        profile.lifetime,
+        SandboxLifetime::OneOperation | SandboxLifetime::OneTask
+    ) {
         return Err(backend_error(
-            "Seatbelt leases currently support one operation only",
+            "Seatbelt does not support the requested sandbox lifetime",
         ));
     }
     if profile.resources.wall_time_ms.is_some()
@@ -315,6 +318,9 @@ fn compile_policy(
     for (index, rule) in profile.filesystem.rules.iter().enumerate() {
         let key = format!("PATH_{index}");
         definitions.insert(key.clone(), rule.path.clone());
+        policy.push_str(&format!(
+            "(allow file-read-metadata file-test-existence (path-ancestors (param \"{key}\")))\n"
+        ));
         let filter =
             format!("(require-any (literal (param \"{key}\")) (subpath (param \"{key}\")))");
         match rule.access {
@@ -523,6 +529,7 @@ mod tests {
         );
         assert!(compiled.artifact.policy.contains("(deny default)"));
         assert!(compiled.artifact.policy.contains("(param \"PATH_"));
+        assert!(compiled.artifact.policy.contains("path-ancestors (param"));
         assert!(
             !compiled
                 .artifact

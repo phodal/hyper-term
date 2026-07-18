@@ -107,6 +107,7 @@ impl CodexAppServerClient {
             arguments,
             working_directory: workspace,
             environment,
+            sandbox: None,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: CODEX_FRAME_BYTES,
         }) {

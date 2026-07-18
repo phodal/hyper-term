@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::{
     DEFAULT_MAX_DRIVER_FRAME_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
-    DriverManifest, DriverProcess, DriverSpec, DriverState, sha256_file,
+    DriverManifest, DriverProcess, DriverSpec, DriverState,
+    deno_containment::compile_deno_task_sandbox, process::sandbox_permission_profile, sha256_file,
 };
 
 const GENUI_PROTOCOL_VERSION: u64 = 1;
@@ -107,38 +108,51 @@ impl DenoGenUiCompiler {
             path_text(&compiler_wasm)?
         );
         let environment = BTreeMap::from([
-            ("DENO_DIR".into(), cache.into_os_string()),
+            ("DENO_DIR".into(), cache.clone().into_os_string()),
             ("DENO_NO_PROMPT".into(), OsString::from("1")),
             ("DENO_NO_UPDATE_CHECK".into(), OsString::from("1")),
             ("HOME".into(), scratch.clone().into_os_string()),
             ("NO_COLOR".into(), OsString::from("1")),
             ("TMPDIR".into(), scratch.clone().into_os_string()),
         ]);
+        let arguments = vec![
+            OsString::from("run"),
+            OsString::from("--cached-only"),
+            OsString::from("--no-config"),
+            OsString::from("--no-lock"),
+            OsString::from("--no-prompt"),
+            OsString::from(read_allowlist),
+            compiler_script.clone().into_os_string(),
+            OsString::from("--wasm"),
+            compiler_wasm.clone().into_os_string(),
+        ];
+        let driver_id = Uuid::new_v4();
+        let sandbox = compile_deno_task_sandbox(
+            driver_id,
+            &config.executable,
+            &arguments,
+            &scratch,
+            &environment,
+            [compiler_script.clone(), compiler_wasm.clone()],
+            [cache, scratch.clone()],
+        )?;
+        let permission_profile = sandbox_permission_profile(&sandbox);
         let process = DriverProcess::spawn(DriverSpec {
             manifest: DriverManifest {
-                driver_id: Uuid::new_v4(),
+                driver_id,
                 kind: DriverKind::DenoGenUi,
                 implementation_version: config.runtime_version,
                 protocol_version: format!("hyper-term-genui-{GENUI_PROTOCOL_VERSION}"),
                 capabilities: vec!["bounded_react_compile".into(), "source_maps".into()],
                 transport: "stdio-json-lines".into(),
                 executable_sha256: config.executable_sha256,
-                permission_profile: "deno-genui-readonly-assets-v1".into(),
+                permission_profile,
             },
             executable: config.executable,
-            arguments: vec![
-                OsString::from("run"),
-                OsString::from("--cached-only"),
-                OsString::from("--no-config"),
-                OsString::from("--no-lock"),
-                OsString::from("--no-prompt"),
-                OsString::from(read_allowlist),
-                compiler_script.into_os_string(),
-                OsString::from("--wasm"),
-                compiler_wasm.into_os_string(),
-            ],
+            arguments,
             working_directory: scratch,
             environment,
+            sandbox: Some(sandbox),
             framing: DriverFraming::JsonLines,
             max_frame_bytes: DEFAULT_MAX_DRIVER_FRAME_BYTES,
         })?;
@@ -247,7 +261,10 @@ impl DenoGenUiCompiler {
                 })
             }
             Ok(DriverEvent::ProtocolError { message }) => Err(DenoGenUiError::Protocol(message)),
-            Ok(DriverEvent::Exited { state, .. }) => Err(DenoGenUiError::Exited(state)),
+            Ok(DriverEvent::Exited { state, .. }) => Err(DenoGenUiError::Exited {
+                state,
+                stderr: self.process.stderr_tail().unwrap_or_default(),
+            }),
             Err(DriverError::Timeout) => Err(DenoGenUiError::Timeout {
                 request_id: request_id.into(),
             }),
@@ -292,7 +309,10 @@ fn wait_until_ready(
     let DriverEvent::Message { payload, .. } = event else {
         return Err(match event {
             DriverEvent::ProtocolError { message } => DenoGenUiError::Protocol(message),
-            DriverEvent::Exited { state, .. } => DenoGenUiError::Exited(state),
+            DriverEvent::Exited { state, .. } => DenoGenUiError::Exited {
+                state,
+                stderr: process.stderr_tail().unwrap_or_default(),
+            },
             DriverEvent::Message { .. } => unreachable!(),
         });
     };
@@ -485,8 +505,8 @@ pub enum DenoGenUiError {
     Timeout { request_id: String },
     #[error("Deno GenUI protocol failed: {0}")]
     Protocol(String),
-    #[error("Deno GenUI compiler exited in state {0:?}")]
-    Exited(DriverState),
+    #[error("Deno GenUI compiler exited in state {state:?}: {stderr}")]
+    Exited { state: DriverState, stderr: String },
     #[error("Deno GenUI compiler rejected the source: {0:?}")]
     CompileFailed(Vec<GenUiCompileDiagnostic>),
     #[error("{label} digest mismatch: expected {expected}, got {actual}")]

@@ -8,7 +8,9 @@ version.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
+hyper-term-core = { path = "../hyper-term-core" }
 hyper-term-protocol = { path = "../hyper-term-protocol" }
+hyper-term-sandbox = { path = "../hyper-term-sandbox" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

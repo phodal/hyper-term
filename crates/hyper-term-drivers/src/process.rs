@@ -10,6 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use hyper_term_core::{SandboxLaunchPlan, terminal_action_digest};
+use hyper_term_protocol::{SandboxBackendKind, TerminalCommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -21,6 +23,7 @@ use crate::{DEFAULT_MAX_DRIVER_FRAME_BYTES, DriverFraming};
 const DRIVER_EVENT_CAPACITY: usize = 256;
 const STDERR_TAIL_BYTES: usize = 64 * 1024;
 const EXIT_AFTER_STDOUT_GRACE: Duration = Duration::from_millis(200);
+const MAX_SANDBOX_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +73,9 @@ pub struct DriverSpec {
     pub arguments: Vec<OsString>,
     pub working_directory: PathBuf,
     pub environment: BTreeMap<String, OsString>,
+    /// A Rust-compiled, enforced launch plan for the exact audited command.
+    /// The supervisor re-computes the inner command digest before using it.
+    pub sandbox: Option<SandboxLaunchPlan>,
     pub framing: DriverFraming,
     pub max_frame_bytes: usize,
 }
@@ -118,12 +124,13 @@ impl DriverProcess {
             });
         }
         let working_directory = spec.working_directory.canonicalize()?;
-        let mut command = Command::new(executable);
+        let launch = resolve_launch(&spec, &executable, &working_directory)?;
+        let mut command = Command::new(launch.executable);
         command
-            .args(&spec.arguments)
-            .current_dir(working_directory)
+            .args(launch.arguments)
+            .current_dir(launch.working_directory)
             .env_clear()
-            .envs(&spec.environment)
+            .envs(launch.environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -281,6 +288,148 @@ impl DriverProcess {
         *state = next;
         Ok(())
     }
+}
+
+struct ResolvedDriverLaunch {
+    executable: PathBuf,
+    arguments: Vec<OsString>,
+    working_directory: PathBuf,
+    environment: BTreeMap<String, OsString>,
+}
+
+fn resolve_launch(
+    spec: &DriverSpec,
+    executable: &Path,
+    working_directory: &Path,
+) -> Result<ResolvedDriverLaunch, DriverError> {
+    let Some(plan) = &spec.sandbox else {
+        return Ok(ResolvedDriverLaunch {
+            executable: executable.to_path_buf(),
+            arguments: spec.arguments.clone(),
+            working_directory: working_directory.to_path_buf(),
+            environment: spec.environment.clone(),
+        });
+    };
+    if !plan.compiled.enforced || !plan.clear_environment {
+        return Err(DriverError::InvalidContainment(
+            "driver sandbox plan must be enforced and clear the inherited environment".into(),
+        ));
+    }
+    let audited = audited_command(spec, executable, working_directory)?;
+    let actual_digest = terminal_action_digest(&audited)
+        .map_err(|error| DriverError::InvalidContainment(error.to_string()))?;
+    if actual_digest != plan.compiled.action_digest {
+        return Err(DriverError::SandboxActionDigestMismatch {
+            expected: plan.compiled.action_digest.to_string(),
+            actual: actual_digest.to_string(),
+        });
+    }
+    let expected_profile = sandbox_permission_profile(plan);
+    if spec.manifest.permission_profile != expected_profile {
+        return Err(DriverError::InvalidContainment(format!(
+            "driver manifest permission profile must be {expected_profile}"
+        )));
+    }
+    let launcher = PathBuf::from(&plan.command.program).canonicalize()?;
+    match plan.compiled.backend {
+        SandboxBackendKind::MacOsSeatbelt => {
+            let expected = PathBuf::from("/usr/bin/sandbox-exec").canonicalize()?;
+            if launcher != expected {
+                return Err(DriverError::InvalidContainment(
+                    "macOS sandbox plan does not use the pinned Seatbelt launcher".into(),
+                ));
+            }
+        }
+        backend => {
+            return Err(DriverError::InvalidContainment(format!(
+                "driver sandbox backend {backend:?} is not supported"
+            )));
+        }
+    }
+    if plan.command.args.len() > 512
+        || plan.command.args.iter().any(|argument| {
+            argument.is_empty()
+                || argument.len() > MAX_SANDBOX_ARGUMENT_BYTES
+                || argument.contains('\0')
+        })
+    {
+        return Err(DriverError::InvalidContainment(
+            "sandbox launcher arguments exceed their bound".into(),
+        ));
+    }
+    let sandbox_cwd = plan
+        .command
+        .cwd
+        .as_deref()
+        .ok_or_else(|| {
+            DriverError::InvalidContainment(
+                "sandbox launcher requires an explicit working directory".into(),
+            )
+        })?
+        .canonicalize()?;
+    Ok(ResolvedDriverLaunch {
+        executable: launcher,
+        arguments: plan.command.args.iter().map(OsString::from).collect(),
+        working_directory: sandbox_cwd,
+        environment: plan
+            .command
+            .env
+            .iter()
+            .map(|(name, value)| (name.clone(), OsString::from(value)))
+            .collect(),
+    })
+}
+
+fn audited_command(
+    spec: &DriverSpec,
+    executable: &Path,
+    working_directory: &Path,
+) -> Result<TerminalCommand, DriverError> {
+    let program = executable
+        .to_str()
+        .ok_or_else(|| {
+            DriverError::InvalidContainment("driver executable path is not UTF-8".into())
+        })?
+        .to_owned();
+    let args = spec
+        .arguments
+        .iter()
+        .map(|argument| {
+            argument.to_str().map(str::to_owned).ok_or_else(|| {
+                DriverError::InvalidContainment("driver argument is not UTF-8".into())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let environment = spec
+        .environment
+        .iter()
+        .map(|(name, value)| {
+            value
+                .to_str()
+                .map(|value| (name.clone(), value.to_owned()))
+                .ok_or_else(|| {
+                    DriverError::InvalidContainment(format!(
+                        "driver environment variable {name} is not UTF-8"
+                    ))
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok(TerminalCommand {
+        program,
+        args,
+        cwd: Some(working_directory.to_path_buf()),
+        env: environment,
+    })
+}
+
+pub(crate) fn sandbox_permission_profile(plan: &SandboxLaunchPlan) -> String {
+    let backend = match plan.compiled.backend {
+        SandboxBackendKind::MacOsSeatbelt => "macos-seatbelt",
+        SandboxBackendKind::LinuxBubblewrap => "linux-bubblewrap",
+        SandboxBackendKind::WindowsRestrictedToken => "windows-restricted-token",
+        SandboxBackendKind::TestOnlyUnenforced => "test-only-unenforced",
+    };
+    format!("{backend}:{}", plan.compiled.profile_digest)
 }
 
 impl Drop for DriverProcess {
@@ -552,6 +701,10 @@ pub enum DriverError {
     InvalidSpec(String),
     #[error("executable digest mismatch: expected {expected}, got {actual}")]
     ExecutableDigestMismatch { expected: String, actual: String },
+    #[error("invalid driver containment: {0}")]
+    InvalidContainment(String),
+    #[error("sandbox action digest mismatch: expected {expected}, got {actual}")]
+    SandboxActionDigestMismatch { expected: String, actual: String },
     #[error("spawned driver did not expose {0}")]
     MissingPipe(&'static str),
     #[error("driver input is closed")]
@@ -590,6 +743,7 @@ mod tests {
             ],
             working_directory: temp.path().canonicalize().unwrap(),
             environment: BTreeMap::new(),
+            sandbox: None,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: 1024,
         })
@@ -622,6 +776,7 @@ mod tests {
             arguments: vec![],
             working_directory: temp.path().canonicalize().unwrap(),
             environment: BTreeMap::new(),
+            sandbox: None,
             framing: DriverFraming::ContentLength,
             max_frame_bytes: 1024,
         });
@@ -641,6 +796,7 @@ mod tests {
             arguments: vec![OsString::from("-c"), OsString::from("sleep 30")],
             working_directory: temp.path().canonicalize().unwrap(),
             environment: BTreeMap::new(),
+            sandbox: None,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: 1024,
         })
@@ -651,6 +807,45 @@ mod tests {
             process.stop(Duration::from_millis(50)).unwrap(),
             DriverState::UnknownExecution
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_plan_is_bound_to_the_exact_audited_driver_command() {
+        let temp = TempDir::new().unwrap();
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let working_directory = temp.path().canonicalize().unwrap();
+        let original_arguments = vec![OsString::from("-c"), OsString::from("printf original")];
+        let driver_id = Uuid::new_v4();
+        let plan = crate::deno_containment::compile_deno_task_sandbox(
+            driver_id,
+            &shell,
+            &original_arguments,
+            &working_directory,
+            &BTreeMap::new(),
+            Vec::new(),
+            [working_directory.clone()],
+        )
+        .unwrap();
+        let permission_profile = sandbox_permission_profile(&plan);
+        let result = DriverProcess::spawn(DriverSpec {
+            manifest: DriverManifest {
+                driver_id,
+                permission_profile,
+                ..manifest(&shell, DriverKind::DenoGenUi)
+            },
+            executable: shell,
+            arguments: vec![OsString::from("-c"), OsString::from("printf changed")],
+            working_directory,
+            environment: BTreeMap::new(),
+            sandbox: Some(plan),
+            framing: DriverFraming::JsonLines,
+            max_frame_bytes: 1024,
+        });
+        assert!(matches!(
+            result,
+            Err(DriverError::SandboxActionDigestMismatch { .. })
+        ));
     }
 
     fn manifest(executable: &Path, kind: DriverKind) -> DriverManifest {

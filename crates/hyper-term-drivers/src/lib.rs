@@ -3,6 +3,7 @@
 mod agent;
 mod codec;
 mod codex;
+mod deno_containment;
 mod deno_genui;
 mod deno_lsp;
 mod mcp;
