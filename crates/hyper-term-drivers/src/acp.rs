@@ -28,6 +28,11 @@ const MAX_BUFFERED_MESSAGES: usize = 512;
 const MAX_BUFFERED_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PENDING_APPROVALS: usize = 128;
 const MAX_PROVIDER_ID_BYTES: usize = 64;
+const HYPER_TERM_MCP_TOOLS: &[&str] = &[
+    "hyper_term.genui.compile",
+    "hyper_term.lsp.query",
+    "hyper_term.diff.review",
+];
 
 #[derive(Clone)]
 pub struct AcpMcpServerConfig {
@@ -106,6 +111,7 @@ pub struct AcpAgentClient {
     inbox: Mutex<BoundedDriverInbox>,
     pending_prompt: Mutex<Option<PendingPrompt>>,
     pending_approvals: Mutex<HashMap<ExternalRequestId, PendingApproval>>,
+    brokered_mcp_calls: Mutex<HashMap<String, BrokeredMcpCall>>,
     provider_id: String,
     workspace: PathBuf,
     mcp_servers: Vec<v1::McpServer>,
@@ -122,6 +128,12 @@ struct PendingPrompt {
 struct PendingApproval {
     proposal: AgentEffectProposal,
     options: Vec<v1::PermissionOption>,
+}
+
+#[derive(Clone)]
+struct BrokeredMcpCall {
+    session_id: String,
+    tool_name: String,
 }
 
 impl AcpAgentClient {
@@ -176,6 +188,7 @@ impl AcpAgentClient {
             )),
             pending_prompt: Mutex::new(None),
             pending_approvals: Mutex::new(HashMap::new()),
+            brokered_mcp_calls: Mutex::new(HashMap::new()),
             provider_id: config.provider_id,
             workspace,
             mcp_servers,
@@ -219,6 +232,7 @@ impl AcpAgentClient {
         if pending.is_some() {
             return Err(AcpAdapterError::PromptAlreadyRunning);
         }
+        lock(&self.brokered_mcp_calls)?.clear();
         self.process.begin_effect()?;
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let turn_id = format!("acp-turn-{request_id}");
@@ -419,6 +433,7 @@ impl AcpAgentClient {
             .filter(|pending| pending.session_id == thread_id)
             .map(|pending| pending.turn_id.clone())
             .unwrap_or_else(|| "acp-turn-unknown".into());
+        self.track_brokered_mcp_update(&thread_id, &notification.update)?;
         match notification.update {
             v1::SessionUpdate::AgentMessageChunk(chunk) => Ok(AgentDriverEvent::MessageDelta {
                 sequence,
@@ -454,6 +469,9 @@ impl AcpAgentClient {
         let request_id = external_request_id(payload.get("id"))?;
         let params = payload.get("params").cloned().unwrap_or(Value::Null);
         let request: v1::RequestPermissionRequest = serde_json::from_value(params.clone())?;
+        if self.resolve_brokered_mcp_consent(&request_id, &request)? {
+            return protocol_notice(sequence, Some("session/request_permission"), &payload);
+        }
         let proposal = normalize_permission(
             self.process.manifest().driver_id,
             request_id.clone(),
@@ -478,6 +496,82 @@ impl AcpAgentClient {
             return Err(AcpAdapterError::DuplicateApproval);
         }
         Ok(AgentDriverEvent::EffectProposed { sequence, proposal })
+    }
+
+    fn track_brokered_mcp_update(
+        &self,
+        session_id: &str,
+        update: &v1::SessionUpdate,
+    ) -> Result<(), AcpAdapterError> {
+        let mut calls = lock(&self.brokered_mcp_calls)?;
+        match update {
+            v1::SessionUpdate::ToolCall(call) => {
+                let Some(tool_name) = brokered_mcp_tool(call) else {
+                    return Ok(());
+                };
+                let tool_call_id = bounded(call.tool_call_id.to_string(), 4096)?;
+                if calls.len() < MAX_PENDING_APPROVALS || calls.contains_key(&tool_call_id) {
+                    calls.insert(
+                        tool_call_id,
+                        BrokeredMcpCall {
+                            session_id: session_id.to_owned(),
+                            tool_name: tool_name.to_owned(),
+                        },
+                    );
+                }
+            }
+            v1::SessionUpdate::ToolCallUpdate(call)
+                if matches!(
+                    call.fields.status,
+                    Some(v1::ToolCallStatus::Completed | v1::ToolCallStatus::Failed)
+                ) =>
+            {
+                calls.remove(call.tool_call_id.to_string().as_str());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn resolve_brokered_mcp_consent(
+        &self,
+        request_id: &ExternalRequestId,
+        request: &v1::RequestPermissionRequest,
+    ) -> Result<bool, AcpAdapterError> {
+        // Codex ACP asks its client for transport-level consent before it sends
+        // the correlated tools/call to the configured MCP server. Forward that
+        // consent only for a previously observed, allowlisted Hyper Term tool.
+        // The digest-pinned MCP server still validates the exact arguments and
+        // creates the user-visible Rust broker operation before executing it.
+        if self.mcp_servers.is_empty() || !is_brokered_mcp_consent(request) {
+            return Ok(false);
+        }
+        let tool_call_id = request.tool_call.tool_call_id.to_string();
+        let Some(call) = lock(&self.brokered_mcp_calls)?.get(&tool_call_id).cloned() else {
+            return Ok(false);
+        };
+        if call.session_id != request.session_id.to_string()
+            || !HYPER_TERM_MCP_TOOLS.contains(&call.tool_name.as_str())
+        {
+            return Ok(false);
+        }
+        let Some(option) = request
+            .options
+            .iter()
+            .find(|option| option.kind == v1::PermissionOptionKind::AllowOnce)
+        else {
+            return Ok(false);
+        };
+        let response = v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Selected(
+            v1::SelectedPermissionOutcome::new(option.option_id.clone()),
+        ));
+        self.process.send_json(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id_value(request_id),
+            "result": response,
+        }))?;
+        lock(&self.brokered_mcp_calls)?.remove(&tool_call_id);
+        Ok(true)
     }
 
     fn complete_prompt(
@@ -581,6 +675,42 @@ fn normalize_permission(
         turn_id: prompt.map(|pending| pending.turn_id.clone()),
         item_id: Some(bounded(request.tool_call.tool_call_id.to_string(), 4096)?),
     })
+}
+
+fn brokered_mcp_tool(call: &v1::ToolCall) -> Option<&str> {
+    if call.kind != v1::ToolKind::Execute
+        || call
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("is_mcp_tool_call"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    let input = call.raw_input.as_ref()?.as_object()?;
+    if input.get("server").and_then(Value::as_str) != Some("hyper_term")
+        || !input.get("arguments").is_some_and(Value::is_object)
+    {
+        return None;
+    }
+    let tool_name = input.get("tool").and_then(Value::as_str)?;
+    if !HYPER_TERM_MCP_TOOLS.contains(&tool_name)
+        || call.title != format!("mcp.hyper_term.{tool_name}")
+    {
+        return None;
+    }
+    Some(tool_name)
+}
+
+fn is_brokered_mcp_consent(request: &v1::RequestPermissionRequest) -> bool {
+    request.tool_call.fields.kind == Some(v1::ToolKind::Execute)
+        && request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("is_mcp_tool_approval"))
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 fn content_text(content: v1::ContentBlock) -> Result<String, AcpAdapterError> {
@@ -856,6 +986,115 @@ mod tests {
             server["args"],
             json!(["--agent-mode", "--socket", "/tmp/hyperd.sock"])
         );
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[test]
+    fn acp_brokered_mcp_consent_is_correlated_and_forwarded_to_the_real_broker() {
+        let (temporary, executable) = fake_agent(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-mcp\"}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-mcp\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"mcp-call-1\",\"kind\":\"execute\",\"title\":\"mcp.hyper_term.hyper_term.genui.compile\",\"status\":\"pending\",\"rawInput\":{\"server\":\"hyper_term\",\"tool\":\"hyper_term.genui.compile\",\"arguments\":{\"source\":\"export default function App() { return null }\"}},\"_meta\":{\"is_mcp_tool_call\":true}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"mcp-consent-1\",\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"session-mcp\",\"toolCall\":{\"toolCallId\":\"mcp-call-1\",\"kind\":\"execute\",\"status\":\"pending\"},\"_meta\":{\"is_mcp_tool_approval\":true},\"options\":[{\"optionId\":\"allow_once\",\"name\":\"Allow\",\"kind\":\"allow_once\"},{\"optionId\":\"decline\",\"name\":\"Decline\",\"kind\":\"reject_once\"}]}}' ;;\n    *'\"id\":\"mcp-consent-1\"'*'\"optionId\":\"allow_once\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+        );
+        let workspace = TempDir::new().unwrap();
+        let mcp = temporary.path().join("hyper-term-mcp");
+        std::fs::write(&mcp, "fixture MCP").unwrap();
+        let mut permissions = std::fs::metadata(&mcp).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&mcp, permissions).unwrap();
+        let client = AcpAgentClient::launch(AcpAgentConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            arguments: vec![],
+            environment: BTreeMap::new(),
+            implementation_version: "fixture-1".into(),
+            provider_id: "fixture-acp".into(),
+            workspace: workspace.path().to_owned(),
+            brokered_mcp_server: Some(AcpMcpServerConfig {
+                executable: mcp.clone(),
+                executable_sha256: sha256_file(&mcp).unwrap(),
+                arguments: vec!["--agent-mode".into()],
+            }),
+        })
+        .unwrap();
+
+        client.initialize(Duration::from_secs(2)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(2)).unwrap();
+        client
+            .start_turn(&session_id, "compile the counter")
+            .unwrap();
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::ProtocolNotice {
+                method: Some(method),
+                ..
+            } if method == "session/update"
+        ));
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::ProtocolNotice {
+                method: Some(method),
+                ..
+            } if method == "session/request_permission"
+        ));
+        assert!(client.pending_effects().unwrap().is_empty());
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::TurnCompleted { .. }
+        ));
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[test]
+    fn acp_unmatched_mcp_consent_remains_a_fail_closed_effect() {
+        let (temporary, executable) = fake_agent(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-mcp\"}}' ;;\n    *'\"method\":\"session/prompt\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"unmatched-consent\",\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"session-mcp\",\"toolCall\":{\"toolCallId\":\"unseen-call\",\"kind\":\"execute\",\"status\":\"pending\"},\"_meta\":{\"is_mcp_tool_approval\":true},\"options\":[{\"optionId\":\"allow_once\",\"name\":\"Allow\",\"kind\":\"allow_once\"},{\"optionId\":\"decline\",\"name\":\"Decline\",\"kind\":\"reject_once\"}]}}' ;;\n    *'\"id\":\"unmatched-consent\"'*'\"optionId\":\"decline\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+        );
+        let workspace = TempDir::new().unwrap();
+        let mcp = temporary.path().join("hyper-term-mcp");
+        std::fs::write(&mcp, "fixture MCP").unwrap();
+        let mut permissions = std::fs::metadata(&mcp).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&mcp, permissions).unwrap();
+        let client = AcpAgentClient::launch(AcpAgentConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            arguments: vec![],
+            environment: BTreeMap::new(),
+            implementation_version: "fixture-1".into(),
+            provider_id: "fixture-acp".into(),
+            workspace: workspace.path().to_owned(),
+            brokered_mcp_server: Some(AcpMcpServerConfig {
+                executable: mcp.clone(),
+                executable_sha256: sha256_file(&mcp).unwrap(),
+                arguments: vec!["--agent-mode".into()],
+            }),
+        })
+        .unwrap();
+
+        client.initialize(Duration::from_secs(2)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(2)).unwrap();
+        client
+            .start_turn(&session_id, "attempt an unmatched call")
+            .unwrap();
+        let proposal = match client.next_event(Duration::from_secs(2)).unwrap() {
+            AgentDriverEvent::EffectProposed { proposal, .. } => proposal,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        assert_eq!(proposal.kind, AgentEffectKind::Shell);
+        client
+            .resolve_effect(
+                &proposal.request_id,
+                AgentEffectAuthorization {
+                    operation_id: OperationId::new(),
+                    operation_revision: 1,
+                    proposal_sha256: proposal.payload_sha256,
+                    decision: PermissionDecision::RejectOnce,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::TurnCompleted { .. }
+        ));
         assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 

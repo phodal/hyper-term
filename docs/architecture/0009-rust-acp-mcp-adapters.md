@@ -183,6 +183,14 @@ set is enabled per release.
   private workspace snapshot. A real-Deno integration test proves an ACP Agent
   can discover all three tools, propose and authorize `hyper_term.lsp.query`,
   and receive the real LSP result through the Agent turn.
+- Codex ACP emits a transport-level MCP consent request before forwarding the
+  actual `tools/call`. Rust correlates that request with the preceding ACP
+  `tool_call` by session and tool-call ID, requires the `hyper_term` server,
+  exact title, structured input, MCP marker, and allowlisted tool name, and
+  answers only `allow_once`. This does not authorize execution: the
+  digest-pinned `hyper-term-mcp` process independently validates the exact
+  arguments and creates the user-visible broker operation. Missing or
+  inconsistent correlation remains a normal fail-closed ACP effect proposal.
 - A directory that cannot be captured within the private snapshot limits no
   longer prevents the ACP session itself from starting. Rust omits only the
   Deno LSP capability for that session, deletes the partial snapshot, and keeps
