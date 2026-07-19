@@ -563,7 +563,7 @@ fn load_bundled_acp_runtime(
     let mut total_bytes = 0_u64;
     for file in manifest.files {
         let relative_path = validate_bundled_relative_path(&file.path)?;
-        if !is_sha256(&file.sha256) || file.bytes == 0 {
+        if !is_sha256(&file.sha256) {
             return Err(format!(
                 "bundled ACP file metadata is invalid: {}",
                 file.path
@@ -1034,6 +1034,7 @@ mod tests {
                 "node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js",
                 "claude adapter",
             ),
+            ("node_modules/empty-package-marker", ""),
         ];
         let inventory = files
             .iter()
