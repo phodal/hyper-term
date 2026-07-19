@@ -34,6 +34,10 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::DaemonState;
+use crate::artifact_editor_store::{
+    ArtifactEditorCheckpoint, ArtifactEditorCheckpointRequest, ArtifactEditorStore,
+    ArtifactEditorStoreError,
+};
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
 use crate::workspace_apply::{
     DurableWorkspaceApplyResult, MAX_WORKSPACE_APPLY_FILES, WorkspaceApplyError,
@@ -166,6 +170,8 @@ struct AgentGatewayRuntime {
     workbench_assets: Option<Arc<PathBuf>>,
     editor_lsp: Option<Arc<EditorLspService>>,
     artifact_draft_compiler: Option<Arc<ArtifactDraftCompiler>>,
+    artifact_editor_store: Arc<ArtifactEditorStore>,
+    artifact_editor_lock: Arc<Mutex<()>>,
     artifact_drafts: Arc<Mutex<HashMap<OperationId, ArtifactDraftRecord>>>,
     workspace_applies: Arc<Mutex<HashMap<OperationId, WorkspaceApplyRecord>>>,
     workspace_recovery_block: Arc<Mutex<Option<String>>>,
@@ -539,6 +545,10 @@ pub async fn spawn_agent_gateway(
         .map(|runtime| ArtifactDraftCompiler::new(runtime, &config.state_directory))
         .transpose()?
         .map(Arc::new);
+    let artifact_editor_store = Arc::new(
+        ArtifactEditorStore::open(&config.state_directory)
+            .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?,
+    );
     let workbench_assets = config
         .workbench_assets
         .take()
@@ -567,6 +577,8 @@ pub async fn spawn_agent_gateway(
         workbench_assets,
         editor_lsp,
         artifact_draft_compiler,
+        artifact_editor_store,
+        artifact_editor_lock: Arc::new(Mutex::new(())),
         artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
         workspace_applies: Arc::new(Mutex::new(HashMap::new())),
         workspace_recovery_block: Arc::new(Mutex::new(workspace_recovery_block)),
@@ -589,6 +601,10 @@ pub async fn spawn_agent_gateway(
             get(artifact_source_map),
         )
         .route("/agent/artifact/{artifact_id}/source", get(artifact_source))
+        .route(
+            "/agent/artifact/{artifact_id}/editor-state",
+            get(artifact_editor_state).put(save_artifact_editor_state),
+        )
         .route(
             "/agent/artifact/{artifact_id}/history",
             get(artifact_history),
@@ -851,6 +867,87 @@ async fn artifact_source(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Artifact source could not be read",
         ),
+    }
+}
+
+async fn artifact_editor_state(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let result =
+        tokio::task::spawn_blocking(move || runtime.artifact_editor_state(session_id, artifact_id))
+            .await;
+    artifact_editor_response(result)
+}
+
+async fn save_artifact_editor_state(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let request = match serde_json::from_slice::<ArtifactEditorCheckpointRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return status_response(
+                StatusCode::BAD_REQUEST,
+                "Artifact editor checkpoint is invalid",
+            );
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.save_artifact_editor_state(session_id, artifact_id, request)
+    })
+    .await;
+    artifact_editor_response(result)
+}
+
+fn artifact_editor_response(
+    result: Result<Result<ArtifactEditorCheckpoint, ArtifactEditorError>, tokio::task::JoinError>,
+) -> Response {
+    match result {
+        Ok(Ok(checkpoint)) => json_response(StatusCode::OK, &checkpoint),
+        Ok(Err(
+            ArtifactEditorError::SessionUnavailable | ArtifactEditorError::ArtifactUnavailable,
+        )) => status_response(
+            StatusCode::NOT_FOUND,
+            "Artifact editor state is unavailable",
+        ),
+        Ok(Err(ArtifactEditorError::AcpRequired)) => status_response(
+            StatusCode::FORBIDDEN,
+            "Artifact editor state is available only for ACP Agent artifacts",
+        ),
+        Ok(Err(ArtifactEditorError::StaleRevision)) => status_response(
+            StatusCode::CONFLICT,
+            "Artifact editor checkpoint no longer matches the current revision",
+        ),
+        Ok(Err(ArtifactEditorError::InvalidRequest)) => status_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Artifact editor checkpoint violates the bounded fixed-path state",
+        ),
+        Ok(Err(ArtifactEditorError::Lock | ArtifactEditorError::Store)) | Err(_) => {
+            status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Artifact editor checkpoint could not be persisted",
+            )
+        }
     }
 }
 
@@ -1369,6 +1466,17 @@ enum ArtifactDraftError {
 }
 
 #[derive(Debug)]
+enum ArtifactEditorError {
+    SessionUnavailable,
+    AcpRequired,
+    ArtifactUnavailable,
+    StaleRevision,
+    InvalidRequest,
+    Lock,
+    Store,
+}
+
+#[derive(Debug)]
 enum WorkspaceProposalError {
     SessionUnavailable,
     AcpRequired,
@@ -1668,6 +1776,72 @@ impl AgentGatewayRuntime {
             entrypoint: artifact.metadata.entrypoint,
             files: artifact.source_files,
         })
+    }
+
+    fn artifact_editor_state(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+    ) -> Result<ArtifactEditorCheckpoint, ArtifactEditorError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| ArtifactEditorError::SessionUnavailable)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(ArtifactEditorError::AcpRequired);
+        }
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| ArtifactEditorError::ArtifactUnavailable)?;
+        let _guard = self
+            .artifact_editor_lock
+            .lock()
+            .map_err(|_| ArtifactEditorError::Lock)?;
+        self.artifact_editor_store
+            .load(
+                session.task_id,
+                artifact_id,
+                artifact.metadata.source_revision,
+                &artifact.metadata.entrypoint,
+                &artifact.source_files,
+            )
+            .map_err(map_artifact_editor_store_error)
+    }
+
+    fn save_artifact_editor_state(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        request: ArtifactEditorCheckpointRequest,
+    ) -> Result<ArtifactEditorCheckpoint, ArtifactEditorError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| ArtifactEditorError::SessionUnavailable)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(ArtifactEditorError::AcpRequired);
+        }
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| ArtifactEditorError::ArtifactUnavailable)?;
+        if request.base_source_revision != artifact.metadata.source_revision {
+            return Err(ArtifactEditorError::StaleRevision);
+        }
+        let _guard = self
+            .artifact_editor_lock
+            .lock()
+            .map_err(|_| ArtifactEditorError::Lock)?;
+        self.artifact_editor_store
+            .save(
+                session.task_id,
+                artifact_id,
+                &artifact.metadata.entrypoint,
+                &artifact.source_files,
+                request,
+            )
+            .map_err(map_artifact_editor_store_error)
     }
 
     fn artifact_history(
@@ -3143,6 +3317,23 @@ fn map_workspace_prepare_error(error: WorkspaceApplyError) -> WorkspaceProposalE
     }
 }
 
+fn map_artifact_editor_store_error(error: ArtifactEditorStoreError) -> ArtifactEditorError {
+    match error {
+        ArtifactEditorStoreError::StaleRevision { .. }
+        | ArtifactEditorStoreError::ContextMismatch
+        | ArtifactEditorStoreError::RevisionGap => ArtifactEditorError::StaleRevision,
+        ArtifactEditorStoreError::InvalidPath
+        | ArtifactEditorStoreError::InvalidFileSet
+        | ArtifactEditorStoreError::InvalidEditorState
+        | ArtifactEditorStoreError::TooLarge
+        | ArtifactEditorStoreError::TornJournal
+        | ArtifactEditorStoreError::RevisionOverflow => ArtifactEditorError::InvalidRequest,
+        ArtifactEditorStoreError::Io(_) | ArtifactEditorStoreError::Json(_) => {
+            ArtifactEditorError::Store
+        }
+    }
+}
+
 fn workspace_preview_response(review: &PreparedWorkspaceReview) -> AgentWorkspacePreviewResponse {
     let changes = review
         .source_paths
@@ -4330,6 +4521,51 @@ mod tests {
                 },
             )
             .unwrap();
+
+        let editor_state_path = format!(
+            "/agent/artifact/{}/editor-state?token={token}&session_id=10",
+            accepted.artifact_id
+        );
+        let (status, body) = request_path(gateway.address(), &editor_state_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let baseline_state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(baseline_state["revision"], 0);
+        assert_eq!(baseline_state["active_path"], "/App.tsx");
+        assert_eq!(baseline_state["files"]["/theme.ts"], artifact_theme);
+        let edited_theme = "export const accent = 'draft amber';\n";
+        let checkpoint = serde_json::to_vec(&serde_json::json!({
+            "expected_revision": 0,
+            "base_source_revision": 3,
+            "files": {
+                "/App.tsx": artifact_source,
+                "/theme.ts": edited_theme
+            },
+            "active_path": "/theme.ts",
+            "view": "diff",
+            "selections": {
+                "/theme.ts": {"anchor": 7, "head": 12}
+            }
+        }))
+        .unwrap();
+        let (status, body) =
+            request_path(gateway.address(), &editor_state_path, "PUT", &checkpoint).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let saved_state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(saved_state["revision"], 1);
+        assert_eq!(saved_state["state_digest"].as_str().map(str::len), Some(64));
+        let (status, body) = request_path(gateway.address(), &editor_state_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let restored_state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(restored_state["files"]["/theme.ts"], edited_theme);
+        assert_eq!(restored_state["active_path"], "/theme.ts");
+        assert_eq!(restored_state["view"], "diff");
+        assert_eq!(restored_state["selections"]["/theme.ts"]["head"], 12);
+        assert_eq!(
+            request_path(gateway.address(), &editor_state_path, "PUT", &checkpoint)
+                .await
+                .0,
+            StatusCode::CONFLICT.as_u16()
+        );
 
         let preview_path = format!(
             "/agent/artifact/{}/workspace-preview?token={token}&session_id=10",
@@ -5592,6 +5828,8 @@ mod tests {
             workbench_assets: None,
             editor_lsp: None,
             artifact_draft_compiler: None,
+            artifact_editor_store: Arc::new(ArtifactEditorStore::open(&state_directory).unwrap()),
+            artifact_editor_lock: Arc::new(Mutex::new(())),
             artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
             workspace_applies: Arc::new(Mutex::new(HashMap::new())),
             workspace_recovery_block: Arc::new(Mutex::new(None)),
