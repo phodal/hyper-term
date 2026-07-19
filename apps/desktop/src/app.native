@@ -31,13 +31,16 @@
         <if test="{agent_provider_picker_open}">
           <dropdown-menu anchor="below" anchor-alignment="end" on-dismiss="dismiss_agent_provider_picker">
             <if test="{codexProviderAvailable}">
-              <menu-item selected="{selected_agent_provider == 'codex'}" on-press="choose_codex_agent">New Agent Tab · Codex app-server</menu-item>
+              <menu-item selected="{selected_agent_provider == 'codex'}" disabled="{codexProviderDisabled}" on-press="choose_codex_agent">{codexProviderMenuLabel}</menu-item>
             </if>
             <if test="{codexAcpProviderAvailable}">
-              <menu-item selected="{selected_agent_provider == 'codex_acp'}" on-press="choose_codex_acp_agent">New Agent Tab · Codex ACP</menu-item>
+              <menu-item selected="{selected_agent_provider == 'codex_acp'}" disabled="{codexAcpProviderDisabled}" on-press="choose_codex_acp_agent">{codexAcpProviderMenuLabel}</menu-item>
             </if>
             <if test="{claudeAcpProviderAvailable}">
-              <menu-item selected="{selected_agent_provider == 'claude_acp'}" on-press="choose_claude_acp_agent">New Agent Tab · Claude ACP</menu-item>
+              <menu-item selected="{selected_agent_provider == 'claude_acp'}" disabled="{claudeAcpProviderDisabled}" on-press="choose_claude_acp_agent">{claudeAcpProviderMenuLabel}</menu-item>
+            </if>
+            <if test="{copilotAcpProviderAvailable}">
+              <menu-item selected="{selected_agent_provider == 'copilot_acp'}" disabled="{copilotAcpProviderDisabled}" on-press="choose_copilot_acp_agent">{copilotAcpProviderMenuLabel}</menu-item>
             </if>
           </dropdown-menu>
         </if>

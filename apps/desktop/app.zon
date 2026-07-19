@@ -29,6 +29,7 @@
                 .{ .label = "New Codex Agent Tab", .command = "hyper-term.new-codex-agent" },
                 .{ .label = "New Codex ACP Agent Tab", .command = "hyper-term.new-codex-acp-agent" },
                 .{ .label = "New Claude ACP Agent Tab", .command = "hyper-term.new-claude-acp-agent" },
+                .{ .label = "New Copilot ACP Agent Tab", .command = "hyper-term.new-copilot-acp-agent" },
             },
         },
     },

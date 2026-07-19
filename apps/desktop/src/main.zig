@@ -27,6 +27,7 @@ const terminal_url_capacity: usize = 256;
 const agent_url_capacity: usize = 256;
 const genui_url_capacity: usize = 512;
 const max_gateway_token_bytes: usize = 128;
+const max_agent_provider_status_bytes: usize = 4 * 1024;
 const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
 const agent_effect_url_capacity: usize = agent_url_capacity + 64;
 const max_agent_blocks: usize = 16;
@@ -112,12 +113,14 @@ pub const AgentProvider = enum {
     codex,
     codex_acp,
     claude_acp,
+    copilot_acp,
 
     pub fn id(provider: AgentProvider) []const u8 {
         return switch (provider) {
             .codex => "codex",
             .codex_acp => "codex-acp",
             .claude_acp => "claude-acp",
+            .copilot_acp => "copilot-acp",
         };
     }
 
@@ -126,8 +129,18 @@ pub const AgentProvider = enum {
             .codex => "Codex",
             .codex_acp => "Codex ACP",
             .claude_acp => "Claude ACP",
+            .copilot_acp => "Copilot ACP",
         };
     }
+};
+
+pub const AgentProviderReadiness = enum {
+    unavailable,
+    authenticated,
+    available,
+    login_required,
+    provider_missing,
+    probe_failed,
 };
 
 pub const AgentConnection = enum {
@@ -312,6 +325,12 @@ pub const Model = struct {
     agent_provider_picker_open: bool = false,
     selected_agent_provider: AgentProvider = .codex,
     available_agent_providers: u8 = 0,
+    authenticated_agent_providers: u8 = 0,
+    session_auth_agent_providers: u8 = 0,
+    login_required_agent_providers: u8 = 0,
+    provider_missing_agent_providers: u8 = 0,
+    provider_probe_failed_agent_providers: u8 = 0,
+    containment_pending_agent_providers: u8 = 0,
     terminal_base_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
     terminal_base_url_len: usize = 0,
     terminal_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
@@ -344,6 +363,12 @@ pub const Model = struct {
         "session_count",
         "next_session_id",
         "available_agent_providers",
+        "authenticated_agent_providers",
+        "session_auth_agent_providers",
+        "login_required_agent_providers",
+        "provider_missing_agent_providers",
+        "provider_probe_failed_agent_providers",
+        "containment_pending_agent_providers",
         "terminal_base_url_storage",
         "terminal_base_url_len",
         "terminal_url_storage",
@@ -424,16 +449,76 @@ pub const Model = struct {
         return model.agentProviderAvailable(.claude_acp);
     }
 
+    pub fn copilotAcpProviderAvailable(model: *const Model) bool {
+        return model.agentProviderAvailable(.copilot_acp);
+    }
+
     pub fn agentProviderAvailable(model: *const Model, provider: AgentProvider) bool {
         return model.available_agent_providers & providerBit(provider) != 0;
     }
 
+    pub fn agentProviderReady(model: *const Model, provider: AgentProvider) bool {
+        const bit = providerBit(provider);
+        return (model.authenticated_agent_providers | model.session_auth_agent_providers) & bit != 0;
+    }
+
+    pub fn agentProviderReadiness(model: *const Model, provider: AgentProvider) AgentProviderReadiness {
+        const bit = providerBit(provider);
+        if (model.authenticated_agent_providers & bit != 0) return .authenticated;
+        if (model.session_auth_agent_providers & bit != 0) return .available;
+        if (model.login_required_agent_providers & bit != 0) return .login_required;
+        if (model.provider_missing_agent_providers & bit != 0) return .provider_missing;
+        if (model.provider_probe_failed_agent_providers & bit != 0) return .probe_failed;
+        return .unavailable;
+    }
+
+    pub fn codexProviderDisabled(model: *const Model) bool {
+        return !model.agentProviderReady(.codex);
+    }
+
+    pub fn codexAcpProviderDisabled(model: *const Model) bool {
+        return !model.agentProviderReady(.codex_acp);
+    }
+
+    pub fn claudeAcpProviderDisabled(model: *const Model) bool {
+        return !model.agentProviderReady(.claude_acp);
+    }
+
+    pub fn copilotAcpProviderDisabled(model: *const Model) bool {
+        return !model.agentProviderReady(.copilot_acp);
+    }
+
+    pub fn codexProviderMenuLabel(model: *const Model) []const u8 {
+        return providerMenuLabel(model, .codex);
+    }
+
+    pub fn codexAcpProviderMenuLabel(model: *const Model) []const u8 {
+        return providerMenuLabel(model, .codex_acp);
+    }
+
+    pub fn claudeAcpProviderMenuLabel(model: *const Model) []const u8 {
+        return providerMenuLabel(model, .claude_acp);
+    }
+
+    pub fn copilotAcpProviderMenuLabel(model: *const Model) []const u8 {
+        return providerMenuLabel(model, .copilot_acp);
+    }
+
     pub fn agentButtonLabel(model: *const Model) []const u8 {
         if (model.agentProviderUnavailable()) return "Agent unavailable";
+        if (!model.agentProviderReady(model.selected_agent_provider)) {
+            return switch (model.selected_agent_provider) {
+                .codex => "Agent · Codex · sign in",
+                .codex_acp => "Agent · Codex ACP · sign in",
+                .claude_acp => "Agent · Claude ACP · sign in",
+                .copilot_acp => "Agent · Copilot ACP · unavailable",
+            };
+        }
         return switch (model.selected_agent_provider) {
             .codex => "Agent · Codex",
             .codex_acp => "Agent · Codex ACP",
             .claude_acp => "Agent · Claude ACP",
+            .copilot_acp => "Agent · Copilot ACP",
         };
     }
 
@@ -460,20 +545,31 @@ pub const Model = struct {
     }
 
     pub fn agentStatus(model: *const Model) []const u8 {
+        const session = model.activeSession();
+        if (session.mode == .agent and !model.agentProviderReady(session.agent_provider)) {
+            return switch (model.agentProviderReadiness(session.agent_provider)) {
+                .login_required => "Provider sign-in required · no command executed",
+                .provider_missing => "Provider executable missing · no command executed",
+                .probe_failed => "Provider readiness check failed · no command executed",
+                .unavailable => "Agent unavailable · no command executed",
+                .authenticated => unreachable,
+                .available => unreachable,
+            };
+        }
         if (model.activeSession().agent_connection == .ready) {
             return switch (model.agent_turn_status) {
-                .running => "Agent is responding · BlockDocument streaming",
-                .waiting_approval => "Effect proposed · waiting for Rust permission flow",
+                .running => "Agent responding · external containment pending",
+                .waiting_approval => "Effect proposed · Rust permission flow active",
                 .failed => if (model.agent_error_len > 0) model.agentError() else "Agent turn failed",
-                .completed => "Turn complete · history journaled locally",
-                else => "Structured Agent ready · type a prompt",
+                .completed => "Turn complete · external containment pending",
+                else => "Agent ready · external containment pending",
             };
         }
         return switch (model.activeSession().agent_connection) {
             .unavailable => "Agent unavailable · no command executed",
-            .connecting => "Agent connecting · no command executed",
-            .ready => "Structured Agent ready · permission broker active",
-            .failed => "Agent failed · no command executed",
+            .connecting => "Agent connecting · external containment pending",
+            .ready => "Agent ready · external containment pending",
+            .failed => "Agent start failed · external containment pending",
         };
     }
 
@@ -529,6 +625,7 @@ pub const Msg = union(enum) {
     choose_codex_agent,
     choose_codex_acp_agent,
     choose_claude_acp_agent,
+    choose_copilot_acp_agent,
     select_session: u8,
     close_session: u8,
     close_active_session,
@@ -571,6 +668,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .choose_codex_agent => createAgentSession(model, .codex, fx),
         .choose_codex_acp_agent => createAgentSession(model, .codex_acp, fx),
         .choose_claude_acp_agent => createAgentSession(model, .claude_acp, fx),
+        .choose_copilot_acp_agent => createAgentSession(model, .copilot_acp, fx),
         .select_session => |session_id| {
             const previous = model.active_session_id;
             selectSession(model, session_id);
@@ -632,7 +730,7 @@ fn createAgentSession(model: *Model, provider: AgentProvider, fx: *Effects) void
     if (model.available_agent_providers != 0 and !model.agentProviderAvailable(provider)) return;
     model.selected_agent_provider = provider;
     if (appendSession(model, .agent)) |session_id| {
-        if (model.agent_base_url_len > 0 and model.agentProviderAvailable(provider)) {
+        if (model.agent_base_url_len > 0 and model.agentProviderReady(provider)) {
             requestAgentStart(model, session_id, fx);
         }
     }
@@ -1261,6 +1359,7 @@ pub fn command(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "hyper-term.new-codex-agent")) return .choose_codex_agent;
     if (std.mem.eql(u8, name, "hyper-term.new-codex-acp-agent")) return .choose_codex_acp_agent;
     if (std.mem.eql(u8, name, "hyper-term.new-claude-acp-agent")) return .choose_claude_acp_agent;
+    if (std.mem.eql(u8, name, "hyper-term.new-copilot-acp-agent")) return .choose_copilot_acp_agent;
     if (std.mem.eql(u8, name, "hyper-term.close-session")) return .close_active_session;
     return null;
 }
@@ -1402,6 +1501,15 @@ pub fn initialModelWithServices(terminal_url: []const u8, agent_url: []const u8)
 }
 
 pub fn initialModelWithProviders(terminal_url: []const u8, agent_url: []const u8, providers: []const u8) Model {
+    return initialModelWithProviderStatus(terminal_url, agent_url, providers, "");
+}
+
+pub fn initialModelWithProviderStatus(
+    terminal_url: []const u8,
+    agent_url: []const u8,
+    providers: []const u8,
+    provider_status: []const u8,
+) Model {
     var model = initialModel();
     if (trustedTerminalUrl(terminal_url)) {
         @memcpy(model.terminal_base_url_storage[0..terminal_url.len], terminal_url);
@@ -1411,8 +1519,18 @@ pub fn initialModelWithProviders(terminal_url: []const u8, agent_url: []const u8
     if (trustedAgentUrl(agent_url)) {
         @memcpy(model.agent_base_url_storage[0..agent_url.len], agent_url);
         model.agent_base_url_len = agent_url.len;
-        model.available_agent_providers = parseAgentProviders(providers);
-        model.selected_agent_provider = firstAvailableAgentProvider(model.available_agent_providers) orelse .codex;
+        const legacy_providers = parseAgentProviders(providers);
+        if (provider_status.len == 0) {
+            model.available_agent_providers = legacy_providers;
+            model.authenticated_agent_providers = legacy_providers;
+        } else if (!applyAgentProviderStatus(&model, provider_status)) {
+            // The status document crosses a process boundary. Fail closed if
+            // it is malformed instead of trusting the legacy ready list.
+            clearAgentProviderStatus(&model);
+        }
+        const ready = model.authenticated_agent_providers | model.session_auth_agent_providers;
+        model.selected_agent_provider = firstAvailableAgentProvider(ready) orelse
+            firstAvailableAgentProvider(model.available_agent_providers) orelse .codex;
     }
     return model;
 }
@@ -1422,6 +1540,7 @@ fn providerBit(provider: AgentProvider) u8 {
         .codex => 1,
         .codex_acp => 2,
         .claude_acp => 4,
+        .copilot_acp => 8,
     };
 }
 
@@ -1432,15 +1551,119 @@ fn parseAgentProviders(value: []const u8) u8 {
         if (std.mem.eql(u8, provider, "codex")) providers |= providerBit(.codex);
         if (std.mem.eql(u8, provider, "codex-acp")) providers |= providerBit(.codex_acp);
         if (std.mem.eql(u8, provider, "claude-acp")) providers |= providerBit(.claude_acp);
+        if (std.mem.eql(u8, provider, "copilot-acp")) providers |= providerBit(.copilot_acp);
     }
     return providers;
 }
 
 fn firstAvailableAgentProvider(providers: u8) ?AgentProvider {
-    inline for (.{ AgentProvider.codex, AgentProvider.codex_acp, AgentProvider.claude_acp }) |provider| {
+    inline for (.{ AgentProvider.codex, AgentProvider.codex_acp, AgentProvider.claude_acp, AgentProvider.copilot_acp }) |provider| {
         if (providers & providerBit(provider) != 0) return provider;
     }
     return null;
+}
+
+const AgentProviderStatusWire = struct {
+    id: []const u8,
+    protocol: []const u8,
+    readiness: []const u8,
+    containment: []const u8,
+};
+
+fn applyAgentProviderStatus(model: *Model, source: []const u8) bool {
+    if (source.len == 0 or source.len > max_agent_provider_status_bytes) return false;
+    const parsed = std.json.parseFromSlice(
+        []const AgentProviderStatusWire,
+        std.heap.page_allocator,
+        source,
+        .{ .ignore_unknown_fields = false },
+    ) catch return false;
+    defer parsed.deinit();
+    if (parsed.value.len == 0 or parsed.value.len > 4) return false;
+
+    var detected: u8 = 0;
+    var authenticated: u8 = 0;
+    var session_auth: u8 = 0;
+    var login_required: u8 = 0;
+    var provider_missing: u8 = 0;
+    var probe_failed: u8 = 0;
+    var containment_pending: u8 = 0;
+    for (parsed.value) |status| {
+        const provider = parseAgentProvider(status.id) orelse return false;
+        const bit = providerBit(provider);
+        if (detected & bit != 0 or !std.mem.eql(u8, status.protocol, expectedAgentProtocol(provider))) return false;
+        detected |= bit;
+        if (!std.mem.eql(u8, status.containment, "external_enforcement_pending")) return false;
+        containment_pending |= bit;
+        if (std.mem.eql(u8, status.readiness, "authenticated")) {
+            authenticated |= bit;
+        } else if (std.mem.eql(u8, status.readiness, "available")) {
+            session_auth |= bit;
+        } else if (std.mem.eql(u8, status.readiness, "login_required")) {
+            login_required |= bit;
+        } else if (std.mem.eql(u8, status.readiness, "provider_missing")) {
+            provider_missing |= bit;
+        } else if (std.mem.eql(u8, status.readiness, "probe_failed")) {
+            probe_failed |= bit;
+        } else return false;
+    }
+    model.available_agent_providers = detected;
+    model.authenticated_agent_providers = authenticated;
+    model.session_auth_agent_providers = session_auth;
+    model.login_required_agent_providers = login_required;
+    model.provider_missing_agent_providers = provider_missing;
+    model.provider_probe_failed_agent_providers = probe_failed;
+    model.containment_pending_agent_providers = containment_pending;
+    return true;
+}
+
+fn clearAgentProviderStatus(model: *Model) void {
+    model.available_agent_providers = 0;
+    model.authenticated_agent_providers = 0;
+    model.session_auth_agent_providers = 0;
+    model.login_required_agent_providers = 0;
+    model.provider_missing_agent_providers = 0;
+    model.provider_probe_failed_agent_providers = 0;
+    model.containment_pending_agent_providers = 0;
+}
+
+fn parseAgentProvider(id: []const u8) ?AgentProvider {
+    inline for (.{ AgentProvider.codex, AgentProvider.codex_acp, AgentProvider.claude_acp, AgentProvider.copilot_acp }) |provider| {
+        if (std.mem.eql(u8, id, provider.id())) return provider;
+    }
+    return null;
+}
+
+fn expectedAgentProtocol(provider: AgentProvider) []const u8 {
+    return if (provider == .codex) "codex-app-server-v2" else "acp-v1";
+}
+
+fn providerMenuLabel(model: *const Model, provider: AgentProvider) []const u8 {
+    return switch (provider) {
+        .codex => switch (model.agentProviderReadiness(provider)) {
+            .authenticated => "Codex · App Server · authenticated",
+            .login_required => "Codex · App Server · sign in required",
+            .probe_failed => "Codex · App Server · readiness failed",
+            else => "Codex · App Server · unavailable",
+        },
+        .codex_acp => switch (model.agentProviderReadiness(provider)) {
+            .authenticated => "Codex · ACP · authenticated",
+            .login_required => "Codex · ACP · sign in required",
+            .probe_failed => "Codex · ACP · readiness failed",
+            else => "Codex · ACP · unavailable",
+        },
+        .claude_acp => switch (model.agentProviderReadiness(provider)) {
+            .authenticated => "Claude · ACP · authenticated",
+            .login_required => "Claude · ACP · sign in required",
+            .probe_failed => "Claude · ACP · readiness failed",
+            else => "Claude · ACP · unavailable",
+        },
+        .copilot_acp => switch (model.agentProviderReadiness(provider)) {
+            .available => "Copilot · ACP · auth on session",
+            .probe_failed => "Copilot · ACP · readiness failed",
+            else => "Copilot · ACP · unavailable",
+        },
+    };
 }
 
 fn refreshTerminalUrl(model: *Model) void {
@@ -1552,6 +1775,7 @@ pub fn main(init: std.process.Init) !void {
     const terminal_url = init.environ_map.get("HYPER_TERM_TERMINAL_URL") orelse "";
     const agent_url = init.environ_map.get("HYPER_TERM_AGENT_URL") orelse "";
     const agent_providers = init.environ_map.get("HYPER_TERM_AGENT_PROVIDERS") orelse "";
+    const agent_provider_status = init.environ_map.get("HYPER_TERM_AGENT_PROVIDER_STATUS") orelse "";
     var allowed_origins = [_][]const u8{
         "zero://app",
         "zero://inline",
@@ -1581,7 +1805,12 @@ pub fn main(init: std.process.Init) !void {
             null,
     });
     defer app_state.destroy();
-    app_state.model = initialModelWithProviders(terminal_url, agent_url, agent_providers);
+    app_state.model = initialModelWithProviderStatus(
+        terminal_url,
+        agent_url,
+        agent_providers,
+        agent_provider_status,
+    );
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "hyper-term",

@@ -144,10 +144,18 @@ set is enabled per release.
 - Fixtures cover initialization, session creation, prompt streaming, session
   updates, permission proposals, and MCP capability negotiation.
 - The desktop supervisor clears the adapter environment, verifies executable
-  digests, only auto-discovers adapters with the official version signature,
-  and exposes a bounded provider inventory to the Native host.
-- Native tabs are bound to their selected provider. Codex and Claude are chosen
-  explicitly from the Agent menu rather than inferred from terminal contents.
+  digests, runs authentication and version probes with a two-second process-group
+  timeout and 4 KiB output cap, and exposes a strict bounded provider inventory
+  to the Native host.
+- Native tabs are bound to their selected provider. Direct Codex app-server,
+  Codex ACP, Claude ACP, and `copilot --acp --stdio` are separate provider
+  registrations chosen explicitly from the Agent menu rather than inferred
+  from terminal contents. Disabled menu entries retain the reason they cannot
+  start; the Native layer never probes credentials or launches a provider.
+- The packaged Codex adapter is the current `@agentclientprotocol/codex-acp`.
+  An explicit adapter path remains compatible with the older
+  `@zed-industries/codex-acp` executable, while automatic discovery does not
+  silently prefer it over the bundled successor.
 - Ignored, credential-using integration gates completed a harmless real prompt
   through official Codex ACP 1.1.4 and Claude Agent ACP 0.59.0 artifacts. Claude
   subscription authentication on macOS requires the exact Claude executable

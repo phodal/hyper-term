@@ -384,12 +384,22 @@ HYPER_TERM_CLAUDE_PATH=/absolute/path/to/claude \
 cargo test -p hyper-term-drivers --test acp_agent -- --ignored
 ```
 
-Automatic desktop discovery rejects the legacy `@zed-industries/codex-acp`
-signature. Packaged applications instead prefer official Codex ACP 1.1.4 and
-Claude Agent ACP 0.59.0 from the per-file digest-verified, Deno-locked offline
-runtime. The large provider binaries are deliberately excluded: a provider is
-shown only when the corresponding locally authenticated `codex` or `claude`
-executable is available.
+Packaged applications prefer the current `@agentclientprotocol/codex-acp`
+adapter (the successor recommended by the Zed adapter repository) and Claude
+Agent ACP from the per-file digest-verified, Deno-locked offline runtime. A
+user-selected `--codex-acp PATH` or `HYPER_TERM_CODEX_ACP_PATH` remains the
+compatibility path for the inspected executable distributed by
+`@zed-industries/codex-acp` (the package commonly run as
+`npx @zed-industries/codex-acp`); the renderer never invokes `npx` itself.
+
+The desktop also discovers a local GitHub Copilot CLI and registers it as the
+independent `copilot-acp` provider using `copilot --acp --stdio`. Copilot has no
+read-only login-status command, so authentication is negotiated by its ACP
+session rather than inferred from credential files. Rust publishes a bounded
+provider-status document (`authenticated`, `available`, `login_required`, or
+`probe_failed`) to the Native UI, and only usable providers enter the Agent
+gateway. Every external provider is still labelled `external containment
+pending`; proposal-only controls remain in force until ADR 0014 is satisfied.
 
 ## License
 

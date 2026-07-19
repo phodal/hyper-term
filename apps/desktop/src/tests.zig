@@ -118,7 +118,7 @@ test "Agent provider picker creates a provider-bound ACP tab" {
     try testing.expect(model.agent_provider_picker_open);
 
     tree = try buildTree(arena, &model);
-    const codex_acp = findAnyByText(tree.root, "New Agent Tab · Codex ACP").?;
+    const codex_acp = findAnyByText(tree.root, "Codex · ACP · authenticated").?;
     main.update(&model, tree.msgForPointer(codex_acp.id, .up).?, &fx);
 
     try testing.expect(!model.agent_provider_picker_open);
@@ -130,6 +130,58 @@ test "Agent provider picker creates a provider-bound ACP tab" {
         "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2&provider=codex-acp",
         fx.pendingFetchAt(0).?.url,
     );
+}
+
+test "Agent provider status disables unready adapters and enables Copilot ACP" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    const status =
+        \\[
+        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"external_enforcement_pending"},
+        \\  {"id":"codex-acp","protocol":"acp-v1","readiness":"login_required","containment":"external_enforcement_pending"},
+        \\  {"id":"claude-acp","protocol":"acp-v1","readiness":"probe_failed","containment":"external_enforcement_pending"},
+        \\  {"id":"copilot-acp","protocol":"acp-v1","readiness":"available","containment":"external_enforcement_pending"}
+        \\]
+    ;
+    var model = main.initialModelWithProviderStatus(terminal_url, agent_url, "", status);
+    try testing.expect(model.agentProviderReady(.codex));
+    try testing.expect(!model.agentProviderReady(.codex_acp));
+    try testing.expect(model.agentProviderReady(.copilot_acp));
+    try testing.expectEqual(main.AgentProviderReadiness.available, model.agentProviderReadiness(.copilot_acp));
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tree = try buildTree(arena, &model);
+    const picker = findByLabel(tree.root, "Choose provider for a new Agent tab").?;
+    main.update(&model, tree.msgForPointer(picker.id, .up).?, &fx);
+    tree = try buildTree(arena, &model);
+    const unavailable_codex = findAnyByText(tree.root, "Codex · ACP · sign in required").?;
+    try testing.expect(tree.msgForPointer(unavailable_codex.id, .up) == null);
+
+    const copilot = findAnyByText(tree.root, "Copilot · ACP · auth on session").?;
+    main.update(&model, tree.msgForPointer(copilot.id, .up).?, &fx);
+    try testing.expectEqual(main.AgentProvider.copilot_acp, model.activeSession().agent_provider);
+    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
+    try testing.expect(std.mem.endsWith(u8, fx.pendingFetchAt(0).?.url, "provider=copilot-acp"));
+    try testing.expectEqualStrings("Agent connecting · external containment pending", model.agentStatus());
+}
+
+test "malformed Agent provider status fails closed" {
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    const duplicate =
+        \\[
+        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"external_enforcement_pending"},
+        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"external_enforcement_pending"}
+        \\]
+    ;
+    const model = main.initialModelWithProviderStatus("", agent_url, "codex", duplicate);
+    try testing.expectEqual(@as(u8, 0), model.available_agent_providers);
+    try testing.expect(model.agentProviderUnavailable());
 }
 
 test "Agent tabs start the brokered Codex runtime and render readiness" {
@@ -156,7 +208,7 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
         .body = "{\"session_id\":2,\"provider\":\"codex\",\"protocol\":\"codex-app-server-v2\",\"status\":\"ready\"}",
     } }, &fx);
     try testing.expectEqual(main.AgentConnection.ready, model.activeSession().agent_connection);
-    try testing.expectEqualStrings("Structured Agent ready · type a prompt", model.agentStatus());
+    try testing.expectEqualStrings("Agent ready · external containment pending", model.agentStatus());
     try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
     try testing.expectEqual(std.http.Method.GET, fx.pendingFetchAt(1).?.method);
     try testing.expectEqualStrings(
@@ -500,6 +552,7 @@ test "native menu commands map to explicit tab lifecycles" {
     const codex = main.command("hyper-term.new-codex-agent") orelse return error.TestUnexpectedResult;
     const codex_acp = main.command("hyper-term.new-codex-acp-agent") orelse return error.TestUnexpectedResult;
     const claude_acp = main.command("hyper-term.new-claude-acp-agent") orelse return error.TestUnexpectedResult;
+    const copilot_acp = main.command("hyper-term.new-copilot-acp-agent") orelse return error.TestUnexpectedResult;
 
     switch (terminal) {
         .choose_terminal => {},
@@ -516,6 +569,7 @@ test "native menu commands map to explicit tab lifecycles" {
     try testing.expect(codex == .choose_codex_agent);
     try testing.expect(codex_acp == .choose_codex_acp_agent);
     try testing.expect(claude_acp == .choose_claude_acp_agent);
+    try testing.expect(copilot_acp == .choose_copilot_acp_agent);
     try testing.expect(main.command("hyper-term.new-session") == null);
 }
 

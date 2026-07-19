@@ -34,9 +34,11 @@ the Tier 2 containment policy remains the release gate in ADR 0014.
 
 The application does not bundle Node or the large provider CLI binaries. It
 only offers a bundled ACP provider when the matching `codex` or `claude`
-executable is available locally. Rust verifies all ACP runtime files before
-advertising that provider, clears inherited API keys, and passes the exact
-discovered executable path to the adapter.
+executable is available locally, and may register an installed GitHub Copilot
+CLI directly as `copilot --acp --stdio`. Rust verifies all bundled ACP runtime
+files before advertising them, clears inherited API keys, bounds provider
+readiness probes, and passes exact discovered executable paths to the gateway.
+The Native renderer receives status metadata only and cannot launch providers.
 
 For pipeline testing, a pre-release tag may run without Apple secrets. In that
 case the workflow ad-hoc signs the bundle and gives the asset an explicit
