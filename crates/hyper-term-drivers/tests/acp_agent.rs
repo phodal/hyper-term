@@ -26,10 +26,11 @@ fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
         format!("Reply with exactly {expected}. Do not use tools or modify files.")
     });
     let workspace = TempDir::new().expect("temporary ACP workspace");
+    let arguments = adapter_arguments();
     let client = AcpAgentClient::launch(AcpAgentConfig {
         executable: executable.clone(),
         executable_sha256: digest,
-        arguments: Vec::new(),
+        arguments,
         environment: adapter_environment(&executable),
         implementation_version: "installed-e2e".into(),
         provider_id,
@@ -95,6 +96,26 @@ fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
     assert_eq!(client.close().unwrap(), DriverState::Closed);
 }
 
+fn adapter_arguments() -> Vec<OsString> {
+    let Some(entrypoint) = std::env::var_os("HYPER_TERM_ACP_DENO_ENTRYPOINT") else {
+        return Vec::new();
+    };
+    let entrypoint = PathBuf::from(entrypoint)
+        .canonicalize()
+        .expect("HYPER_TERM_ACP_DENO_ENTRYPOINT must resolve inside the built runtime");
+    [
+        "run",
+        "--cached-only",
+        "--no-config",
+        "--node-modules-dir=manual",
+        "-A",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain(std::iter::once(entrypoint.into_os_string()))
+    .collect()
+}
+
 fn required_path(name: &str) -> PathBuf {
     PathBuf::from(
         std::env::var_os(name).unwrap_or_else(|| panic!("{name} must select an inspected binary")),
@@ -119,6 +140,8 @@ fn adapter_environment(executable: &Path) -> BTreeMap<String, OsString> {
         ("PATH".into(), path),
         ("TERM".into(), "dumb".into()),
         ("NO_BROWSER".into(), "1".into()),
+        ("DENO_NO_UPDATE_CHECK".into(), "1".into()),
+        ("DENO_NO_PROMPT".into(), "1".into()),
     ]);
     for name in ["USER", "LOGNAME"] {
         if let Some(value) = std::env::var_os(name) {

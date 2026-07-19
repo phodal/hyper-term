@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
@@ -20,10 +20,16 @@ use hyper_term_daemon::{
 };
 use uuid::Uuid;
 
+use hyper_term_drivers::sha256_file;
+use serde::Deserialize;
+
 const DESKTOP_TERMINAL_ADDRESS: &str = "127.0.0.1:47437";
 const TERMINAL_URL_ENV: &str = "HYPER_TERM_TERMINAL_URL";
 const AGENT_URL_ENV: &str = "HYPER_TERM_AGENT_URL";
 const AGENT_PROVIDERS_ENV: &str = "HYPER_TERM_AGENT_PROVIDERS";
+const ACP_RUNTIME_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const ACP_RUNTIME_MAX_FILES: usize = 8 * 1024;
+const ACP_RUNTIME_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 
 fn main() {
     match run() {
@@ -272,10 +278,46 @@ impl Options {
             && preview_shell.is_file();
         let genui_runtime =
             (explicit_runtime || complete_runtime).then_some(ResolvedGenUiRuntime {
-                deno_executable,
+                deno_executable: deno_executable.clone(),
                 compiler_script,
                 compiler_wasm,
                 preview_shell,
+            });
+        let codex = self
+            .codex
+            .or_else(|| std::env::var_os("HYPER_TERM_CODEX_PATH").map(PathBuf::from))
+            .or_else(|| find_executable("codex", home));
+        let claude = self
+            .claude
+            .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_PATH").map(PathBuf::from))
+            .or_else(|| find_executable("claude", home));
+        let bundled_acp = load_bundled_acp_runtime(&runtime_resources, &deno_executable)?;
+        let codex_acp = self
+            .codex_acp
+            .or_else(|| std::env::var_os("HYPER_TERM_CODEX_ACP_PATH").map(PathBuf::from))
+            .map(ResolvedAcpAdapter::installed)
+            .or_else(|| {
+                codex
+                    .is_some()
+                    .then(|| bundled_acp.get("codex-acp").cloned())
+                    .flatten()
+            })
+            .or_else(|| {
+                discover_official_acp_adapter("codex-acp", home).map(ResolvedAcpAdapter::installed)
+            });
+        let claude_agent_acp = self
+            .claude_agent_acp
+            .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_AGENT_ACP_PATH").map(PathBuf::from))
+            .map(ResolvedAcpAdapter::installed)
+            .or_else(|| {
+                claude
+                    .is_some()
+                    .then(|| bundled_acp.get("claude-acp").cloned())
+                    .flatten()
+            })
+            .or_else(|| {
+                discover_official_acp_adapter("claude-agent-acp", home)
+                    .map(ResolvedAcpAdapter::installed)
             });
         Ok(ResolvedOptions {
             ui: self
@@ -288,26 +330,14 @@ impl Options {
                 .state_directory
                 .unwrap_or_else(|| default_state_directory(home)),
             shell_cwd: self.shell_cwd.unwrap_or_else(|| home.to_owned()),
-            codex: self
-                .codex
-                .or_else(|| std::env::var_os("HYPER_TERM_CODEX_PATH").map(PathBuf::from))
-                .or_else(|| find_executable("codex", home)),
+            codex,
             codex_auth: self.codex_auth.or_else(|| {
                 let candidate = home.join(".codex/auth.json");
                 candidate.is_file().then_some(candidate)
             }),
-            codex_acp: self
-                .codex_acp
-                .or_else(|| std::env::var_os("HYPER_TERM_CODEX_ACP_PATH").map(PathBuf::from))
-                .or_else(|| discover_official_acp_adapter("codex-acp", home)),
-            claude_agent_acp: self
-                .claude_agent_acp
-                .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_AGENT_ACP_PATH").map(PathBuf::from))
-                .or_else(|| discover_official_acp_adapter("claude-agent-acp", home)),
-            claude: self
-                .claude
-                .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_PATH").map(PathBuf::from))
-                .or_else(|| find_executable("claude", home)),
+            codex_acp,
+            claude_agent_acp,
+            claude,
             mcp: executable
                 .with_file_name("hyper-term-mcp")
                 .is_file()
@@ -325,8 +355,8 @@ struct ResolvedOptions {
     shell_cwd: PathBuf,
     codex: Option<PathBuf>,
     codex_auth: Option<PathBuf>,
-    codex_acp: Option<PathBuf>,
-    claude_agent_acp: Option<PathBuf>,
+    codex_acp: Option<ResolvedAcpAdapter>,
+    claude_agent_acp: Option<ResolvedAcpAdapter>,
     claude: Option<PathBuf>,
     mcp: Option<PathBuf>,
     genui_runtime: Option<ResolvedGenUiRuntime>,
@@ -338,6 +368,23 @@ struct ResolvedGenUiRuntime {
     compiler_script: PathBuf,
     compiler_wasm: PathBuf,
     preview_shell: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedAcpAdapter {
+    executable: PathBuf,
+    arguments: Vec<OsString>,
+    implementation_version: String,
+}
+
+impl ResolvedAcpAdapter {
+    fn installed(executable: PathBuf) -> Self {
+        Self {
+            executable,
+            arguments: Vec::new(),
+            implementation_version: "installed".into(),
+        }
+    }
 }
 
 impl ResolvedOptions {
@@ -367,10 +414,10 @@ impl ResolvedOptions {
             ));
         }
         if let Some(codex_acp) = &self.codex_acp {
-            validate_executable(codex_acp)?;
+            validate_executable(&codex_acp.executable)?;
         }
         if let Some(claude_agent_acp) = &self.claude_agent_acp {
-            validate_executable(claude_agent_acp)?;
+            validate_executable(&claude_agent_acp.executable)?;
         }
         if let Some(claude) = &self.claude {
             validate_executable(claude)?;
@@ -412,22 +459,26 @@ impl ResolvedOptions {
 
     fn acp_providers(&self, home: &Path) -> Result<Vec<AcpAgentProviderConfig>, String> {
         let mut providers = Vec::with_capacity(2);
-        if let Some(executable) = &self.codex_acp {
-            let mut environment = acp_environment(home, executable)?;
+        if let Some(adapter) = &self.codex_acp {
+            let mut environment = acp_environment(home, &adapter.executable)?;
             environment.insert("NO_BROWSER".into(), "1".into());
+            environment.insert("DENO_NO_UPDATE_CHECK".into(), "1".into());
+            environment.insert("DENO_NO_PROMPT".into(), "1".into());
             if let Some(codex) = &self.codex {
                 environment.insert("CODEX_PATH".into(), codex.as_os_str().to_owned());
             }
             providers.push(AcpAgentProviderConfig {
                 provider_id: "codex-acp".into(),
-                executable: executable.clone(),
-                arguments: Vec::new(),
+                executable: adapter.executable.clone(),
+                arguments: adapter.arguments.clone(),
                 environment,
-                implementation_version: "installed".into(),
+                implementation_version: adapter.implementation_version.clone(),
             });
         }
-        if let Some(executable) = &self.claude_agent_acp {
-            let mut environment = acp_environment(home, executable)?;
+        if let Some(adapter) = &self.claude_agent_acp {
+            let mut environment = acp_environment(home, &adapter.executable)?;
+            environment.insert("DENO_NO_UPDATE_CHECK".into(), "1".into());
+            environment.insert("DENO_NO_PROMPT".into(), "1".into());
             if let Some(claude) = &self.claude {
                 environment.insert(
                     "CLAUDE_CODE_EXECUTABLE".into(),
@@ -436,14 +487,202 @@ impl ResolvedOptions {
             }
             providers.push(AcpAgentProviderConfig {
                 provider_id: "claude-acp".into(),
-                executable: executable.clone(),
-                arguments: Vec::new(),
+                executable: adapter.executable.clone(),
+                arguments: adapter.arguments.clone(),
                 environment,
-                implementation_version: "installed".into(),
+                implementation_version: adapter.implementation_version.clone(),
             });
         }
         Ok(providers)
     }
+}
+
+#[derive(Deserialize)]
+struct BundledAcpRuntimeManifest {
+    schema_version: u32,
+    runtime: BundledAcpRuntimeIdentity,
+    adapters: Vec<BundledAcpAdapterManifest>,
+    files: Vec<BundledAcpFileManifest>,
+}
+
+#[derive(Deserialize)]
+struct BundledAcpRuntimeIdentity {
+    name: String,
+    version: String,
+}
+
+#[derive(Deserialize)]
+struct BundledAcpAdapterManifest {
+    provider_id: String,
+    package: String,
+    version: String,
+    entrypoint: String,
+    required_agent: String,
+    entrypoint_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct BundledAcpFileManifest {
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+fn load_bundled_acp_runtime(
+    runtime_resources: &Path,
+    deno_executable: &Path,
+) -> Result<BTreeMap<String, ResolvedAcpAdapter>, String> {
+    let root = runtime_resources.join("acp");
+    let manifest_path = root.join("manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    validate_executable(deno_executable)?;
+    let manifest_metadata = std::fs::metadata(&manifest_path)
+        .map_err(|error| format!("cannot inspect bundled ACP manifest: {error}"))?;
+    if manifest_metadata.len() == 0 || manifest_metadata.len() > ACP_RUNTIME_MANIFEST_MAX_BYTES {
+        return Err("bundled ACP manifest size is invalid".into());
+    }
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .map_err(|error| format!("cannot read bundled ACP manifest: {error}"))?;
+    let manifest: BundledAcpRuntimeManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("cannot parse bundled ACP manifest: {error}"))?;
+    if manifest.schema_version != 1
+        || manifest.runtime.name != "deno"
+        || manifest.runtime.version != "2.9.3"
+    {
+        return Err("bundled ACP runtime identity is unsupported".into());
+    }
+    if manifest.files.is_empty() || manifest.files.len() > ACP_RUNTIME_MAX_FILES {
+        return Err("bundled ACP file inventory is invalid".into());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve bundled ACP runtime: {error}"))?;
+    let mut file_digests = BTreeMap::new();
+    let mut total_bytes = 0_u64;
+    for file in manifest.files {
+        let relative_path = validate_bundled_relative_path(&file.path)?;
+        if !is_sha256(&file.sha256) || file.bytes == 0 {
+            return Err(format!(
+                "bundled ACP file metadata is invalid: {}",
+                file.path
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(file.bytes)
+            .ok_or_else(|| "bundled ACP runtime byte count overflowed".to_owned())?;
+        if total_bytes > ACP_RUNTIME_MAX_TOTAL_BYTES {
+            return Err("bundled ACP runtime exceeds its byte budget".into());
+        }
+        let path = canonical_root.join(&relative_path);
+        let canonical_path = path
+            .canonicalize()
+            .map_err(|error| format!("bundled ACP file is unavailable: {}: {error}", file.path))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(format!(
+                "bundled ACP file escapes its runtime: {}",
+                file.path
+            ));
+        }
+        let metadata = std::fs::metadata(&canonical_path)
+            .map_err(|error| format!("cannot inspect bundled ACP file {}: {error}", file.path))?;
+        if !metadata.is_file() || metadata.len() != file.bytes {
+            return Err(format!("bundled ACP file size changed: {}", file.path));
+        }
+        let actual = sha256_file(&canonical_path)
+            .map_err(|error| format!("cannot hash bundled ACP file {}: {error}", file.path))?;
+        if actual != file.sha256 {
+            return Err(format!("bundled ACP file digest changed: {}", file.path));
+        }
+        if file_digests
+            .insert(file.path.clone(), file.sha256)
+            .is_some()
+        {
+            return Err(format!("bundled ACP file is duplicated: {}", file.path));
+        }
+    }
+
+    if manifest.adapters.len() != 2 {
+        return Err("bundled ACP adapter inventory is incomplete".into());
+    }
+    let mut adapters = BTreeMap::new();
+    for adapter in manifest.adapters {
+        let expected_package = match adapter.provider_id.as_str() {
+            "codex-acp" if adapter.required_agent == "codex" => "@agentclientprotocol/codex-acp",
+            "claude-acp" if adapter.required_agent == "claude" => {
+                "@agentclientprotocol/claude-agent-acp"
+            }
+            _ => return Err("bundled ACP adapter identity is unsupported".into()),
+        };
+        if adapter.package != expected_package || adapter.version.is_empty() {
+            return Err(format!(
+                "bundled ACP package identity changed: {}",
+                adapter.provider_id
+            ));
+        }
+        let entrypoint = validate_bundled_relative_path(&adapter.entrypoint)?;
+        let Some(file_digest) = file_digests.get(&adapter.entrypoint) else {
+            return Err(format!(
+                "bundled ACP entrypoint is not inventoried: {}",
+                adapter.provider_id
+            ));
+        };
+        if file_digest != &adapter.entrypoint_sha256 || !is_sha256(file_digest) {
+            return Err(format!(
+                "bundled ACP entrypoint digest changed: {}",
+                adapter.provider_id
+            ));
+        }
+        let entrypoint = canonical_root.join(entrypoint);
+        let resolved = ResolvedAcpAdapter {
+            executable: deno_executable.to_owned(),
+            arguments: [
+                "run",
+                "--cached-only",
+                "--no-config",
+                "--node-modules-dir=manual",
+                "-A",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .chain(std::iter::once(entrypoint.into_os_string()))
+            .collect(),
+            implementation_version: adapter.version,
+        };
+        if adapters
+            .insert(adapter.provider_id.clone(), resolved)
+            .is_some()
+        {
+            return Err(format!(
+                "bundled ACP adapter is duplicated: {}",
+                adapter.provider_id
+            ));
+        }
+    }
+    Ok(adapters)
+}
+
+fn validate_bundled_relative_path(path: &str) -> Result<PathBuf, String> {
+    if path.is_empty() || path.len() > 4096 {
+        return Err("bundled ACP path length is invalid".into());
+    }
+    let path = PathBuf::from(path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "bundled ACP path must be normalized and relative: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn acp_environment(home: &Path, executable: &Path) -> Result<BTreeMap<String, OsString>, String> {
@@ -677,8 +916,12 @@ mod tests {
             shell_cwd: "/tmp".into(),
             codex: Some("/opt/homebrew/bin/codex".into()),
             codex_auth: None,
-            codex_acp: Some("/opt/homebrew/bin/codex-acp".into()),
-            claude_agent_acp: Some("/opt/homebrew/bin/claude-agent-acp".into()),
+            codex_acp: Some(ResolvedAcpAdapter::installed(
+                "/opt/homebrew/bin/codex-acp".into(),
+            )),
+            claude_agent_acp: Some(ResolvedAcpAdapter::installed(
+                "/opt/homebrew/bin/claude-agent-acp".into(),
+            )),
             claude: Some("/Users/example/.local/bin/claude".into()),
             mcp: None,
             genui_runtime: None,
@@ -732,5 +975,106 @@ mod tests {
         }
         assert!(official_acp_adapter_version(&official, "codex-acp"));
         assert!(!official_acp_adapter_version(&legacy, "codex-acp"));
+    }
+
+    #[test]
+    fn bundled_acp_runtime_is_digest_verified_and_launched_by_deno() {
+        let (_temporary, runtime, deno) = bundled_acp_fixture();
+        let adapters = load_bundled_acp_runtime(&runtime, &deno).expect("bundled adapters");
+        assert_eq!(
+            adapters.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["claude-acp", "codex-acp"]
+        );
+        let codex = &adapters["codex-acp"];
+        assert_eq!(codex.executable, deno);
+        assert_eq!(codex.implementation_version, "1.1.4");
+        assert_eq!(codex.arguments[0], "run");
+        assert_eq!(codex.arguments[1], "--cached-only");
+        assert!(
+            Path::new(codex.arguments.last().expect("entrypoint"))
+                .ends_with("node_modules/@agentclientprotocol/codex-acp/dist/index.js")
+        );
+    }
+
+    #[test]
+    fn bundled_acp_runtime_rejects_a_tampered_dependency() {
+        let (_temporary, runtime, deno) = bundled_acp_fixture();
+        std::fs::write(
+            runtime.join("acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js"),
+            "tampered",
+        )
+        .expect("tamper adapter");
+        let error = load_bundled_acp_runtime(&runtime, &deno)
+            .expect_err("tampered adapter must fail closed");
+        assert!(error.contains("size changed") || error.contains("digest changed"));
+    }
+
+    fn bundled_acp_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temporary = tempfile::tempdir().expect("temporary bundle");
+        let runtime = temporary.path().join("Contents/Resources/runtime");
+        let acp = runtime.join("acp");
+        let deno = runtime.join("deno");
+        std::fs::create_dir_all(acp.join("node_modules/@agentclientprotocol/codex-acp/dist"))
+            .expect("Codex adapter directory");
+        std::fs::create_dir_all(
+            acp.join("node_modules/@agentclientprotocol/claude-agent-acp/dist"),
+        )
+        .expect("Claude adapter directory");
+        std::fs::write(&deno, "#!/bin/sh\nexit 0\n").expect("fake Deno");
+        let mut permissions = std::fs::metadata(&deno).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&deno, permissions).unwrap();
+
+        let files = [
+            (
+                "node_modules/@agentclientprotocol/codex-acp/dist/index.js",
+                "codex adapter",
+            ),
+            (
+                "node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js",
+                "claude adapter",
+            ),
+        ];
+        let inventory = files
+            .iter()
+            .map(|(relative, contents)| {
+                let path = acp.join(relative);
+                std::fs::write(&path, contents).expect("adapter fixture");
+                serde_json::json!({
+                    "path": relative,
+                    "bytes": contents.len(),
+                    "sha256": sha256_file(&path).expect("fixture digest"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "runtime": { "name": "deno", "version": "2.9.3" },
+            "adapters": [
+                {
+                    "provider_id": "codex-acp",
+                    "package": "@agentclientprotocol/codex-acp",
+                    "version": "1.1.4",
+                    "entrypoint": files[0].0,
+                    "required_agent": "codex",
+                    "entrypoint_sha256": inventory[0]["sha256"],
+                },
+                {
+                    "provider_id": "claude-acp",
+                    "package": "@agentclientprotocol/claude-agent-acp",
+                    "version": "0.59.0",
+                    "entrypoint": files[1].0,
+                    "required_agent": "claude",
+                    "entrypoint_sha256": inventory[1]["sha256"],
+                },
+            ],
+            "files": inventory,
+        });
+        std::fs::write(
+            acp.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+        (temporary, runtime, deno)
     }
 }
