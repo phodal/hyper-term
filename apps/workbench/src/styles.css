@@ -834,6 +834,21 @@ textarea:focus-visible {
 .studio-header {
   padding: 15px 17px 12px;
 }
+.studio-header > div:first-child {
+  min-width: 0;
+}
+.studio-header h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.studio-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  min-width: 0;
+}
 .compiler-status {
   display: flex;
   align-items: center;
@@ -854,6 +869,46 @@ textarea:focus-visible {
 .compiler-status.has-error > span {
   background: var(--red);
   box-shadow: 0 0 7px #ff8d83;
+}
+.publish-draft {
+  height: 27px;
+  padding: 0 9px;
+  border: 1px solid #77933c;
+  border-radius: 6px;
+  background: var(--acid);
+  color: #11140e;
+  cursor: pointer;
+  font: 750 8px ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+}
+.publish-draft:hover:not(:disabled) {
+  background: #e2ff98;
+}
+.publish-draft:focus-visible {
+  outline: 2px solid var(--acid);
+  outline-offset: 2px;
+}
+.publish-draft:disabled {
+  border-color: #3c4434;
+  background: #252b21;
+  color: #7b8472;
+  cursor: default;
+}
+.publish-draft[data-state="waiting_approval"] {
+  border-color: #7d6633;
+  background: #332b1a;
+  color: #e0c481;
+}
+.publish-draft[data-state="compiling"] {
+  border-color: #526638;
+  background: #25301e;
+  color: #b9d27b;
+}
+.publish-draft[data-state="failed"],
+.publish-draft[data-state="rejected"] {
+  border-color: #74433d;
+  background: #321e1b;
+  color: #ffaaa1;
 }
 .studio-tabs {
   display: flex;
@@ -1089,6 +1144,22 @@ textarea:focus-visible {
 }
 
 @media (max-width: 520px) {
+  [data-surface="artifact"] .studio-header {
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 11px 9px;
+  }
+  [data-surface="artifact"] .studio-actions {
+    align-items: flex-end;
+    flex-direction: column;
+    gap: 5px;
+  }
+  [data-surface="artifact"] .compiler-status {
+    max-width: 132px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   [data-surface="artifact"] .studio-tabs button {
     padding: 0 6px;
     font-size: 8px;

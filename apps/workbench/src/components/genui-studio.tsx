@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { ArtifactDraftStatus } from "../artifact-draft-publisher.ts";
 import type { HyperTermHost } from "../host.ts";
 import type { AcceptedArtifact } from "../protocol.ts";
 import type { EditorLanguageService } from "../editor-language-service.ts";
@@ -72,6 +73,9 @@ export interface GenUiStudioProps {
   initialRevision?: number;
   heading?: string;
   languageService?: EditorLanguageService;
+  onPublishDraft?: (source: string) => void;
+  publishStatus?: ArtifactDraftStatus | "idle";
+  publishError?: string;
 }
 
 export function GenUiStudio({
@@ -81,6 +85,9 @@ export function GenUiStudio({
   initialRevision = 0,
   heading = "Live artifact",
   languageService,
+  onPublishDraft,
+  publishStatus = "idle",
+  publishError,
 }: GenUiStudioProps) {
   const [source, setSource] = useState(initialSource);
   const [view, setView] = useState<StudioView>("code");
@@ -189,7 +196,7 @@ export function GenUiStudio({
       const sourceRevision = ++revision.current;
       const activeCompiler = compiler.current;
       if (!activeCompiler) return;
-      setStatus(`Building source r${sourceRevision}`);
+      setStatus(`Local build r${sourceRevision}`);
       setError(undefined);
       setTrace((entries) =>
         [{
@@ -204,12 +211,14 @@ export function GenUiStudio({
         const nextAccepted = await host.acceptArtifact(candidate);
         if (sourceRevision !== revision.current) return;
         setAccepted(nextAccepted);
-        setStatus(`Accepted r${sourceRevision} · ${candidate.bundle.length} B`);
+        setStatus(
+          `Preview ready r${sourceRevision} · ${candidate.bundle.length} B`,
+        );
         setTrace((entries) =>
           [{
             revision: sourceRevision,
-            label: "Artifact accepted",
-            detail: `${nextAccepted.artifact_id} · ${nextAccepted.accepted_by}`,
+            label: "Local preview accepted",
+            detail: `${nextAccepted.artifact_id} · browser sandbox`,
             state: "accepted" as const,
           }, ...entries.filter((entry) => entry.revision !== sourceRevision)]
             .slice(0, 8)
@@ -236,6 +245,9 @@ export function GenUiStudio({
   }, [host, source]);
 
   const runtimeLocation = runtimeDiagnostic?.original;
+  const draftChanged = source !== baselineSource;
+  const publishBusy = publishStatus === "waiting_approval" ||
+    publishStatus === "compiling";
 
   return (
     <aside className="studio" aria-label="Agentic UI Studio">
@@ -244,9 +256,28 @@ export function GenUiStudio({
           <span className="eyebrow">Agentic UI Studio</span>
           <h2>{heading}</h2>
         </div>
-        <span className={`compiler-status ${error ? "has-error" : ""}`}>
-          <span /> {status}
-        </span>
+        <div className="studio-actions">
+          <span className={`compiler-status ${error ? "has-error" : ""}`}>
+            <span /> {status}
+          </span>
+          {onPublishDraft && (
+            <button
+              className="publish-draft"
+              data-state={publishStatus}
+              type="button"
+              disabled={!draftChanged || publishBusy || Boolean(error)}
+              title={publishError ??
+                "Create an Approval Block, then rebuild this draft with Rust-supervised Deno"}
+              onClick={() => onPublishDraft(source)}
+            >
+              {publishDraftLabel(
+                publishStatus,
+                draftChanged,
+                initialRevision,
+              )}
+            </button>
+          )}
+        </div>
       </header>
       <div className="studio-tabs" role="tablist" aria-label="Artifact tools">
         {(["code", "diff", "trace"] as const).map((tab) => (
@@ -296,6 +327,12 @@ export function GenUiStudio({
       </div>
       {error
         ? <div className="compile-error" role="alert">{error}</div>
+        : publishError
+        ? (
+          <div className="compile-error publish-error" role="alert">
+            {publishError}
+          </div>
+        )
         : runtimeDiagnostic && (
           <div
             className="compile-error runtime-error"
@@ -320,7 +357,7 @@ export function GenUiStudio({
         )}
       <div className="preview-header">
         <div>
-          <span className="eyebrow">Isolated preview</span>
+          <span className="eyebrow">Isolated local preview</span>
           <strong>
             {accepted?.artifact_id ?? "Waiting for accepted artifact"}
           </strong>
@@ -350,6 +387,18 @@ export function GenUiStudio({
       </div>
     </aside>
   );
+}
+
+function publishDraftLabel(
+  status: ArtifactDraftStatus | "idle",
+  changed: boolean,
+  revision: number,
+): string {
+  if (status === "waiting_approval") return "Approve publish";
+  if (status === "compiling") return "Deno compiling";
+  if (status === "accepted" && !changed) return `Published r${revision}`;
+  if (status === "failed" || status === "rejected") return "Retry publish";
+  return "Publish draft";
 }
 
 function TraceTimeline({ entries }: { entries: TraceEntry[] }) {

@@ -134,8 +134,22 @@ artifact endpoint. Rust creates a private source snapshot, fences every request
 to the current artifact and source revision, and returns only normalized bounded
 advisory data. A real Deno integration test covers `didOpen`, `didChange`,
 diagnostics, and completion; a 360-pixel browser pass proves the editor, LSP
-status, and preview headers do not overflow. Multi-file selection, transaction
-journaling, and brokered apply remain open.
+status, and preview headers do not overflow.
+
+Workbench edits can now enter a separate Artifact publish transaction. The
+trusted editor submits the complete bounded virtual source tree plus its exact
+base artifact and source revision. Rust rejects stale revisions, changed path
+sets, overlapping drafts, and non-ACP sessions before creating a
+`hyper_term.genui.compile` Approval Block. `AllowOnce` moves that exact
+operation through dispatch, recompiles with the digest-pinned Deno and
+`esbuild-wasm` runtime, accepts a new immutable Artifact revision, records its
+receipt, and refreshes the Workbench from Rust source. The browser's 260 ms
+compiler remains advisory local preview only. Publishing an Artifact still
+does not write to the workspace; brokered apply is a later transaction. A real
+Deno integration test covers approval, compilation, Artifact replacement,
+source recovery, and stale revision rejection. Multi-file selection,
+fine-grained edit transaction journaling, and brokered workspace apply remain
+open.
 
 ## Validation gates
 

@@ -1,4 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArtifactDraftPublisher,
+  type ArtifactDraftStatus,
+} from "../artifact-draft-publisher.ts";
 import { resolveHost } from "../host.ts";
 import { ArtifactLanguageService } from "../editor-language-service.ts";
 import { GenUiStudio } from "./genui-studio.tsx";
@@ -25,10 +29,15 @@ export function ArtifactWorkbench() {
   const host = useMemo(resolveHost, []);
   const context = useMemo(readArtifactContext, []);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [publishStatus, setPublishStatus] = useState<
+    ArtifactDraftStatus | "idle"
+  >("idle");
+  const [publishError, setPublishError] = useState<string>();
+  const publishController = useRef<AbortController | undefined>(undefined);
   const languageService = useMemo(() => {
     if (!context || state.kind !== "ready") return undefined;
     return new ArtifactLanguageService({
-      artifactId: context.artifactId,
+      artifactId: state.source.artifact_id,
       sourceRevision: state.source.source_revision,
       documentPath: state.source.entrypoint,
       sessionId: context.sessionId,
@@ -45,34 +54,8 @@ export function ArtifactWorkbench() {
       return;
     }
     const controller = new AbortController();
-    const query = new URLSearchParams({
-      token: context.token,
-      session_id: String(context.sessionId),
-    });
-    fetch(
-      `/agent/artifact/${
-        encodeURIComponent(context.artifactId)
-      }/source?${query}`,
-      { cache: "no-store", signal: controller.signal },
-    )
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(`Rust source endpoint returned ${response.status}.`);
-        }
-        return await response.json() as ArtifactSourceResponse;
-      })
+    fetchArtifactSource(context, context.artifactId, controller.signal)
       .then((source) => {
-        if (
-          source.artifact_id !== context.artifactId ||
-          !Number.isSafeInteger(source.source_revision) ||
-          source.source_revision < 1 ||
-          typeof source.entrypoint !== "string" ||
-          typeof source.files[source.entrypoint] !== "string"
-        ) {
-          throw new Error(
-            "Rust source snapshot did not match the active artifact.",
-          );
-        }
         setState({ kind: "ready", source });
       })
       .catch((error: unknown) => {
@@ -84,6 +67,39 @@ export function ArtifactWorkbench() {
       });
     return () => controller.abort();
   }, [context]);
+
+  useEffect(() => () => publishController.current?.abort(), []);
+
+  const publishDraft = useCallback((source: string) => {
+    if (!context || state.kind !== "ready") return;
+    publishController.current?.abort();
+    const controller = new AbortController();
+    publishController.current = controller;
+    setPublishError(undefined);
+    const publisher = new ArtifactDraftPublisher({
+      artifactId: state.source.artifact_id,
+      sourceRevision: state.source.source_revision,
+      entrypoint: state.source.entrypoint,
+      files: state.source.files,
+      sessionId: context.sessionId,
+      token: context.token,
+    });
+    publisher.publish(
+      source,
+      (update) => setPublishStatus(update.status),
+      controller.signal,
+    ).then((artifact) =>
+      fetchArtifactSource(context, artifact.artifact_id, controller.signal)
+    ).then((nextSource) => {
+      if (controller.signal.aborted) return;
+      setState({ kind: "ready", source: nextSource });
+      setPublishStatus("accepted");
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      setPublishStatus("failed");
+      setPublishError(error instanceof Error ? error.message : String(error));
+    });
+  }, [context, state]);
 
   return (
     <main className="artifact-surface">
@@ -118,6 +134,9 @@ export function ArtifactWorkbench() {
           initialRevision={state.source.source_revision}
           heading={state.source.entrypoint}
           languageService={languageService}
+          onPublishDraft={publishDraft}
+          publishStatus={publishStatus}
+          publishError={publishError}
         />
       )}
       <footer className="artifact-surface-footer">
@@ -134,6 +153,35 @@ export function ArtifactWorkbench() {
       </footer>
     </main>
   );
+}
+
+async function fetchArtifactSource(
+  context: ArtifactContext,
+  artifactId: string,
+  signal: AbortSignal,
+): Promise<ArtifactSourceResponse> {
+  const query = new URLSearchParams({
+    token: context.token,
+    session_id: String(context.sessionId),
+  });
+  const response = await fetch(
+    `/agent/artifact/${encodeURIComponent(artifactId)}/source?${query}`,
+    { cache: "no-store", signal },
+  );
+  if (!response.ok) {
+    throw new Error(`Rust source endpoint returned ${response.status}.`);
+  }
+  const source = await response.json() as ArtifactSourceResponse;
+  if (
+    source.artifact_id !== artifactId ||
+    !Number.isSafeInteger(source.source_revision) ||
+    source.source_revision < 1 ||
+    typeof source.entrypoint !== "string" ||
+    typeof source.files[source.entrypoint] !== "string"
+  ) {
+    throw new Error("Rust source snapshot did not match the active artifact.");
+  }
+  return source;
 }
 
 function readArtifactContext(): ArtifactContext | undefined {

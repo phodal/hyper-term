@@ -50,7 +50,9 @@ task model without giving the UI direct command or filesystem authority.
   operation proposal; Rust and the user authorize it before execution.
 - **Artifact Workbench.** Current artifacts can open in a CodeMirror editor with
   Diff, Time Travel, source-mapped diagnostics, completion, and an isolated
-  local preview. Drafts do not write to the workspace.
+  local preview. Publishing a draft creates an Approval Block and a new
+  Rust-accepted revision compiled by pinned Deno; it does not write to the
+  workspace.
 - **Local-first authority.** Rust owns PTYs, process lifetime, permissions,
   durable state, and accepted artifacts. WebViews render trusted projections
   and cannot spawn commands or choose arbitrary files.
@@ -91,7 +93,7 @@ UI bridge.
 | GitHub Copilot ACP discovery | Implemented baseline |
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
-| Artifact editor, Diff, Time Travel, diagnostics, and completion | Experimental |
+| Artifact editor, Diff, Time Travel, diagnostics, completion, and approved publish | Experimental |
 | Brokered workspace edits | Not implemented |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |
