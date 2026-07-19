@@ -36,7 +36,8 @@ use tokio::task::JoinHandle;
 use crate::DaemonState;
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
 use crate::workspace_apply::{
-    WorkspaceApplyError, WorkspaceApplyPlan, apply_workspace_plan, prepare_workspace_apply,
+    MAX_WORKSPACE_APPLY_FILES, WorkspaceApplyError, WorkspaceApplySetPlan,
+    apply_workspace_set_plan, prepare_workspace_apply_set,
 };
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
 
@@ -191,9 +192,9 @@ struct WorkspaceApplyRecord {
     task_id: TaskId,
     artifact_id: ArtifactId,
     artifact_source_revision: u64,
-    source_path: String,
+    source_paths: Vec<String>,
     waiting_revision: u64,
-    plan: WorkspaceApplyPlan,
+    plan: WorkspaceApplySetPlan,
     state: WorkspaceApplyState,
 }
 
@@ -351,6 +352,16 @@ struct AgentArtifactDraftResponse {
 #[derive(Deserialize)]
 struct AgentWorkspaceApplyRequest {
     artifact_source_revision: u64,
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default)]
+    target_path: Option<String>,
+    #[serde(default)]
+    mappings: Vec<AgentWorkspaceApplyMapping>,
+}
+
+#[derive(Deserialize)]
+struct AgentWorkspaceApplyMapping {
     source_path: String,
     target_path: String,
 }
@@ -385,8 +396,20 @@ struct AgentWorkspaceApplyResponse {
     proposed_digest: String,
     before: String,
     after: String,
+    transaction_digest: String,
+    changes: Vec<AgentWorkspaceApplyChangeResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AgentWorkspaceApplyChangeResponse {
+    source_path: String,
+    target_path: String,
+    base_digest: Option<String>,
+    proposed_digest: String,
+    before: String,
+    after: String,
 }
 
 #[derive(Deserialize)]
@@ -1726,24 +1749,39 @@ impl AgentGatewayRuntime {
         if request.artifact_source_revision != artifact.metadata.source_revision {
             return Err(WorkspaceProposalError::StaleRevision);
         }
-        let proposed_content = artifact
-            .source_files
-            .get(&request.source_path)
-            .cloned()
-            .ok_or(WorkspaceProposalError::InvalidRequest)?;
-        let plan = prepare_workspace_apply(
-            &self.config.workspace,
-            &request.target_path,
-            proposed_content,
-        )
-        .map_err(map_workspace_prepare_error)?;
-        let payload = serde_json::to_vec(&(
-            artifact_id,
-            request.artifact_source_revision,
-            &request.source_path,
-            &plan,
-        ))
-        .map_err(|_| WorkspaceProposalError::InvalidRequest)?;
+        let artifact_source_revision = request.artifact_source_revision;
+        let mappings = normalize_workspace_apply_mappings(request)?;
+        let mut target_sources = BTreeMap::new();
+        let mut plan_requests = Vec::with_capacity(mappings.len());
+        for mapping in mappings {
+            if target_sources
+                .insert(mapping.target_path.clone(), mapping.source_path.clone())
+                .is_some()
+            {
+                return Err(WorkspaceProposalError::InvalidRequest);
+            }
+            let proposed_content = artifact
+                .source_files
+                .get(&mapping.source_path)
+                .cloned()
+                .ok_or(WorkspaceProposalError::InvalidRequest)?;
+            plan_requests.push((mapping.target_path, proposed_content));
+        }
+        let plan = prepare_workspace_apply_set(&self.config.workspace, plan_requests)
+            .map_err(map_workspace_prepare_error)?;
+        let source_paths = plan
+            .plans
+            .iter()
+            .map(|plan| {
+                target_sources
+                    .get(&plan.target_path)
+                    .cloned()
+                    .ok_or(WorkspaceProposalError::InvalidRequest)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload =
+            serde_json::to_vec(&(artifact_id, artifact_source_revision, &source_paths, &plan))
+                .map_err(|_| WorkspaceProposalError::InvalidRequest)?;
         let payload_digest = sha256_bytes(&payload);
         let mut applies = self
             .workspace_applies
@@ -1776,8 +1814,9 @@ impl AgentGatewayRuntime {
                     payload_digest,
                 },
                 format!(
-                    "Apply {} from Artifact r{} to workspace {}",
-                    request.source_path, request.artifact_source_revision, plan.target_path
+                    "Apply {} Artifact source file(s) from r{} to the workspace",
+                    plan.plans.len(),
+                    artifact_source_revision
                 ),
                 RiskClass::WorkspaceWrite,
                 vec!["workspace_write".into(), "artifact_apply".into()],
@@ -1787,8 +1826,8 @@ impl AgentGatewayRuntime {
             session_id,
             task_id: session.task_id,
             artifact_id,
-            artifact_source_revision: request.artifact_source_revision,
-            source_path: request.source_path,
+            artifact_source_revision,
+            source_paths,
             waiting_revision: operation.revision,
             plan,
             state: WorkspaceApplyState::WaitingApproval,
@@ -1863,28 +1902,31 @@ impl AgentGatewayRuntime {
                     "artifact source revision is no longer current".into(),
                 ));
             }
-            let current_source =
-                current
-                    .source_files
-                    .get(&record.source_path)
-                    .ok_or_else(|| {
-                        WorkspaceExecutionError::Failed(
-                            "artifact source path is no longer current".into(),
-                        )
-                    })?;
-            if sha256_bytes(current_source.as_bytes()) != record.plan.proposed_digest {
+            if record.source_paths.len() != record.plan.plans.len() {
                 return Err(WorkspaceExecutionError::Failed(
-                    "artifact source digest is no longer current".into(),
+                    "workspace apply source mapping is inconsistent".into(),
                 ));
             }
-            apply_workspace_plan(&self.config.workspace, &record.plan).map_err(
-                |error| match error {
+            for (source_path, plan) in record.source_paths.iter().zip(&record.plan.plans) {
+                let current_source = current.source_files.get(source_path).ok_or_else(|| {
+                    WorkspaceExecutionError::Failed(
+                        "artifact source path is no longer current".into(),
+                    )
+                })?;
+                if sha256_bytes(current_source.as_bytes()) != plan.proposed_digest {
+                    return Err(WorkspaceExecutionError::Failed(
+                        "artifact source digest is no longer current".into(),
+                    ));
+                }
+            }
+            apply_workspace_set_plan(&self.config.workspace, &record.plan).map_err(|error| {
+                match error {
                     WorkspaceApplyError::UnknownExecution(message) => {
                         WorkspaceExecutionError::UnknownExecution(message)
                     }
                     error => WorkspaceExecutionError::Failed(error.to_string()),
-                },
-            )
+                }
+            })
         })();
         match result {
             Ok(result_digest) => {
@@ -1892,7 +1934,10 @@ impl AgentGatewayRuntime {
                     executor: "hyper-term-workspace-apply".into(),
                     succeeded: true,
                     outcome: Some(OperationOutcome::Succeeded),
-                    summary: format!("applied Artifact source to {}", record.plan.target_path),
+                    summary: format!(
+                        "applied {} Artifact source file(s) to the workspace",
+                        record.plan.plans.len()
+                    ),
                     result_digest: Some(result_digest),
                 };
                 if let Err(error) = self.config.daemon.complete_operation(
@@ -2629,6 +2674,40 @@ fn artifact_draft_response(
     }
 }
 
+fn normalize_workspace_apply_mappings(
+    request: AgentWorkspaceApplyRequest,
+) -> Result<Vec<AgentWorkspaceApplyMapping>, WorkspaceProposalError> {
+    let mut mappings = if request.mappings.is_empty() {
+        match (request.source_path, request.target_path) {
+            (Some(source_path), Some(target_path)) => {
+                vec![AgentWorkspaceApplyMapping {
+                    source_path,
+                    target_path,
+                }]
+            }
+            _ => return Err(WorkspaceProposalError::InvalidRequest),
+        }
+    } else {
+        if request.source_path.is_some() || request.target_path.is_some() {
+            return Err(WorkspaceProposalError::InvalidRequest);
+        }
+        request.mappings
+    };
+    if mappings.is_empty() || mappings.len() > MAX_WORKSPACE_APPLY_FILES {
+        return Err(WorkspaceProposalError::InvalidRequest);
+    }
+    let mut source_paths = HashSet::new();
+    if mappings.iter().any(|mapping| {
+        mapping.source_path.is_empty()
+            || mapping.target_path.is_empty()
+            || !source_paths.insert(mapping.source_path.clone())
+    }) {
+        return Err(WorkspaceProposalError::InvalidRequest);
+    }
+    mappings.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+    Ok(mappings)
+}
+
 fn map_workspace_prepare_error(error: WorkspaceApplyError) -> WorkspaceProposalError {
     match error {
         WorkspaceApplyError::NoChanges => WorkspaceProposalError::NoChanges,
@@ -2658,17 +2737,35 @@ fn workspace_apply_response(
             (WorkspaceApplyStatus::UnknownExecution, Some(error.clone()))
         }
     };
+    let changes = record
+        .source_paths
+        .iter()
+        .zip(&record.plan.plans)
+        .map(|(source_path, plan)| AgentWorkspaceApplyChangeResponse {
+            source_path: source_path.clone(),
+            target_path: plan.target_path.clone(),
+            base_digest: plan.base_digest().map(str::to_owned),
+            proposed_digest: plan.proposed_digest.clone(),
+            before: plan.base_content().to_owned(),
+            after: plan.proposed_content.clone(),
+        })
+        .collect::<Vec<_>>();
+    let first = changes
+        .first()
+        .expect("workspace apply records always contain at least one change");
     AgentWorkspaceApplyResponse {
         operation_id,
         operation_revision,
         status,
         artifact_source_revision: record.artifact_source_revision,
-        source_path: record.source_path.clone(),
-        target_path: record.plan.target_path.clone(),
-        base_digest: record.plan.base_digest().map(str::to_owned),
-        proposed_digest: record.plan.proposed_digest.clone(),
-        before: record.plan.base_content().to_owned(),
-        after: record.plan.proposed_content.clone(),
+        source_path: first.source_path.clone(),
+        target_path: first.target_path.clone(),
+        base_digest: first.base_digest.clone(),
+        proposed_digest: first.proposed_digest.clone(),
+        before: first.before.clone(),
+        after: first.after.clone(),
+        transaction_digest: record.plan.result_digest.clone(),
+        changes,
         error,
     }
 }
@@ -3509,12 +3606,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn acp_artifact_workspace_apply_waits_for_exact_approval_before_writing() {
+    async fn acp_artifact_workspace_apply_set_waits_for_one_exact_approval() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let workspace_source = "export default function App(){return <main>Workspace</main>;}\n";
+        let workspace_theme = "export const accent = 'workspace';\n";
         std::fs::write(workspace.join("App.tsx"), workspace_source).unwrap();
+        std::fs::write(workspace.join("theme.ts"), workspace_theme).unwrap();
         let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
         let fake_acp = temporary.path().join("fixture-acp");
         std::fs::write(
@@ -3580,6 +3679,7 @@ mod tests {
             .begin_operation(task_id, seed.operation_id, seed.revision)
             .unwrap();
         let artifact_source = "export default function App(){return <main>AI Artifact</main>;}\n";
+        let artifact_theme = "export const accent = 'agent';\n";
         let bundle = "globalThis.workspaceApplyFixture=true;";
         let accepted = daemon
             .accept_genui_artifact(
@@ -3590,7 +3690,10 @@ mod tests {
                     schema_version: 1,
                     source_revision: 3,
                     entrypoint: "/App.tsx".into(),
-                    source_files: BTreeMap::from([("/App.tsx".into(), artifact_source.into())]),
+                    source_files: BTreeMap::from([
+                        ("/App.tsx".into(), artifact_source.into()),
+                        ("/theme.ts".into(), artifact_theme.into()),
+                    ]),
                     bundle: bundle.into(),
                     css: String::new(),
                     source_map: "{\"version\":3}".into(),
@@ -3624,8 +3727,10 @@ mod tests {
         );
         let apply_request = serde_json::to_vec(&serde_json::json!({
             "artifact_source_revision": 3,
-            "source_path": "/App.tsx",
-            "target_path": "App.tsx"
+            "mappings": [
+                {"source_path": "/App.tsx", "target_path": "App.tsx"},
+                {"source_path": "/theme.ts", "target_path": "theme.ts"}
+            ]
         }))
         .unwrap();
         let (status, body) =
@@ -3637,8 +3742,20 @@ mod tests {
         assert_eq!(proposal["after"], artifact_source);
         assert_eq!(proposal["base_digest"].as_str().map(str::len), Some(64));
         assert_eq!(
+            proposal["transaction_digest"].as_str().map(str::len),
+            Some(64)
+        );
+        assert_eq!(proposal["changes"].as_array().unwrap().len(), 2);
+        assert_eq!(proposal["changes"][1]["source_path"], "/theme.ts");
+        assert_eq!(proposal["changes"][1]["before"], workspace_theme);
+        assert_eq!(proposal["changes"][1]["after"], artifact_theme);
+        assert_eq!(
             std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
             workspace_source
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("theme.ts")).unwrap(),
+            workspace_theme
         );
         let operation_id: OperationId =
             serde_json::from_value(proposal["operation_id"].clone()).unwrap();
@@ -3666,6 +3783,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
             workspace_source
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("theme.ts")).unwrap(),
+            workspace_theme
         );
 
         let approval = serde_json::to_vec(&serde_json::json!({
@@ -3697,6 +3818,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
             artifact_source
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("theme.ts")).unwrap(),
+            artifact_theme
         );
         assert_eq!(
             daemon.operation(operation_id).unwrap().state,

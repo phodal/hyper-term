@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -12,6 +13,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub(crate) const MAX_WORKSPACE_FILE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_WORKSPACE_APPLY_FILES: usize = 32;
+pub(crate) const MAX_WORKSPACE_APPLY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TARGET_PATH_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -46,6 +49,12 @@ impl WorkspaceApplyPlan {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct WorkspaceApplySetPlan {
+    pub plans: Vec<WorkspaceApplyPlan>,
+    pub result_digest: String,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum WorkspaceApplyError {
     #[error("workspace target path is invalid")]
@@ -75,7 +84,65 @@ struct OpenParent {
     inode: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_workspace_apply(
+    workspace: &Path,
+    target_path: &str,
+    proposed_content: String,
+) -> Result<WorkspaceApplyPlan, WorkspaceApplyError> {
+    let mut set =
+        prepare_workspace_apply_set(workspace, vec![(target_path.to_owned(), proposed_content)])?;
+    Ok(set
+        .plans
+        .pop()
+        .expect("a single-file set always retains its changed plan"))
+}
+
+pub(crate) fn prepare_workspace_apply_set(
+    workspace: &Path,
+    requests: Vec<(String, String)>,
+) -> Result<WorkspaceApplySetPlan, WorkspaceApplyError> {
+    if requests.is_empty() || requests.len() > MAX_WORKSPACE_APPLY_FILES {
+        return Err(WorkspaceApplyError::InvalidPath);
+    }
+    let total_bytes = requests
+        .iter()
+        .try_fold(0_usize, |total, (_, content)| {
+            total.checked_add(content.len())
+        })
+        .ok_or(WorkspaceApplyError::TooLarge)?;
+    if total_bytes > MAX_WORKSPACE_APPLY_BYTES {
+        return Err(WorkspaceApplyError::TooLarge);
+    }
+    let mut targets = BTreeSet::new();
+    let mut plans = Vec::with_capacity(requests.len());
+    for (target_path, proposed_content) in requests {
+        if !targets.insert(target_path.clone()) {
+            return Err(WorkspaceApplyError::InvalidPath);
+        }
+        match prepare_workspace_file(workspace, &target_path, proposed_content) {
+            Ok(plan) => plans.push(plan),
+            Err(WorkspaceApplyError::NoChanges) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if plans.is_empty() {
+        return Err(WorkspaceApplyError::NoChanges);
+    }
+    let base_bytes = plans.iter().try_fold(0_usize, |total, plan| {
+        total.checked_add(plan.base_content().len())
+    });
+    if base_bytes.is_none_or(|bytes| bytes > MAX_WORKSPACE_APPLY_BYTES) {
+        return Err(WorkspaceApplyError::TooLarge);
+    }
+    let result_digest = workspace_set_digest(&plans);
+    Ok(WorkspaceApplySetPlan {
+        plans,
+        result_digest,
+    })
+}
+
+fn prepare_workspace_file(
     workspace: &Path,
     target_path: &str,
     proposed_content: String,
@@ -102,10 +169,40 @@ pub(crate) fn prepare_workspace_apply(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn apply_workspace_plan(
     workspace: &Path,
     plan: &WorkspaceApplyPlan,
 ) -> Result<String, WorkspaceApplyError> {
+    let set = WorkspaceApplySetPlan {
+        plans: vec![plan.clone()],
+        result_digest: plan.proposed_digest.clone(),
+    };
+    apply_workspace_set_plan(workspace, &set)
+}
+
+pub(crate) fn apply_workspace_set_plan(
+    workspace: &Path,
+    set: &WorkspaceApplySetPlan,
+) -> Result<String, WorkspaceApplyError> {
+    if set.plans.is_empty()
+        || set.plans.len() > MAX_WORKSPACE_APPLY_FILES
+        || workspace_set_digest(&set.plans) != set.result_digest
+    {
+        return Err(WorkspaceApplyError::InvalidPath);
+    }
+    if set.plans.len() == 1 {
+        apply_single_workspace_plan(workspace, &set.plans[0])?;
+        return Ok(set.result_digest.clone());
+    }
+    apply_workspace_transaction(workspace, set)?;
+    Ok(set.result_digest.clone())
+}
+
+fn apply_single_workspace_plan(
+    workspace: &Path,
+    plan: &WorkspaceApplyPlan,
+) -> Result<(), WorkspaceApplyError> {
     let relative = validate_target_path(&plan.target_path)?;
     let parent = open_parent(workspace, &relative)?;
     if parent.device != plan.parent_device || parent.inode != plan.parent_inode {
@@ -161,7 +258,220 @@ pub(crate) fn apply_workspace_plan(
             Err(error)
         };
     }
-    Ok(plan.proposed_digest.clone())
+    Ok(())
+}
+
+struct StagedWorkspacePlan {
+    plan: WorkspaceApplyPlan,
+    parent: OpenParent,
+    stage_name: CString,
+    backup_name: Option<CString>,
+    installed: bool,
+}
+
+fn apply_workspace_transaction(
+    workspace: &Path,
+    set: &WorkspaceApplySetPlan,
+) -> Result<(), WorkspaceApplyError> {
+    let mut staged = Vec::with_capacity(set.plans.len());
+    for plan in &set.plans {
+        match stage_workspace_plan(workspace, plan) {
+            Ok(candidate) => staged.push(candidate),
+            Err(error) => {
+                cleanup_staged_workspace_plans(&staged);
+                return Err(error);
+            }
+        }
+    }
+
+    for index in 0..staged.len() {
+        let install_result = install_transaction_plan(&mut staged[index]);
+        if let Err(error) = install_result {
+            let rollback = rollback_workspace_transaction(&mut staged);
+            cleanup_staged_workspace_plans(&staged);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(WorkspaceApplyError::UnknownExecution(format!(
+                    "{error}; rollback failed: {rollback_error}"
+                ))),
+            };
+        }
+    }
+
+    for staged_plan in &staged {
+        if let Some(backup_name) = staged_plan.backup_name.as_ref() {
+            if let Err(error) =
+                unlink_at_checked(staged_plan.parent.directory.as_raw_fd(), backup_name).and_then(
+                    |()| {
+                        staged_plan
+                            .parent
+                            .directory
+                            .sync_all()
+                            .map_err(WorkspaceApplyError::from)
+                    },
+                )
+            {
+                return Err(WorkspaceApplyError::UnknownExecution(format!(
+                    "targets were installed but transaction cleanup failed: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stage_workspace_plan(
+    workspace: &Path,
+    plan: &WorkspaceApplyPlan,
+) -> Result<StagedWorkspacePlan, WorkspaceApplyError> {
+    let relative = validate_target_path(&plan.target_path)?;
+    let parent = open_parent(workspace, &relative)?;
+    if parent.device != plan.parent_device || parent.inode != plan.parent_inode {
+        return Err(WorkspaceApplyError::ParentChanged);
+    }
+    let parent_fd = parent.directory.as_raw_fd();
+    let current = read_target_at(parent_fd, &parent.file_name)?;
+    if !same_file_state(current.as_ref(), plan.base.as_ref()) {
+        return Err(WorkspaceApplyError::StaleBase);
+    }
+
+    let transaction_id = Uuid::new_v4();
+    let stage_name = CString::new(format!(".hyper-term-apply-{transaction_id}.tmp"))
+        .expect("generated workspace stage names do not contain NUL");
+    let backup_name = plan.base.as_ref().map(|_| {
+        CString::new(format!(".hyper-term-apply-{transaction_id}.base"))
+            .expect("generated workspace backup names do not contain NUL")
+    });
+    let result = (|| {
+        let mut stage = create_stage(parent_fd, &stage_name)?;
+        stage.write_all(plan.proposed_content.as_bytes())?;
+        let mode = plan
+            .base
+            .as_ref()
+            .map(|snapshot| snapshot.mode & 0o7777)
+            .unwrap_or(0o644);
+        stage.set_permissions(fs::Permissions::from_mode(mode))?;
+        stage.sync_all()?;
+        drop(stage);
+        if let Some(backup_name) = backup_name.as_ref() {
+            link_target_at(parent_fd, &parent.file_name, backup_name)?;
+        }
+        let latest = read_target_at(parent_fd, &parent.file_name)?;
+        if !same_file_state(latest.as_ref(), plan.base.as_ref()) {
+            return Err(WorkspaceApplyError::StaleBase);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        unlink_at(parent_fd, &stage_name);
+        if let Some(backup_name) = backup_name.as_ref() {
+            unlink_at(parent_fd, backup_name);
+        }
+        return Err(error);
+    }
+    Ok(StagedWorkspacePlan {
+        plan: plan.clone(),
+        parent,
+        stage_name,
+        backup_name,
+        installed: false,
+    })
+}
+
+fn install_transaction_plan(staged: &mut StagedWorkspacePlan) -> Result<(), WorkspaceApplyError> {
+    let parent_fd = staged.parent.directory.as_raw_fd();
+    let latest = read_target_at(parent_fd, &staged.parent.file_name)?;
+    if !same_file_state(latest.as_ref(), staged.plan.base.as_ref()) {
+        return Err(WorkspaceApplyError::StaleBase);
+    }
+    install_transaction_stage(
+        parent_fd,
+        &staged.stage_name,
+        &staged.parent.file_name,
+        staged.plan.base.is_some(),
+    )?;
+    staged.installed = true;
+    staged.parent.directory.sync_all()?;
+    let installed = read_target_at(parent_fd, &staged.parent.file_name)?
+        .ok_or(WorkspaceApplyError::StaleBase)?;
+    if installed.digest != staged.plan.proposed_digest
+        || installed.mode & 0o7777
+            != staged
+                .plan
+                .base
+                .as_ref()
+                .map(|base| base.mode & 0o7777)
+                .unwrap_or(0o644)
+    {
+        return Err(WorkspaceApplyError::StaleBase);
+    }
+    Ok(())
+}
+
+fn rollback_workspace_transaction(
+    staged: &mut [StagedWorkspacePlan],
+) -> Result<(), WorkspaceApplyError> {
+    for staged_plan in staged.iter_mut().rev().filter(|plan| plan.installed) {
+        let parent_fd = staged_plan.parent.directory.as_raw_fd();
+        let current = read_target_at(parent_fd, &staged_plan.parent.file_name)?;
+        if current.as_ref().map(|snapshot| snapshot.digest.as_str())
+            != Some(staged_plan.plan.proposed_digest.as_str())
+        {
+            return Err(WorkspaceApplyError::StaleBase);
+        }
+        match (
+            staged_plan.plan.base.as_ref(),
+            staged_plan.backup_name.as_ref(),
+        ) {
+            (Some(base), Some(backup_name)) => {
+                let backup = read_target_at(parent_fd, backup_name)?;
+                if !same_file_state(backup.as_ref(), Some(base)) {
+                    return Err(WorkspaceApplyError::StaleBase);
+                }
+                replace_target_at(parent_fd, backup_name, &staged_plan.parent.file_name)?;
+                let restored = read_target_at(parent_fd, &staged_plan.parent.file_name)?;
+                if !same_file_state(restored.as_ref(), Some(base)) {
+                    return Err(WorkspaceApplyError::StaleBase);
+                }
+            }
+            (None, None) => {
+                unlink_at_checked(parent_fd, &staged_plan.parent.file_name)?;
+                if read_target_at(parent_fd, &staged_plan.parent.file_name)?.is_some() {
+                    return Err(WorkspaceApplyError::StaleBase);
+                }
+            }
+            _ => return Err(WorkspaceApplyError::StaleBase),
+        }
+        staged_plan.parent.directory.sync_all()?;
+        staged_plan.installed = false;
+    }
+    Ok(())
+}
+
+fn cleanup_staged_workspace_plans(staged: &[StagedWorkspacePlan]) {
+    for staged_plan in staged {
+        let parent_fd = staged_plan.parent.directory.as_raw_fd();
+        if !staged_plan.installed {
+            unlink_at(parent_fd, &staged_plan.stage_name);
+        }
+        if let Some(backup_name) = staged_plan.backup_name.as_ref() {
+            unlink_at(parent_fd, backup_name);
+        }
+    }
+}
+
+fn workspace_set_digest(plans: &[WorkspaceApplyPlan]) -> String {
+    if let [plan] = plans {
+        return plan.proposed_digest.clone();
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"hyper-term.workspace.apply-set.v1\0");
+    for plan in plans {
+        digest.update((plan.target_path.len() as u64).to_be_bytes());
+        digest.update(plan.target_path.as_bytes());
+        digest.update(plan.proposed_digest.as_bytes());
+    }
+    sha256_digest(digest.finalize())
 }
 
 fn validate_target_path(value: &str) -> Result<PathBuf, WorkspaceApplyError> {
@@ -355,6 +665,136 @@ fn install_stage(
     Ok(())
 }
 
+fn link_target_at(
+    parent_fd: RawFd,
+    target_name: &CStr,
+    backup_name: &CStr,
+) -> Result<(), WorkspaceApplyError> {
+    // SAFETY: both names are bounded and relative to the same open directory.
+    let result = unsafe {
+        libc::linkat(
+            parent_fd,
+            target_name.as_ptr(),
+            parent_fd,
+            backup_name.as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(WorkspaceApplyError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_transaction_stage(
+    parent_fd: RawFd,
+    stage_name: &CStr,
+    target_name: &CStr,
+    replacing: bool,
+) -> Result<(), WorkspaceApplyError> {
+    let result = if replacing {
+        // SAFETY: both names are bounded and relative to the same open directory.
+        unsafe {
+            libc::renameat(
+                parent_fd,
+                stage_name.as_ptr(),
+                parent_fd,
+                target_name.as_ptr(),
+            )
+        }
+    } else {
+        // SAFETY: both names are bounded and relative to the same open directory.
+        unsafe {
+            libc::renameatx_np(
+                parent_fd,
+                stage_name.as_ptr(),
+                parent_fd,
+                target_name.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            Err(WorkspaceApplyError::StaleBase)
+        } else {
+            Err(WorkspaceApplyError::Io(error))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_transaction_stage(
+    parent_fd: RawFd,
+    stage_name: &CStr,
+    target_name: &CStr,
+    replacing: bool,
+) -> Result<(), WorkspaceApplyError> {
+    let result = if replacing {
+        // SAFETY: both names are bounded and relative to the same open directory.
+        unsafe {
+            libc::renameat(
+                parent_fd,
+                stage_name.as_ptr(),
+                parent_fd,
+                target_name.as_ptr(),
+            )
+        }
+    } else {
+        // linkat supplies an atomic no-replace boundary where renameat2 is not portable.
+        // SAFETY: both names are bounded and relative to the same open directory.
+        let linked = unsafe {
+            libc::linkat(
+                parent_fd,
+                stage_name.as_ptr(),
+                parent_fd,
+                target_name.as_ptr(),
+                0,
+            )
+        };
+        if linked == 0 {
+            unlink_at(parent_fd, stage_name);
+        }
+        linked
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            Err(WorkspaceApplyError::StaleBase)
+        } else {
+            Err(WorkspaceApplyError::Io(error))
+        }
+    }
+}
+
+fn replace_target_at(
+    parent_fd: RawFd,
+    source_name: &CStr,
+    target_name: &CStr,
+) -> Result<(), WorkspaceApplyError> {
+    // SAFETY: both names are bounded and relative to the same open directory.
+    let result = unsafe {
+        libc::renameat(
+            parent_fd,
+            source_name.as_ptr(),
+            parent_fd,
+            target_name.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(WorkspaceApplyError::Io(std::io::Error::last_os_error()))
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn install_stage(
     parent_fd: RawFd,
@@ -425,8 +865,23 @@ fn unlink_at(parent_fd: RawFd, name: &CStr) {
     let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
 }
 
+fn unlink_at_checked(parent_fd: RawFd, name: &CStr) -> Result<(), WorkspaceApplyError> {
+    // SAFETY: name is bounded and relative to an open directory descriptor.
+    let result = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(WorkspaceApplyError::Io(std::io::Error::last_os_error()))
+    }
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
+    sha256_digest(Sha256::digest(bytes))
+}
+
+fn sha256_digest(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -535,5 +990,122 @@ mod tests {
             assert!(prepare_workspace_apply(&workspace, target, "x".into()).is_err());
         }
         assert!(!outside.join("escape.ts").exists());
+    }
+
+    #[test]
+    fn multi_file_set_installs_all_reviewed_targets_and_cleans_backups() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(workspace.join("src/App.tsx"), "before app\n").unwrap();
+        fs::write(workspace.join("src/theme.ts"), "before theme\n").unwrap();
+
+        let set = prepare_workspace_apply_set(
+            &workspace,
+            vec![
+                ("src/App.tsx".into(), "after app\n".into()),
+                ("src/theme.ts".into(), "after theme\n".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(set.plans.len(), 2);
+        assert_eq!(set.result_digest.len(), 64);
+        let digest = apply_workspace_set_plan(&workspace, &set).unwrap();
+
+        assert_eq!(digest, set.result_digest);
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/App.tsx")).unwrap(),
+            "after app\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/theme.ts")).unwrap(),
+            "after theme\n"
+        );
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn stale_member_blocks_the_whole_set_before_any_target_is_written() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        fs::write(workspace.join("one.ts"), "one before\n").unwrap();
+        fs::write(workspace.join("two.ts"), "two before\n").unwrap();
+        let set = prepare_workspace_apply_set(
+            &workspace,
+            vec![
+                ("one.ts".into(), "one after\n".into()),
+                ("two.ts".into(), "two after\n".into()),
+            ],
+        )
+        .unwrap();
+        fs::write(workspace.join("two.ts"), "external writer\n").unwrap();
+
+        assert!(matches!(
+            apply_workspace_set_plan(&workspace, &set),
+            Err(WorkspaceApplyError::StaleBase)
+        ));
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one before\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "external writer\n"
+        );
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn installed_members_roll_back_when_a_later_member_turns_stale() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        fs::write(workspace.join("one.ts"), "one before\n").unwrap();
+        fs::write(workspace.join("two.ts"), "two before\n").unwrap();
+        let set = prepare_workspace_apply_set(
+            &workspace,
+            vec![
+                ("one.ts".into(), "one after\n".into()),
+                ("two.ts".into(), "two after\n".into()),
+            ],
+        )
+        .unwrap();
+        let mut staged = set
+            .plans
+            .iter()
+            .map(|plan| stage_workspace_plan(&workspace, plan).unwrap())
+            .collect::<Vec<_>>();
+        install_transaction_plan(&mut staged[0]).unwrap();
+        let replacement = workspace.join("replacement.ts");
+        fs::write(&replacement, "external writer\n").unwrap();
+        fs::rename(&replacement, workspace.join("two.ts")).unwrap();
+
+        assert!(matches!(
+            install_transaction_plan(&mut staged[1]),
+            Err(WorkspaceApplyError::StaleBase)
+        ));
+        rollback_workspace_transaction(&mut staged).unwrap();
+        cleanup_staged_workspace_plans(&staged);
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one before\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "external writer\n"
+        );
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    fn contains_transaction_file(root: &Path) -> bool {
+        fs::read_dir(root).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                return contains_transaction_file(&entry.path());
+            }
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".hyper-term-apply-")
+        })
     }
 }
