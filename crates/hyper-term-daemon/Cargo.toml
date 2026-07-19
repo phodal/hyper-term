@@ -24,6 +24,7 @@ path = "src/mcp.rs"
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 crossbeam-channel.workspace = true
 futures-util.workspace = true
 hyper-term-core = { path = "../hyper-term-core" }

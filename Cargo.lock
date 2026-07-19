@@ -864,6 +864,7 @@ name = "hyper-term-daemon"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "crossbeam-channel",
  "futures-util",
  "hyper-term-core",

@@ -39,6 +39,11 @@ mod client;
 mod editor_lsp;
 #[cfg(unix)]
 mod mcp_gateway;
+#[allow(
+    dead_code,
+    reason = "the managed proxy is wired into Direct Codex in the next containment slice"
+)]
+mod network_proxy;
 mod web_gateway;
 mod workspace_apply;
 mod workspace_diff;

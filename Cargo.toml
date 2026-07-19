@@ -18,6 +18,7 @@ version = "0.1.0"
 agent-client-protocol = "1.2.0"
 anyhow = "1.0"
 axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.22.1"
 crossbeam-channel = "0.5.15"
 futures-util = "0.3.31"
 libc = "0.2.186"
@@ -28,7 +29,7 @@ sha2 = "0.11.0"
 similar = "3.1.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-tokio = { version = "1.53.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1.24.0", features = ["serde", "v4", "v5"] }
 
 [profile.release]
