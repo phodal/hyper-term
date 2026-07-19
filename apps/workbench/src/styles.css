@@ -1316,6 +1316,37 @@ textarea:focus-visible {
   gap: 8px;
   padding: 7px 0;
 }
+.trace-entry.durable {
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  border-bottom: 1px solid #252b21;
+}
+.trace-entry.durable button {
+  height: 25px;
+  padding: 0 8px;
+  border: 1px solid #46543a;
+  border-radius: 6px;
+  background: #1b2118;
+  color: #aeb9a3;
+  cursor: pointer;
+  font: 700 8px ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+}
+.trace-entry.durable button:hover:not(:disabled) {
+  border-color: #71834e;
+  color: #d7ff72;
+}
+.trace-entry.durable button:disabled {
+  opacity: .48;
+  cursor: default;
+}
+.trace-history-error {
+  padding: 8px 10px;
+  border: 1px solid #74433d;
+  border-radius: 7px;
+  color: #ffaaa1;
+  font-size: 9px;
+}
 .trace-node {
   width: 7px;
   height: 7px;

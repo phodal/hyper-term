@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ArtifactDraftStatus } from "../artifact-draft-publisher.ts";
+import type {
+  ArtifactHistoryEntry,
+  ArtifactHistorySource,
+} from "../artifact-history-client.ts";
 import type { HyperTermHost } from "../host.ts";
 import type { AcceptedArtifact } from "../protocol.ts";
 import type { EditorLanguageService } from "../editor-language-service.ts";
@@ -84,6 +88,13 @@ export interface GenUiStudioProps {
   onDraftStateChange?: (changed: boolean) => void;
   publishStatus?: ArtifactDraftStatus | "idle";
   publishError?: string;
+  historyEntries?: ArtifactHistoryEntry[];
+  historyStatus?: "loading" | "ready" | "failed";
+  historyError?: string;
+  onLoadHistorySource?: (
+    entry: ArtifactHistoryEntry,
+    signal: AbortSignal,
+  ) => Promise<ArtifactHistorySource>;
 }
 
 export function GenUiStudio({
@@ -100,6 +111,10 @@ export function GenUiStudio({
   onDraftStateChange,
   publishStatus = "idle",
   publishError,
+  historyEntries = [],
+  historyStatus = "ready",
+  historyError,
+  onLoadHistorySource,
 }: GenUiStudioProps) {
   const [files, setFiles] = useState<Record<string, string>>(() => ({
     ...initialFiles,
@@ -121,7 +136,12 @@ export function GenUiStudio({
     "idle" | "checking" | "ready" | "failed"
   >(languageServiceForPath ? "idle" : "failed");
   const [trace, setTrace] = useState<TraceEntry[]>([]);
+  const [historyRestoreStatus, setHistoryRestoreStatus] = useState<
+    "idle" | "loading" | "failed"
+  >("idle");
+  const [historyRestoreError, setHistoryRestoreError] = useState<string>();
   const compiler = useRef<GenUiCompiler | null>(null);
+  const historyController = useRef<AbortController | null>(null);
   const filesRef = useRef(files);
   filesRef.current = files;
   const previewFrame = useRef<HTMLIFrameElement | null>(null);
@@ -140,6 +160,8 @@ export function GenUiStudio({
     compiler.current = new GenUiCompiler();
     return () => compiler.current?.dispose();
   }, []);
+
+  useEffect(() => () => historyController.current?.abort(), []);
 
   useEffect(() => {
     function receivePreviewEvent(event: MessageEvent) {
@@ -289,6 +311,52 @@ export function GenUiStudio({
   const publishBusy = publishStatus === "waiting_approval" ||
     publishStatus === "compiling";
 
+  const loadHistoryAsDraft = async (entry: ArtifactHistoryEntry) => {
+    if (!onLoadHistorySource || publishBusy) return;
+    historyController.current?.abort();
+    const controller = new AbortController();
+    historyController.current = controller;
+    setHistoryRestoreStatus("loading");
+    setHistoryRestoreError(undefined);
+    try {
+      const historical = await onLoadHistorySource(entry, controller.signal);
+      if (controller.signal.aborted) return;
+      const currentPaths = Object.keys(baselineFiles).sort();
+      const historicalPaths = Object.keys(historical.files).sort();
+      if (
+        historical.entrypoint !== entrypoint ||
+        currentPaths.length !== historicalPaths.length ||
+        currentPaths.some((path, index) => path !== historicalPaths[index])
+      ) {
+        throw new Error(
+          "This revision uses a different virtual file tree and cannot be restored into the current fixed-path draft.",
+        );
+      }
+      setFiles({ ...historical.files });
+      if (!(activePath in historical.files)) {
+        setActivePath(historical.entrypoint);
+      }
+      setHistoryRestoreStatus("idle");
+      setTrace((entries) =>
+        [{
+          revision: historical.source_revision,
+          label: "Historical source loaded as draft",
+          detail: `journal #${entry.event_sequence} · no effects replayed`,
+          state: "accepted" as const,
+        }, ...entries].slice(0, 8)
+      );
+      setView("diff");
+    } catch (historyError) {
+      if (controller.signal.aborted) return;
+      setHistoryRestoreStatus("failed");
+      setHistoryRestoreError(
+        historyError instanceof Error
+          ? historyError.message
+          : String(historyError),
+      );
+    }
+  };
+
   useEffect(() => {
     onDraftStateChange?.(draftChanged);
   }, [draftChanged, onDraftStateChange]);
@@ -389,7 +457,20 @@ export function GenUiStudio({
             readOnlyModified={publishBusy}
           />
         )}
-        {view === "trace" && <TraceTimeline entries={trace} />}
+        {view === "trace" && (
+          <TraceTimeline
+            entries={trace}
+            historyEntries={historyEntries}
+            historyStatus={historyStatus}
+            historyError={historyRestoreError ?? historyError}
+            historyRestoreStatus={historyRestoreStatus}
+            publishBusy={publishBusy}
+            draftChanged={draftChanged}
+            onLoadHistory={onLoadHistorySource
+              ? (entry) => void loadHistoryAsDraft(entry)
+              : undefined}
+          />
+        )}
       </div>
       {error
         ? <div className="compile-error" role="alert">{error}</div>
@@ -467,14 +548,74 @@ function publishDraftLabel(
   return "Publish draft";
 }
 
-function TraceTimeline({ entries }: { entries: TraceEntry[] }) {
+interface TraceTimelineProps {
+  entries: TraceEntry[];
+  historyEntries: ArtifactHistoryEntry[];
+  historyStatus: "loading" | "ready" | "failed";
+  historyError?: string;
+  historyRestoreStatus: "idle" | "loading" | "failed";
+  publishBusy: boolean;
+  draftChanged: boolean;
+  onLoadHistory?: (entry: ArtifactHistoryEntry) => void;
+}
+
+function TraceTimeline({
+  entries,
+  historyEntries,
+  historyStatus,
+  historyError,
+  historyRestoreStatus,
+  publishBusy,
+  draftChanged,
+  onLoadHistory,
+}: TraceTimelineProps) {
   return (
     <div className="trace-timeline">
       <div className="trace-note">
-        Semantic trace records revisions and accepted transitions. Replaying
-        this view does not repeat Shell, MCP, ACP, or Computer Use effects.
+        Rust journal revisions are replay-only. Loading one creates a local
+        draft and never repeats Shell, MCP, ACP, or Computer Use effects.
       </div>
-      {entries.length === 0 && (
+      {historyStatus === "loading" && (
+        <p className="dim">Loading durable Artifact history…</p>
+      )}
+      {historyError && (
+        <p className="trace-history-error" role="alert">{historyError}</p>
+      )}
+      {historyEntries.map((entry, index) => (
+        <div
+          className="trace-entry durable"
+          data-state="accepted"
+          key={entry.artifact.artifact_id}
+        >
+          <span className="trace-node" />
+          <div>
+            <strong>
+              source r{entry.artifact.source_revision}
+              {index === 0 ? " · Current" : " · Accepted"}
+            </strong>
+            <p>
+              journal #{entry.event_sequence} · {formatHistoryTime(
+                entry.recorded_at_ms,
+              )} · {entry.artifact.content_digest.slice(0, 10)}
+            </p>
+          </div>
+          {onLoadHistory && (
+            <button
+              type="button"
+              disabled={publishBusy || historyRestoreStatus === "loading" ||
+                index === 0 && !draftChanged}
+              title={index === 0
+                ? "Discard local edits and reload the current Rust revision"
+                : "Load this historical source as a local draft for Diff and preview"}
+              onClick={() => onLoadHistory(entry)}
+            >
+              {index === 0 ? "Reset draft" : "Load as draft"}
+            </button>
+          )}
+        </div>
+      ))}
+      {historyEntries.length === 0 && historyStatus === "ready" &&
+        entries.length === 0 && (
         <p className="dim">Compile once to create a trace.</p>
       )}
       {entries.map((entry, index) => (
@@ -492,4 +633,13 @@ function TraceTimeline({ entries }: { entries: TraceEntry[] }) {
       ))}
     </div>
   );
+}
+
+function formatHistoryTime(recordedAtMs: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(recordedAtMs));
 }

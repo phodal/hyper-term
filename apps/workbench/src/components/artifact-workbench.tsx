@@ -3,6 +3,11 @@ import {
   ArtifactDraftPublisher,
   type ArtifactDraftStatus,
 } from "../artifact-draft-publisher.ts";
+import {
+  ArtifactHistoryClient,
+  type ArtifactHistoryEntry,
+  type ArtifactHistorySource,
+} from "../artifact-history-client.ts";
 import { resolveHost } from "../host.ts";
 import { ArtifactLanguageService } from "../editor-language-service.ts";
 import {
@@ -25,6 +30,15 @@ type LoadState =
   | { kind: "failed"; message: string }
   | { kind: "ready"; source: ArtifactSourceResponse };
 
+type HistoryState =
+  | { kind: "loading" }
+  | { kind: "failed"; message: string }
+  | {
+    kind: "ready";
+    activeArtifactId: string;
+    entries: ArtifactHistoryEntry[];
+  };
+
 interface ArtifactContext {
   artifactId: string;
   sessionId: number;
@@ -35,6 +49,9 @@ export function ArtifactWorkbench() {
   const host = useMemo(resolveHost, []);
   const context = useMemo(readArtifactContext, []);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [historyState, setHistoryState] = useState<HistoryState>({
+    kind: "loading",
+  });
   const [publishStatus, setPublishStatus] = useState<
     ArtifactDraftStatus | "idle"
   >("idle");
@@ -90,6 +107,28 @@ export function ArtifactWorkbench() {
     return () => controller.abort();
   }, [context]);
 
+  useEffect(() => {
+    if (!context || state.kind !== "ready") return;
+    const controller = new AbortController();
+    const activeArtifactId = state.source.artifact_id;
+    setHistoryState({ kind: "loading" });
+    new ArtifactHistoryClient({
+      activeArtifactId,
+      sessionId: context.sessionId,
+      token: context.token,
+    }).list(controller.signal).then((entries) => {
+      if (controller.signal.aborted) return;
+      setHistoryState({ kind: "ready", activeArtifactId, entries });
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      setHistoryState({
+        kind: "failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return () => controller.abort();
+  }, [context, state]);
+
   useEffect(() => () => {
     publishController.current?.abort();
     applyController.current?.abort();
@@ -129,6 +168,22 @@ export function ArtifactWorkbench() {
       setPublishStatus("failed");
       setPublishError(error instanceof Error ? error.message : String(error));
     });
+  }, [context, state]);
+
+  const loadHistorySource = useCallback((
+    entry: ArtifactHistoryEntry,
+    signal: AbortSignal,
+  ): Promise<ArtifactHistorySource> => {
+    if (!context || state.kind !== "ready") {
+      return Promise.reject(
+        new Error("Artifact history context is unavailable."),
+      );
+    }
+    return new ArtifactHistoryClient({
+      activeArtifactId: state.source.artifact_id,
+      sessionId: context.sessionId,
+      token: context.token,
+    }).source(entry, signal);
   }, [context, state]);
 
   const applyWorkspace = useCallback(() => {
@@ -220,6 +275,18 @@ export function ArtifactWorkbench() {
               onDraftStateChange={setHasLocalDraft}
               publishStatus={publishStatus}
               publishError={publishError}
+              historyEntries={historyState.kind === "ready" &&
+                  historyState.activeArtifactId === state.source.artifact_id
+                ? historyState.entries
+                : []}
+              historyStatus={historyState.kind === "ready" &&
+                  historyState.activeArtifactId !== state.source.artifact_id
+                ? "loading"
+                : historyState.kind}
+              historyError={historyState.kind === "failed"
+                ? historyState.message
+                : undefined}
+              onLoadHistorySource={loadHistorySource}
             />
           </div>
           {reviewVisible && applyReview && (
