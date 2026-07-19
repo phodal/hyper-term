@@ -76,8 +76,11 @@ fi
 if [[ ! -x "$packaged_runtime/deno" \
   || ! -f "$packaged_runtime/genui-compiler.js" \
   || ! -f "$packaged_runtime/esbuild.wasm" \
-  || ! -f "$packaged_runtime/genui/preview.html" ]]; then
-  echo "assembled app is missing the brokered GenUI runtime" >&2
+  || ! -f "$packaged_runtime/genui/preview.html" \
+  || ! -f "$packaged_runtime/acp/manifest.json" \
+  || ! -f "$packaged_runtime/acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js" \
+  || ! -f "$packaged_runtime/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js" ]]; then
+  echo "assembled app is missing the brokered GenUI/ACP runtime" >&2
   exit 1
 fi
 

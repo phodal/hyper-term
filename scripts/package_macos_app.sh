@@ -105,8 +105,11 @@ fi
 if [[ ! -x "$hyper_staging_app/Contents/Resources/runtime/deno" \
   || ! -f "$hyper_staging_app/Contents/Resources/runtime/genui-compiler.js" \
   || ! -f "$hyper_staging_app/Contents/Resources/runtime/esbuild.wasm" \
-  || ! -f "$hyper_staging_app/Contents/Resources/runtime/genui/preview.html" ]]; then
-  echo "packaged brokered GenUI runtime is unavailable" >&2
+  || ! -f "$hyper_staging_app/Contents/Resources/runtime/genui/preview.html" \
+  || ! -f "$hyper_staging_app/Contents/Resources/runtime/acp/manifest.json" \
+  || ! -f "$hyper_staging_app/Contents/Resources/runtime/acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js" \
+  || ! -f "$hyper_staging_app/Contents/Resources/runtime/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js" ]]; then
+  echo "packaged brokered GenUI/ACP runtime is unavailable" >&2
   exit 1
 fi
 

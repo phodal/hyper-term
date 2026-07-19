@@ -270,6 +270,9 @@ jobs:
           test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/genui-compiler.js"
           test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/genui/preview.html"
           test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/esbuild.wasm"
+          test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/acp/manifest.json"
+          test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
+          test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
 
       - name: Select release signing mode
         shell: bash

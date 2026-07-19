@@ -1,0 +1,9 @@
+{
+  "name": "hyper-term-acp-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.59.0",
+    "@agentclientprotocol/codex-acp": "1.1.4"
+  }
+}
