@@ -152,8 +152,10 @@ set is enabled per release.
   registrations chosen explicitly from the Agent menu rather than inferred
   from terminal contents. Disabled menu entries retain the reason they cannot
   start; the Native layer never probes credentials or launches a provider.
-- ACP resolution is explicit path first, then a recognized installed package,
-  then the digest-inventoried bundled runtime. Codex accepts both
+- ACP resolution is explicit path first, then the digest-inventoried bundled
+  runtime, then a recognized installed package. This keeps automatic startup
+  on the adapter version tested with the desktop build while preserving exact
+  user overrides and source-checkout fallbacks. Codex accepts both
   `@zed-industries/codex-acp` and `@agentclientprotocol/codex-acp`; Claude
   accepts `@agentclientprotocol/claude-agent-acp`. Automatic discovery
   canonicalizes the executable and requires its bounded, non-symlinked

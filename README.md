@@ -42,9 +42,10 @@ task model without giving the UI direct command or filesystem authority.
   output.
 - **Codex, Claude, and Copilot adapters.** Hyper Term discovers locally
   installed provider CLIs and connects through provider-specific, supervised
-  adapters. Known installed Codex ACP packages from Zed or Agent Client
-  Protocol are preferred over the offline bundled fallback; package identity,
-  version, and executable entrypoint must agree. Provider binaries and
+  adapters. An explicit ACP path wins; automatic mode prefers the
+  digest-inventoried offline adapter bundled with Hyper Term, then falls back
+  to a recognized installed Zed or Agent Client Protocol package whose package
+  identity, version, and executable entrypoint agree. Provider binaries and
   credentials are never bundled.
 - **Generated UI artifacts.** Agents can propose React/TypeScript interfaces
   that are compiled by a pinned Deno runtime, content-addressed by Rust, and

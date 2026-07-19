@@ -364,28 +364,31 @@ impl Options {
             .or_else(|| std::env::var_os("HYPER_TERM_COPILOT_PATH").map(PathBuf::from))
             .or_else(|| find_executable("copilot", home));
         let bundled_acp = load_bundled_acp_runtime(&runtime_resources, &deno_executable)?;
-        let codex_acp = self
+        let explicit_codex_acp = self
             .codex_acp
             .or_else(|| std::env::var_os("HYPER_TERM_CODEX_ACP_PATH").map(PathBuf::from))
-            .map(ResolvedAcpAdapter::installed)
-            .or_else(|| discover_known_acp_adapter("codex-acp", home))
-            .or_else(|| {
-                codex
-                    .is_some()
-                    .then(|| bundled_acp.get("codex-acp").cloned())
-                    .flatten()
-            });
-        let claude_agent_acp = self
+            .map(ResolvedAcpAdapter::installed);
+        let bundled_codex_acp = codex
+            .is_some()
+            .then(|| bundled_acp.get("codex-acp").cloned())
+            .flatten();
+        let discovered_codex_acp = discover_known_acp_adapter("codex-acp", home);
+        let codex_acp =
+            select_acp_adapter(explicit_codex_acp, bundled_codex_acp, discovered_codex_acp);
+        let explicit_claude_acp = self
             .claude_agent_acp
             .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_AGENT_ACP_PATH").map(PathBuf::from))
-            .map(ResolvedAcpAdapter::installed)
-            .or_else(|| discover_known_acp_adapter("claude-agent-acp", home))
-            .or_else(|| {
-                claude
-                    .is_some()
-                    .then(|| bundled_acp.get("claude-acp").cloned())
-                    .flatten()
-            });
+            .map(ResolvedAcpAdapter::installed);
+        let bundled_claude_acp = claude
+            .is_some()
+            .then(|| bundled_acp.get("claude-acp").cloned())
+            .flatten();
+        let discovered_claude_acp = discover_known_acp_adapter("claude-agent-acp", home);
+        let claude_agent_acp = select_acp_adapter(
+            explicit_claude_acp,
+            bundled_claude_acp,
+            discovered_claude_acp,
+        );
         Ok(ResolvedOptions {
             ui: self
                 .ui
@@ -508,6 +511,19 @@ impl ResolvedAcpAdapter {
             implementation_version: implementation_version.into(),
         }
     }
+}
+
+fn select_acp_adapter(
+    explicit: Option<ResolvedAcpAdapter>,
+    bundled: Option<ResolvedAcpAdapter>,
+    discovered: Option<ResolvedAcpAdapter>,
+) -> Option<ResolvedAcpAdapter> {
+    // An explicit path is user authority. In automatic mode prefer the
+    // digest-inventoried adapter shipped with this build: it is tested against
+    // Hyper Term's ACP contract and delegates to the current provider CLI.
+    // A recognized global package remains a useful fallback when the complete
+    // runtime bundle is not present (for example in a source-only checkout).
+    explicit.or(bundled).or(discovered)
 }
 
 impl ResolvedOptions {
@@ -1544,6 +1560,29 @@ mod tests {
         )
         .expect("pretender manifest");
         assert!(resolve_known_acp_adapter(pretender, "codex-acp").is_none());
+    }
+
+    #[test]
+    fn automatic_acp_selection_prefers_the_verified_bundle_but_respects_explicit_paths() {
+        let discovered = ResolvedAcpAdapter::installed_version(
+            "/opt/homebrew/bin/codex-acp".into(),
+            "@zed-industries/codex-acp@0.15.0",
+        );
+        let bundled = ResolvedAcpAdapter {
+            executable: "/Applications/Hyper Term.app/Contents/Resources/runtime/deno".into(),
+            arguments: vec!["run".into(), "codex-acp.js".into()],
+            implementation_version: "1.1.4".into(),
+        };
+        let explicit = ResolvedAcpAdapter::installed("/tmp/explicit-codex-acp".into());
+
+        assert_eq!(
+            select_acp_adapter(None, Some(bundled.clone()), Some(discovered.clone())),
+            Some(bundled.clone())
+        );
+        assert_eq!(
+            select_acp_adapter(Some(explicit.clone()), Some(bundled), Some(discovered)),
+            Some(explicit)
+        );
     }
 
     #[test]
