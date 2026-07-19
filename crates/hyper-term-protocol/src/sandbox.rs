@@ -110,6 +110,8 @@ pub enum SandboxNetworkPolicy {
         proxy_url: String,
         #[serde(default)]
         allowed_hosts: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowed_unix_sockets: Vec<PathBuf>,
     },
 }
 
@@ -234,6 +236,24 @@ mod tests {
         assert_eq!(
             SandboxProfileDigest::parse("0".repeat(63)),
             Err(DigestError::InvalidSha256)
+        );
+    }
+
+    #[test]
+    fn legacy_proxy_policy_defaults_to_no_unix_socket_authority() {
+        let policy: SandboxNetworkPolicy = serde_json::from_value(serde_json::json!({
+            "mode": "proxy_only",
+            "proxy_url": "http://127.0.0.1:43128",
+            "allowed_hosts": ["api.openai.com"]
+        }))
+        .unwrap();
+        assert_eq!(
+            policy,
+            SandboxNetworkPolicy::ProxyOnly {
+                proxy_url: "http://127.0.0.1:43128".into(),
+                allowed_hosts: vec!["api.openai.com".into()],
+                allowed_unix_sockets: Vec::new(),
+            }
         );
     }
 }

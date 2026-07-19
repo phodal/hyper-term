@@ -108,6 +108,7 @@ pub fn canonicalize_sandbox_profile(
     if let hyper_term_protocol::SandboxNetworkPolicy::ProxyOnly {
         proxy_url,
         allowed_hosts,
+        allowed_unix_sockets,
     } = &mut canonical.network
     {
         if proxy_url.trim().is_empty() {
@@ -121,6 +122,12 @@ pub fn canonicalize_sandbox_profile(
         }
         allowed_hosts.sort();
         allowed_hosts.dedup();
+        *allowed_unix_sockets = allowed_unix_sockets
+            .iter()
+            .map(|path| normalize_absolute_path(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        allowed_unix_sockets.sort();
+        allowed_unix_sockets.dedup();
     }
 
     Ok(canonical)
@@ -486,6 +493,38 @@ mod tests {
         assert!(matches!(
             canonicalize_sandbox_profile(&profile),
             Err(SandboxError::AnyExecutableRequiresChildProcesses)
+        ));
+    }
+
+    #[test]
+    fn proxy_unix_sockets_are_absolute_deduplicated_authority_paths() {
+        let mut profile = profile(Vec::new());
+        profile.network = SandboxNetworkPolicy::ProxyOnly {
+            proxy_url: "http://127.0.0.1:43128".into(),
+            allowed_hosts: vec!["api.openai.com".into()],
+            allowed_unix_sockets: vec!["/tmp/hyperd.sock".into(), "/tmp/hyperd.sock".into()],
+        };
+        let canonical = canonicalize_sandbox_profile(&profile).unwrap();
+        let SandboxNetworkPolicy::ProxyOnly {
+            allowed_unix_sockets,
+            ..
+        } = canonical.network
+        else {
+            panic!("expected proxy-only policy");
+        };
+        assert_eq!(
+            allowed_unix_sockets,
+            vec![PathBuf::from("/tmp/hyperd.sock")]
+        );
+
+        profile.network = SandboxNetworkPolicy::ProxyOnly {
+            proxy_url: "http://127.0.0.1:43128".into(),
+            allowed_hosts: vec!["api.openai.com".into()],
+            allowed_unix_sockets: vec!["hyperd.sock".into()],
+        };
+        assert!(matches!(
+            canonicalize_sandbox_profile(&profile),
+            Err(SandboxError::RelativePath(_))
         ));
     }
 

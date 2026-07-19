@@ -172,6 +172,18 @@ fn resolve_profile_for_seatbelt(profile: &SandboxProfile) -> Result<SandboxProfi
     executables.sort();
     executables.dedup();
     profile.process.allowed_executables = executables;
+    if let SandboxNetworkPolicy::ProxyOnly {
+        allowed_unix_sockets,
+        ..
+    } = &mut profile.network
+    {
+        *allowed_unix_sockets = allowed_unix_sockets
+            .iter()
+            .map(|path| resolve_path_for_seatbelt(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        allowed_unix_sockets.sort();
+        allowed_unix_sockets.dedup();
+    }
     Ok(profile)
 }
 
@@ -318,6 +330,22 @@ fn compile_policy(
         ));
         policy.push_str(NETWORK_SUPPORT_POLICY);
     }
+    if let SandboxNetworkPolicy::ProxyOnly {
+        allowed_unix_sockets,
+        ..
+    } = &profile.network
+    {
+        if !allowed_unix_sockets.is_empty() {
+            policy.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
+        }
+        for (index, socket) in allowed_unix_sockets.iter().enumerate() {
+            let key = format!("UNIX_SOCKET_{index}");
+            definitions.insert(key.clone(), socket.clone());
+            policy.push_str(&format!(
+                "(allow network-outbound (remote unix-socket (subpath (param \"{key}\"))))\n"
+            ));
+        }
+    }
 
     policy.push_str("\n; canonical filesystem policy\n");
     for (index, rule) in profile.filesystem.rules.iter().enumerate() {
@@ -437,6 +465,7 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
     use std::process::{Command, Output};
 
     use hyper_term_protocol::{
@@ -619,10 +648,17 @@ mod tests {
         let allowed_port = allowed.local_addr().unwrap().port();
         let denied = TcpListener::bind("127.0.0.1:0").unwrap();
         let denied_port = denied.local_addr().unwrap().port();
+        let allowed_socket = fixture.scratch.join("broker.sock");
+        let denied_socket = fixture.scratch.join("other.sock");
+        let allowed_socket_listener = UnixListener::bind(&allowed_socket).unwrap();
+        let _denied_socket_listener = UnixListener::bind(&denied_socket).unwrap();
+        let resolved_allowed_socket = fs::canonicalize(&allowed_socket).unwrap();
+        let resolved_denied_socket = fs::canonicalize(&denied_socket).unwrap();
         let mut proxy_profile = fixture.profile();
         proxy_profile.network = SandboxNetworkPolicy::ProxyOnly {
             proxy_url: format!("http://127.0.0.1:{allowed_port}"),
             allowed_hosts: vec!["api.openai.com".into()],
+            allowed_unix_sockets: vec![allowed_socket.clone()],
         };
 
         let compiled = MacOsSeatbeltLauncher
@@ -642,10 +678,34 @@ mod tests {
                 .policy
                 .contains("(allow network-outbound)")
         );
-        assert_eq!(
-            compiled.launch_plan.compiled.profile.network,
-            proxy_profile.network
+        assert!(compiled.artifact.policy.contains(
+            "(allow network-outbound (remote unix-socket (subpath (param \"UNIX_SOCKET_0\"))))"
+        ));
+        assert!(
+            compiled
+                .artifact
+                .definitions
+                .values()
+                .any(|path| path == &resolved_allowed_socket)
         );
+        assert!(
+            !compiled
+                .artifact
+                .definitions
+                .values()
+                .any(|path| path == &resolved_denied_socket)
+        );
+        let SandboxNetworkPolicy::ProxyOnly {
+            proxy_url,
+            allowed_hosts,
+            allowed_unix_sockets,
+        } = &compiled.launch_plan.compiled.profile.network
+        else {
+            panic!("expected proxy-only profile");
+        };
+        assert_eq!(proxy_url, &format!("http://127.0.0.1:{allowed_port}"));
+        assert_eq!(allowed_hosts, &["api.openai.com"]);
+        assert_eq!(allowed_unix_sockets, &[resolved_allowed_socket]);
 
         let output = run(request(
             proxy_profile.clone(),
@@ -659,9 +719,46 @@ mod tests {
         );
 
         let output = run(request(
-            proxy_profile,
+            proxy_profile.clone(),
             "/usr/bin/nc -z 127.0.0.1 \"$1\"",
             vec![denied_port.to_string()],
+        ));
+        assert!(!output.status.success());
+
+        allowed_socket_listener.set_nonblocking(true).unwrap();
+        let accepted = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match allowed_socket_listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            panic!("sandboxed client did not reach the allowed broker socket");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("broker socket accept failed: {error}"),
+                }
+            }
+        });
+        let output = run(request(
+            proxy_profile.clone(),
+            "printf connected | /usr/bin/nc -U \"$1\"",
+            vec![allowed_socket.to_string_lossy().into_owned()],
+        ));
+        let _ = accepted.join().unwrap();
+        assert!(
+            output.status.success(),
+            "allowed broker socket failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = run(request(
+            proxy_profile,
+            "/usr/bin/nc -zU \"$1\"",
+            vec![denied_socket.to_string_lossy().into_owned()],
         ));
         assert!(!output.status.success());
     }
@@ -682,6 +779,7 @@ mod tests {
             invalid.network = SandboxNetworkPolicy::ProxyOnly {
                 proxy_url: proxy_url.into(),
                 allowed_hosts: vec!["api.openai.com".into()],
+                allowed_unix_sockets: Vec::new(),
             };
             assert!(
                 MacOsSeatbeltLauncher
@@ -695,6 +793,7 @@ mod tests {
         empty_allowlist.network = SandboxNetworkPolicy::ProxyOnly {
             proxy_url: "http://127.0.0.1:43128".into(),
             allowed_hosts: Vec::new(),
+            allowed_unix_sockets: Vec::new(),
         };
         assert!(
             MacOsSeatbeltLauncher
