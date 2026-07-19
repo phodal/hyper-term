@@ -35,6 +35,9 @@ use tokio::task::JoinHandle;
 
 use crate::DaemonState;
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
+use crate::workspace_apply::{
+    WorkspaceApplyError, WorkspaceApplyPlan, apply_workspace_plan, prepare_workspace_apply,
+};
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
 
 const MIN_TOKEN_BYTES: usize = 32;
@@ -154,6 +157,7 @@ struct AgentGatewayRuntime {
     editor_lsp: Option<Arc<EditorLspService>>,
     artifact_draft_compiler: Option<Arc<ArtifactDraftCompiler>>,
     artifact_drafts: Arc<Mutex<HashMap<OperationId, ArtifactDraftRecord>>>,
+    workspace_applies: Arc<Mutex<HashMap<OperationId, WorkspaceApplyRecord>>>,
 }
 
 struct ArtifactDraftCompiler {
@@ -179,6 +183,28 @@ enum ArtifactDraftState {
     Accepted(AcceptedGenUiArtifact),
     Rejected,
     Failed(String),
+}
+
+#[derive(Clone)]
+struct WorkspaceApplyRecord {
+    session_id: u16,
+    task_id: TaskId,
+    artifact_id: ArtifactId,
+    artifact_source_revision: u64,
+    source_path: String,
+    waiting_revision: u64,
+    plan: WorkspaceApplyPlan,
+    state: WorkspaceApplyState,
+}
+
+#[derive(Clone)]
+enum WorkspaceApplyState {
+    WaitingApproval,
+    Applying,
+    Applied,
+    Rejected,
+    Failed(String),
+    UnknownExecution(String),
 }
 
 struct AgentSession {
@@ -309,6 +335,47 @@ struct AgentArtifactDraftResponse {
 }
 
 #[derive(Deserialize)]
+struct AgentWorkspaceApplyRequest {
+    artifact_source_revision: u64,
+    source_path: String,
+    target_path: String,
+}
+
+#[derive(Deserialize)]
+struct AgentWorkspaceApplyStatusQuery {
+    token: Option<String>,
+    session_id: Option<u16>,
+    operation_id: Option<OperationId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceApplyStatus {
+    WaitingApproval,
+    Applying,
+    Applied,
+    Rejected,
+    Failed,
+    UnknownExecution,
+}
+
+#[derive(Serialize)]
+struct AgentWorkspaceApplyResponse {
+    operation_id: OperationId,
+    operation_revision: u64,
+    status: WorkspaceApplyStatus,
+    artifact_source_revision: u64,
+    source_path: String,
+    target_path: String,
+    base_digest: Option<String>,
+    proposed_digest: String,
+    before: String,
+    after: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct AgentPermissionRequest {
     operation_id: OperationId,
     expected_revision: u64,
@@ -416,6 +483,7 @@ pub async fn spawn_agent_gateway(
         editor_lsp,
         artifact_draft_compiler,
         artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
+        workspace_applies: Arc::new(Mutex::new(HashMap::new())),
     };
     let router = Router::new()
         .route(
@@ -438,6 +506,10 @@ pub async fn spawn_agent_gateway(
         .route(
             "/agent/artifact/{artifact_id}/draft",
             get(artifact_draft_status).post(propose_artifact_draft),
+        )
+        .route(
+            "/agent/artifact/{artifact_id}/workspace-apply",
+            get(workspace_apply_status).post(propose_workspace_apply),
         )
         .route(
             "/agent/artifact/{artifact_id}/lsp",
@@ -831,6 +903,109 @@ async fn artifact_draft_status(
     }
 }
 
+async fn propose_workspace_apply(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let request = match serde_json::from_slice::<AgentWorkspaceApplyRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return status_response(
+                StatusCode::BAD_REQUEST,
+                "Workspace apply request is invalid",
+            );
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.propose_workspace_apply(session_id, artifact_id, request)
+    })
+    .await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::ACCEPTED, &response),
+        Ok(Err(WorkspaceProposalError::SessionUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Ok(Err(WorkspaceProposalError::AcpRequired)) => status_response(
+            StatusCode::FORBIDDEN,
+            "Workspace apply is available only for ACP Agent artifacts",
+        ),
+        Ok(Err(WorkspaceProposalError::ArtifactUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
+        }
+        Ok(Err(WorkspaceProposalError::StaleRevision | WorkspaceProposalError::Busy)) => {
+            status_response(
+                StatusCode::CONFLICT,
+                "Workspace apply no longer matches the current revision",
+            )
+        }
+        Ok(Err(WorkspaceProposalError::NoChanges)) => status_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Workspace target already matches the artifact source",
+        ),
+        Ok(Err(WorkspaceProposalError::InvalidRequest | WorkspaceProposalError::UnsafeTarget)) => {
+            status_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Workspace target is not a bounded regular file path",
+            )
+        }
+        Ok(Err(WorkspaceProposalError::Daemon | WorkspaceProposalError::Lock)) | Err(_) => {
+            status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Workspace apply could not enter the permission broker",
+            )
+        }
+    }
+}
+
+async fn workspace_apply_status(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentWorkspaceApplyStatusQuery>,
+) -> Response {
+    let session_id = match authorize(
+        &runtime,
+        &AgentSessionQuery {
+            token: query.token,
+            session_id: query.session_id,
+            provider: None,
+        },
+    ) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let Some(operation_id) = query.operation_id else {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            "Workspace apply operation id is invalid",
+        );
+    };
+    match runtime.workspace_apply_status(session_id, artifact_id, operation_id) {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(
+            WorkspaceProposalError::SessionUnavailable
+            | WorkspaceProposalError::ArtifactUnavailable,
+        ) => status_response(StatusCode::NOT_FOUND, "Workspace apply is unavailable"),
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Workspace apply status could not be read",
+        ),
+    }
+}
+
 async fn start_turn(
     State(runtime): State<AgentGatewayRuntime>,
     Query(query): Query<AgentSessionQuery>,
@@ -970,6 +1145,25 @@ enum ArtifactDraftError {
     RuntimeUnavailable,
     Daemon,
     Lock,
+}
+
+#[derive(Debug)]
+enum WorkspaceProposalError {
+    SessionUnavailable,
+    AcpRequired,
+    ArtifactUnavailable,
+    StaleRevision,
+    InvalidRequest,
+    UnsafeTarget,
+    NoChanges,
+    Busy,
+    Daemon,
+    Lock,
+}
+
+enum WorkspaceExecutionError {
+    Failed(String),
+    UnknownExecution(String),
 }
 
 impl AgentGatewayRuntime {
@@ -1389,6 +1583,255 @@ impl AgentGatewayRuntime {
         }
     }
 
+    fn propose_workspace_apply(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        request: AgentWorkspaceApplyRequest,
+    ) -> Result<AgentWorkspaceApplyResponse, WorkspaceProposalError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| WorkspaceProposalError::SessionUnavailable)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(WorkspaceProposalError::AcpRequired);
+        }
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| WorkspaceProposalError::ArtifactUnavailable)?;
+        if request.artifact_source_revision != artifact.metadata.source_revision {
+            return Err(WorkspaceProposalError::StaleRevision);
+        }
+        let proposed_content = artifact
+            .source_files
+            .get(&request.source_path)
+            .cloned()
+            .ok_or(WorkspaceProposalError::InvalidRequest)?;
+        let plan = prepare_workspace_apply(
+            &self.config.workspace,
+            &request.target_path,
+            proposed_content,
+        )
+        .map_err(map_workspace_prepare_error)?;
+        let payload = serde_json::to_vec(&(
+            artifact_id,
+            request.artifact_source_revision,
+            &request.source_path,
+            &plan,
+        ))
+        .map_err(|_| WorkspaceProposalError::InvalidRequest)?;
+        let payload_digest = sha256_bytes(&payload);
+        let mut applies = self
+            .workspace_applies
+            .lock()
+            .map_err(|_| WorkspaceProposalError::Lock)?;
+        applies.retain(|_, record| {
+            record.session_id != session_id
+                || matches!(
+                    record.state,
+                    WorkspaceApplyState::WaitingApproval | WorkspaceApplyState::Applying
+                )
+        });
+        if applies.values().any(|record| {
+            record.session_id == session_id
+                && matches!(
+                    record.state,
+                    WorkspaceApplyState::WaitingApproval | WorkspaceApplyState::Applying
+                )
+        }) {
+            return Err(WorkspaceProposalError::Busy);
+        }
+        let operation = self
+            .config
+            .daemon
+            .propose_operation(
+                session.task_id,
+                OperationKind::FileEdit,
+                OperationAction::Opaque {
+                    kind: "hyper_term.workspace.apply".into(),
+                    payload_digest,
+                },
+                format!(
+                    "Apply {} from Artifact r{} to workspace {}",
+                    request.source_path, request.artifact_source_revision, plan.target_path
+                ),
+                RiskClass::WorkspaceWrite,
+                vec!["workspace_write".into(), "artifact_apply".into()],
+            )
+            .map_err(|_| WorkspaceProposalError::Daemon)?;
+        let record = WorkspaceApplyRecord {
+            session_id,
+            task_id: session.task_id,
+            artifact_id,
+            artifact_source_revision: request.artifact_source_revision,
+            source_path: request.source_path,
+            waiting_revision: operation.revision,
+            plan,
+            state: WorkspaceApplyState::WaitingApproval,
+        };
+        let response =
+            workspace_apply_response(operation.operation_id, operation.revision, &record);
+        applies.insert(operation.operation_id, record);
+        Ok(response)
+    }
+
+    fn workspace_apply_status(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        operation_id: OperationId,
+    ) -> Result<AgentWorkspaceApplyResponse, WorkspaceProposalError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| WorkspaceProposalError::SessionUnavailable)?;
+        let applies = self
+            .workspace_applies
+            .lock()
+            .map_err(|_| WorkspaceProposalError::Lock)?;
+        let record = applies
+            .get(&operation_id)
+            .filter(|record| {
+                record.session_id == session_id
+                    && record.task_id == session.task_id
+                    && record.artifact_id == artifact_id
+            })
+            .ok_or(WorkspaceProposalError::ArtifactUnavailable)?;
+        let revision = self
+            .config
+            .daemon
+            .operation(operation_id)
+            .map(|operation| operation.revision)
+            .unwrap_or(record.waiting_revision);
+        Ok(workspace_apply_response(operation_id, revision, record))
+    }
+
+    fn execute_workspace_apply(&self, operation_id: OperationId, authorized_revision: u64) {
+        let record = match self
+            .workspace_applies
+            .lock()
+            .ok()
+            .and_then(|applies| applies.get(&operation_id).cloned())
+        {
+            Some(record) => record,
+            None => return,
+        };
+        let dispatching = match self.config.daemon.begin_operation(
+            record.task_id,
+            operation_id,
+            authorized_revision,
+        ) {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.set_workspace_apply_failed(operation_id, &error.to_string());
+                return;
+            }
+        };
+        let result: Result<String, WorkspaceExecutionError> = (|| {
+            let current = self
+                .config
+                .daemon
+                .read_active_genui_artifact(record.task_id, record.artifact_id)
+                .map_err(|_| {
+                    WorkspaceExecutionError::Failed("artifact is no longer current".into())
+                })?;
+            if current.metadata.source_revision != record.artifact_source_revision {
+                return Err(WorkspaceExecutionError::Failed(
+                    "artifact source revision is no longer current".into(),
+                ));
+            }
+            let current_source =
+                current
+                    .source_files
+                    .get(&record.source_path)
+                    .ok_or_else(|| {
+                        WorkspaceExecutionError::Failed(
+                            "artifact source path is no longer current".into(),
+                        )
+                    })?;
+            if sha256_bytes(current_source.as_bytes()) != record.plan.proposed_digest {
+                return Err(WorkspaceExecutionError::Failed(
+                    "artifact source digest is no longer current".into(),
+                ));
+            }
+            apply_workspace_plan(&self.config.workspace, &record.plan).map_err(
+                |error| match error {
+                    WorkspaceApplyError::UnknownExecution(message) => {
+                        WorkspaceExecutionError::UnknownExecution(message)
+                    }
+                    error => WorkspaceExecutionError::Failed(error.to_string()),
+                },
+            )
+        })();
+        match result {
+            Ok(result_digest) => {
+                let completion = OperationCompletion {
+                    executor: "hyper-term-workspace-apply".into(),
+                    succeeded: true,
+                    outcome: Some(OperationOutcome::Succeeded),
+                    summary: format!("applied Artifact source to {}", record.plan.target_path),
+                    result_digest: Some(result_digest),
+                };
+                if let Err(error) = self.config.daemon.complete_operation(
+                    record.task_id,
+                    operation_id,
+                    dispatching.revision,
+                    completion,
+                ) {
+                    self.set_workspace_apply_unknown(operation_id, &error.to_string());
+                    return;
+                }
+                if let Ok(mut applies) = self.workspace_applies.lock()
+                    && let Some(record) = applies.get_mut(&operation_id)
+                {
+                    record.state = WorkspaceApplyState::Applied;
+                }
+            }
+            Err(error) => {
+                let (message, outcome) = match error {
+                    WorkspaceExecutionError::Failed(message) => (message, OperationOutcome::Failed),
+                    WorkspaceExecutionError::UnknownExecution(message) => {
+                        (message, OperationOutcome::UnknownExecution)
+                    }
+                };
+                let summary = bounded_error(&message);
+                let _ = self.config.daemon.complete_operation(
+                    record.task_id,
+                    operation_id,
+                    dispatching.revision,
+                    OperationCompletion {
+                        executor: "hyper-term-workspace-apply".into(),
+                        succeeded: false,
+                        outcome: Some(outcome),
+                        summary: summary.clone(),
+                        result_digest: None,
+                    },
+                );
+                if outcome == OperationOutcome::UnknownExecution {
+                    self.set_workspace_apply_unknown(operation_id, &summary);
+                } else {
+                    self.set_workspace_apply_failed(operation_id, &summary);
+                }
+            }
+        }
+    }
+
+    fn set_workspace_apply_failed(&self, operation_id: OperationId, message: &str) {
+        if let Ok(mut applies) = self.workspace_applies.lock()
+            && let Some(record) = applies.get_mut(&operation_id)
+        {
+            record.state = WorkspaceApplyState::Failed(bounded_error(message));
+        }
+    }
+
+    fn set_workspace_apply_unknown(&self, operation_id: OperationId, message: &str) {
+        if let Ok(mut applies) = self.workspace_applies.lock()
+            && let Some(record) = applies.get_mut(&operation_id)
+        {
+            record.state = WorkspaceApplyState::UnknownExecution(bounded_error(message));
+        }
+    }
+
     fn editor_lsp_query(
         &self,
         session_id: u16,
@@ -1507,17 +1950,24 @@ impl AgentGatewayRuntime {
             {
                 return Err(SessionError::StalePermission);
             }
-            if request.decision == PermissionDecision::AllowOnce
-                && !allowable_brokered_mcp_operation(&operation)
-            {
-                return Err(SessionError::UnsafeApproval);
-            }
             let draft = self
                 .artifact_drafts
                 .lock()
                 .map_err(|_| SessionError::Lock)?
                 .get(&request.operation_id)
                 .cloned();
+            let workspace_apply = self
+                .workspace_applies
+                .lock()
+                .map_err(|_| SessionError::Lock)?
+                .get(&request.operation_id)
+                .cloned();
+            if request.decision == PermissionDecision::AllowOnce
+                && workspace_apply.is_none()
+                && !allowable_brokered_mcp_operation(&operation)
+            {
+                return Err(SessionError::UnsafeApproval);
+            }
             if let Some(draft) = draft {
                 if draft.session_id != session_id
                     || draft.task_id != session.task_id
@@ -1561,6 +2011,67 @@ impl AgentGatewayRuntime {
                             self.set_artifact_draft_failed(
                                 request.operation_id,
                                 "Artifact draft worker could not start",
+                            );
+                            SessionError::Thread
+                        })?;
+                }
+                let status = session
+                    .progress
+                    .lock()
+                    .map_err(|_| SessionError::Lock)?
+                    .status;
+                return Ok(AgentTurnResponse { session_id, status });
+            }
+            if let Some(workspace_apply) = workspace_apply {
+                if workspace_apply.session_id != session_id
+                    || workspace_apply.task_id != session.task_id
+                    || workspace_apply.waiting_revision != request.expected_revision
+                    || !matches!(workspace_apply.state, WorkspaceApplyState::WaitingApproval)
+                    || operation.kind != OperationKind::FileEdit
+                    || operation.risk != RiskClass::WorkspaceWrite
+                    || !matches!(
+                        &operation.action,
+                        OperationAction::Opaque { kind, .. }
+                            if kind == "hyper_term.workspace.apply"
+                    )
+                {
+                    return Err(SessionError::StalePermission);
+                }
+                let decided = self
+                    .config
+                    .daemon
+                    .decide_permission(
+                        session.task_id,
+                        request.operation_id,
+                        request.expected_revision,
+                        request.decision,
+                    )
+                    .map_err(|_| SessionError::StalePermission)?;
+                {
+                    let mut applies = self
+                        .workspace_applies
+                        .lock()
+                        .map_err(|_| SessionError::Lock)?;
+                    let record = applies
+                        .get_mut(&request.operation_id)
+                        .ok_or(SessionError::StalePermission)?;
+                    record.state = if request.decision == PermissionDecision::AllowOnce {
+                        WorkspaceApplyState::Applying
+                    } else {
+                        WorkspaceApplyState::Rejected
+                    };
+                }
+                if request.decision == PermissionDecision::AllowOnce {
+                    let runtime = self.clone();
+                    std::thread::Builder::new()
+                        .name(format!("hyper-term-workspace-apply-{session_id}"))
+                        .spawn(move || {
+                            runtime.execute_workspace_apply(request.operation_id, decided.revision)
+                        })
+                        .map_err(|_| {
+                            self.set_workspace_apply_failed(
+                                request.operation_id,
+                                "Workspace apply worker could not start",
                             );
                             SessionError::Thread
                         })?;
@@ -1728,6 +2239,7 @@ impl AgentGatewayRuntime {
 
     fn close_session(&self, session_id: u16) {
         self.close_artifact_drafts(session_id);
+        self.close_workspace_applies(session_id);
         let session = self
             .sessions
             .lock()
@@ -1750,6 +2262,7 @@ impl AgentGatewayRuntime {
             .unwrap_or_default();
         for session_id in session_ids {
             self.close_artifact_drafts(session_id);
+            self.close_workspace_applies(session_id);
         }
         let sessions = if let Ok(mut sessions) = self.sessions.lock() {
             sessions.drain().map(|(_, session)| session).collect()
@@ -1793,6 +2306,34 @@ impl AgentGatewayRuntime {
         }
         if let Ok(mut drafts) = self.artifact_drafts.lock() {
             drafts.retain(|_, record| record.session_id != session_id);
+        }
+    }
+
+    fn close_workspace_applies(&self, session_id: u16) {
+        let waiting = self
+            .workspace_applies
+            .lock()
+            .map(|applies| {
+                applies
+                    .iter()
+                    .filter_map(|(operation_id, record)| {
+                        (record.session_id == session_id
+                            && matches!(record.state, WorkspaceApplyState::WaitingApproval))
+                        .then_some((*operation_id, record.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (operation_id, record) in waiting {
+            let _ = self.config.daemon.decide_permission(
+                record.task_id,
+                operation_id,
+                record.waiting_revision,
+                PermissionDecision::Cancelled,
+            );
+        }
+        if let Ok(mut applies) = self.workspace_applies.lock() {
+            applies.retain(|_, record| record.session_id != session_id);
         }
     }
 }
@@ -1961,6 +2502,50 @@ fn artifact_draft_response(
         operation_revision,
         status,
         artifact,
+        error,
+    }
+}
+
+fn map_workspace_prepare_error(error: WorkspaceApplyError) -> WorkspaceProposalError {
+    match error {
+        WorkspaceApplyError::NoChanges => WorkspaceProposalError::NoChanges,
+        WorkspaceApplyError::InvalidPath
+        | WorkspaceApplyError::ParentUnavailable
+        | WorkspaceApplyError::ParentChanged
+        | WorkspaceApplyError::UnsupportedTarget
+        | WorkspaceApplyError::TooLarge
+        | WorkspaceApplyError::StaleBase
+        | WorkspaceApplyError::UnknownExecution(_) => WorkspaceProposalError::UnsafeTarget,
+        WorkspaceApplyError::Io(_) => WorkspaceProposalError::Daemon,
+    }
+}
+
+fn workspace_apply_response(
+    operation_id: OperationId,
+    operation_revision: u64,
+    record: &WorkspaceApplyRecord,
+) -> AgentWorkspaceApplyResponse {
+    let (status, error) = match &record.state {
+        WorkspaceApplyState::WaitingApproval => (WorkspaceApplyStatus::WaitingApproval, None),
+        WorkspaceApplyState::Applying => (WorkspaceApplyStatus::Applying, None),
+        WorkspaceApplyState::Applied => (WorkspaceApplyStatus::Applied, None),
+        WorkspaceApplyState::Rejected => (WorkspaceApplyStatus::Rejected, None),
+        WorkspaceApplyState::Failed(error) => (WorkspaceApplyStatus::Failed, Some(error.clone())),
+        WorkspaceApplyState::UnknownExecution(error) => {
+            (WorkspaceApplyStatus::UnknownExecution, Some(error.clone()))
+        }
+    };
+    AgentWorkspaceApplyResponse {
+        operation_id,
+        operation_revision,
+        status,
+        artifact_source_revision: record.artifact_source_revision,
+        source_path: record.source_path.clone(),
+        target_path: record.plan.target_path.clone(),
+        base_digest: record.plan.base_digest().map(str::to_owned),
+        proposed_digest: record.plan.proposed_digest.clone(),
+        before: record.plan.base_content().to_owned(),
+        after: record.plan.proposed_content.clone(),
         error,
     }
 }
@@ -2769,6 +3354,203 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_artifact_workspace_apply_waits_for_exact_approval_before_writing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace_source = "export default function App(){return <main>Workspace</main>;}\n";
+        std::fs::write(workspace.join("App.tsx"), workspace_source).unwrap();
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
+        let fake_acp = temporary.path().join("fixture-acp");
+        std::fs::write(
+            &fake_acp,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"workspace-apply-session\"}}' ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_acp).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_acp, permissions).unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace: workspace.clone(),
+            state_directory: temporary.path().join("gateway-state"),
+            daemon: daemon.clone(),
+            codex_executable: None,
+            codex_auth_file: None,
+            acp_providers: vec![AcpAgentProviderConfig {
+                provider_id: "fixture-acp".into(),
+                executable: fake_acp,
+                arguments: Vec::new(),
+                environment: BTreeMap::new(),
+                implementation_version: "fixture-1".into(),
+            }],
+            mcp_executable: None,
+            genui_runtime: None,
+            workbench_assets: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .unwrap();
+        let session_path =
+            format!("/agent/session?token={token}&session_id=10&provider=fixture-acp");
+        let (status, body) = request_path(gateway.address(), &session_path, "POST", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id: TaskId = serde_json::from_value(session["task_id"].clone()).unwrap();
+
+        let seed = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.genui.compile".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                "Seed workspace apply fixture".into(),
+                RiskClass::ReadOnly,
+                vec!["artifact_build".into()],
+            )
+            .unwrap();
+        let seed = daemon
+            .decide_permission(
+                task_id,
+                seed.operation_id,
+                seed.revision,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap();
+        let seed = daemon
+            .begin_operation(task_id, seed.operation_id, seed.revision)
+            .unwrap();
+        let artifact_source = "export default function App(){return <main>AI Artifact</main>;}\n";
+        let bundle = "globalThis.workspaceApplyFixture=true;";
+        let accepted = daemon
+            .accept_genui_artifact(
+                task_id,
+                seed.operation_id,
+                seed.revision,
+                GenUiArtifactCandidate {
+                    schema_version: 1,
+                    source_revision: 3,
+                    entrypoint: "/App.tsx".into(),
+                    source_files: BTreeMap::from([("/App.tsx".into(), artifact_source.into())]),
+                    bundle: bundle.into(),
+                    css: String::new(),
+                    source_map: "{\"version\":3}".into(),
+                    content_digest: sha256_bytes(bundle.as_bytes()),
+                    compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                        name: "esbuild-wasm".into(),
+                        version: "0.28.1".into(),
+                    },
+                    diagnostics: Vec::new(),
+                },
+            )
+            .unwrap();
+        daemon
+            .complete_operation(
+                task_id,
+                seed.operation_id,
+                seed.revision,
+                OperationCompletion {
+                    executor: "fixture".into(),
+                    succeeded: true,
+                    outcome: Some(OperationOutcome::Succeeded),
+                    summary: "seeded workspace apply fixture".into(),
+                    result_digest: Some(accepted.content_digest.clone()),
+                },
+            )
+            .unwrap();
+
+        let apply_path = format!(
+            "/agent/artifact/{}/workspace-apply?token={token}&session_id=10",
+            accepted.artifact_id
+        );
+        let apply_request = serde_json::to_vec(&serde_json::json!({
+            "artifact_source_revision": 3,
+            "source_path": "/App.tsx",
+            "target_path": "App.tsx"
+        }))
+        .unwrap();
+        let (status, body) =
+            request_path(gateway.address(), &apply_path, "POST", &apply_request).await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
+        let proposal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(proposal["status"], "waiting_approval");
+        assert_eq!(proposal["before"], workspace_source);
+        assert_eq!(proposal["after"], artifact_source);
+        assert_eq!(proposal["base_digest"].as_str().map(str::len), Some(64));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
+            workspace_source
+        );
+        let operation_id: OperationId =
+            serde_json::from_value(proposal["operation_id"].clone()).unwrap();
+        let operation = daemon.operation(operation_id).unwrap();
+        assert_eq!(operation.kind, OperationKind::FileEdit);
+        assert_eq!(operation.risk, RiskClass::WorkspaceWrite);
+        assert!(matches!(
+            operation.action,
+            OperationAction::Opaque { ref kind, .. } if kind == "hyper_term.workspace.apply"
+        ));
+
+        let stale_approval = serde_json::to_vec(&serde_json::json!({
+            "operation_id": operation_id,
+            "expected_revision": proposal["operation_revision"].as_u64().unwrap() + 1,
+            "decision": "allow_once"
+        }))
+        .unwrap();
+        let permission_path = format!("/agent/session/permission?token={token}&session_id=10");
+        assert_eq!(
+            request_path(gateway.address(), &permission_path, "POST", &stale_approval,)
+                .await
+                .0,
+            StatusCode::CONFLICT.as_u16()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
+            workspace_source
+        );
+
+        let approval = serde_json::to_vec(&serde_json::json!({
+            "operation_id": operation_id,
+            "expected_revision": proposal["operation_revision"],
+            "decision": "allow_once"
+        }))
+        .unwrap();
+        assert_eq!(
+            request_path(gateway.address(), &permission_path, "POST", &approval)
+                .await
+                .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+        let status_path = format!(
+            "{apply_path}&operation_id={}",
+            proposal["operation_id"].as_str().unwrap()
+        );
+        let applied = loop {
+            let (status, body) = request_path(gateway.address(), &status_path, "GET", b"").await;
+            assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if response["status"] != "applying" {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
+            artifact_source
+        );
+        assert_eq!(
+            daemon.operation(operation_id).unwrap().state,
+            hyper_term_protocol::OperationState::Succeeded
+        );
+        gateway.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3757,6 +4539,7 @@ mod tests {
             editor_lsp: None,
             artifact_draft_compiler: None,
             artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
+            workspace_applies: Arc::new(Mutex::new(HashMap::new())),
         };
         let session_root = state_directory.join("agents/session-7");
         let config = runtime

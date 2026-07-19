@@ -39,6 +39,7 @@ mod editor_lsp;
 #[cfg(unix)]
 mod mcp_gateway;
 mod web_gateway;
+mod workspace_apply;
 mod workspace_snapshot;
 
 use artifact_store::{ArtifactStore, ArtifactStoreError, StoredGenUiArtifact};
