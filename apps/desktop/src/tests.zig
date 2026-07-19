@@ -300,8 +300,11 @@ test "Agent tabs stay single-pane until an ACP artifact enters editing" {
     try testing.expect(!model.hasAgentEditor());
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
+    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
     try testing.expectEqualStrings("zero://inline", panes[0].url);
+    try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
+    try testing.expectEqualStrings("zero://inline", panes[1].url);
+    try testing.expectEqualStrings(main.genui_view_label, panes[1].label);
 }
 
 test "accepted ACP artifact opens the authenticated Workbench panel" {
@@ -322,8 +325,11 @@ test "accepted ACP artifact opens the authenticated Workbench panel" {
     try testing.expect(!model.hasAgentEditor());
 
     var initial_panes: [2]main.HyperTermApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &initial_panes));
+    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &initial_panes));
     try testing.expectEqualStrings("zero://inline", initial_panes[0].url);
+    try testing.expectEqualStrings(main.terminal_view_label, initial_panes[0].label);
+    try testing.expectEqualStrings("zero://inline", initial_panes[1].url);
+    try testing.expectEqualStrings(main.genui_view_label, initial_panes[1].label);
 
     var initial_arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer initial_arena_state.deinit();
@@ -353,11 +359,13 @@ test "accepted ACP artifact opens the authenticated Workbench panel" {
     try testing.expectEqual(@as(usize, 0), model.agentBlocks().len);
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
-    try testing.expectEqualStrings(main.genui_view_label, panes[0].label);
-    try testing.expectEqualStrings(main.genui_view_anchor, panes[0].anchor.?);
-    try testing.expectEqualStrings(model.genUiWorkbenchUrl(), panes[0].url);
-    try testing.expectEqual(@as(u64, 7), panes[0].reload_token);
+    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
+    try testing.expectEqualStrings("zero://inline", panes[0].url);
+    try testing.expectEqualStrings(main.genui_view_label, panes[1].label);
+    try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
+    try testing.expectEqualStrings(model.genUiWorkbenchUrl(), panes[1].url);
+    try testing.expectEqual(@as(u64, 7), panes[1].reload_token);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -739,6 +747,13 @@ test "terminal web pane accepts only the authenticated fixed loopback shape" {
     try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
     try testing.expectEqualStrings(main.terminal_view_anchor, panes[0].anchor.?);
     try testing.expectEqualStrings(url ++ "&tab=1", panes[0].url);
+
+    var desktop_panes: [2]main.HyperTermApp.WebViewPane = undefined;
+    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &desktop_panes));
+    try testing.expectEqualStrings(main.terminal_view_label, desktop_panes[0].label);
+    try testing.expectEqualStrings(url ++ "&tab=1", desktop_panes[0].url);
+    try testing.expectEqualStrings(main.genui_view_label, desktop_panes[1].label);
+    try testing.expectEqualStrings("zero://inline", desktop_panes[1].url);
 
     model = main.initialModel();
     try testing.expectEqual(@as(usize, 0), main.terminalPanes(&model, &panes));

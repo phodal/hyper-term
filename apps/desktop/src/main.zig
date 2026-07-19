@@ -1696,9 +1696,18 @@ pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize
 }
 
 pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize {
-    var count = terminalPanes(model, out);
-    if (count == out.len) return count;
-    out[count] = if (model.hasAgentEditor()) .{
+    if (out.len == 0) return 0;
+    out[0] = if (model.isTerminal() and model.terminalReady()) .{
+        .label = terminal_view_label,
+        .anchor = terminal_view_anchor,
+        .url = model.terminalUrl(),
+    } else .{
+        .label = terminal_view_label,
+        .frame = geometry.RectF.init(0, 0, 1, 1),
+        .url = "zero://inline",
+    };
+    if (out.len == 1) return 1;
+    out[1] = if (model.hasAgentEditor()) .{
         .label = genui_view_label,
         .anchor = genui_view_anchor,
         .url = model.genUiWorkbenchUrl(),
@@ -1708,8 +1717,7 @@ pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize 
         .frame = geometry.RectF.init(0, 0, 1, 1),
         .url = "zero://inline",
     };
-    count += 1;
-    return count;
+    return 2;
 }
 
 fn refreshGenUiWorkbenchUrl(model: *Model) void {
