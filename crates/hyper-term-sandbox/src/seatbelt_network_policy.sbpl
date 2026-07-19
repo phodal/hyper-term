@@ -1,0 +1,28 @@
+; Derived from OpenAI Codex's Apache-2.0 seatbelt_network_policy.sbpl.
+; This platform-service baseline does not grant general network access. Hyper
+; Term injects one exact loopback proxy port before including this policy.
+; See THIRD_PARTY_NOTICES.md.
+
+; Safe AF_SYSTEM sockets used by local platform services.
+(allow system-socket
+  (require-all
+    (socket-domain AF_SYSTEM)
+    (socket-protocol 2)))
+
+(allow mach-lookup
+  ; User directory helpers.
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.system.opendirectoryd.membership")
+
+  ; TLS certificate and trust services. DNS is resolved by the Rust proxy.
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.networkd")
+  (global-name "com.apple.ocspd")
+  (global-name "com.apple.trustd.agent")
+
+  ; Read-only network configuration used by platform runtimes.
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.SystemConfiguration.configd"))
+
+(allow sysctl-read
+  (sysctl-name-regex #"^net.routetable"))

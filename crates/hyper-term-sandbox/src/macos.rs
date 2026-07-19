@@ -15,6 +15,7 @@ use hyper_term_protocol::{
 pub const MACOS_SEATBELT_EXECUTABLE: &str = "/usr/bin/sandbox-exec";
 
 const BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
+const NETWORK_SUPPORT_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeatbeltPolicyArtifact {
@@ -114,11 +115,7 @@ fn validate_supported_contract(profile: &SandboxProfile) -> Result<(), SandboxEr
             "Seatbelt implements native operation isolation, not isolated tasks",
         ));
     }
-    if !matches!(profile.network, SandboxNetworkPolicy::Offline) {
-        return Err(backend_error(
-            "Seatbelt proxy-only networking is not implemented",
-        ));
-    }
+    validate_network_policy(&profile.network)?;
     if !matches!(
         profile.lifetime,
         SandboxLifetime::OneOperation | SandboxLifetime::OneTask
@@ -314,6 +311,14 @@ fn compile_policy(
         policy.push_str("(allow process-fork)\n");
     }
 
+    if let Some(port) = proxy_loopback_port(&profile.network)? {
+        policy.push_str("\n; exact Rust-owned proxy endpoint\n");
+        policy.push_str(&format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
+        policy.push_str(NETWORK_SUPPORT_POLICY);
+    }
+
     policy.push_str("\n; canonical filesystem policy\n");
     for (index, rule) in profile.filesystem.rules.iter().enumerate() {
         let key = format!("PATH_{index}");
@@ -345,6 +350,53 @@ fn compile_policy(
         policy,
         definitions,
     })
+}
+
+fn validate_network_policy(network: &SandboxNetworkPolicy) -> Result<(), SandboxError> {
+    if let SandboxNetworkPolicy::ProxyOnly { allowed_hosts, .. } = network
+        && allowed_hosts.is_empty()
+    {
+        return Err(backend_error(
+            "Seatbelt proxy-only networking requires an explicit host allowlist",
+        ));
+    }
+    proxy_loopback_port(network).map(|_| ())
+}
+
+fn proxy_loopback_port(network: &SandboxNetworkPolicy) -> Result<Option<u16>, SandboxError> {
+    let SandboxNetworkPolicy::ProxyOnly { proxy_url, .. } = network else {
+        return Ok(None);
+    };
+    let Some(authority) = proxy_url.strip_prefix("http://") else {
+        return Err(backend_error(
+            "Seatbelt proxy-only networking requires an HTTP loopback endpoint",
+        ));
+    };
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.chars().any(char::is_whitespace)
+    {
+        return Err(backend_error(
+            "Seatbelt proxy endpoint must not contain credentials, paths, queries, or fragments",
+        ));
+    }
+    let Some((host, port)) = authority.split_once(':') else {
+        return Err(backend_error(
+            "Seatbelt proxy endpoint requires an explicit port",
+        ));
+    };
+    if host != "127.0.0.1" || port.contains(':') {
+        return Err(backend_error(
+            "Seatbelt proxy endpoint must use the IPv4 loopback address",
+        ));
+    }
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| backend_error("Seatbelt proxy endpoint has an invalid port"))?;
+    Ok(Some(port))
 }
 
 #[cfg(target_os = "macos")]
@@ -551,22 +603,102 @@ mod tests {
                 .is_err()
         );
 
-        let mut proxy = base.clone();
-        proxy.network = SandboxNetworkPolicy::ProxyOnly {
-            proxy_url: "http://127.0.0.1:3000".into(),
-            allowed_hosts: vec!["example.com".into()],
-        };
-        assert!(
-            MacOsSeatbeltLauncher
-                .compile(&request(proxy, "true", Vec::new()))
-                .is_err()
-        );
-
         let mut limited = base;
         limited.resources.wall_time_ms = Some(1_000);
         assert!(
             MacOsSeatbeltLauncher
                 .compile(&request(limited, "true", Vec::new()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn proxy_only_policy_allows_exactly_one_loopback_port() {
+        let fixture = Fixture::new();
+        let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let allowed_port = allowed.local_addr().unwrap().port();
+        let denied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let denied_port = denied.local_addr().unwrap().port();
+        let mut proxy_profile = fixture.profile();
+        proxy_profile.network = SandboxNetworkPolicy::ProxyOnly {
+            proxy_url: format!("http://127.0.0.1:{allowed_port}"),
+            allowed_hosts: vec!["api.openai.com".into()],
+        };
+
+        let compiled = MacOsSeatbeltLauncher
+            .compile_inspectable(&request(proxy_profile.clone(), "true", Vec::new()))
+            .unwrap();
+        assert!(compiled.artifact.policy.contains(&format!(
+            "(allow network-outbound (remote ip \"localhost:{allowed_port}\"))"
+        )));
+        assert!(!compiled.artifact.policy.contains(&format!(
+            "(allow network-outbound (remote ip \"localhost:{denied_port}\"))"
+        )));
+        assert!(!compiled.artifact.policy.contains("(remote ip \"*:53\")"));
+        assert!(!compiled.artifact.policy.contains("(allow network-inbound"));
+        assert!(
+            !compiled
+                .artifact
+                .policy
+                .contains("(allow network-outbound)")
+        );
+        assert_eq!(
+            compiled.launch_plan.compiled.profile.network,
+            proxy_profile.network
+        );
+
+        let output = run(request(
+            proxy_profile.clone(),
+            "/usr/bin/nc -z 127.0.0.1 \"$1\"",
+            vec![allowed_port.to_string()],
+        ));
+        assert!(
+            output.status.success(),
+            "allowed proxy port failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run(request(
+            proxy_profile,
+            "/usr/bin/nc -z 127.0.0.1 \"$1\"",
+            vec![denied_port.to_string()],
+        ));
+        assert!(!output.status.success());
+    }
+
+    #[test]
+    fn proxy_only_policy_rejects_ambiguous_or_credentialed_endpoints() {
+        let fixture = Fixture::new();
+        for proxy_url in [
+            "https://127.0.0.1:43128",
+            "http://localhost:43128",
+            "http://user:secret@127.0.0.1:43128",
+            "http://127.0.0.1",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:43128/path",
+            "http://127.0.0.1:43128?query",
+        ] {
+            let mut invalid = fixture.profile();
+            invalid.network = SandboxNetworkPolicy::ProxyOnly {
+                proxy_url: proxy_url.into(),
+                allowed_hosts: vec!["api.openai.com".into()],
+            };
+            assert!(
+                MacOsSeatbeltLauncher
+                    .compile(&request(invalid, "true", Vec::new()))
+                    .is_err(),
+                "accepted invalid proxy URL {proxy_url}"
+            );
+        }
+
+        let mut empty_allowlist = fixture.profile();
+        empty_allowlist.network = SandboxNetworkPolicy::ProxyOnly {
+            proxy_url: "http://127.0.0.1:43128".into(),
+            allowed_hosts: Vec::new(),
+        };
+        assert!(
+            MacOsSeatbeltLauncher
+                .compile(&request(empty_allowlist, "true", Vec::new()))
                 .is_err()
         );
     }
