@@ -70,28 +70,83 @@ task model without giving the UI direct command or filesystem authority.
 - **Native macOS shell.** The desktop application uses a Native SDK window with
   a fast ordinary Terminal surface and contextual Agent/editor panes.
 
-## How it works
+## Architecture
 
 ```mermaid
-flowchart LR
-    UI["Native macOS shell"] -->|typed intents| CORE["Rust control kernel"]
-    TERM["Terminal surface"] <-->|authenticated PTY stream| CORE
-    ACP["Codex / Claude / Copilot"] <-->|ACP and structured events| CORE
+flowchart TB
+    USER["User"]
 
-    CORE --> PTY["PTYs and process lifecycle"]
-    CORE --> STATE["Journal, blocks, and artifacts"]
-    CORE --> BROKER["Permission broker"]
-    CORE --> DENO["Supervised Deno sidecar"]
+    subgraph UI["Presentation — renders state and proposes intents"]
+        direction LR
+        SHELL["Native SDK macOS shell"]
+        TERMINAL["Terminal surface"]
+        AGENT["Agent blocks and approvals"]
+        WORKBENCH["Artifact Workbench"]
+        PREVIEW["Generated UI preview<br/>isolated and network-closed"]
 
-    DENO --> LSP["Artifact LSP"]
-    DENO --> GENUI["GenUI compiler"]
-    GENUI --> PREVIEW["Isolated preview"]
+        SHELL --> TERMINAL
+        SHELL --> AGENT
+        SHELL --> WORKBENCH
+        WORKBENCH -->|"accepted artifacts"| PREVIEW
+    end
+
+    subgraph RUST["Rust authority — authorizes, executes, and records"]
+        direction LR
+        DAEMON["hyper-term-daemon<br/>desktop supervisor and local gateways"]
+        CORE["hyper-term-core<br/>PTY sessions · operation ledger · journal · input lease"]
+        BROKER["Permission broker<br/>revision-bound approval and capability lease"]
+        ARTIFACTS["Artifact and workspace stores<br/>history · diff · transactional exact apply"]
+        PROTOCOL["hyper-term-protocol<br/>versioned blocks, domain, and wire contracts"]
+
+        DAEMON --> CORE
+        DAEMON --> BROKER
+        DAEMON --> ARTIFACTS
+        DAEMON --- PROTOCOL
+    end
+
+    subgraph SERVICES["Supervised adapters — bounded capabilities"]
+        direction LR
+        PTY["Normal login shell<br/>PTY process group"]
+        AGENT_PROCESS["Approved Agent command"]
+        PROVIDERS["hyper-term-drivers<br/>ACP · Codex · installed provider CLIs"]
+        MCP["Digest-pinned MCP tool server"]
+        DENO["Pinned Deno sidecars<br/>LSP · GenUI compiler"]
+        SANDBOX["hyper-term-sandbox<br/>Seatbelt policy and process-tree supervision"]
+    end
+
+    subgraph DATA["External data and effects"]
+        direction LR
+        WORKSPACE["Workspace files"]
+        PRIVATE["Private snapshots, cache, and scratch"]
+    end
+
+    USER --> SHELL
+
+    TERMINAL -->|"typed input · ordered output projection"| DAEMON
+    AGENT -->|"prompts · blocks · approval intents"| DAEMON
+    WORKBENCH -->|"draft · diff · publish · exact apply"| DAEMON
+
+    CORE -->|"normal PTY lifecycle"| PTY
+    CORE -->|"sandboxed PTY lifecycle"| AGENT_PROCESS
+    DAEMON -->|"structured ACP events"| PROVIDERS
+    DAEMON -->|"bounded tool IPC"| MCP
+    DAEMON -->|"bounded compiler and LSP IPC"| DENO
+    BROKER -->|"approved profile and one-use lease"| SANDBOX
+    SANDBOX -. "enforced launch plan" .-> AGENT_PROCESS
+    SANDBOX -. "enforced launch plan" .-> DENO
+
+    ARTIFACTS -->|"snapshot · diff · approved exact write"| WORKSPACE
+    MCP -->|"bounded snapshot queries"| PRIVATE
+    DENO -->|"read-only source · private writes"| PRIVATE
 ```
 
-The central rule is simple: **presentation proposes; Rust authorizes and
-executes**. `hyper-term-core` is renderer-independent, terminal output is
-always treated as untrusted data, and bulk PTY traffic does not cross a generic
-UI bridge.
+The central rule is: **presentation proposes; Rust authorizes, executes, and
+records**. The Native SDK shell and its WebView surfaces receive projections
+and submit typed intents, but they cannot spawn commands or select arbitrary
+files. Provider CLIs, MCP tools, and Deno sidecars remain supervised adapters;
+their output is a proposal or candidate until the Rust operation ledger accepts
+it. PTY bytes stay on a dedicated ordered stream, while generated previews see
+only accepted artifacts and no native capability bridge.
 
 ## Project status
 
