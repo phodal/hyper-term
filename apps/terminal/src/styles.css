@@ -23,6 +23,11 @@ body {
   background: #0d0f0b;
 }
 
+button,
+input {
+  font: inherit;
+}
+
 #terminal {
   padding: 8px 10px 10px;
 }
@@ -35,6 +40,71 @@ body {
   overscroll-behavior: contain;
   scrollbar-color: #46513a transparent;
   scrollbar-width: thin;
+}
+
+#terminal-search {
+  position: absolute;
+  z-index: 2;
+  top: 9px;
+  right: 12px;
+  display: grid;
+  grid-template-columns: auto minmax(130px, 240px) auto 27px 27px 27px;
+  align-items: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 4px 5px 4px 8px;
+  border: 1px solid #39432f;
+  border-radius: 6px;
+  background: rgb(18 21 15 / 97%);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 35%);
+  color: #89917e;
+  font: 600 11px/1.3 Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+#terminal-search[hidden] {
+  display: none;
+}
+
+#terminal-search input {
+  min-width: 0;
+  height: 25px;
+  padding: 0 7px;
+  border: 1px solid #3f4937;
+  border-radius: 4px;
+  outline: none;
+  background: #0d0f0b;
+  color: #e6e9dd;
+}
+
+#terminal-search input:focus-visible {
+  border-color: #a8d558;
+  box-shadow: 0 0 0 1px #a8d558;
+}
+
+#terminal-search output {
+  min-width: 62px;
+  color: #89917e;
+  text-align: right;
+  white-space: nowrap;
+}
+
+#terminal-search button {
+  width: 27px;
+  height: 25px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #b7bead;
+  cursor: pointer;
+}
+
+#terminal-search button:hover,
+#terminal-search button:focus-visible {
+  border-color: #46513a;
+  outline: none;
+  background: #242b1d;
+  color: #d7ff72;
 }
 
 #connection-status {
@@ -62,5 +132,25 @@ body {
 @media (prefers-reduced-motion: reduce) {
   #connection-status {
     transition: none;
+  }
+}
+
+@media (max-width: 560px) {
+  #terminal-search {
+    right: 8px;
+    left: 8px;
+    grid-template-columns: minmax(100px, 1fr) auto 27px 27px 27px;
+  }
+
+  #terminal-search label {
+    position: absolute;
+    overflow: hidden;
+    width: 1px;
+    height: 1px;
+    clip-path: inset(50%);
+  }
+
+  #terminal-search output {
+    min-width: 56px;
   }
 }

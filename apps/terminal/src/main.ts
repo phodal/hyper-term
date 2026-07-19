@@ -1,4 +1,5 @@
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import {
@@ -15,6 +16,13 @@ import {
   TerminalConnectionState,
   terminalSessionId,
 } from "./connection-state.ts";
+import {
+  nextTerminalFontSize,
+  parseTerminalFontSize,
+  TERMINAL_FONT_SIZE_STORAGE_KEY,
+  type TerminalShortcut,
+  terminalShortcut,
+} from "./terminal-preferences.ts";
 import "./styles.css";
 
 const attachmentStorageKey = terminalAttachmentStorageKey(
@@ -23,6 +31,17 @@ const attachmentStorageKey = terminalAttachmentStorageKey(
 const sessionId = terminalSessionId(globalThis.location.href);
 const terminalElement = requiredElement("#terminal");
 const statusElement = requiredElement("#connection-status");
+const searchForm = requiredElement<HTMLFormElement>("#terminal-search");
+const searchInput = requiredElement<HTMLInputElement>("#terminal-search-input");
+const searchResults = requiredElement<HTMLOutputElement>(
+  "#terminal-search-results",
+);
+const searchPrevious = requiredElement<HTMLButtonElement>(
+  "#terminal-search-previous",
+);
+const searchClose = requiredElement<HTMLButtonElement>(
+  "#terminal-search-close",
+);
 
 const terminal = new Terminal({
   allowProposedApi: false,
@@ -34,7 +53,7 @@ const terminal = new Terminal({
   drawBoldTextInBrightColors: true,
   fontFamily:
     "SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, monospace",
-  fontSize: 13,
+  fontSize: readFontSize(),
   fontWeight: "400",
   fontWeightBold: "600",
   letterSpacing: 0,
@@ -70,7 +89,9 @@ const terminal = new Terminal({
   },
 });
 const fit = new FitAddon();
+const search = new SearchAddon();
 terminal.loadAddon(fit);
+terminal.loadAddon(search);
 terminal.open(terminalElement);
 fitTerminal();
 terminal.focus();
@@ -80,7 +101,28 @@ let reconnectTimer: number | null = null;
 let reconnectAttempt = 0;
 let afterSequence = 0n;
 let attachmentId = readAttachmentId();
+let transientStatusTimer: number | null = null;
 const connectionState = new TerminalConnectionState();
+
+searchInput.addEventListener("input", () => findNext(true));
+searchForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  findNext(false);
+});
+searchPrevious.addEventListener("click", () => findPrevious());
+searchClose.addEventListener("click", closeSearch);
+searchInput.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeSearch();
+  } else if (event.key === "Enter" && event.shiftKey) {
+    event.preventDefault();
+    findPrevious();
+  }
+});
+document.addEventListener("keydown", handleApplicationShortcut, {
+  capture: true,
+});
 
 terminal.onData((data) => sendInput(new TextEncoder().encode(data)));
 terminal.onBinary((data) => {
@@ -271,6 +313,93 @@ function setStatus(message: string, visible: boolean): void {
   statusElement.toggleAttribute("data-visible", visible);
 }
 
+function handleApplicationShortcut(event: KeyboardEvent): void {
+  const shortcut = terminalShortcut(event);
+  if (!shortcut) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (shortcut === "find") {
+    openSearch();
+  } else {
+    applyZoom(shortcut);
+  }
+}
+
+function openSearch(): void {
+  searchForm.hidden = false;
+  const selection = terminal.getSelection().replaceAll("\n", " ").trim();
+  if (selection.length > 0 && selection.length <= 512) {
+    searchInput.value = selection;
+    findNext(true);
+  }
+  searchInput.focus();
+  searchInput.select();
+}
+
+function closeSearch(): void {
+  searchForm.hidden = true;
+  search.clearDecorations();
+  searchResults.value = "";
+  terminal.focus();
+}
+
+function findNext(incremental: boolean): void {
+  const query = searchInput.value;
+  if (query.length === 0) {
+    search.clearDecorations();
+    searchResults.value = "";
+    return;
+  }
+  const found = search.findNext(query, {
+    caseSensitive: false,
+    incremental,
+  });
+  searchResults.value = found ? "Match" : "No results";
+}
+
+function findPrevious(): void {
+  if (searchInput.value.length === 0) return;
+  const found = search.findPrevious(searchInput.value, {
+    caseSensitive: false,
+  });
+  searchResults.value = found ? "Match" : "No results";
+}
+
+function applyZoom(
+  shortcut: Extract<TerminalShortcut, "zoom_in" | "zoom_out" | "zoom_reset">,
+): void {
+  const fontSize = nextTerminalFontSize(
+    terminal.options.fontSize ?? readFontSize(),
+    shortcut,
+  );
+  terminal.options.fontSize = fontSize;
+  writeFontSize(fontSize);
+  globalThis.requestAnimationFrame(() => {
+    fitTerminal();
+    if (connectionState.canSend(socket?.readyState === WebSocket.OPEN)) {
+      sendControl({
+        type: "resize",
+        generation: connectionState.takeResizeGeneration(),
+        size: terminalSize(),
+      });
+    }
+  });
+  showTransientStatus(`Font ${fontSize} px`);
+}
+
+function showTransientStatus(message: string): void {
+  if (transientStatusTimer !== null) {
+    globalThis.clearTimeout(transientStatusTimer);
+  }
+  setStatus(message, true);
+  transientStatusTimer = globalThis.setTimeout(() => {
+    transientStatusTimer = null;
+    if (connectionState.canSend(socket?.readyState === WebSocket.OPEN)) {
+      setStatus("Connected", false);
+    }
+  }, 1_200);
+}
+
 function fitTerminal(): void {
   try {
     fit.fit();
@@ -299,12 +428,35 @@ function writeAttachmentId(value: string): void {
   }
 }
 
+function readFontSize(): number {
+  try {
+    return parseTerminalFontSize(
+      globalThis.localStorage.getItem(TERMINAL_FONT_SIZE_STORAGE_KEY),
+    );
+  } catch {
+    return parseTerminalFontSize(null);
+  }
+}
+
+function writeFontSize(value: number): void {
+  try {
+    globalThis.localStorage.setItem(
+      TERMINAL_FONT_SIZE_STORAGE_KEY,
+      String(value),
+    );
+  } catch {
+    // Zoom remains active for the lifetime of this terminal renderer.
+  }
+}
+
 function safeNumber(value: bigint): number {
   return Number(value > BigInt(Number.MAX_SAFE_INTEGER) ? 0n : value);
 }
 
-function requiredElement(selector: string): HTMLElement {
-  const element = document.querySelector<HTMLElement>(selector);
+function requiredElement<Element extends HTMLElement = HTMLElement>(
+  selector: string,
+): Element {
+  const element = document.querySelector<Element>(selector);
   if (!element) throw new Error(`terminal document is missing ${selector}`);
   return element;
 }
