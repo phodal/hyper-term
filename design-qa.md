@@ -59,10 +59,16 @@ ACP-provided `skills` command.
 
 ## Findings and fixes
 
-- P1 fixed: Debug builds enabled whole-document runtime markup reload, which
-  bypassed the Zig `rootView` composition seam and left the builder-owned Agent
-  timeline blank. Runtime markup reload is now disabled until Native SDK offers
-  fragment composition; Debug and Release builds render the same Agent tree.
+- P1 fixed: whole-document runtime markup reload bypassed the Zig `rootView`
+  composition seam and left the builder-owned Agent timeline blank. Hyper Term
+  now registers the compiled shell with Native SDK `fragment_watch`: saved
+  `.native` edits reload in place and still pass through the same Agent Block
+  composition used by Release builds.
+- Live reload proof: with an ACP fixture showing `Ran 2 commands` and
+  `Goal · Verify repository state · 1 / 2`, changing the running Debug app's
+  title to `Hyper Term Live` appeared without restart while both Agent elements
+  remained present and `markup_watch=armed`; restoring the source removed the
+  temporary title and retained the same Agent tree.
 - No remaining P1 or P2 layout, clipping, interaction, or accessibility issue
   was found in the validated states.
 

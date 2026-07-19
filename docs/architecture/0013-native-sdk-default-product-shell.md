@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-18
-- Amended: 2026-07-19 (explicit tabs and isolated Agentic UI pane)
+- Amended: 2026-07-20 (hybrid fragment hot reload)
 - Supersedes the product-shell decision in:
   [ADR 0012](0012-native-sdk-renderer-spike.md)
 - Depends on: [ADR 0002](0002-runtime-authority-boundaries.md),
@@ -121,11 +121,17 @@ proved the Agent tab and workspace were removed while `zsh 1` became selected.
 Agent mode also owns a second system WebView for the current accepted Agentic UI
 artifact. The compositor derives its URL from a validated isolated Artifact
 Block, uses the artifact source revision as a reload token, and collapses it to
-1-by-1 when inactive or absent. Native strict checks, 20 renderer tests,
+1-by-1 when inactive or absent. Native strict checks, 33 renderer tests,
 minimum-window and text-expansion layout sweeps, semantic snapshots, and a Metal
 canvas screenshot pass. Native automation cannot capture a child system
 WebView, so authenticated HTTP tests and browser verification separately prove
 the compiled React preview capsule.
+
+Debug authoring uses Native SDK's hybrid fragment watcher rather than its
+whole-document runtime root. `src/app.native` remains a compiled fragment
+embedded by the Zig `rootView`; saved edits reload that fragment in place and
+then pass through the same builder-owned Agent Block composition seam. Release
+builds retain only the ahead-of-time compiled document and no source watcher.
 
 ## Rejected alternatives
 

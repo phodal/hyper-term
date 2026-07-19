@@ -7,6 +7,7 @@
 //! has no JavaScript bridge and never spawns a shell.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 
@@ -826,10 +827,10 @@ pub const Msg = union(enum) {
     pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_config_updated", "agent_permission_decided", "agent_poll", "system_appearance", "chrome_changed" };
 };
 
-// Runtime markup currently replaces the Zig `rootView` instead of composing
-// through it. Keep it disabled until Native SDK exposes fragment hot reload;
-// otherwise Debug builds silently drop the builder-owned Agent timeline.
-const dev_markup_reload = false;
+// Debug watches compiled markup as a fragment instead of installing it as the
+// runtime root. That keeps `rootView` authoritative for Zig-owned Agent Block
+// composition while preserving edit-save-refresh authoring for app.native.
+const dev_markup_reload = builtin.mode == .Debug;
 pub const HyperTermApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = dev_markup_reload });
 pub const Effects = HyperTermApp.Effects;
 
@@ -2350,6 +2351,9 @@ pub fn preferredUiFontPath(configured: ?[]const u8) []const u8 {
 pub const HyperTermUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
 pub const CompiledHyperTermView = canvas.CompiledMarkupView(Model, Msg, app_markup);
+pub const hyper_term_fragments = [_]canvas.MarkupFragment{
+    CompiledHyperTermView.fragment("src/app.native"),
+};
 const AgentMarkdown = native_sdk.markdown.Markdown(Msg);
 
 const agent_timeline_id = "agent-blocks";
@@ -2893,8 +2897,12 @@ pub fn main(init: std.process.Init) !void {
         .on_chrome = onChrome,
         .view = rootView,
         .web_panes = desktopPanes,
-        .markup = if (dev_markup_reload)
-            .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io }
+        // Whole-document `.markup` would replace `rootView` after the first
+        // edit. A watched fragment reloads the compiled shell in place, then
+        // still passes it through the Agent timeline composition seam.
+        .markup = null,
+        .fragment_watch = if (dev_markup_reload)
+            .{ .fragments = &hyper_term_fragments, .io = init.io }
         else
             null,
     });

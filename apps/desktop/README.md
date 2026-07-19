@@ -76,6 +76,8 @@ npx -y @native-sdk/cli@0.5.3 dev
 npx -y @native-sdk/cli@0.5.3 build --release=fast
 ```
 
-Debug builds hot-reload `src/app.native` while retaining the Zig model. Release
-builds compile the same markup ahead of time. Generated `.native/`, Zig cache,
-and build output stay untracked.
+Debug builds register `src/app.native` as a watched compiled fragment. A saved
+edit is parsed at runtime, but the refreshed fragment still passes through the
+Zig `rootView` that composes the Agent Block timeline. Release builds compile
+the same markup ahead of time and carry no source path or watcher. Generated
+`.native/`, Zig cache, and build output stay untracked.
