@@ -301,6 +301,41 @@ test "Agent NDJSON stream applies message patches and state without polling" {
     try testing.expectEqualStrings("Streaming", model.agentBlocks()[0].content());
 }
 
+test "Agent NDJSON stream appends a reasoning activity without rebuilding the transcript" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_stream_session_id = 2;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"running","document":{"revision":4,"blocks":[{"block_id":"00000000-0000-4000-8000-000000000042","kind":"message","payload":{"type":"message","role":"thought","text":"Inspecting"}}]}}
+        ,
+    } }, &fx);
+    try testing.expect(model.agentBlocks()[0].isActivity());
+    try testing.expectEqualStrings("Processed", model.agentBlocks()[0].activityTitle());
+    const before = fx.pendingFetchCount();
+
+    main.update(&model, .{ .agent_stream_line = .{
+        .key = main.agent_stream_effect_key_base + 2,
+        .line =
+        \\{"type":"patch","status":"running","patch":{"stream_sequence":5,"base_revision":4,"target_revision":5,"operations":[{"type":"append_content","block_id":"00000000-0000-4000-8000-000000000042","expected_previous_revision":1,"block_revision":2,"text":" workspace"}]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqualStrings("Inspecting workspace", model.agentBlocks()[0].content());
+    try testing.expectEqual(@as(u64, 5), model.agent_document_revision);
+    try testing.expectEqual(before, fx.pendingFetchCount());
+}
+
 test "Agent patch revision gaps request one bounded snapshot resync" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
@@ -728,6 +763,7 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
         \\{"status":"completed","error":null,"document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000031","kind":"message","payload":{"type":"message","role":"agent","text":"Warning: Skill descriptions were shortened to fit the budget.\n\nHi! What are we working on today?"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000030","kind":"message","payload":{"type":"message","role":"agent","text":"Model metadata for gpt-5.6-sol is unavailable"}},
+        \\  {"block_id":"00000000-0000-4000-8000-000000000035","kind":"message","payload":{"type":"message","role":"thought","text":"Inspecting the workspace before editing."}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000032","kind":"agent_tool_call","payload":{"type":"agent_tool_call","turn_id":"turn-1","call":{"tool_call_id":"edit-1","title":"Edit src/lib.rs","kind":"edit","status":"completed","locations":[{"path":"/workspace/src/lib.rs","line":7}],"content":[{"type":"diff","path":"/workspace/src/lib.rs","patch":"--- a/src/lib.rs\n+++ b/src/lib.rs\n-old\n+new\n","added_lines":1,"removed_lines":1},{"type":"terminal","terminal_id":"terminal-7"}],"raw_input":null,"raw_output":"{\"ok\":true}"}}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000034","kind":"agent_tool_call","payload":{"type":"agent_tool_call","turn_id":"turn-1","call":{"tool_call_id":"exec-1","title":"sed -n '1,240p' Cargo.toml && rg -n '^name' --glob Cargo.toml .","kind":"execute","status":"completed","locations":[],"content":[{"type":"terminal","terminal_id":"terminal-9"}],"raw_input":"{\"command\":\"sed Cargo.toml\"}","raw_output":null}}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000033","kind":"agent_plan","payload":{"type":"agent_plan","turn_id":"turn-1","entries":[{"content":"Inspect the workspace","priority":"high","status":"completed"},{"content":"Verify the edit","priority":"medium","status":"in_progress"}]}}
@@ -738,7 +774,7 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expectEqual(@as(usize, 2), model.agentBlocks().len);
     try testing.expectEqualStrings("Hi! What are we working on today?", model.agentBlocks()[0].content());
     try testing.expect(model.agentBlocks()[1].isActivity());
-    try testing.expectEqualStrings("Used 2 tools", model.agentBlocks()[1].activityTitle());
+    try testing.expectEqualStrings("Processed", model.agentBlocks()[1].activityTitle());
     try testing.expectEqualStrings("completed · 2 tools · 1 file · +1 −1", model.agentBlocks()[1].activityMeta());
     try testing.expect(!model.agentBlocks()[1].expanded);
     const plan = model.agentPlan().?;
@@ -752,9 +788,9 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(!containsText(tree.root, "Skill descriptions were shortened"));
     try testing.expect(!containsText(tree.root, "Model metadata for"));
     try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
-    try testing.expect(containsText(tree.root, "Used 2 tools"));
+    try testing.expect(containsText(tree.root, "Processed"));
     try testing.expect(containsText(tree.root, "Goal · Verify the edit · 1 / 2"));
-    try testing.expect(!findByText(tree.root, .accordion, "Used 2 tools").?.state.selected);
+    try testing.expect(!findByText(tree.root, .accordion, "Processed").?.state.selected);
     try testing.expect(!findByText(tree.root, .accordion, "Goal · Verify the edit · 1 / 2").?.state.selected);
 
     main.update(&model, .{ .toggle_agent_block = plan.id }, &fx);
@@ -767,7 +803,8 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(findByText(tree.root, .accordion, "Used 2 tools").?.state.selected);
+    try testing.expect(findByText(tree.root, .accordion, "Processed").?.state.selected);
+    try testing.expect(containsText(tree.root, "Inspecting the workspace before editing."));
     try testing.expect(containsText(tree.root, "Edit src/lib.rs"));
     try testing.expect(containsText(tree.root, "Run shell command"));
     try testing.expect(containsText(tree.root, "/workspace/src/lib.rs"));

@@ -217,6 +217,7 @@ pub const AgentBlockView = struct {
     expanded: bool = false,
     tool_status: AgentToolStatus = .pending,
     activity_count: u16 = 0,
+    has_reasoning: bool = false,
     execute_count: u16 = 0,
     read_count: u16 = 0,
     edit_count: u16 = 0,
@@ -1599,17 +1600,17 @@ fn applyAgentPatch(model: *Model, session_id: u8, patch: AgentPatchWire, fx: *Ef
             requestAgentPatchResync(model, session_id, patch.target_revision, fx);
             return;
         }
-        const block = findAgentMessageBlock(model, operation.block_id.?) orelse {
+        const block = findAgentAppendTarget(model, operation.block_id.?) orelse {
             requestAgentPatchResync(model, session_id, patch.target_revision, fx);
             return;
         };
-        if (block.role != .agent) {
+        if (block.role != .agent and block.role != .thought) {
             requestAgentPatchResync(model, session_id, patch.target_revision, fx);
             return;
         }
     }
     for (patch.operations) |operation| {
-        const block = findAgentMessageBlock(model, operation.block_id.?).?;
+        const block = findAgentAppendTarget(model, operation.block_id.?).?;
         appendAgentBlockContent(block, operation.text.?);
     }
     model.agent_document_revision = patch.target_revision;
@@ -1621,10 +1622,12 @@ fn requestAgentPatchResync(model: *Model, session_id: u8, target_revision: u64, 
     requestAgentSnapshot(model, session_id, fx);
 }
 
-fn findAgentMessageBlock(model: *Model, block_id: []const u8) ?*AgentBlockView {
+fn findAgentAppendTarget(model: *Model, block_id: []const u8) ?*AgentBlockView {
     const projected_id = stableAgentBlockId(block_id, 0);
     for (model.agent_blocks[0..model.agent_block_count]) |*block| {
-        if (block.id == projected_id and block.kind == .message) return block;
+        if (block.id != projected_id) continue;
+        if (block.kind == .message or
+            (block.kind == .tool_call and block.has_reasoning and block.activity_count == 0)) return block;
     }
     return null;
 }
@@ -1782,13 +1785,13 @@ fn appendCapabilityText(destination: []u8, length: *usize, value: []const u8) vo
     length.* += bounded_length;
 }
 
-const AgentProjectionGroup = enum { none, tool_calls, reasoning, single };
+const AgentProjectionGroup = enum { none, activity, single };
 
 fn agentProjectionGroup(block: AgentBlockWire) AgentProjectionGroup {
     if (!renderableAgentBlock(block) or std.mem.eql(u8, block.kind, "agent_plan")) return .none;
-    if (std.mem.eql(u8, block.kind, "agent_tool_call")) return .tool_calls;
+    if (std.mem.eql(u8, block.kind, "agent_tool_call")) return .activity;
     if (std.mem.eql(u8, block.kind, "message") and
-        parseAgentMessageRole(block.payload.role.?) == .thought) return .reasoning;
+        parseAgentMessageRole(block.payload.role.?) == .thought) return .activity;
     return .single;
 }
 
@@ -1856,9 +1859,13 @@ fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
         if (!continues) view.id = stableAgentBlockId(block.block_id, block_index);
         if (std.mem.eql(u8, block.kind, "message")) {
             const role = parseAgentMessageRole(block.payload.role.?);
-            if (continues and role == .thought) {
-                appendActivitySlice(view, "\n\n");
+            if (role == .thought) {
+                if (view.content_len > 0) appendActivitySlice(view, "\n\n");
+                view.kind = .tool_call;
+                view.role = .thought;
+                view.has_reasoning = true;
                 appendActivitySlice(view, visibleAgentMessageText(block.payload.text.?));
+                copyActivityTitle(view, "Processed");
             } else {
                 view.kind = .message;
                 view.role = role;
@@ -2013,6 +2020,7 @@ fn appendAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
     if (view.activity_count == 0) {
         view.kind = .tool_call;
         view.tool_status = call_status;
+        if (view.content_len > 0) appendActivitySlice(view, "\n---\n\n");
     } else {
         view.tool_status = mergedAgentToolStatus(view.tool_status, call_status);
         appendActivitySlice(view, "\n---\n\n");
@@ -2096,7 +2104,9 @@ fn mergedAgentToolStatus(left: AgentToolStatus, right: AgentToolStatus) AgentToo
 
 fn updateAgentToolSummary(view: *AgentBlockView, last_call: AgentToolCallWire) void {
     var title: [max_agent_activity_title_bytes]u8 = undefined;
-    const rendered_title = if (view.activity_count == 1)
+    const rendered_title = if (view.has_reasoning)
+        "Processed"
+    else if (view.activity_count == 1)
         displayAgentToolTitle(last_call.kind, last_call.title)
     else if (view.other_tool_count == 0 and view.edit_count == 0 and view.execute_count > 0)
         if (view.read_count > 0)
@@ -2626,9 +2636,14 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
             timeline,
         });
     if (!model.agent_plan_visible) return transcript;
+    const goal_width: f32 = if (model.hasAgentEditor()) 360 else 620;
     return ui.column(.{ .grow = 1 }, .{
         transcript,
-        ui.column(.{ .padding = 5 }, .{agentActivityNode(ui, &model.agent_plan)}),
+        ui.row(.{ .gap = 5, .padding = 5, .cross = .center }, .{
+            ui.spacer(1),
+            agentActivityNodeWithWidth(ui, &model.agent_plan, goal_width),
+            ui.spacer(1),
+        }),
     });
 }
 
@@ -2681,8 +2696,13 @@ fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBl
 }
 
 fn agentActivityNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
+    return agentActivityNodeWithWidth(ui, block, 0);
+}
+
+fn agentActivityNodeWithWidth(ui: *HyperTermUi, block: *const AgentBlockView, width: f32) HyperTermUi.Node {
     return ui.el(.accordion, .{
         .text = block.activityTitle(),
+        .width = width,
         .size = .sm,
         .selected = block.expanded,
         .on_toggle = Msg{ .toggle_agent_block = block.id },

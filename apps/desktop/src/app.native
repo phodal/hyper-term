@@ -2,7 +2,7 @@
      Agent-authored content enters later as versioned Block data, never markup. -->
 <template name="agent-thread">
   <column min-width="400" grow="1" background="surface" label="Agent conversation">
-    <row gap="6" padding="7" cross="center">
+    <row gap="6" padding="5" cross="center">
       <icon name="circle-dot" width="12" height="12" foreground="accent" />
       <text grow="1"><span weight="medium">Agent</span></text>
       <badge variant="secondary">{activeAgentProviderLabel}</badge>
@@ -124,7 +124,7 @@
       </if>
     </column>
     <separator />
-    <column padding="8">
+    <column padding="6">
       <input-group label="Agent prompt composer" height="{agentComposerHeight}">
         <textarea size="sm" text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerDisabled}" label="Agent prompt" />
         <input-group-actions>

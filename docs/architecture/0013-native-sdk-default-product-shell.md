@@ -133,6 +133,23 @@ embedded by the Zig `rootView`; saved edits reload that fragment in place and
 then pass through the same builder-owned Agent Block composition seam. Release
 builds retain only the ahead-of-time compiled document and no source watcher.
 
+## Compact Agent interaction evidence (2026-07-20)
+
+The Native Agent transcript now follows the Codex-style disclosure hierarchy
+without copying its application structure. Consecutive reasoning and tool-call
+Blocks project into one collapsed `Processed` activity row; final Agent prose
+remains first-class transcript content. The active `PlanBlock` renders as a
+bounded, centered Goal disclosure directly above the composer instead of a
+full-width panel or permanent side pane.
+
+The composer stays at 68 points for a one-line prompt and grows to 144 points
+for four lines while retaining its bottom action row. ACP-provided Skills and
+commands remain behind the plus menu, and model/config choices remain anchored
+selectors in that row. Native automation exercised both disclosures, opened
+the Skills and model menus, entered a four-line Chinese prompt through the real
+text-input path, and captured a nonblank Metal/reference-renderer screenshot
+without dispatch or widget-budget errors.
+
 ## Rejected alternatives
 
 - **Use a full-window WebView as the default UI.** It fails the native-first
