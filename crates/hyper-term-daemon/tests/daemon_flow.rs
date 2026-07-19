@@ -527,6 +527,10 @@ fn only_a_valid_dispatching_genui_compile_replaces_the_last_known_good_artifact(
             schema_version: 1,
             source_revision: revision,
             entrypoint: "/App.tsx".into(),
+            source_files: BTreeMap::from([(
+                "/App.tsx".into(),
+                "export default () => null;".into(),
+            )]),
             bundle: bundle.into(),
             css: String::new(),
             source_map: "{}".into(),

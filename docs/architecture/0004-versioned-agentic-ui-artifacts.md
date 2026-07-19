@@ -138,10 +138,20 @@ mapped an intentional failure back to `/App.tsx`, and recovered after editing,
 while a Native automation run proved Terminal/Agent tab switching and the
 bounded pane layout.
 
-This closes the first accepted-artifact, last-known-good delivery, and initial
-runtime-error mapping slices. It does not yet close the complete hostile-artifact
-matrix, multi-file editor navigation, action/trace protocol, resource budgets,
-or accessibility gates below.
+New acceptance now also requires the exact bounded virtual source tree passed
+to the supervised compiler. Rust attaches that snapshot after the Deno child
+returns, validates its entrypoint, normalized paths, file count, and byte
+budget, then persists it beside bundle, CSS, and source map in the private
+artifact file. A task-current authenticated `/source` endpoint returns this
+snapshot for the trusted editor; wrong tokens and stale artifact IDs fail
+closed. Pre-source artifacts remain previewable during migration but cannot
+claim editable-source availability.
+
+This closes the first accepted-artifact, last-known-good delivery, initial
+runtime-error mapping, and source-recovery slices. It does not yet close the
+complete hostile-artifact matrix, Native trusted-workbench integration,
+multi-file editor navigation, action/trace protocol, resource budgets, or
+accessibility gates below.
 
 ## Validation gates
 

@@ -220,6 +220,14 @@ struct AgentTurnResponse {
     status: AgentStatus,
 }
 
+#[derive(Serialize)]
+struct AgentArtifactSourceResponse {
+    artifact_id: ArtifactId,
+    source_revision: u64,
+    entrypoint: String,
+    files: BTreeMap<String, String>,
+}
+
 #[derive(Deserialize)]
 struct AgentPermissionRequest {
     operation_id: OperationId,
@@ -304,6 +312,7 @@ pub async fn spawn_agent_gateway(
             "/agent/artifact/{artifact_id}/source-map",
             get(artifact_source_map),
         )
+        .route("/agent/artifact/{artifact_id}/source", get(artifact_source))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_PROMPT_BYTES))
         .with_state(runtime.clone());
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -444,6 +453,31 @@ async fn artifact_source_map(
         Err(_) => status_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Artifact source map could not be read",
+        ),
+    }
+}
+
+async fn artifact_source(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    match runtime.artifact_source(session_id, artifact_id) {
+        Ok(source) => json_response(StatusCode::OK, &source),
+        Err(SessionError::NotFound | SessionError::ArtifactUnavailable) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
+        }
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Artifact source could not be read",
         ),
     }
 }
@@ -727,6 +761,28 @@ impl AgentGatewayRuntime {
             .read_active_genui_artifact(session.task_id, artifact_id)
             .map(|artifact| artifact.source_map)
             .map_err(|_| SessionError::ArtifactUnavailable)
+    }
+
+    fn artifact_source(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+    ) -> Result<AgentArtifactSourceResponse, SessionError> {
+        let session = self.session(session_id)?;
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| SessionError::ArtifactUnavailable)?;
+        if artifact.source_files.is_empty() {
+            return Err(SessionError::ArtifactUnavailable);
+        }
+        Ok(AgentArtifactSourceResponse {
+            artifact_id: artifact.metadata.artifact_id,
+            source_revision: artifact.metadata.source_revision,
+            entrypoint: artifact.metadata.entrypoint,
+            files: artifact.source_files,
+        })
     }
 
     fn submit_turn(
@@ -1399,6 +1455,10 @@ mod tests {
                     version: "0.28.1".into(),
                 },
             },
+            source_files: BTreeMap::from([(
+                "/App.tsx".into(),
+                "export default () => null;".into(),
+            )]),
             bundle: "globalThis.value='</script><script>bad()'".into(),
             css: "main::after{content:'<&>'}".into(),
             source_map: "{}".into(),
@@ -1690,6 +1750,10 @@ mod tests {
                     schema_version: 1,
                     source_revision: 9,
                     entrypoint: "/App.tsx".into(),
+                    source_files: BTreeMap::from([(
+                        "/App.tsx".into(),
+                        "export default () => <main>ready</main>;".into(),
+                    )]),
                     bundle: bundle.into(),
                     css: css.into(),
                     source_map: "{\"version\":3}".into(),
@@ -1731,6 +1795,34 @@ mod tests {
             request_path(gateway.address(), &source_map_path, "GET", b"").await;
         assert_eq!(status, StatusCode::OK.as_u16());
         assert_eq!(source_map, b"{\"version\":3}");
+        let source_path = format!(
+            "/agent/artifact/{}/source?token={token}&session_id=6",
+            accepted.artifact_id
+        );
+        let (status, headers, source) =
+            request_path_raw(gateway.address(), &source_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+        assert!(headers.contains("content-type: application/json"));
+        assert!(headers.contains("cache-control: no-store"));
+        let source: serde_json::Value = serde_json::from_slice(&source).unwrap();
+        assert_eq!(source["artifact_id"], accepted.artifact_id.to_string());
+        assert_eq!(source["source_revision"], 9);
+        assert_eq!(source["entrypoint"], "/App.tsx");
+        assert_eq!(
+            source["files"]["/App.tsx"],
+            "export default () => <main>ready</main>;"
+        );
+        let unauthorized_source_path = format!(
+            "/agent/artifact/{}/source?token=wrong&session_id=6",
+            accepted.artifact_id
+        );
+        assert_eq!(
+            request_path(gateway.address(), &unauthorized_source_path, "GET", b"")
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
         let stale_path = format!(
             "/agent/artifact/{}/preview?token={token}&session_id=6",
             ArtifactId::new()

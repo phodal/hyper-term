@@ -112,6 +112,21 @@ behind the gates below. Transaction normalization adds adapter work, but it give
 resume, replay, multi-surface consistency, and permission-safe apply. Tiptap and
 CodeMirror version upgrades require schema and transaction migration tests.
 
+## Implementation evidence (2026-07-19)
+
+The Deno-built React Workbench contains a real CodeMirror 6 TSX editor,
+`@codemirror/merge` diff view, persistent `esbuild-wasm` Worker, isolated live
+preview, source-mapped runtime diagnostics, and bounded Time Travel trace. It
+still runs against an inert demo broker when opened by itself, so that browser
+surface is not yet evidence of workspace-write authority.
+
+The Rust acceptance path now retains the exact bounded virtual source snapshot
+for every new GenUI artifact and exposes only the current task artifact through
+an authenticated, no-store Agent endpoint. That closes the missing source
+recovery seam needed to open Agent-generated code in the trusted editor without
+letting the WebView read the workspace. Native embedding, multi-file selection,
+transaction journaling, Deno LSP editor requests, and brokered apply remain open.
+
 ## Validation gates
 
 - Restore Tiptap and CodeMirror documents, selections, attachments, and undo

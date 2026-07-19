@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,9 @@ use thiserror::Error;
 const MAX_BUNDLE_BYTES: usize = 768 * 1024;
 const MAX_CSS_BYTES: usize = 256 * 1024;
 const MAX_SOURCE_MAP_BYTES: usize = 768 * 1024;
-const MAX_STORED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SOURCE_FILES: usize = 100;
+const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+const MAX_STORED_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIAGNOSTICS: usize = 256;
 
 pub(crate) struct ArtifactStore {
@@ -24,6 +27,7 @@ pub(crate) struct ArtifactStore {
 #[derive(Clone)]
 pub(crate) struct StoredGenUiArtifact {
     pub metadata: AcceptedGenUiArtifact,
+    pub source_files: BTreeMap<String, String>,
     pub bundle: String,
     pub css: String,
     pub source_map: String,
@@ -42,7 +46,7 @@ impl ArtifactStore {
         &self,
         candidate: GenUiArtifactCandidate,
     ) -> Result<AcceptedGenUiArtifact, ArtifactStoreError> {
-        validate_candidate(&candidate)?;
+        validate_candidate(&candidate, true)?;
         let metadata = AcceptedGenUiArtifact {
             artifact_id: ArtifactId::new(),
             source_revision: candidate.source_revision,
@@ -96,7 +100,7 @@ impl ArtifactStore {
             return Err(ArtifactStoreError::InvalidStoredArtifact);
         }
         let candidate: GenUiArtifactCandidate = serde_json::from_slice(&encoded)?;
-        validate_candidate(&candidate)?;
+        validate_candidate(&candidate, false)?;
         if candidate.source_revision != accepted.source_revision
             || candidate.entrypoint != accepted.entrypoint
             || candidate.content_digest != accepted.content_digest
@@ -106,6 +110,7 @@ impl ArtifactStore {
         }
         Ok(StoredGenUiArtifact {
             metadata: accepted.clone(),
+            source_files: candidate.source_files,
             bundle: candidate.bundle,
             css: candidate.css,
             source_map: candidate.source_map,
@@ -117,13 +122,17 @@ impl ArtifactStore {
     }
 }
 
-fn validate_candidate(candidate: &GenUiArtifactCandidate) -> Result<(), ArtifactStoreError> {
+fn validate_candidate(
+    candidate: &GenUiArtifactCandidate,
+    require_source: bool,
+) -> Result<(), ArtifactStoreError> {
     if candidate.schema_version != 1 || candidate.source_revision == 0 {
         return Err(ArtifactStoreError::InvalidMetadata);
     }
     if !valid_virtual_entrypoint(&candidate.entrypoint) {
         return Err(ArtifactStoreError::InvalidEntrypoint);
     }
+    validate_source_files(candidate, require_source)?;
     if candidate.compiler.name != "esbuild-wasm"
         || candidate.compiler.version.is_empty()
         || candidate.compiler.version.len() > 64
@@ -150,14 +159,44 @@ fn validate_candidate(candidate: &GenUiArtifactCandidate) -> Result<(), Artifact
     Ok(())
 }
 
+fn validate_source_files(
+    candidate: &GenUiArtifactCandidate,
+    require_source: bool,
+) -> Result<(), ArtifactStoreError> {
+    if candidate.source_files.is_empty() {
+        return if require_source {
+            Err(ArtifactStoreError::InvalidSourceSnapshot)
+        } else {
+            Ok(())
+        };
+    }
+    if candidate.source_files.len() > MAX_SOURCE_FILES
+        || !candidate.source_files.contains_key(&candidate.entrypoint)
+    {
+        return Err(ArtifactStoreError::InvalidSourceSnapshot);
+    }
+    let mut bytes = 0usize;
+    for (path, source) in &candidate.source_files {
+        if !valid_virtual_source_path(path) {
+            return Err(ArtifactStoreError::InvalidSourceSnapshot);
+        }
+        bytes = bytes.saturating_add(source.len());
+    }
+    if bytes > MAX_SOURCE_BYTES {
+        return Err(ArtifactStoreError::InvalidSourceSnapshot);
+    }
+    Ok(())
+}
+
 fn valid_virtual_entrypoint(value: &str) -> bool {
-    value.starts_with('/')
-        && !value.contains("..")
-        && !value.contains('\\')
-        && value.len() <= 4096
+    valid_virtual_source_path(value)
         && [".tsx", ".ts", ".jsx", ".js"]
             .iter()
             .any(|extension| value.ends_with(extension))
+}
+
+fn valid_virtual_source_path(value: &str) -> bool {
+    value.starts_with('/') && !value.contains("..") && !value.contains('\\') && value.len() <= 4096
 }
 
 fn validate_diagnostics(diagnostics: &[GenUiCompileDiagnostic]) -> Result<(), ArtifactStoreError> {
@@ -203,6 +242,8 @@ pub(crate) enum ArtifactStoreError {
     InvalidMetadata,
     #[error("artifact entrypoint is not a bounded virtual module")]
     InvalidEntrypoint,
+    #[error("artifact source snapshot is missing or invalid")]
+    InvalidSourceSnapshot,
     #[error("artifact compiler identity is invalid")]
     InvalidCompiler,
     #[error("artifact output exceeds the accepted size budget")]
@@ -232,6 +273,10 @@ mod tests {
             schema_version: 1,
             source_revision: 7,
             entrypoint: "/App.tsx".into(),
+            source_files: BTreeMap::from([(
+                "/App.tsx".into(),
+                "export default () => null;".into(),
+            )]),
             bundle: bundle.into(),
             css: String::new(),
             source_map: "{}".into(),
@@ -251,6 +296,10 @@ mod tests {
         let accepted = store.persist(candidate("bundle")).unwrap();
         let stored = store.read(&accepted).unwrap();
         assert_eq!(stored.metadata, accepted);
+        assert_eq!(
+            stored.source_files.get("/App.tsx").map(String::as_str),
+            Some("export default () => null;")
+        );
         assert_eq!(stored.bundle, "bundle");
         assert_eq!(stored.source_map, "{}");
         let mode = fs::metadata(store.path(accepted.artifact_id))
@@ -273,5 +322,33 @@ mod tests {
             Err(ArtifactStoreError::DigestMismatch { .. })
         ));
         assert_eq!(store.read(&accepted).unwrap().bundle, "last good");
+    }
+
+    #[test]
+    fn new_acceptance_requires_source_but_legacy_artifacts_remain_readable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::open(temporary.path()).unwrap();
+        let mut legacy = candidate("legacy");
+        legacy.source_files.clear();
+        assert!(matches!(
+            store.persist(legacy.clone()),
+            Err(ArtifactStoreError::InvalidSourceSnapshot)
+        ));
+
+        let accepted = AcceptedGenUiArtifact {
+            artifact_id: ArtifactId::new(),
+            source_revision: legacy.source_revision,
+            entrypoint: legacy.entrypoint.clone(),
+            content_digest: legacy.content_digest.clone(),
+            compiler: legacy.compiler.clone(),
+        };
+        fs::write(
+            store.path(accepted.artifact_id),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let stored = store.read(&accepted).unwrap();
+        assert!(stored.source_files.is_empty());
+        assert_eq!(stored.bundle, "legacy");
     }
 }

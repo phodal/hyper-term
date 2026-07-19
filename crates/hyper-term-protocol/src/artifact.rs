@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ArtifactId;
@@ -30,6 +32,13 @@ pub struct GenUiArtifactCandidate {
     pub schema_version: u16,
     pub source_revision: u64,
     pub entrypoint: String,
+    /// The exact bounded virtual source tree that produced this candidate.
+    ///
+    /// Older stored artifacts did not retain source. The default keeps those
+    /// files readable during migration, while new acceptance requires a
+    /// non-empty snapshot before the candidate can enter authority state.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_files: BTreeMap<String, String>,
     pub bundle: String,
     pub css: String,
     pub source_map: String,

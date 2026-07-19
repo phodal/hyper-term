@@ -371,6 +371,10 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
             .unwrap()
             .contains("data-brokered")
     );
+    assert_eq!(
+        result["result"]["structuredContent"]["source_files"]["/App.tsx"],
+        "export default function App(){ return <main data-brokered=\"true\">Ready</main>; }"
+    );
     assert!(
         state
             .block_snapshot(task_id)

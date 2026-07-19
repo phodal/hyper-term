@@ -16,7 +16,11 @@ executors and projections of one durable human–AI task model.
 > a digest-checked Deno GenUI compiler and frozen official Codex/Claude ACP
 > adapters without bundling Node. Broker-accepted artifacts are persisted
 > by Rust, projected as isolated Blocks, and served to a bounded Native WebView
-> pane without replacing the last-known-good revision on failure. Deno LSP and
+> pane without replacing the last-known-good revision on failure. Every newly
+> accepted artifact retains its exact bounded virtual TS/JS source tree in the
+> private Rust store and exposes it only through the authenticated,
+> task-current Agent source endpoint, establishing the authority path for the
+> real CodeMirror editor and diff surface. Deno LSP and
 > GenUI now run in digest-bound macOS Seatbelt task profiles, and timed-out
 > effects terminate their complete process group without being replayed. Driver
 > queues and secondary Agent/LSP inboxes have byte budgets, and uncertain MCP
@@ -280,7 +284,11 @@ The preview response uses a network-closed CSP. Rust injects the current bounded
 source map into the authenticated preview capsule, which maps runtime failures
 to their virtual source and renders a local diagnostic overlay without opening
 a Native SDK bridge. The same map remains available through a separate
-authenticated endpoint for the trusted editor.
+authenticated endpoint for the trusted editor. New artifacts also retain the
+exact compiler input snapshot and expose it as bounded JSON at
+`/agent/artifact/:id/source`; the token, session, task, and current-artifact
+checks are identical to the preview boundary. Older artifacts remain readable
+for preview but honestly report source as unavailable.
 
 The Rust `hyper-term-drivers` crate launches the same pinned Deno executable
 with a cleared environment, dedicated cache and scratch roots, bounded framing,

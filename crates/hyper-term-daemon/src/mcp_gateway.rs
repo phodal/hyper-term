@@ -723,18 +723,21 @@ impl DenoGenUiExecutor {
             .next_source_revision
             .checked_add(1)
             .ok_or_else(|| "GenUI source revision exhausted".to_owned())?;
+        let source_files = BTreeMap::from([(entrypoint.clone(), source.to_owned())]);
         let candidate = self
             .compiler
             .compile(
                 GenUiCompileRequest {
                     source_revision,
                     entrypoint: entrypoint.clone(),
-                    files: BTreeMap::from([(entrypoint, source.to_owned())]),
+                    files: source_files.clone(),
                 },
                 Duration::from_secs(15),
             )
             .map_err(|error| error.to_string())?;
-        let structured = serde_json::to_value(&candidate).map_err(|error| error.to_string())?;
+        let mut structured = serde_json::to_value(&candidate).map_err(|error| error.to_string())?;
+        structured["source_files"] =
+            serde_json::to_value(source_files).map_err(|error| error.to_string())?;
         Ok(McpToolResult::success(
             format!(
                 "Compiled GenUI revision {} with {} {} (artifact {}).",
