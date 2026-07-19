@@ -1739,7 +1739,112 @@ textarea:focus-visible {
   }
 }
 
+@media (max-width: 900px) {
+  html,
+  body,
+  #root {
+    min-width: 0;
+  }
+  .app-shell {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+  .activity-bar {
+    padding-right: 4px;
+    padding-left: 4px;
+  }
+  .task-rail {
+    display: none;
+  }
+  .workspace {
+    min-width: 0;
+  }
+  .attention-bar {
+    min-width: 0;
+    padding: 0 10px;
+  }
+  .attention-bar > span:not(.attention-pulse) {
+    display: none;
+  }
+  .attention-bar strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .workspace-grid {
+    display: flex;
+    min-width: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    flex-direction: column;
+  }
+  .timeline,
+  .workspace-grid > .studio {
+    width: 100%;
+    min-width: 0;
+    min-height: 720px;
+    flex: none;
+  }
+  .timeline {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .terminal-chrome {
+    grid-template-columns: 36px minmax(0, 1fr) auto;
+    gap: 5px;
+    padding: 0 8px;
+  }
+  .terminal-chrome code,
+  .pty-status {
+    display: none;
+  }
+}
+
 @media (max-width: 520px) {
+  .workspace-grid > .studio {
+    min-height: 760px;
+  }
+  .studio-header {
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 11px 9px;
+  }
+  .studio-actions {
+    align-items: flex-end;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .compiler-status {
+    max-width: 132px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .checkpoint-status {
+    max-width: 116px;
+  }
+  .studio-tabs button {
+    padding: 0 6px;
+    font-size: 8px;
+  }
+  .source-revision {
+    display: none;
+  }
+  .preview-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 7px;
+  }
+  .preview-header > div:first-child {
+    min-width: 0;
+    width: 100%;
+  }
+  .preview-header strong {
+    max-width: 100%;
+  }
+  .preview-badges {
+    flex-wrap: wrap;
+    margin-left: 0;
+  }
   [data-surface="artifact"] .studio-header {
     align-items: flex-start;
     gap: 8px;
