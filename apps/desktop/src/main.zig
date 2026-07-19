@@ -999,6 +999,9 @@ fn requestAgentStart(model: *Model, session_id: u8, fx: *Effects) void {
         .key = agent_start_effect_key_base + session_id,
         .method = .POST,
         .url = request_url,
+        // Zig 0.16's HTTP client requires POST to take the body-aware send
+        // path even when this endpoint has no request fields.
+        .body = "{}",
         .timeout_ms = 12_000,
         .on_response = Effects.responseMsg(.agent_session_started),
     });
@@ -2181,6 +2184,7 @@ fn requestTerminalClose(model: *const Model, session_id: u8, fx: *Effects) void 
         .key = terminal_close_effect_key_base + session_id,
         .method = .POST,
         .url = url,
+        .body = "{}",
         .timeout_ms = 2_000,
         .on_response = Effects.responseMsg(.terminal_session_closed),
     });

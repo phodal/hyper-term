@@ -226,6 +226,7 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
     try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
     const request = fx.pendingFetchAt(0).?;
     try testing.expectEqual(std.http.Method.POST, request.method);
+    try testing.expectEqualStrings("{}", request.body);
     try testing.expectEqualStrings(
         "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2&provider=codex",
         request.url,
@@ -885,6 +886,7 @@ test "tabs expose close controls and close the active session like a desktop ter
     try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
     const close_request = fx.pendingFetchAt(0).?;
     try testing.expectEqual(std.http.Method.POST, close_request.method);
+    try testing.expectEqualStrings("{}", close_request.body);
     try testing.expectEqualStrings(
         "http://127.0.0.1:47437/terminal/session/close?token=0123456789abcdef0123456789abcdef&session_id=3",
         close_request.url,
