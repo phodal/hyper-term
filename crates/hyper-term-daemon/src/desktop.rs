@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::future::Future;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -188,8 +189,30 @@ fn run() -> Result<i32, String> {
 
 #[cfg(unix)]
 async fn wait_for_renderer(renderer: &mut std::process::Child) -> Result<ExitStatus, String> {
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
+    wait_for_renderer_until(renderer, desktop_shutdown_signal()).await
+}
+
+#[cfg(unix)]
+async fn desktop_shutdown_signal() -> Result<(), String> {
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| format!("cannot listen for desktop termination: {error}"))?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(|error| format!("cannot wait for desktop interrupt: {error}"))
+        }
+        result = terminate.recv() => {
+            result.ok_or_else(|| "desktop termination signal stream closed".to_owned())
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_renderer_until(
+    renderer: &mut std::process::Child,
+    shutdown: impl Future<Output = Result<(), String>>,
+) -> Result<ExitStatus, String> {
+    tokio::pin!(shutdown);
     loop {
         if let Some(status) = renderer
             .try_wait()
@@ -198,8 +221,8 @@ async fn wait_for_renderer(renderer: &mut std::process::Child) -> Result<ExitSta
             return Ok(status);
         }
         tokio::select! {
-            result = &mut interrupt => {
-                result.map_err(|error| format!("cannot wait for desktop interrupt: {error}"))?;
+            result = &mut shutdown => {
+                result?;
                 let _ = renderer.kill();
                 return renderer
                     .wait()
@@ -1313,6 +1336,21 @@ mod tests {
         let token = desktop_token();
         assert_eq!(token.len(), 64);
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn desktop_shutdown_reaps_the_native_renderer() {
+        let mut renderer = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("start renderer fixture");
+
+        let status = wait_for_renderer_until(&mut renderer, async { Ok(()) })
+            .await
+            .expect("stop renderer");
+
+        assert!(!status.success());
+        assert!(renderer.try_wait().expect("inspect renderer").is_some());
     }
 
     #[test]
