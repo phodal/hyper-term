@@ -54,6 +54,7 @@ pub const agent_snapshot_effect_key_base: u64 = 0x4854_4500;
 pub const agent_poll_timer_key_base: u64 = 0x4854_4600;
 pub const agent_permission_effect_key_base: u64 = 0x4854_4700;
 pub const agent_config_effect_key_base: u64 = 0x4854_4800;
+pub const agent_stream_effect_key_base: u64 = 0x4854_4900;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -463,10 +464,14 @@ pub const Model = struct {
     agent_plan: AgentBlockView = .{},
     agent_plan_visible: bool = false,
     agent_projection_session_id: u8 = 0,
+    agent_document_revision: u64 = 0,
+    agent_stream_sequence: u64 = 0,
     agent_turn_status: AgentTurnStatus = .idle,
     agent_error_storage: [max_agent_error_bytes]u8 = [_]u8{0} ** max_agent_error_bytes,
     agent_error_len: usize = 0,
     agent_snapshot_in_flight_session_id: u8 = 0,
+    agent_snapshot_resync_revision: u64 = 0,
+    agent_stream_session_id: u8 = 0,
     agent_permission_in_flight_session_id: u8 = 0,
     agent_config_options: [max_agent_config_options]AgentConfigOptionView = [_]AgentConfigOptionView{.{}} ** max_agent_config_options,
     agent_config_option_count: usize = 0,
@@ -511,10 +516,14 @@ pub const Model = struct {
         "agent_plan",
         "agent_plan_visible",
         "agent_projection_session_id",
+        "agent_document_revision",
+        "agent_stream_sequence",
         "agent_turn_status",
         "agent_error_storage",
         "agent_error_len",
         "agent_snapshot_in_flight_session_id",
+        "agent_snapshot_resync_revision",
+        "agent_stream_session_id",
         "agent_permission_in_flight_session_id",
         "agent_config_options",
         "agent_config_option_count",
@@ -800,6 +809,8 @@ pub const Msg = union(enum) {
     send_agent_prompt,
     agent_turn_started: native_sdk.EffectResponse,
     agent_snapshot_received: native_sdk.EffectResponse,
+    agent_stream_line: native_sdk.EffectLine,
+    agent_stream_closed: native_sdk.EffectResponse,
     toggle_agent_config_picker: u8,
     dismiss_agent_config_picker,
     toggle_agent_command_picker,
@@ -824,7 +835,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_config_updated", "agent_permission_decided", "agent_poll", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -850,8 +861,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const previous = model.active_session_id;
             selectSession(model, session_id);
             if (previous != model.active_session_id) {
+                cancelAgentStream(model, previous, fx);
                 resetAgentProjection(model, model.active_session_id);
-                requestActiveAgentSnapshot(model, fx);
+                requestActiveAgentStream(model, fx);
             }
         },
         .close_session => |session_id| closeSession(model, session_id, fx),
@@ -863,6 +875,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
+        .agent_stream_line => |line| applyAgentStreamLine(model, line, fx),
+        .agent_stream_closed => |response| applyAgentStreamClosed(model, response, fx),
         .toggle_agent_config_picker => |index| toggleAgentConfigPicker(model, index),
         .dismiss_agent_config_picker => closeAgentConfigPickers(model),
         .toggle_agent_command_picker => model.agent_command_picker_open = !model.agent_command_picker_open,
@@ -886,7 +900,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .cancel_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "cancelled", fx),
         .agent_permission_decided => |response| applyAgentPermissionResponse(model, response, fx),
         .agent_poll => |timer| {
-            if (timer.outcome == .fired) requestActiveAgentSnapshot(model, fx);
+            if (timer.outcome == .fired) requestActiveAgentStream(model, fx);
         },
         .open_agent_editor => {
             if (model.hasEditableAgentArtifact()) {
@@ -959,6 +973,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     if (session.mode == .agent) {
         requestAgentClose(model, session_id, fx);
         fx.cancelTimer(agent_poll_timer_key_base + session_id);
+        cancelAgentStream(model, session_id, fx);
         fx.cancel(agent_permission_effect_key_base + session_id);
         fx.cancel(agent_config_effect_key_base + session_id);
         if (model.agent_permission_in_flight_session_id == session_id) {
@@ -990,7 +1005,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     refreshTerminalUrl(model);
     if (was_active) {
         resetAgentProjection(model, model.active_session_id);
-        requestActiveAgentSnapshot(model, fx);
+        requestActiveAgentStream(model, fx);
     }
 }
 
@@ -1098,6 +1113,7 @@ fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse, f
         model.agent_turn_status = if (ready) .ready else .failed;
         if (ready) {
             requestAgentSnapshot(model, session_id, fx);
+            requestAgentStream(model, session_id, fx);
         } else {
             setAgentError(model, agentStartFailureMessage(response));
         }
@@ -1137,7 +1153,7 @@ fn requestAgentTurn(model: *Model, fx: *Effects) void {
     model.agent_error_len = 0;
 }
 
-fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, _: *Effects) void {
     const session_id = effectSessionId(response.key, agent_turn_effect_key_base) orelse return;
     if (session_id != model.active_session_id) return;
     const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
@@ -1146,7 +1162,6 @@ fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, fx
         setAgentError(model, "Agent turn could not be started");
         return;
     }
-    requestAgentSnapshot(model, session_id, fx);
 }
 
 fn requestAgentPermission(model: *Model, operation_id: []const u8, decision: []const u8, fx: *Effects) void {
@@ -1179,7 +1194,7 @@ fn requestAgentPermission(model: *Model, operation_id: []const u8, decision: []c
     model.agent_error_len = 0;
 }
 
-fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectResponse, _: *Effects) void {
     const session_id = effectSessionId(response.key, agent_permission_effect_key_base) orelse return;
     if (model.agent_permission_in_flight_session_id == session_id) {
         model.agent_permission_in_flight_session_id = 0;
@@ -1192,7 +1207,6 @@ fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectRespon
         return;
     }
     model.agent_turn_status = .running;
-    requestAgentSnapshot(model, session_id, fx);
 }
 
 fn toggleAgentConfigPicker(model: *Model, index: u8) void {
@@ -1311,11 +1325,48 @@ fn insertAgentCommand(model: *Model, index: u8) void {
     model.agent_composer_buffer = canvas.TextBuffer(max_agent_prompt_bytes).init(next);
 }
 
-fn requestActiveAgentSnapshot(model: *Model, fx: *Effects) void {
+fn requestActiveAgentStream(model: *Model, fx: *Effects) void {
     const session = model.activeSession();
     if (session.mode == .agent and session.agent_connection == .ready) {
         requestAgentSnapshot(model, session.id, fx);
+        requestAgentStream(model, session.id, fx);
     }
+}
+
+fn requestAgentStream(model: *Model, session_id: u8, fx: *Effects) void {
+    if (model.agent_stream_session_id != 0) return;
+    var storage: [agent_effect_url_capacity]u8 = undefined;
+    const request_url = writeAgentStreamUrl(model, session_id, storage[0..]) orelse return;
+    fx.cancelTimer(agent_poll_timer_key_base + session_id);
+    model.agent_stream_session_id = session_id;
+    fx.fetch(.{
+        .key = agent_stream_effect_key_base + session_id,
+        .url = request_url,
+        .timeout_ms = 30 * 60 * 1_000,
+        .response = .stream,
+        .max_line_bytes = native_sdk.max_effect_line_bytes_ceiling,
+        .on_line = Effects.lineMsg(.agent_stream_line),
+        .on_response = Effects.responseMsg(.agent_stream_closed),
+    });
+}
+
+fn cancelAgentStream(model: *Model, session_id: u8, fx: *Effects) void {
+    if (model.agent_stream_session_id != session_id) return;
+    model.agent_stream_session_id = 0;
+    fx.cancel(agent_stream_effect_key_base + session_id);
+}
+
+fn writeAgentStreamUrl(model: *const Model, session_id: u8, storage: []u8) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(
+        storage,
+        "{s}/agent/session/stream?token={s}&session_id={d}",
+        .{ origin, token, session_id },
+    ) catch null;
 }
 
 fn requestAgentSnapshot(model: *Model, session_id: u8, fx: *Effects) void {
@@ -1332,10 +1383,12 @@ fn requestAgentSnapshot(model: *Model, session_id: u8, fx: *Effects) void {
 }
 
 const AgentSnapshotWire = struct {
+    session_id: ?u8 = null,
     status: []const u8,
     @"error": ?[]const u8 = null,
     capabilities: AgentCapabilitiesWire = .{},
     document: struct {
+        revision: u64 = 0,
         blocks: []const AgentBlockWire,
     },
 };
@@ -1360,6 +1413,29 @@ const AgentCommandWire = struct {
 const AgentCapabilitiesWire = struct {
     config_options: []const AgentConfigOptionWire = &.{},
     available_commands: []const AgentCommandWire = &.{},
+};
+
+const AgentPatchOperationWire = struct {
+    type: []const u8,
+    block_id: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+};
+
+const AgentPatchWire = struct {
+    stream_sequence: u64,
+    base_revision: u64,
+    target_revision: u64,
+    operations: []const AgentPatchOperationWire,
+};
+
+const AgentStreamFrameWire = struct {
+    type: []const u8,
+    status: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+    capabilities: AgentCapabilitiesWire = .{},
+    patch: ?AgentPatchWire = null,
+    target_revision: ?u64 = null,
+    reason: ?[]const u8 = null,
 };
 
 const AgentCapabilitiesResponseWire = struct {
@@ -1443,7 +1519,7 @@ fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse
         model.agent_snapshot_in_flight_session_id = 0;
     }
     if (session_id != model.active_session_id) {
-        requestActiveAgentSnapshot(model, fx);
+        requestActiveAgentStream(model, fx);
         return;
     }
     if (response.outcome != .ok or response.status != 200 or response.truncated) {
@@ -1451,22 +1527,152 @@ fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse
         setAgentError(model, "Agent history could not be refreshed");
         return;
     }
+    if (!applyAgentSnapshotPayload(model, session_id, response.body)) return;
+    if (model.agent_document_revision < model.agent_snapshot_resync_revision) {
+        requestAgentSnapshot(model, session_id, fx);
+    } else {
+        model.agent_snapshot_resync_revision = 0;
+    }
+    if (model.agent_stream_session_id == 0) scheduleAgentStreamRetry(session_id, fx);
+}
+
+fn applyAgentStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) void {
+    const session_id = effectSessionId(line.key, agent_stream_effect_key_base) orelse return;
+    if (session_id != model.active_session_id or model.agent_stream_session_id != session_id) return;
+    if (line.truncated or line.dropped_before != 0) {
+        setAgentError(model, "Agent live updates exceeded the bounded stream");
+        cancelAgentStream(model, session_id, fx);
+        scheduleAgentStreamRetry(session_id, fx);
+        return;
+    }
+    const parsed = std.json.parseFromSlice(
+        AgentStreamFrameWire,
+        std.heap.page_allocator,
+        line.line,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        setAgentError(model, "Agent live update was invalid; refreshing history");
+        requestAgentSnapshot(model, session_id, fx);
+        return;
+    };
+    defer parsed.deinit();
+    const frame = parsed.value;
+    if (std.mem.eql(u8, frame.type, "state")) {
+        projectAgentCapabilities(model, frame.capabilities);
+        if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
+        if (frame.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
+        return;
+    }
+    if (std.mem.eql(u8, frame.type, "resync")) {
+        if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
+        requestAgentPatchResync(model, session_id, frame.target_revision orelse 0, fx);
+        return;
+    }
+    if (!std.mem.eql(u8, frame.type, "patch") or frame.patch == null) {
+        setAgentError(model, "Agent live update type was unsupported; refreshing history");
+        requestAgentSnapshot(model, session_id, fx);
+        return;
+    }
+    if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
+    applyAgentPatch(model, session_id, frame.patch.?, fx);
+}
+
+fn applyAgentPatch(model: *Model, session_id: u8, patch: AgentPatchWire, fx: *Effects) void {
+    if (patch.target_revision <= model.agent_document_revision) {
+        model.agent_stream_sequence = @max(model.agent_stream_sequence, patch.stream_sequence);
+        return;
+    }
+    if (model.agent_snapshot_in_flight_session_id != 0) {
+        requestAgentPatchResync(model, session_id, patch.target_revision, fx);
+        return;
+    }
+    if (patch.base_revision != model.agent_document_revision or
+        (model.agent_stream_sequence != 0 and patch.stream_sequence <= model.agent_stream_sequence))
+    {
+        requestAgentPatchResync(model, session_id, patch.target_revision, fx);
+        return;
+    }
+    for (patch.operations) |operation| {
+        if (!std.mem.eql(u8, operation.type, "append_content") or
+            operation.block_id == null or operation.text == null)
+        {
+            requestAgentPatchResync(model, session_id, patch.target_revision, fx);
+            return;
+        }
+        const block = findAgentMessageBlock(model, operation.block_id.?) orelse {
+            requestAgentPatchResync(model, session_id, patch.target_revision, fx);
+            return;
+        };
+        if (block.role != .agent) {
+            requestAgentPatchResync(model, session_id, patch.target_revision, fx);
+            return;
+        }
+    }
+    for (patch.operations) |operation| {
+        const block = findAgentMessageBlock(model, operation.block_id.?).?;
+        appendAgentBlockContent(block, operation.text.?);
+    }
+    model.agent_document_revision = patch.target_revision;
+    model.agent_stream_sequence = patch.stream_sequence;
+}
+
+fn requestAgentPatchResync(model: *Model, session_id: u8, target_revision: u64, fx: *Effects) void {
+    model.agent_snapshot_resync_revision = @max(model.agent_snapshot_resync_revision, target_revision);
+    requestAgentSnapshot(model, session_id, fx);
+}
+
+fn findAgentMessageBlock(model: *Model, block_id: []const u8) ?*AgentBlockView {
+    const projected_id = stableAgentBlockId(block_id, 0);
+    for (model.agent_blocks[0..model.agent_block_count]) |*block| {
+        if (block.id == projected_id and block.kind == .message) return block;
+    }
+    return null;
+}
+
+fn appendAgentBlockContent(view: *AgentBlockView, value: []const u8) void {
+    const remaining = view.content_storage.len - view.content_len;
+    const length = utf8BoundedLength(value, remaining);
+    @memcpy(view.content_storage[view.content_len..][0..length], value[0..length]);
+    view.content_len += length;
+    view.truncated = view.truncated or length < value.len;
+}
+
+fn applyAgentStreamClosed(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    const session_id = effectSessionId(response.key, agent_stream_effect_key_base) orelse return;
+    if (model.agent_stream_session_id == session_id) model.agent_stream_session_id = 0;
+    if (session_id != model.active_session_id or
+        model.activeSession().mode != .agent or
+        model.activeSession().agent_connection != .ready or
+        response.outcome == .cancelled) return;
+    if (response.outcome != .ok or response.status != 200 or response.dropped_before != 0) {
+        setAgentError(model, "Agent live updates disconnected; reconnecting");
+    }
+    requestAgentSnapshot(model, session_id, fx);
+    scheduleAgentStreamRetry(session_id, fx);
+}
+
+fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8) bool {
     const parsed = std.json.parseFromSlice(
         AgentSnapshotWire,
         std.heap.page_allocator,
-        response.body,
+        body,
         .{ .ignore_unknown_fields = true },
     ) catch {
         model.agent_turn_status = .failed;
         setAgentError(model, "Agent history response was invalid");
-        return;
+        return false;
     };
     defer parsed.deinit();
+    if (parsed.value.session_id) |wire_session_id| {
+        if (wire_session_id != session_id) return false;
+    }
     projectAgentCapabilities(model, parsed.value.capabilities);
     projectAgentBlocks(model, parsed.value.document.blocks);
+    model.agent_document_revision = parsed.value.document.revision;
+    model.agent_stream_sequence = parsed.value.document.revision;
     model.agent_turn_status = parseAgentTurnStatus(parsed.value.status);
     if (parsed.value.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
-    if (model.agent_turn_status == .running) scheduleAgentPoll(session_id, fx);
+    return true;
 }
 
 fn projectAgentCapabilities(model: *Model, capabilities: AgentCapabilitiesWire) void {
@@ -2116,10 +2322,10 @@ fn parseAgentTurnStatus(value: []const u8) AgentTurnStatus {
     return .idle;
 }
 
-fn scheduleAgentPoll(session_id: u8, fx: *Effects) void {
+fn scheduleAgentStreamRetry(session_id: u8, fx: *Effects) void {
     fx.startTimer(.{
         .key = agent_poll_timer_key_base + session_id,
-        .interval_ms = 250,
+        .interval_ms = 500,
         .on_fire = Effects.timerMsg(.agent_poll),
     });
 }
@@ -2139,8 +2345,11 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_plan = .{};
     model.agent_plan_visible = false;
     model.agent_projection_session_id = session_id;
+    model.agent_document_revision = 0;
+    model.agent_stream_sequence = 0;
     model.agent_turn_status = .idle;
     model.agent_error_len = 0;
+    model.agent_snapshot_resync_revision = 0;
     model.agent_permission_in_flight_session_id = 0;
     for (&model.agent_config_options) |*option| option.* = .{};
     for (&model.agent_commands) |*entry| entry.* = .{};

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::Infallible;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -23,15 +24,15 @@ use hyper_term_drivers::{
     StructuredAgentProtocol, sha256_file,
 };
 use hyper_term_protocol::{
-    AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, GenUiArtifactCandidate, MessageRole,
-    OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
-    OperationState, PermissionDecision, RiskClass, TaskId,
+    AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, GenUiArtifactCandidate,
+    MessageRole, OperationAction, OperationCompletion, OperationId, OperationKind,
+    OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::DaemonState;
@@ -61,6 +62,10 @@ const START_TURN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPLETE_TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_AGENT_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_AGENT_STREAM_LINE_BYTES: usize = 256 * 1024;
+const AGENT_STREAM_PATCH_QUEUE: usize = 512;
+const AGENT_STREAM_REFRESH: Duration = Duration::from_millis(75);
+const AGENT_STREAM_FRAME_CADENCE: Duration = Duration::from_millis(16);
 const AGENT_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
 const PREVIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const WORKBENCH_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; frame-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -615,6 +620,7 @@ pub async fn spawn_agent_gateway(
                 .delete(close_session),
         )
         .route("/agent/session/turn", post(start_turn))
+        .route("/agent/session/stream", get(stream_session))
         .route("/agent/session/config", post(set_session_config))
         .route("/agent/session/permission", post(decide_permission))
         .route(
@@ -822,6 +828,209 @@ async fn snapshot_session(
             "Agent session snapshot failed",
         ),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AgentStreamStateFrame {
+    status: AgentStatus,
+    turn_id: Option<String>,
+    error: Option<String>,
+    capabilities: AgentSessionCapabilities,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AgentStreamFrame<'a> {
+    State {
+        #[serde(flatten)]
+        state: &'a AgentStreamStateFrame,
+    },
+    Patch {
+        status: AgentStatus,
+        patch: &'a BlockPatch,
+    },
+    Resync {
+        status: AgentStatus,
+        target_revision: u64,
+        reason: &'static str,
+    },
+}
+
+struct AgentEventStreamState {
+    runtime: AgentGatewayRuntime,
+    session_id: u16,
+    patches: mpsc::Receiver<BlockPatch>,
+    previous_state: Vec<u8>,
+    first_state: Option<Vec<u8>>,
+    refresh: tokio::time::Interval,
+}
+
+#[derive(Debug)]
+enum AgentStreamError {
+    Encode,
+    TooLarge,
+}
+
+fn encode_agent_stream_line(value: &impl Serialize) -> Result<Vec<u8>, AgentStreamError> {
+    let mut line = serde_json::to_vec(value).map_err(|_| AgentStreamError::Encode)?;
+    if line.len() + 1 > MAX_AGENT_STREAM_LINE_BYTES {
+        return Err(AgentStreamError::TooLarge);
+    }
+    line.push(b'\n');
+    Ok(line)
+}
+
+async fn stream_session(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let session = match runtime.session(session_id) {
+        Ok(session) => session,
+        Err(SessionError::NotFound) => {
+            return status_response(StatusCode::NOT_FOUND, "Agent session does not exist");
+        }
+        Err(_) => {
+            return status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Agent session stream could not start",
+            );
+        }
+    };
+    let task_id = session.task_id;
+    let block_patches = match runtime.config.daemon.subscribe_block_patches() {
+        Ok(receiver) => receiver,
+        Err(_) => {
+            return status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Agent session stream could not subscribe",
+            );
+        }
+    };
+    let initial_state = match runtime.stream_state(session_id) {
+        Ok(state) => state,
+        Err(_) => {
+            return status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Agent session stream could not start",
+            );
+        }
+    };
+    let initial = match encode_agent_stream_line(&AgentStreamFrame::State {
+        state: &initial_state,
+    }) {
+        Ok(line) => line,
+        Err(_) => {
+            return status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Agent session state exceeds the stream frame bound",
+            );
+        }
+    };
+    let (patch_sender, patch_receiver) = mpsc::channel(AGENT_STREAM_PATCH_QUEUE);
+    let _ = std::thread::Builder::new()
+        .name(format!("hyper-term-agent-stream-{session_id}"))
+        .spawn(move || {
+            while !patch_sender.is_closed() {
+                match block_patches.recv_timeout(Duration::from_millis(100)) {
+                    Ok((candidate_task_id, patch)) => {
+                        if candidate_task_id == task_id
+                            && patch_sender.blocking_send(patch).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+    let mut refresh = tokio::time::interval(AGENT_STREAM_REFRESH);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let state = AgentEventStreamState {
+        runtime,
+        session_id,
+        patches: patch_receiver,
+        previous_state: initial.clone(),
+        first_state: Some(initial),
+        refresh,
+    };
+    let stream = futures_util::stream::unfold(state, |mut state| async move {
+        if let Some(first) = state.first_state.take() {
+            return Some((Ok::<Bytes, Infallible>(Bytes::from(first)), state));
+        }
+        loop {
+            tokio::select! {
+                patch = state.patches.recv() => {
+                    let mut patch = patch?;
+                    let mut patch_gap = false;
+                    let cadence = tokio::time::sleep(AGENT_STREAM_FRAME_CADENCE);
+                    tokio::pin!(cadence);
+                    loop {
+                        tokio::select! {
+                            _ = &mut cadence => break,
+                            next = state.patches.recv() => {
+                                let Some(next) = next else { break };
+                                if next.base_revision != patch.target_revision {
+                                    patch.stream_sequence = next.stream_sequence;
+                                    patch.target_revision = next.target_revision;
+                                    patch_gap = true;
+                                    break;
+                                }
+                                patch.stream_sequence = next.stream_sequence;
+                                patch.target_revision = next.target_revision;
+                                patch.operations.extend(next.operations);
+                            }
+                        }
+                    }
+                    let status = state.runtime.stream_status(state.session_id).ok()?;
+                    let frame = if patch_gap {
+                        AgentStreamFrame::Resync {
+                            status,
+                            target_revision: patch.target_revision,
+                            reason: "patch_sequence_gap",
+                        }
+                    } else {
+                        AgentStreamFrame::Patch {
+                            status,
+                            patch: &patch,
+                        }
+                    };
+                    let line = match encode_agent_stream_line(&frame) {
+                        Ok(line) => line,
+                        Err(AgentStreamError::TooLarge) => encode_agent_stream_line(
+                            &AgentStreamFrame::Resync {
+                                status,
+                                target_revision: patch.target_revision,
+                                reason: "patch_frame_too_large",
+                            },
+                        ).ok()?,
+                        Err(AgentStreamError::Encode) => return None,
+                    };
+                    return Some((Ok(Bytes::from(line)), state));
+                }
+                _ = state.refresh.tick() => {
+                    let current = state.runtime.stream_state(state.session_id).ok()?;
+                    let line = encode_agent_stream_line(&AgentStreamFrame::State {
+                        state: &current,
+                    }).ok()?;
+                    if line == state.previous_state {
+                        continue;
+                    }
+                    state.previous_state = line.clone();
+                    return Some((Ok(Bytes::from(line)), state));
+                }
+            }
+        }
+    });
+    secure_response(
+        StatusCode::OK,
+        "application/x-ndjson; charset=utf-8",
+        Body::from_stream(stream),
+    )
 }
 
 async fn preview_artifact(
@@ -1840,6 +2049,31 @@ impl AgentGatewayRuntime {
             error,
             capabilities,
             document,
+        })
+    }
+
+    fn stream_status(&self, session_id: u16) -> Result<AgentStatus, SessionError> {
+        let session = self.session(session_id)?;
+        let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
+        Ok(progress.status)
+    }
+
+    fn stream_state(&self, session_id: u16) -> Result<AgentStreamStateFrame, SessionError> {
+        let session = self.session(session_id)?;
+        let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
+        let status = progress.status;
+        let turn_id = progress.turn_id.clone();
+        let error = progress.error.clone();
+        drop(progress);
+        let capabilities = session
+            .client
+            .session_capabilities()
+            .map_err(|_| SessionError::Driver)?;
+        Ok(AgentStreamStateFrame {
+            status,
+            turn_id,
+            error,
+            capabilities,
         })
     }
 
@@ -4019,6 +4253,7 @@ fn constant_time_eq(candidate: &[u8], expected: &[u8]) -> bool {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4441,6 +4676,58 @@ mod tests {
         assert_eq!(response["status"], "ready");
         assert_eq!(response["thread_id"], "thread-3");
 
+        let stream_response = stream_session(
+            State(gateway.runtime.clone()),
+            Query(AgentSessionQuery {
+                token: Some(token.clone()),
+                session_id: Some(3),
+                provider: None,
+            }),
+        )
+        .await;
+        assert_eq!(stream_response.status(), StatusCode::OK);
+        assert_eq!(
+            stream_response.headers()[CONTENT_TYPE],
+            "application/x-ndjson; charset=utf-8"
+        );
+        assert_eq!(stream_response.headers()[CACHE_CONTROL], "no-store");
+        let mut updates = stream_response.into_body().into_data_stream();
+        let initial = tokio::time::timeout(Duration::from_secs(1), updates.next())
+            .await
+            .expect("initial stream timeout")
+            .expect("initial stream frame")
+            .expect("initial stream body");
+        let initial: serde_json::Value =
+            serde_json::from_slice(initial.as_ref()).expect("initial NDJSON state");
+        assert_eq!(initial["type"], "state");
+        assert_eq!(initial["status"], "ready");
+        assert!(initial.get("document").is_none());
+
+        let unrelated_task = gateway
+            .runtime
+            .config
+            .daemon
+            .create_task("unrelated stream task".into())
+            .expect("create unrelated task");
+        gateway
+            .runtime
+            .config
+            .daemon
+            .append_message(
+                unrelated_task,
+                BlockId::new(),
+                MessageRole::Agent,
+                None,
+                "must not cross the session boundary".into(),
+            )
+            .expect("append unrelated message");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), updates.next())
+                .await
+                .is_err(),
+            "Agent stream must filter another task's block patches"
+        );
+
         let (status, body) = request_path(
             gateway.address(),
             &format!("/agent/session/turn?token={token}&session_id=3"),
@@ -4450,16 +4737,31 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
 
-        let snapshot = loop {
-            let (status, body) = request(gateway.address(), &token, 3, "GET").await;
-            assert_eq!(status, StatusCode::OK.as_u16());
-            let snapshot: serde_json::Value =
-                serde_json::from_slice(&body).expect("snapshot response");
-            if snapshot["status"] == "completed" {
-                break snapshot;
+        let mut saw_patch = false;
+        loop {
+            let body = tokio::time::timeout(Duration::from_secs(2), updates.next())
+                .await
+                .expect("Agent stream update timeout")
+                .expect("Agent stream stayed open")
+                .expect("Agent stream body");
+            let frame: serde_json::Value =
+                serde_json::from_slice(body.as_ref()).expect("NDJSON Agent stream frame");
+            match frame["type"].as_str() {
+                Some("patch") => {
+                    saw_patch = true;
+                    assert!(frame["patch"]["target_revision"].as_u64().is_some());
+                    assert!(frame.get("document").is_none());
+                }
+                Some("state") if frame["status"] == "completed" => break,
+                Some("state" | "resync") => {}
+                other => panic!("unexpected Agent stream frame: {other:?}"),
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        }
+        assert!(saw_patch, "Agent turn should emit canonical block patches");
+        let (status, body) = request(gateway.address(), &token, 3, "GET").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&body).expect("final snapshot response");
         let blocks = snapshot["document"]["blocks"]
             .as_array()
             .expect("snapshot blocks");

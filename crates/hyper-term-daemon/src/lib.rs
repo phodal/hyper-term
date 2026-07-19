@@ -16,7 +16,7 @@ use hyper_term_core::{
     TerminalSupervisor, UserShellConfig,
 };
 use hyper_term_protocol::{
-    AcceptedGenUiArtifact, Actor, BlockDocument, BlockId, CapabilityLease, ClientId,
+    AcceptedGenUiArtifact, Actor, BlockDocument, BlockId, BlockPatch, CapabilityLease, ClientId,
     CompiledSandboxProfile, ControlRequest, ControlRequestEnvelope, ControlResponse,
     ControlResponseEnvelope, DomainEvent, GenUiArtifactCandidate, InputLeaseId, MessageRole,
     NewEvent, OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
@@ -63,6 +63,7 @@ pub use web_gateway::{
 };
 
 const CONTROL_SUBSCRIBER_CAPACITY: usize = 512;
+const BLOCK_SUBSCRIBER_CAPACITY: usize = 512;
 const OBSERVATION_BATCH_BYTES: u64 = 64 * 1024;
 const SANDBOX_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
 const MAX_GENUI_ARTIFACT_HISTORY: usize = 64;
@@ -89,6 +90,7 @@ struct DaemonInner {
     lease_generations: Mutex<HashMap<TerminalId, u64>>,
     cancelled_terminals: Mutex<HashSet<TerminalId>>,
     control_subscribers: Mutex<Vec<Sender<ControlResponse>>>,
+    block_subscribers: Mutex<Vec<Sender<(TaskId, BlockPatch)>>>,
     sandbox_launcher: Arc<dyn SandboxLauncher>,
     sandbox_leases: Mutex<CapabilityLeaseLedger>,
     authorized_sandboxes: Mutex<HashMap<OperationId, AuthorizedSandbox>>,
@@ -204,6 +206,7 @@ impl DaemonState {
                 lease_generations: Mutex::new(HashMap::new()),
                 cancelled_terminals: Mutex::new(HashSet::new()),
                 control_subscribers: Mutex::new(Vec::new()),
+                block_subscribers: Mutex::new(Vec::new()),
                 sandbox_launcher,
                 sandbox_leases: Mutex::new(CapabilityLeaseLedger::default()),
                 authorized_sandboxes: Mutex::new(HashMap::new()),
@@ -1670,7 +1673,26 @@ impl DaemonState {
         self.broadcast(ControlResponse::BlockPatch {
             patch: patch.clone(),
         });
+        self.broadcast_block_patch(event.task_id, patch);
         Ok(())
+    }
+
+    pub(crate) fn subscribe_block_patches(
+        &self,
+    ) -> Result<Receiver<(TaskId, BlockPatch)>, DaemonError> {
+        let (sender, receiver) = bounded(BLOCK_SUBSCRIBER_CAPACITY);
+        lock(&self.inner.block_subscribers)?.push(sender);
+        Ok(receiver)
+    }
+
+    fn broadcast_block_patch(&self, task_id: TaskId, patch: BlockPatch) {
+        let Ok(mut subscribers) = self.inner.block_subscribers.lock() else {
+            return;
+        };
+        subscribers.retain(|sender| match sender.try_send((task_id, patch.clone())) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 
     fn subscribe_control(&self) -> Result<Receiver<ControlResponse>, DaemonError> {

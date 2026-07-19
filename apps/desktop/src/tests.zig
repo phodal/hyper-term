@@ -240,12 +240,130 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
     try testing.expectEqual(main.AgentConnection.ready, model.activeSession().agent_connection);
     try testing.expectEqualStrings("Agent ready", model.agentStatus());
     try testing.expect(!model.hasAgentStatusNotice());
-    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
+    try testing.expectEqual(@as(usize, 3), fx.pendingFetchCount());
     try testing.expectEqual(std.http.Method.GET, fx.pendingFetchAt(1).?.method);
     try testing.expectEqualStrings(
         "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2",
         fx.pendingFetchAt(1).?.url,
     );
+    try testing.expectEqual(std.http.Method.GET, fx.pendingFetchAt(2).?.method);
+    try testing.expectEqual(native_sdk.FetchResponseMode.stream, fx.pendingFetchAt(2).?.response);
+    try testing.expectEqual(native_sdk.max_effect_line_bytes_ceiling, fx.pendingFetchAt(2).?.max_line_bytes);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session/stream?token=abcdef0123456789abcdef0123456789&session_id=2",
+        fx.pendingFetchAt(2).?.url,
+    );
+}
+
+test "Agent NDJSON stream applies message patches and state without polling" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    main.update(&model, .{ .agent_session_started = .{
+        .key = main.agent_start_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"session_id\":2,\"provider\":\"codex\",\"protocol\":\"codex-app-server-v2\",\"status\":\"ready\"}",
+    } }, &fx);
+    try testing.expectEqual(@as(u8, 2), model.agent_stream_session_id);
+
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"ready","error":null,"document":{"revision":4,"blocks":[{"block_id":"00000000-0000-4000-8000-000000000041","kind":"message","payload":{"type":"message","role":"agent","text":"Stream"}}]}}
+        ,
+    } }, &fx);
+    try testing.expectEqual(@as(u64, 4), model.agent_document_revision);
+
+    main.update(&model, .{ .agent_stream_line = .{
+        .key = main.agent_stream_effect_key_base + 2,
+        .line =
+        \\{"type":"patch","status":"running","patch":{"stream_sequence":5,"base_revision":4,"target_revision":5,"operations":[{"type":"append_content","block_id":"00000000-0000-4000-8000-000000000041","expected_previous_revision":1,"block_revision":2,"text":"ing"}]}}
+        ,
+    } }, &fx);
+    try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+    try testing.expectEqualStrings("Streaming", model.agentBlocks()[0].content());
+    try testing.expectEqual(@as(u64, 5), model.agent_document_revision);
+    try testing.expectEqual(@as(usize, 0), fx.pendingTimerCount());
+
+    main.update(&model, .{ .agent_stream_line = .{
+        .key = main.agent_stream_effect_key_base + 2,
+        .line =
+        \\{"type":"state","status":"completed","error":null,"capabilities":{"config_options":[],"available_commands":[]}}
+        ,
+    } }, &fx);
+    try testing.expectEqual(main.AgentTurnStatus.completed, model.agent_turn_status);
+    try testing.expectEqualStrings("Streaming", model.agentBlocks()[0].content());
+}
+
+test "Agent patch revision gaps request one bounded snapshot resync" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_stream_session_id = 2;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"session_id\":2,\"status\":\"ready\",\"document\":{\"revision\":7,\"blocks\":[]}}",
+    } }, &fx);
+    const before = fx.pendingFetchCount();
+
+    main.update(&model, .{ .agent_stream_line = .{
+        .key = main.agent_stream_effect_key_base + 2,
+        .line =
+        \\{"type":"patch","status":"running","patch":{"stream_sequence":9,"base_revision":8,"target_revision":9,"operations":[]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqual(@as(u64, 7), model.agent_document_revision);
+    try testing.expectEqual(before + 1, fx.pendingFetchCount());
+    try testing.expectEqual(main.agent_snapshot_effect_key_base + 2, fx.pendingFetchAt(before).?.key);
+}
+
+test "Agent patches observed during a snapshot force a follow-up resync" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_stream_session_id = 2;
+    model.agent_document_revision = 4;
+    model.agent_stream_sequence = 4;
+    model.agent_snapshot_in_flight_session_id = 2;
+
+    main.update(&model, .{ .agent_stream_line = .{
+        .key = main.agent_stream_effect_key_base + 2,
+        .line =
+        \\{"type":"patch","status":"running","patch":{"stream_sequence":5,"base_revision":4,"target_revision":5,"operations":[]}}
+        ,
+    } }, &fx);
+    try testing.expectEqual(@as(u64, 5), model.agent_snapshot_resync_revision);
+    const before = fx.pendingFetchCount();
+
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"session_id\":2,\"status\":\"running\",\"document\":{\"revision\":4,\"blocks\":[]}}",
+    } }, &fx);
+
+    try testing.expectEqual(before + 1, fx.pendingFetchCount());
+    try testing.expectEqual(@as(u64, 5), model.agent_snapshot_resync_revision);
 }
 
 test "Agent start failures keep the tab inert and explain the gateway result" {
@@ -824,7 +942,7 @@ test "untrusted operation metadata cannot enter trusted approval chrome" {
     try testing.expectEqualStrings("Review the real proposal", model.agentBlocks()[0].content());
 }
 
-test "running Agent snapshots schedule one bounded refresh timer" {
+test "fallback Agent snapshots schedule one bounded stream reconnect" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     var model = main.initialModelWithServices(terminal_url, agent_url);
@@ -845,7 +963,7 @@ test "running Agent snapshots schedule one bounded refresh timer" {
     try testing.expectEqual(@as(usize, 1), fx.pendingTimerCount());
     const timer = fx.pendingTimerAt(0).?;
     try testing.expectEqual(main.agent_poll_timer_key_base + 2, timer.key);
-    try testing.expectEqual(@as(u64, 250), timer.interval_ms);
+    try testing.expectEqual(@as(u64, 500), timer.interval_ms);
 }
 
 test "closing an Agent tab closes its PTY and Codex app-server" {

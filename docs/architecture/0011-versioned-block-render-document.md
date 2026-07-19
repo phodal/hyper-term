@@ -312,6 +312,26 @@ authenticated HTTP fixture, browser capsule verification, and Native semantic
 automation cover this initial route; pooled multi-block eviction and stale
 renderer-lease tests remain open.
 
+## Streaming implementation evidence (2026-07-20)
+
+The authenticated Agent gateway now exposes a bounded NDJSON stream containing
+only lightweight session-state frames and task-scoped canonical `BlockPatch`
+frames. The daemon publishes patches on an internal task-tagged channel so two
+concurrent Agent sessions cannot receive each other's document updates. It
+coalesces consecutive revisions at a 16 ms frame cadence and emits an explicit
+`resync` frame instead of an oversized or discontinuous patch.
+
+The Native adapter opens the stream alongside one bounded initial snapshot. It
+applies `AppendContent` directly to an existing Agent message and tracks both
+document revision and stream sequence. Structural operations, stale bases,
+dropped lines, oversized frames, and sequence gaps request one fresh snapshot.
+Patches observed while that snapshot is in flight raise a target-revision
+watermark, so a response that raced with later model output triggers a second
+bounded refresh rather than silently losing the tail of the response. Gateway
+tests prove cross-task filtering and absence of full documents in stream
+frames; Native tests cover direct append, status completion, revision gaps, and
+the in-flight snapshot race.
+
 ## Validation gates
 
 - Golden ACP fixtures for every negotiated version produce the same canonical

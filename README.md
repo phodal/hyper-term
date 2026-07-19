@@ -39,7 +39,9 @@ task model without giving the UI direct command or filesystem authority.
   normal terminal never starts a model or changes shell behavior.
 - **Structured coding-agent sessions.** ACP adapters turn messages, plans, tool
   calls, approvals, and results into typed blocks instead of scraping ANSI
-  output.
+  output. The Native transcript consumes ordered, frame-coalesced Block patches;
+  revision gaps fall back to one bounded snapshot instead of polling or
+  serializing the complete history for every model delta.
 - **Codex, Claude, and Copilot adapters.** Hyper Term discovers locally
   installed provider CLIs and connects through provider-specific, supervised
   adapters. An explicit ACP path wins; automatic mode prefers the
