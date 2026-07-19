@@ -293,6 +293,20 @@ test "accepted ACP artifact opens the authenticated Workbench panel" {
     fx.executor = .fake;
 
     main.update(&model, .choose_codex_acp_agent, &fx);
+    try testing.expectEqual(main.AgentProvider.codex_acp, model.activeSession().agent_provider);
+    try testing.expect(!model.hasGenUiArtifact());
+    try testing.expect(!model.hasAgentEditor());
+
+    var initial_panes: [2]main.HyperTermApp.WebViewPane = undefined;
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &initial_panes));
+    try testing.expectEqualStrings("zero://inline", initial_panes[0].url);
+
+    var initial_arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer initial_arena_state.deinit();
+    const initial_tree = try buildTree(initial_arena_state.allocator(), &model);
+    try testing.expect(findByLabel(initial_tree.root, "Agent conversation") != null);
+    try testing.expect(findByLabel(initial_tree.root, main.genui_view_anchor) == null);
+
     model.session_slots[1].agent_connection = .ready;
     model.agent_snapshot_in_flight_session_id = 2;
     main.update(&model, .{ .agent_snapshot_received = .{
