@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .native_sdk = .{
-            .url = "git+https://github.com/phodal/native.git#9505bf14d3286f6d9e2983d44c4866738ab0d7f5",
-            .hash = "native_sdk-0.1.0-hzDzQgpakQFLKFTqlGsYq4d1AuWA6Y72tfcrC0tPl6jP",
+            .url = "git+https://github.com/phodal/native.git#654079f0406ed57db696f069e754ceb6defae55b",
+            .hash = "native_sdk-0.1.0-hzDzQndxkwEbhcyvhJWv26SUOMk4CiSbbT194GLTnhL-",
         },
     },
     .paths = .{
