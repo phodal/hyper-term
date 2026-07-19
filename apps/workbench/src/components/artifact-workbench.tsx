@@ -12,9 +12,11 @@ import { resolveHost } from "../host.ts";
 import { ArtifactLanguageService } from "../editor-language-service.ts";
 import {
   type WorkspaceApplyMapping,
+  type WorkspaceApplyPreview,
   WorkspaceApplyPublisher,
   type WorkspaceApplyStatus,
   type WorkspaceApplyUpdate,
+  type WorkspaceHunkSelection,
 } from "../workspace-apply-publisher.ts";
 import { GenUiStudio } from "./genui-studio.tsx";
 import { WorkspaceReview } from "./workspace-review.tsx";
@@ -60,15 +62,16 @@ export function ArtifactWorkbench() {
   const [publishError, setPublishError] = useState<string>();
   const [activeSourcePath, setActiveSourcePath] = useState<string>();
   const [hasLocalDraft, setHasLocalDraft] = useState(false);
+  const [applyPreview, setApplyPreview] = useState<WorkspaceApplyPreview>();
   const [applyReview, setApplyReview] = useState<WorkspaceApplyUpdate>();
   const [applyError, setApplyError] = useState<string>();
   const [workspacePanel, setWorkspacePanel] = useState<
     "none" | "mapping" | "review"
   >("none");
+  const [previewStarting, setPreviewStarting] = useState(false);
   const [applyStarting, setApplyStarting] = useState(false);
   const publishController = useRef<AbortController | undefined>(undefined);
   const applyController = useRef<AbortController | undefined>(undefined);
-  const openedReviewOperation = useRef<string | undefined>(undefined);
   const selectedSourcePath = state.kind === "ready" && activeSourcePath &&
       activeSourcePath in state.source.files
     ? activeSourcePath
@@ -163,6 +166,9 @@ export function ArtifactWorkbench() {
       setState({ kind: "ready", source: nextSource });
       setPublishStatus("accepted");
       setHasLocalDraft(false);
+      setApplyPreview(undefined);
+      setApplyReview(undefined);
+      setWorkspacePanel("none");
     }).catch((error: unknown) => {
       if (controller.signal.aborted) return;
       setPublishStatus("failed");
@@ -186,7 +192,37 @@ export function ArtifactWorkbench() {
     }).source(entry, signal);
   }, [context, state]);
 
-  const applyWorkspace = useCallback((mappings: WorkspaceApplyMapping[]) => {
+  const reviewWorkspace = useCallback((mappings: WorkspaceApplyMapping[]) => {
+    if (!context || state.kind !== "ready" || hasLocalDraft) return;
+    applyController.current?.abort();
+    const controller = new AbortController();
+    applyController.current = controller;
+    setPreviewStarting(true);
+    setApplyError(undefined);
+    setApplyPreview(undefined);
+    setApplyReview(undefined);
+    const publisher = new WorkspaceApplyPublisher({
+      artifactId: state.source.artifact_id,
+      sourceRevision: state.source.source_revision,
+      sessionId: context.sessionId,
+      token: context.token,
+    });
+    publisher.preview(mappings, controller.signal).then((preview) => {
+      if (controller.signal.aborted) return;
+      setPreviewStarting(false);
+      setApplyPreview(preview);
+      setWorkspacePanel("review");
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      setPreviewStarting(false);
+      setApplyError(error instanceof Error ? error.message : String(error));
+    });
+  }, [context, hasLocalDraft, state]);
+
+  const applyWorkspace = useCallback((
+    preview: WorkspaceApplyPreview,
+    selections: WorkspaceHunkSelection[],
+  ) => {
     if (!context || state.kind !== "ready" || hasLocalDraft) return;
     applyController.current?.abort();
     const controller = new AbortController();
@@ -201,14 +237,11 @@ export function ArtifactWorkbench() {
       token: context.token,
     });
     publisher.apply(
-      mappings,
+      preview,
+      selections,
       (update) => {
         setApplyStarting(false);
         setApplyReview(update);
-        if (openedReviewOperation.current !== update.operation_id) {
-          openedReviewOperation.current = update.operation_id;
-          setWorkspacePanel("review");
-        }
       },
       controller.signal,
     ).catch((error: unknown) => {
@@ -220,8 +253,8 @@ export function ArtifactWorkbench() {
 
   const applyStatus: WorkspaceApplyStatus | "idle" = applyReview?.status ??
     "idle";
-  const applyBusy = applyStarting || applyStatus === "waiting_approval" ||
-    applyStatus === "applying";
+  const applyBusy = previewStarting || applyStarting ||
+    applyStatus === "waiting_approval" || applyStatus === "applying";
 
   return (
     <main className="artifact-surface">
@@ -285,18 +318,21 @@ export function ArtifactWorkbench() {
           {workspacePanel === "mapping" && (
             <WorkspaceApplyComposer
               sourcePaths={Object.keys(state.source.files)}
-              busy={applyStarting}
+              busy={previewStarting}
               error={applyError}
               onCancel={() => setWorkspacePanel("none")}
-              onReview={applyWorkspace}
+              onReview={reviewWorkspace}
             />
           )}
-          {workspacePanel === "review" && applyReview && (
+          {workspacePanel === "review" && applyPreview && (
             <WorkspaceReview
+              key={applyPreview.review_digest}
+              preview={applyPreview}
               review={applyReview}
-              status={applyReview.status}
+              busy={applyStarting}
               error={applyError}
               onBack={() => setWorkspacePanel("none")}
+              onApply={(selections) => applyWorkspace(applyPreview, selections)}
             />
           )}
         </div>
@@ -313,12 +349,12 @@ export function ArtifactWorkbench() {
         </span>
         {state.kind === "ready" && workspacePanel !== "mapping" && (
           <div className="workspace-apply-form">
-            {applyReview && workspacePanel !== "review" && (
+            {applyPreview && workspacePanel !== "review" && (
               <button
                 type="button"
                 onClick={() => setWorkspacePanel("review")}
               >
-                Show {applyReview.changes.length} diff(s)
+                Show {applyPreview.changes.length} review(s)
               </button>
             )}
             <button
@@ -330,11 +366,13 @@ export function ArtifactWorkbench() {
                 : "Map Artifact files to explicit workspace targets before creating one WorkspaceWrite Approval Block"}
               onClick={() => {
                 setApplyError(undefined);
+                setApplyPreview(undefined);
+                setApplyReview(undefined);
                 setWorkspacePanel("mapping");
               }}
             >
               {workspaceApplyLabel(
-                applyStarting ? "applying" : applyStatus,
+                previewStarting || applyStarting ? "applying" : applyStatus,
                 Object.keys(state.source.files).length,
               )}
             </button>

@@ -54,8 +54,8 @@ export function WorkspaceApplyComposer({
       </header>
       <div className="workspace-mapping-note">
         Select up to {maximumFiles}{" "}
-        bounded text files. Rust captures every target base before creating one
-        WorkspaceWrite approval.
+        bounded text files. Rust captures each target base and computes
+        selectable hunks without creating a WorkspaceWrite approval.
       </div>
       <form
         className="workspace-mapping-form"
@@ -103,7 +103,7 @@ export function WorkspaceApplyComposer({
           ))}
         </div>
         <footer className="workspace-mapping-footer">
-          <span>{selected.length} selected · one approval</span>
+          <span>{selected.length} selected · preview first</span>
           {(validation || error) && (
             <strong role="alert">{validation ?? error}</strong>
           )}
