@@ -25,8 +25,9 @@ use hyper_term_drivers::{
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, GenUiArtifactCandidate,
-    MessageRole, OperationAction, OperationCompletion, OperationId, OperationKind,
-    OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
+    GenUiRuntimeTraceAppendRequest, GenUiRuntimeTraceProjection, MessageRole, OperationAction,
+    OperationCompletion, OperationId, OperationKind, OperationOutcome, OperationState,
+    PermissionDecision, RiskClass, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,6 +41,7 @@ use crate::artifact_editor_store::{
     ArtifactEditorCheckpoint, ArtifactEditorCheckpointRequest, ArtifactEditorStore,
     ArtifactEditorStoreError,
 };
+use crate::artifact_runtime_trace_store::{ArtifactRuntimeTraceStore, RuntimeTraceStoreError};
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
 use crate::network_proxy::ManagedConnectProxy;
 use crate::workspace_apply::{
@@ -180,6 +182,8 @@ struct AgentGatewayRuntime {
     artifact_draft_compiler: Option<Arc<ArtifactDraftCompiler>>,
     artifact_editor_store: Arc<ArtifactEditorStore>,
     artifact_editor_lock: Arc<Mutex<()>>,
+    artifact_runtime_trace_store: Arc<ArtifactRuntimeTraceStore>,
+    artifact_runtime_trace_lock: Arc<Mutex<()>>,
     artifact_drafts: Arc<Mutex<HashMap<OperationId, ArtifactDraftRecord>>>,
     workspace_applies: Arc<Mutex<HashMap<OperationId, WorkspaceApplyRecord>>>,
     workspace_recovery_block: Arc<Mutex<Option<String>>>,
@@ -578,6 +582,10 @@ pub async fn spawn_agent_gateway(
         ArtifactEditorStore::open(&config.state_directory)
             .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?,
     );
+    let artifact_runtime_trace_store = Arc::new(
+        ArtifactRuntimeTraceStore::open(&config.state_directory)
+            .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?,
+    );
     let workbench_assets = config
         .workbench_assets
         .take()
@@ -608,6 +616,8 @@ pub async fn spawn_agent_gateway(
         artifact_draft_compiler,
         artifact_editor_store,
         artifact_editor_lock: Arc::new(Mutex::new(())),
+        artifact_runtime_trace_store,
+        artifact_runtime_trace_lock: Arc::new(Mutex::new(())),
         artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
         workspace_applies: Arc::new(Mutex::new(HashMap::new())),
         workspace_recovery_block: Arc::new(Mutex::new(workspace_recovery_block)),
@@ -635,6 +645,10 @@ pub async fn spawn_agent_gateway(
         .route(
             "/agent/artifact/{artifact_id}/editor-state",
             get(artifact_editor_state).put(save_artifact_editor_state),
+        )
+        .route(
+            "/agent/artifact/{artifact_id}/runtime-trace",
+            get(artifact_runtime_trace).post(append_artifact_runtime_trace),
         )
         .route(
             "/agent/artifact/{artifact_id}/history",
@@ -1195,6 +1209,80 @@ fn artifact_editor_response(
                 "Artifact editor checkpoint could not be persisted",
             )
         }
+    }
+}
+
+async fn artifact_runtime_trace(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.artifact_runtime_trace(session_id, artifact_id)
+    })
+    .await;
+    artifact_runtime_trace_response(result)
+}
+
+async fn append_artifact_runtime_trace(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let request = match serde_json::from_slice::<GenUiRuntimeTraceAppendRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return status_response(StatusCode::BAD_REQUEST, "Runtime trace batch is invalid");
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.append_artifact_runtime_trace(session_id, artifact_id, request)
+    })
+    .await;
+    artifact_runtime_trace_response(result)
+}
+
+fn artifact_runtime_trace_response(
+    result: Result<Result<GenUiRuntimeTraceProjection, RuntimeTraceError>, tokio::task::JoinError>,
+) -> Response {
+    match result {
+        Ok(Ok(projection)) => json_response(StatusCode::OK, &projection),
+        Ok(Err(RuntimeTraceError::SessionUnavailable | RuntimeTraceError::ArtifactUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Runtime trace is unavailable")
+        }
+        Ok(Err(RuntimeTraceError::AcpRequired)) => status_response(
+            StatusCode::FORBIDDEN,
+            "Runtime trace is available only for ACP Agent artifacts",
+        ),
+        Ok(Err(RuntimeTraceError::StaleRevision | RuntimeTraceError::Sequence)) => status_response(
+            StatusCode::CONFLICT,
+            "Runtime trace no longer matches the current Artifact stream",
+        ),
+        Ok(Err(RuntimeTraceError::InvalidRequest)) => status_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Runtime trace violates the bounded redacted event contract",
+        ),
+        Ok(Err(RuntimeTraceError::Lock | RuntimeTraceError::Store)) | Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Runtime trace could not be persisted",
+        ),
     }
 }
 
@@ -1765,6 +1853,18 @@ enum ArtifactEditorError {
 }
 
 #[derive(Debug)]
+enum RuntimeTraceError {
+    SessionUnavailable,
+    AcpRequired,
+    ArtifactUnavailable,
+    StaleRevision,
+    InvalidRequest,
+    Sequence,
+    Lock,
+    Store,
+}
+
+#[derive(Debug)]
 enum WorkspaceProposalError {
     SessionUnavailable,
     AcpRequired,
@@ -2194,6 +2294,69 @@ impl AgentGatewayRuntime {
                 request,
             )
             .map_err(map_artifact_editor_store_error)
+    }
+
+    fn artifact_runtime_trace(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+    ) -> Result<GenUiRuntimeTraceProjection, RuntimeTraceError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| RuntimeTraceError::SessionUnavailable)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(RuntimeTraceError::AcpRequired);
+        }
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| RuntimeTraceError::ArtifactUnavailable)?;
+        let _guard = self
+            .artifact_runtime_trace_lock
+            .lock()
+            .map_err(|_| RuntimeTraceError::Lock)?;
+        self.artifact_runtime_trace_store
+            .load(
+                session.task_id,
+                artifact_id,
+                artifact.metadata.source_revision,
+            )
+            .map_err(map_runtime_trace_store_error)
+    }
+
+    fn append_artifact_runtime_trace(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        request: GenUiRuntimeTraceAppendRequest,
+    ) -> Result<GenUiRuntimeTraceProjection, RuntimeTraceError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| RuntimeTraceError::SessionUnavailable)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(RuntimeTraceError::AcpRequired);
+        }
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| RuntimeTraceError::ArtifactUnavailable)?;
+        if request.source_revision != artifact.metadata.source_revision {
+            return Err(RuntimeTraceError::StaleRevision);
+        }
+        let _guard = self
+            .artifact_runtime_trace_lock
+            .lock()
+            .map_err(|_| RuntimeTraceError::Lock)?;
+        self.artifact_runtime_trace_store
+            .append(
+                session.task_id,
+                artifact_id,
+                request.source_revision,
+                request.events,
+            )
+            .map_err(map_runtime_trace_store_error)
     }
 
     fn artifact_history(
@@ -3727,6 +3890,22 @@ fn map_artifact_editor_store_error(error: ArtifactEditorStoreError) -> ArtifactE
     }
 }
 
+fn map_runtime_trace_store_error(error: RuntimeTraceStoreError) -> RuntimeTraceError {
+    match error {
+        RuntimeTraceStoreError::ContextMismatch => RuntimeTraceError::StaleRevision,
+        RuntimeTraceStoreError::SequenceConflict
+        | RuntimeTraceStoreError::SequenceGap { .. }
+        | RuntimeTraceStoreError::SequenceOverflow => RuntimeTraceError::Sequence,
+        RuntimeTraceStoreError::InvalidPath
+        | RuntimeTraceStoreError::InvalidEvent
+        | RuntimeTraceStoreError::TornJournal
+        | RuntimeTraceStoreError::TooLarge => RuntimeTraceError::InvalidRequest,
+        RuntimeTraceStoreError::Clock
+        | RuntimeTraceStoreError::Io(_)
+        | RuntimeTraceStoreError::Json(_) => RuntimeTraceError::Store,
+    }
+}
+
 fn workspace_preview_response(review: &PreparedWorkspaceReview) -> AgentWorkspacePreviewResponse {
     let changes = review
         .source_paths
@@ -3952,10 +4131,8 @@ fn continue_turn(
                     continue;
                 }
                 if projection.agent_message_interrupted && projection.agent_message_bytes > 0 {
-                    projection.agent_message_phase = projection
-                        .agent_message_phase
-                        .checked_add(1)
-                        .unwrap_or(u32::MAX);
+                    projection.agent_message_phase =
+                        projection.agent_message_phase.saturating_add(1);
                     projection.agent_block_id = BlockId::new();
                 }
                 projection.agent_message_bytes = match projection
@@ -5115,6 +5292,70 @@ mod tests {
         assert_eq!(restored_state["selections"]["/theme.ts"]["head"], 12);
         assert_eq!(
             request_path(gateway.address(), &editor_state_path, "PUT", &checkpoint)
+                .await
+                .0,
+            StatusCode::CONFLICT.as_u16()
+        );
+
+        let runtime_trace_path = format!(
+            "/agent/artifact/{}/runtime-trace?token={token}&session_id=10",
+            accepted.artifact_id
+        );
+        let trace_batch = serde_json::to_vec(&serde_json::json!({
+            "source_revision": 3,
+            "events": [{
+                "schema_version": 1,
+                "stream_id": "77777777-7777-4777-8777-777777777777",
+                "client_sequence": 1,
+                "kind": "checkpoint",
+                "name": "agent_status.changed",
+                "payload": {"expanded": true, "access_token": "must-not-persist"}
+            }]
+        }))
+        .unwrap();
+        let (status, body) =
+            request_path(gateway.address(), &runtime_trace_path, "POST", &trace_batch).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let trace: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(trace["source_revision"], 3);
+        assert_eq!(trace["events"].as_array().unwrap().len(), 1);
+        assert_eq!(trace["events"][0]["event_sequence"], 1);
+        assert_eq!(trace["events"][0]["redacted"], true);
+        assert_eq!(trace["events"][0]["payload"]["access_token"], "[REDACTED]");
+        assert_eq!(
+            trace["events"][0]["payload_digest"].as_str().map(str::len),
+            Some(64)
+        );
+        let (status, body) =
+            request_path(gateway.address(), &runtime_trace_path, "POST", &trace_batch).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (status, body) = request_path(gateway.address(), &runtime_trace_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["events"][0]["name"],
+            "agent_status.changed"
+        );
+        let stale_trace = serde_json::to_vec(&serde_json::json!({
+            "source_revision": 2,
+            "events": [{
+                "schema_version": 1,
+                "stream_id": "88888888-8888-4888-8888-888888888888",
+                "client_sequence": 1,
+                "kind": "action",
+                "name": "stale.action",
+                "payload": null
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            request_path(gateway.address(), &runtime_trace_path, "POST", &stale_trace)
                 .await
                 .0,
             StatusCode::CONFLICT.as_u16()
@@ -6383,6 +6624,10 @@ mod tests {
             artifact_draft_compiler: None,
             artifact_editor_store: Arc::new(ArtifactEditorStore::open(&state_directory).unwrap()),
             artifact_editor_lock: Arc::new(Mutex::new(())),
+            artifact_runtime_trace_store: Arc::new(
+                ArtifactRuntimeTraceStore::open(&state_directory).unwrap(),
+            ),
+            artifact_runtime_trace_lock: Arc::new(Mutex::new(())),
             artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
             workspace_applies: Arc::new(Mutex::new(HashMap::new())),
             workspace_recovery_block: Arc::new(Mutex::new(None)),

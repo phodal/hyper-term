@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 mod agent_gateway;
 mod artifact_editor_store;
+mod artifact_runtime_trace_store;
 mod artifact_store;
 #[cfg(unix)]
 mod client;
