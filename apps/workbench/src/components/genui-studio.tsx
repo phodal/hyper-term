@@ -74,6 +74,7 @@ export interface GenUiStudioProps {
   heading?: string;
   languageService?: EditorLanguageService;
   onPublishDraft?: (source: string) => void;
+  onDraftStateChange?: (changed: boolean) => void;
   publishStatus?: ArtifactDraftStatus | "idle";
   publishError?: string;
 }
@@ -86,6 +87,7 @@ export function GenUiStudio({
   heading = "Live artifact",
   languageService,
   onPublishDraft,
+  onDraftStateChange,
   publishStatus = "idle",
   publishError,
 }: GenUiStudioProps) {
@@ -248,6 +250,10 @@ export function GenUiStudio({
   const draftChanged = source !== baselineSource;
   const publishBusy = publishStatus === "waiting_approval" ||
     publishStatus === "compiling";
+
+  useEffect(() => {
+    onDraftStateChange?.(draftChanged);
+  }, [draftChanged, onDraftStateChange]);
 
   return (
     <aside className="studio" aria-label="Agentic UI Studio">

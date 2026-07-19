@@ -9,12 +9,21 @@ interface CodeDiffProps {
   original: string;
   modified: string;
   onChange(value: string): void;
+  readOnlyModified?: boolean;
 }
 
-export function CodeDiff({ original, modified, onChange }: CodeDiffProps) {
+export function CodeDiff({
+  original,
+  modified,
+  onChange,
+  readOnlyModified = false,
+}: CodeDiffProps) {
   const parent = useRef<HTMLDivElement>(null);
+  const mergeRef = useRef<MergeView | undefined>(undefined);
   const onChangeRef = useRef(onChange);
+  const modifiedRef = useRef(modified);
   onChangeRef.current = onChange;
+  modifiedRef.current = modified;
 
   useEffect(() => {
     if (!parent.current) return;
@@ -34,10 +43,16 @@ export function CodeDiff({ original, modified, onChange }: CodeDiffProps) {
         ],
       },
       b: {
-        doc: modified,
+        doc: modifiedRef.current,
         extensions: [
           basicSetup,
           javascript({ jsx: true, typescript: true }),
+          ...(readOnlyModified
+            ? [
+              EditorState.readOnly.of(true),
+              EditorView.editable.of(false),
+            ]
+            : []),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               onChangeRef.current(update.state.doc.toString());
@@ -46,8 +61,20 @@ export function CodeDiff({ original, modified, onChange }: CodeDiffProps) {
         ],
       },
     });
-    return () => merge.destroy();
-  }, [original]);
+    mergeRef.current = merge;
+    return () => {
+      mergeRef.current = undefined;
+      merge.destroy();
+    };
+  }, [original, readOnlyModified]);
+
+  useEffect(() => {
+    const view = mergeRef.current?.b;
+    if (!view || view.state.doc.toString() === modified) return;
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: modified },
+    });
+  }, [modified]);
 
   return <div className="code-diff" ref={parent} />;
 }
