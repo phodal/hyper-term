@@ -94,7 +94,7 @@ UI bridge.
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
 | Artifact editor, Diff, Time Travel, diagnostics, completion, and approved publish | Experimental |
-| Brokered workspace edits | Not implemented |
+| Brokered exact single-file Artifact apply | Experimental |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |
 
@@ -227,8 +227,9 @@ Useful design documents:
 ## Roadmap
 
 - Harden terminal performance, accessibility, reconnect, and recovery gates.
-- Complete brokered workspace transactions without giving the renderer write
-  authority.
+- Extend the brokered exact single-file Artifact apply transaction to
+  multi-file/hunk review and crash-recoverable worktree commits, without giving
+  the renderer write authority.
 - Strengthen containment for external coding-agent processes.
 - Publish signed and notarized Apple Silicon and Intel builds.
 - Define the supported-platform contract before expanding beyond macOS.

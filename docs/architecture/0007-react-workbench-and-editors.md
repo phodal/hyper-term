@@ -145,11 +145,30 @@ operation through dispatch, recompiles with the digest-pinned Deno and
 `esbuild-wasm` runtime, accepts a new immutable Artifact revision, records its
 receipt, and refreshes the Workbench from Rust source. The browser's 260 ms
 compiler remains advisory local preview only. Publishing an Artifact still
-does not write to the workspace; brokered apply is a later transaction. A real
-Deno integration test covers approval, compilation, Artifact replacement,
-source recovery, and stale revision rejection. Multi-file selection,
-fine-grained edit transaction journaling, and brokered workspace apply remain
-open.
+does not write to the workspace. Instead, the accepted Artifact can now enter a
+second, independent `hyper_term.workspace.apply` transaction. The user provides
+an explicit workspace-relative target; Rust captures the exact Artifact source
+revision, source path, target parent identity, existing file identity, mode,
+content digest, and bounded UTF-8 contents before producing the review. The
+renderer receives the immutable before/after pair for a read-only CodeMirror
+diff but has no file API.
+
+The operation is projected as `FileEdit / WorkspaceWrite` and remains unchanged
+until the matching Approval Block receives `AllowOnce`. Dispatch rechecks the
+current Artifact and workspace base. Traversal, VCS metadata, symlink parents,
+special files, files over 1 MiB, changed inodes, changed modes, and changed
+digests fail closed. On macOS the executor stages in the already-open parent
+directory and uses atomic exclusive rename for a new target or atomic swap plus
+displaced-base verification for an existing target. A gateway integration test
+proves that no write occurs before the exact approval and unit tests cover stale
+identity, no-replace creation, and symlink escape rejection. Browser passes at
+480 pixels cover review, returning to the editor during polling, and zero
+horizontal page overflow.
+
+A real Deno integration test separately covers Artifact approval, compilation,
+replacement, source recovery, and stale revision rejection. Multi-file/hunk
+selection, durable edit transaction journaling, crash-recoverable multi-file
+commit, and arbitrary binary files remain open.
 
 ## Validation gates
 
