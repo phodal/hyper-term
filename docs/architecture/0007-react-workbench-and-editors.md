@@ -116,9 +116,9 @@ CodeMirror version upgrades require schema and transaction migration tests.
 
 The Deno-built React Workbench contains a real CodeMirror 6 TSX editor,
 `@codemirror/merge` diff view, persistent `esbuild-wasm` Worker, isolated live
-preview, source-mapped runtime diagnostics, and bounded Time Travel trace. It
-still runs against an inert demo broker when opened by itself, so that browser
-surface is not yet evidence of workspace-write authority.
+preview, source-mapped runtime diagnostics, and Rust-journaled accepted-
+Artifact Time Travel. It still runs against an inert demo broker when opened by
+itself, so that browser surface is not evidence of workspace-write authority.
 
 The Rust acceptance path now retains the exact bounded virtual source snapshot
 for every new GenUI artifact and exposes only the current task artifact through
@@ -176,10 +176,21 @@ browser flow proves a two-file relative import, per-file LSP readiness, draft
 retention across file and review switches, and current-file Workspace Apply
 mapping without page overflow.
 
+Time Travel no longer depends on the lifetime of that mounted React tree. The
+Workbench requests a bounded newest-first Artifact projection from the Rust
+journal and lazily fetches the exact source of a selected historical revision.
+Loading history changes only the local draft, preserves the current Artifact as
+the Diff base, and sends the complete source tree through the advisory live
+preview. The old source becomes authoritative only if the user publishes it as
+a new approved Artifact revision. Daemon-restart and authenticated-gateway
+tests cover persistence and task/current-revision fencing; a 480-pixel browser
+flow covers restore, per-file dirty state, Diff, preview reload, and overflow.
+
 A real Deno integration test separately covers Artifact approval, compilation,
 replacement, source recovery, and stale revision rejection. Multi-file/hunk
-workspace acceptance, durable edit transaction journaling, crash-recoverable
-multi-file commit, and arbitrary binary files remain open.
+workspace acceptance, durable edit-transaction/selection journaling, reducer
+trace checkpoints, crash-recoverable multi-file commit, and arbitrary binary
+files remain open.
 
 ## Validation gates
 

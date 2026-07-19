@@ -145,8 +145,12 @@ returns, validates its entrypoint, normalized paths, file count, and byte
 budget, then persists it beside bundle, CSS, and source map in the private
 artifact file. A task-current authenticated `/source` endpoint returns this
 snapshot for the trusted editor; wrong tokens and stale artifact IDs fail
-closed. Pre-source artifacts remain previewable during migration but cannot
-claim editable-source availability.
+closed. A separate bounded history projection now derives the latest 64
+accepted revisions from the Rust JSONL journal. Historical source is readable
+only through an authenticated session and a still-current Artifact fence, so an
+old Workbench URL cannot continue traversing revisions after the task advances.
+Pre-source artifacts remain previewable during migration but cannot claim
+editable-source availability.
 
 The trusted Workbench now keeps that complete fixed-path source tree as one
 draft. A horizontally responsive file strip selects each source without
@@ -158,11 +162,18 @@ source-map failures select the owning file when it is present. Workspace apply
 also binds to the explicitly selected Artifact source path rather than assuming
 `/App.tsx`.
 
+The Time Travel surface reads those durable accepted revisions newest-first.
+Loading an older source creates an ordinary local multi-file draft, switches to
+Diff, and recompiles only the isolated local preview; it does not re-run the
+operation, Agent, MCP tool, shell command, or workspace write that produced the
+revision. Restart tests prove the same history and historical source can be
+recovered from the journal and private Artifact store.
+
 This closes the first accepted-artifact, last-known-good delivery, initial
-runtime-error mapping, source-recovery, and fixed-file-tree editor navigation
-slices. It does not yet close the complete hostile-artifact matrix, durable
-action/trace protocol, resource budgets, multi-file workspace acceptance, or
-accessibility gates below.
+runtime-error mapping, source-recovery, fixed-file-tree editor navigation, and
+accepted-revision replay slices. It does not yet close the complete hostile-
+artifact matrix, durable reducer/action trace protocol, resource budgets,
+multi-file workspace acceptance, or accessibility gates below.
 
 ## Validation gates
 

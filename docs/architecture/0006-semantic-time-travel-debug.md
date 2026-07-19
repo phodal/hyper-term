@@ -112,6 +112,38 @@ the real world is reversible. It requires stable event schemas, migration,
 checkpoint compatibility, content retention, and deterministic projection
 tests. Event volume must be controlled through batching and artifact references.
 
+## Implementation evidence (2026-07-19)
+
+The first durable Artifact-timeline slice now uses the existing Rust authority
+instead of the former React-only trace list. Every accepted GenUI revision was
+already an `ArtifactAccepted` event in the fsynced JSONL journal, while its
+bounded virtual source tree, compiled output, CSS, and source map were stored in
+the daemon's private Artifact store. The daemon now projects the latest 64
+accepted revisions for one task, including journal sequence, timestamp,
+operation identity, compiler identity, and content digest.
+
+Both history metadata and historical source require the authenticated Agent
+session plus the exact current Artifact ID as a fence. The requested historical
+Artifact must also belong to that task's journal. Advancing the task invalidates
+an already-open stale Workbench URL. A restart test accepts two revisions,
+reopens the daemon, reproduces the same ordered projection, and reads the first
+revision's exact source. A gateway test covers current-fence rejection,
+authentication, bounded metadata, and historical source recovery.
+
+The Workbench Time Travel tab renders this Rust-owned timeline. “Load as draft”
+fetches the exact old source, requires the current fixed virtual path set, marks
+changed files, opens CodeMirror Diff, and runs only the network-closed advisory
+preview compiler. It never replays Shell, filesystem, ACP, MCP, Computer Use,
+clipboard, notification, or audio effects. Publishing the restored draft still
+creates a new revision and passes the normal approval and pinned-Deno path. A
+480-pixel browser flow proves two-file history restore, current-versus-history
+Diff, live preview reload, enabled publish, and zero page overflow.
+
+This is accepted-Artifact Time Travel, not completion of the whole ADR. Durable
+editor transactions and selections, reducer/action trace checkpoints, effect
+receipt substitution, replay projection digests, and redacted offline bug
+capsules remain open.
+
 ## Validation gates
 
 - Replaying the same checkpoint and event range must produce the same canonical

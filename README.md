@@ -49,9 +49,10 @@ task model without giving the UI direct command or filesystem authority.
   server with bounded Diff, GenUI compile, and Deno LSP tools. Every call is an
   operation proposal; Rust and the user authorize it before execution.
 - **Artifact Workbench.** Current artifacts can open in a CodeMirror editor with
-  Diff, Time Travel, source-mapped diagnostics, completion, and an isolated
-  local preview. Publishing a draft creates an Approval Block and a new
-  Rust-accepted revision compiled by pinned Deno; it does not write to the
+  Diff, Rust-journaled Time Travel, source-mapped diagnostics, completion, and
+  an isolated local preview. A historical revision can be loaded as a local
+  draft without replaying effects. Publishing creates an Approval Block and a
+  new Rust-accepted revision compiled by pinned Deno; it does not write to the
   workspace.
 - **Local-first authority.** Rust owns PTYs, process lifetime, permissions,
   durable state, and accepted artifacts. WebViews render trusted projections
@@ -93,7 +94,7 @@ UI bridge.
 | GitHub Copilot ACP discovery | Implemented baseline |
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
-| Multi-file Artifact editor, Diff, Time Travel, diagnostics, completion, and approved publish | Experimental |
+| Multi-file Artifact editor, Diff, durable accepted-revision Time Travel, diagnostics, completion, and approved publish | Experimental |
 | Brokered exact single-file Artifact apply | Experimental |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |
@@ -230,6 +231,8 @@ Useful design documents:
 - Extend the brokered exact single-file Artifact apply transaction to
   multi-file/hunk review and crash-recoverable worktree commits, without giving
   the renderer write authority.
+- Extend accepted-Artifact Time Travel into journaled editor transactions,
+  reducer/runtime trace checkpoints, and redacted offline bug capsules.
 - Strengthen containment for external coding-agent processes.
 - Publish signed and notarized Apple Silicon and Intel builds.
 - Define the supported-platform contract before expanding beyond macOS.
