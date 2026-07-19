@@ -49,6 +49,8 @@ mod workspace_snapshot;
 
 use artifact_store::{ArtifactStore, ArtifactStoreError, StoredGenUiArtifact};
 
+pub use artifact_debug_capsule::{BugCapsuleError, load_bug_capsule};
+
 pub use agent_gateway::{
     AcpAgentProviderConfig, AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle,
     AgentGenUiRuntimeConfig, spawn_agent_gateway,

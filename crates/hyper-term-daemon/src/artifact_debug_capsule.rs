@@ -1,3 +1,8 @@
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::Path;
+
 use hyper_term_protocol::{
     GenUiBugCapsule, GenUiBugCapsuleEditorState, GenUiBugCapsuleEnvironment, GenUiBugCapsuleFile,
     GenUiBugCapsuleInclusion, GenUiBugCapsuleInventoryEntry, GenUiBugCapsuleOutputs,
@@ -5,6 +10,8 @@ use hyper_term_protocol::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use thiserror::Error;
 
 use crate::artifact_editor_store::{ArtifactEditorCheckpoint, ArtifactEditorView};
@@ -17,13 +24,53 @@ const MAX_BUG_CAPSULE_BYTES: usize = 512 * 1024;
 const EXCLUDED_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Error)]
-pub(crate) enum BugCapsuleError {
+pub enum BugCapsuleError {
     #[error("bug capsule exceeds its bounded export size")]
     TooLarge,
     #[error("bug capsule serialization failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("bug capsule runtime projection failed: {0}")]
-    Runtime(#[from] RuntimeTraceStoreError),
+    Runtime(String),
+    #[error("bug capsule I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("bug capsule contract is invalid")]
+    Invalid,
+}
+
+impl From<RuntimeTraceStoreError> for BugCapsuleError {
+    fn from(error: RuntimeTraceStoreError) -> Self {
+        Self::Runtime(error.to_string())
+    }
+}
+
+pub fn load_bug_capsule(path: &Path) -> Result<GenUiBugCapsule, BugCapsuleError> {
+    if !path.is_absolute() {
+        return Err(BugCapsuleError::Invalid);
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_BUG_CAPSULE_BYTES as u64 {
+        return Err(BugCapsuleError::Invalid);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.file_type().is_file()
+        || opened_metadata.len() > MAX_BUG_CAPSULE_BYTES as u64
+    {
+        return Err(BugCapsuleError::Invalid);
+    }
+    let mut encoded = Vec::with_capacity(opened_metadata.len() as usize);
+    file.take(MAX_BUG_CAPSULE_BYTES as u64 + 1)
+        .read_to_end(&mut encoded)?;
+    if encoded.len() > MAX_BUG_CAPSULE_BYTES {
+        return Err(BugCapsuleError::TooLarge);
+    }
+    let capsule: GenUiBugCapsule = serde_json::from_slice(&encoded)?;
+    validate_bug_capsule(&capsule)?;
+    Ok(capsule)
 }
 
 pub(crate) fn build_bug_capsule(
@@ -184,9 +231,116 @@ pub(crate) fn build_bug_capsule(
     Ok(capsule)
 }
 
-#[cfg(test)]
 pub(crate) fn verify_bug_capsule(capsule: &GenUiBugCapsule) -> Result<bool, BugCapsuleError> {
     Ok(capsule.capsule_digest.as_deref() == Some(unsigned_digest(capsule)?.as_str()))
+}
+
+fn validate_bug_capsule(capsule: &GenUiBugCapsule) -> Result<(), BugCapsuleError> {
+    if capsule.schema_version != BUG_CAPSULE_SCHEMA_VERSION
+        || capsule.mode != "replay_only"
+        || capsule.artifact.source_revision == 0
+        || capsule.runtime.artifact_id != capsule.artifact.artifact_id
+        || capsule.runtime.source_revision != capsule.artifact.source_revision
+        || capsule.editor.base_source_revision != capsule.artifact.source_revision
+        || !is_sha256(&capsule.artifact.content_digest)
+        || !is_sha256(&capsule.runtime.projection_digest)
+        || !is_sha256(&capsule.editor.state_digest)
+        || !is_sha256(&capsule.outputs.bundle_digest)
+        || !is_sha256(&capsule.outputs.css_digest)
+        || !is_sha256(&capsule.outputs.source_map_digest)
+        || !capsule.capsule_digest.as_deref().is_some_and(is_sha256)
+        || capsule.accepted_source.is_empty()
+        || capsule.accepted_source.len() > 100
+        || capsule.editor.files.is_empty()
+        || capsule.editor.files.len() > 100
+        || capsule.runtime.events.len() > 256
+        || capsule.inventory.is_empty()
+        || capsule.inventory.len() > 32
+        || capsule.reproduction.is_empty()
+        || capsule.reproduction.len() > 16
+        || capsule.reproduction.iter().any(|step| step.len() > 4096)
+    {
+        return Err(BugCapsuleError::Invalid);
+    }
+    let mut accepted_paths = HashSet::new();
+    if capsule.accepted_source.iter().any(|file| {
+        !valid_capsule_file(file.path.as_str(), &file.content_digest)
+            || file.modified
+            || !accepted_paths.insert(file.path.as_str())
+    }) {
+        return Err(BugCapsuleError::Invalid);
+    }
+    let mut editor_paths = HashSet::new();
+    if capsule.editor.files.iter().any(|file| {
+        !valid_capsule_file(file.path.as_str(), &file.content_digest)
+            || !editor_paths.insert(file.path.as_str())
+    }) || accepted_paths != editor_paths
+        || !editor_paths.contains(capsule.artifact.entrypoint.as_str())
+        || !editor_paths.contains(capsule.editor.active_path.as_str())
+    {
+        return Err(BugCapsuleError::Invalid);
+    }
+    if capsule
+        .runtime
+        .events
+        .iter()
+        .enumerate()
+        .any(|(index, event)| {
+            event.schema_version != 1
+                || event.event_sequence == 0
+                || event.artifact_id != capsule.artifact.artifact_id
+                || event.source_revision != capsule.artifact.source_revision
+                || event.client_sequence == 0
+                || !is_sha256(&event.payload_digest)
+                || (index > 0
+                    && event.event_sequence
+                        != capsule.runtime.events[index - 1]
+                            .event_sequence
+                            .saturating_add(1))
+        })
+    {
+        return Err(BugCapsuleError::Invalid);
+    }
+    if replay_projection_digest(capsule.runtime.source_revision, &capsule.runtime.events)?
+        != capsule.runtime.projection_digest
+    {
+        return Err(BugCapsuleError::Invalid);
+    }
+    let required_exclusions = [
+        "terminal_output",
+        "provider_prompts",
+        "mcp_payloads",
+        "computer_use_and_screenshots",
+        "environment_variables",
+    ];
+    let mut inventory = HashSet::new();
+    if capsule.inventory.iter().any(|entry| {
+        entry.category.is_empty()
+            || entry.category.len() > 128
+            || entry.reason.is_empty()
+            || entry.reason.len() > 4096
+            || !inventory.insert(entry.category.as_str())
+    }) || required_exclusions.iter().any(|category| {
+        !capsule.inventory.iter().any(|entry| {
+            entry.category == *category && entry.inclusion == GenUiBugCapsuleInclusion::Excluded
+        })
+    }) || !verify_bug_capsule(capsule)?
+    {
+        return Err(BugCapsuleError::Invalid);
+    }
+    Ok(())
+}
+
+fn valid_capsule_file(path: &str, digest: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 4096
+        && !path.contains("..")
+        && !path.contains('\\')
+        && is_sha256(digest)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn bounded_runtime_events(
@@ -401,5 +555,110 @@ mod tests {
         );
         assert!(serde_json::to_vec(&capsule).unwrap().len() <= MAX_BUG_CAPSULE_BYTES);
         assert!(verify_bug_capsule(&capsule).unwrap());
+    }
+
+    #[test]
+    fn pretty_saved_capsule_reopens_but_tampering_fails_closed() {
+        let (artifact, editor, runtime) = fixture();
+        let capsule = build_bug_capsule(
+            &artifact,
+            &editor,
+            &runtime,
+            GenUiBugCapsuleEnvironment {
+                hyper_term_version: "0.1.0".into(),
+                os: "macos".into(),
+                architecture: "aarch64".into(),
+                deno_runtime_version: None,
+                deno_executable_digest: None,
+                compiler_script_digest: None,
+                compiler_wasm_digest: None,
+            },
+        )
+        .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("fixture.bug-capsule.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&capsule).unwrap()).unwrap();
+        let loaded = load_bug_capsule(&path).unwrap();
+        assert_eq!(loaded.capsule_digest, capsule.capsule_digest);
+
+        let mut forged_projection = capsule.clone();
+        forged_projection.runtime.projection_digest = "e".repeat(64);
+        forged_projection.capsule_digest = Some(unsigned_digest(&forged_projection).unwrap());
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&forged_projection).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_bug_capsule(&path),
+            Err(BugCapsuleError::Invalid)
+        ));
+
+        let mut tampered = capsule;
+        tampered.environment.os = "tampered".into();
+        std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        assert!(matches!(
+            load_bug_capsule(&path),
+            Err(BugCapsuleError::Invalid)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capsule_loader_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target.json");
+        let link = temporary.path().join("link.json");
+        std::fs::write(&target, "{}").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(matches!(
+            load_bug_capsule(&link),
+            Err(BugCapsuleError::Invalid)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capsule_loader_rejects_non_regular_files_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("capsule.pipe");
+        let encoded_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded_path` is a live, NUL-terminated path and the mode is
+        // bounded to the temporary directory used by this test.
+        assert_eq!(unsafe { libc::mkfifo(encoded_path.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            load_bug_capsule(&path),
+            Err(BugCapsuleError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn imported_projection_digest_uses_the_stable_replay_identity() {
+        let event = GenUiRuntimeTraceEvent {
+            schema_version: 1,
+            event_sequence: 1,
+            artifact_id: ArtifactId::from_uuid(
+                Uuid::parse_str("55555555-5555-4555-8555-555555555555").unwrap(),
+            ),
+            source_revision: 7,
+            stream_id: Uuid::parse_str("77777777-7777-4777-8777-777777777777").unwrap(),
+            client_sequence: 1,
+            kind: GenUiRuntimeTraceKind::Checkpoint,
+            name: "evidence.panel".into(),
+            payload: serde_json::json!({"expanded": true}),
+            payload_digest: "3".repeat(64),
+            redacted: false,
+            recorded_at_ms: 1_753_000_000_001,
+        };
+
+        assert_eq!(
+            replay_projection_digest(7, &[event]).unwrap(),
+            "12fb95ac9b2b5adc0fb43f64f8f10f8861aff850083d1ff3bebee7df568cd38c"
+        );
     }
 }

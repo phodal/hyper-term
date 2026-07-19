@@ -94,6 +94,7 @@ async fn acp_agent_discovers_the_real_brokered_deno_tool_catalog() {
             compiler_version: "0.28.1".into(),
         }),
         workbench_assets: None,
+        debug_capsule: None,
         control_socket,
     })
     .await

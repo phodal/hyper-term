@@ -94,6 +94,7 @@ pub struct AgentGatewayConfig {
     pub mcp_executable: Option<PathBuf>,
     pub genui_runtime: Option<AgentGenUiRuntimeConfig>,
     pub workbench_assets: Option<PathBuf>,
+    pub debug_capsule: Option<GenUiBugCapsule>,
     pub control_socket: PathBuf,
 }
 
@@ -655,6 +656,7 @@ pub async fn spawn_agent_gateway(
             "/agent/artifact/{artifact_id}/debug-capsule",
             get(artifact_debug_capsule),
         )
+        .route("/agent/debug-capsule", get(offline_debug_capsule))
         .route(
             "/agent/artifact/{artifact_id}/history",
             get(artifact_history),
@@ -1327,6 +1329,19 @@ async fn artifact_debug_capsule(
     }
 }
 
+async fn offline_debug_capsule(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    if let Err(response) = authorize_gateway_token(&runtime, &query) {
+        return *response;
+    }
+    match runtime.config.debug_capsule.as_ref() {
+        Some(capsule) => json_response(StatusCode::OK, capsule),
+        None => status_response(StatusCode::NOT_FOUND, "Offline Bug Capsule is unavailable"),
+    }
+}
+
 async fn artifact_history(
     State(runtime): State<AgentGatewayRuntime>,
     RoutePath(artifact_id): RoutePath<String>,
@@ -1813,6 +1828,20 @@ fn authorize(
     runtime: &AgentGatewayRuntime,
     query: &AgentSessionQuery,
 ) -> Result<u16, Box<Response>> {
+    authorize_gateway_token(runtime, query)?;
+    let Some(session_id @ 1..=999) = query.session_id else {
+        return Err(Box::new(status_response(
+            StatusCode::BAD_REQUEST,
+            "agent session id is invalid",
+        )));
+    };
+    Ok(session_id)
+}
+
+fn authorize_gateway_token(
+    runtime: &AgentGatewayRuntime,
+    query: &AgentSessionQuery,
+) -> Result<(), Box<Response>> {
     if !constant_time_eq(
         query.token.as_deref().unwrap_or_default().as_bytes(),
         runtime.config.token.as_bytes(),
@@ -1822,13 +1851,7 @@ fn authorize(
             "agent gateway token is invalid",
         )));
     }
-    let Some(session_id @ 1..=999) = query.session_id else {
-        return Err(Box::new(status_response(
-            StatusCode::BAD_REQUEST,
-            "agent session id is invalid",
-        )));
-    };
-    Ok(session_id)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4567,6 +4590,43 @@ mod tests {
         }
     }
 
+    fn capsule_fixture() -> GenUiBugCapsule {
+        let artifact = draft_fixture();
+        let editor = ArtifactEditorCheckpoint {
+            schema_version: 1,
+            artifact_id: artifact.metadata.artifact_id,
+            base_source_revision: artifact.metadata.source_revision,
+            revision: 0,
+            state_digest: "b".repeat(64),
+            entrypoint: artifact.metadata.entrypoint.clone(),
+            files: artifact.source_files.clone(),
+            active_path: artifact.metadata.entrypoint.clone(),
+            view: crate::artifact_editor_store::ArtifactEditorView::Trace,
+            selections: BTreeMap::new(),
+        };
+        let runtime = GenUiRuntimeTraceProjection {
+            artifact_id: artifact.metadata.artifact_id,
+            source_revision: artifact.metadata.source_revision,
+            projection_digest: "c".repeat(64),
+            events: Vec::new(),
+        };
+        build_bug_capsule(
+            &artifact,
+            &editor,
+            &runtime,
+            GenUiBugCapsuleEnvironment {
+                hyper_term_version: "0.1.0".into(),
+                os: "macos".into(),
+                architecture: "aarch64".into(),
+                deno_runtime_version: None,
+                deno_executable_digest: None,
+                compiler_script_digest: None,
+                compiler_wasm_digest: None,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn daemon_restart_reconciles_a_durable_workspace_commit() {
         let temporary = tempfile::tempdir().unwrap();
@@ -4915,6 +4975,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn offline_capsule_endpoint_requires_only_the_desktop_gateway_token() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let expected = capsule_fixture();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace,
+            state_directory: temporary.path().join("gateway-state"),
+            daemon: DaemonState::open(temporary.path().join("daemon-state")).unwrap(),
+            codex_executable: None,
+            codex_auth_file: None,
+            acp_providers: Vec::new(),
+            mcp_executable: None,
+            genui_runtime: None,
+            workbench_assets: None,
+            debug_capsule: Some(expected.clone()),
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .unwrap();
+        let path = format!("/agent/debug-capsule?token={token}");
+        let (status, body) = request_path(gateway.address(), &path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let actual: GenUiBugCapsule = serde_json::from_slice(&body).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                "/agent/debug-capsule?token=wrong",
+                "GET",
+                b""
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn authenticated_session_streams_a_turn_into_the_block_document() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
@@ -4945,6 +5048,7 @@ mod tests {
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
+            debug_capsule: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -5102,6 +5206,7 @@ mod tests {
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
+            debug_capsule: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -5269,6 +5374,7 @@ mod tests {
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
+            debug_capsule: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -5751,6 +5857,7 @@ mod tests {
                 compiler_version: "0.28.1".into(),
             }),
             workbench_assets: None,
+            debug_capsule: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -5912,6 +6019,7 @@ mod tests {
                 compiler_version: "0.28.1".into(),
             }),
             workbench_assets: None,
+            debug_capsule: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -6165,6 +6273,7 @@ mod tests {
                 compiler_version: "0.28.1".into(),
             }),
             workbench_assets: Some(workbench_assets),
+            debug_capsule: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -6490,6 +6599,7 @@ mod tests {
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
+            debug_capsule: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -6636,6 +6746,7 @@ mod tests {
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
+            debug_capsule: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -6764,6 +6875,7 @@ mod tests {
                     compiler_version: "0.28.1".into(),
                 }),
                 workbench_assets: None,
+                debug_capsule: None,
                 control_socket: temporary.path().join("hyperd.sock"),
             }),
             sessions: Arc::new(Mutex::new(HashMap::new())),

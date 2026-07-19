@@ -19,7 +19,8 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use hyper_term_daemon::{
     AcpAgentProviderConfig, AgentGatewayConfig, AgentGenUiRuntimeConfig, DaemonState,
-    TerminalGatewayConfig, spawn_agent_gateway, spawn_terminal_gateway, spawn_unix_server,
+    TerminalGatewayConfig, load_bug_capsule, spawn_agent_gateway, spawn_terminal_gateway,
+    spawn_unix_server,
 };
 use uuid::Uuid;
 
@@ -31,6 +32,7 @@ const TERMINAL_URL_ENV: &str = "HYPER_TERM_TERMINAL_URL";
 const AGENT_URL_ENV: &str = "HYPER_TERM_AGENT_URL";
 const AGENT_PROVIDERS_ENV: &str = "HYPER_TERM_AGENT_PROVIDERS";
 const AGENT_PROVIDER_STATUS_ENV: &str = "HYPER_TERM_AGENT_PROVIDER_STATUS";
+const BUG_CAPSULE_URL_ENV: &str = "HYPER_TERM_BUG_CAPSULE_URL";
 const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const PROVIDER_PROBE_MAX_STDOUT_BYTES: usize = 4 * 1024;
 const ACP_PACKAGE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
@@ -41,6 +43,7 @@ const DESKTOP_HELP: &str = "Hyper Term desktop host\n\nUsage: hyper-term-desktop
 Options:\n  --ui PATH                 Native renderer executable\n  \
 --terminal-assets PATH    Built terminal renderer directory\n  \
 --workbench-assets PATH   Built trusted artifact Workbench directory\n  \
+--bug-capsule PATH        Open a bounded replay-only Bug Capsule\n  \
 --state-dir PATH          Durable Hyper Term state\n  \
 --shell-cwd PATH          Initial directory for new shells\n  \
 --codex PATH              Codex executable for Agent sessions\n  \
@@ -80,6 +83,12 @@ fn run() -> Result<i32, String> {
         .ok_or_else(|| "HOME is not available for desktop state and shell cwd".to_owned())?;
     let resolved = options.resolve(&executable, &home)?;
     resolved.validate()?;
+    let debug_capsule = resolved
+        .bug_capsule
+        .as_deref()
+        .map(load_bug_capsule)
+        .transpose()
+        .map_err(|error| format!("cannot open Bug Capsule: {error}"))?;
     std::fs::create_dir_all(&resolved.state_directory)
         .map_err(|error| format!("cannot create desktop state directory: {error}"))?;
 
@@ -153,17 +162,28 @@ fn run() -> Result<i32, String> {
                     compiler_version: "0.28.1".into(),
                 }),
             workbench_assets: resolved.workbench_assets.clone(),
+            debug_capsule: debug_capsule.clone(),
             control_socket,
         })
         .await
         .map_err(|error| error.to_string())?;
         let terminal_url = format!("http://{}/?token={terminal_token}", gateway.address());
         let agent_url = format!("http://{}/?token={agent_token}", agent_gateway.address());
+        let bug_capsule_url = debug_capsule.as_ref().map(|_| {
+            format!(
+                "http://{}/agent/workbench/?surface=capsule&token={agent_token}",
+                agent_gateway.address()
+            )
+        });
         let mut renderer = Command::new(&resolved.ui)
             .env(TERMINAL_URL_ENV, terminal_url)
             .env(AGENT_URL_ENV, agent_url)
             .env(AGENT_PROVIDERS_ENV, agent_provider_ids)
             .env(AGENT_PROVIDER_STATUS_ENV, provider_status)
+            .env(
+                BUG_CAPSULE_URL_ENV,
+                bug_capsule_url.as_deref().unwrap_or_default(),
+            )
             .spawn()
             .map_err(|error| format!("cannot start native renderer: {error}"))?;
         let status = wait_for_renderer(&mut renderer).await?;
@@ -238,6 +258,7 @@ struct Options {
     ui: Option<PathBuf>,
     terminal_assets: Option<PathBuf>,
     workbench_assets: Option<PathBuf>,
+    bug_capsule: Option<PathBuf>,
     state_directory: Option<PathBuf>,
     shell_cwd: Option<PathBuf>,
     codex: Option<PathBuf>,
@@ -267,6 +288,9 @@ impl Options {
                 Some("--workbench-assets") => {
                     options.workbench_assets =
                         Some(required_path(&mut arguments, "--workbench-assets")?);
+                }
+                Some("--bug-capsule") => {
+                    options.bug_capsule = Some(required_path(&mut arguments, "--bug-capsule")?);
                 }
                 Some("--state-dir") => {
                     options.state_directory = Some(required_path(&mut arguments, "--state-dir")?);
@@ -324,6 +348,15 @@ impl Options {
         let workbench_assets = (explicit_workbench
             || workbench_candidate.join("index.html").is_file())
         .then_some(workbench_candidate);
+        let bug_capsule = self.bug_capsule.map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(path)
+            }
+        });
         let explicit_runtime = self.deno_runtime.is_some()
             || self.genui_script.is_some()
             || self.genui_wasm.is_some()
@@ -397,6 +430,7 @@ impl Options {
                 .terminal_assets
                 .unwrap_or_else(|| contents.join("Resources/terminal")),
             workbench_assets,
+            bug_capsule,
             state_directory: self
                 .state_directory
                 .unwrap_or_else(|| default_state_directory(home)),
@@ -424,6 +458,7 @@ struct ResolvedOptions {
     ui: PathBuf,
     terminal_assets: PathBuf,
     workbench_assets: Option<PathBuf>,
+    bug_capsule: Option<PathBuf>,
     state_directory: PathBuf,
     shell_cwd: PathBuf,
     codex: Option<PathBuf>,
@@ -542,6 +577,9 @@ impl ResolvedOptions {
                 "Workbench assets are missing index.html: {}",
                 workbench.display()
             ));
+        }
+        if self.bug_capsule.is_some() && self.workbench_assets.is_none() {
+            return Err("Bug Capsule viewer requires bundled Workbench assets".into());
         }
         if !self.shell_cwd.is_absolute() || !self.shell_cwd.is_dir() {
             return Err(format!(
@@ -1270,6 +1308,7 @@ mod tests {
             Path::new("/Applications/Hyper Term.app/Contents/Resources/terminal")
         );
         assert_eq!(options.workbench_assets, None);
+        assert_eq!(options.bug_capsule, None);
         assert_eq!(options.shell_cwd, Path::new("/Users/example"));
     }
 
@@ -1282,6 +1321,8 @@ mod tests {
             "/tmp/terminal".into(),
             "--workbench-assets".into(),
             "/tmp/workbench".into(),
+            "--bug-capsule".into(),
+            "/tmp/capsule.json".into(),
             "--state-dir".into(),
             "/tmp/state".into(),
             "--shell-cwd".into(),
@@ -1317,6 +1358,10 @@ mod tests {
             options.workbench_assets,
             Some(PathBuf::from("/tmp/workbench"))
         );
+        assert_eq!(
+            options.bug_capsule,
+            Some(PathBuf::from("/tmp/capsule.json"))
+        );
         assert_eq!(options.state_directory, Some(PathBuf::from("/tmp/state")));
         assert_eq!(options.shell_cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(options.codex, Some(PathBuf::from("/tmp/codex")));
@@ -1345,6 +1390,7 @@ mod tests {
                 .any(|line| line.trim_start().starts_with('+'))
         );
         assert!(DESKTOP_HELP.contains("--workbench-assets PATH"));
+        assert!(DESKTOP_HELP.contains("--bug-capsule PATH"));
     }
 
     #[test]
@@ -1411,6 +1457,7 @@ mod tests {
             ui: "/tmp/ui".into(),
             terminal_assets: "/tmp/terminal".into(),
             workbench_assets: None,
+            bug_capsule: None,
             state_directory: "/tmp/state".into(),
             shell_cwd: "/tmp".into(),
             codex: Some(codex.clone()),
