@@ -161,7 +161,9 @@ the complete file set and rejects local attempts to add or drop paths. Runtime
 source-map failures select the owning file when it is present. Workspace apply
 maps an explicit bounded subset of Artifact source paths to unique
 workspace-relative targets rather than assuming `/App.tsx` or writing the
-whole Artifact implicitly.
+whole Artifact implicitly. Rust returns immutable digest-bound line hunks for
+that mapping, and the Workbench submits only selected hunk IDs for one separately
+approved workspace transaction.
 
 The Time Travel surface reads those durable accepted revisions newest-first.
 Loading an older source creates an ordinary local multi-file draft, switches to
@@ -171,11 +173,11 @@ revision. Restart tests prove the same history and historical source can be
 recovered from the journal and private Artifact store.
 
 This closes the first accepted-artifact, last-known-good delivery, initial
-runtime-error mapping, source-recovery, fixed-file-tree editor navigation, and
-accepted-revision replay slices. It does not yet close the complete hostile-
-artifact matrix, durable reducer/action trace protocol, hunk selection,
-crash-recoverable workspace transactions, resource budgets, or accessibility
-gates below.
+runtime-error mapping, source-recovery, fixed-file-tree editor navigation,
+accepted-revision replay, and workspace hunk-selection slices. It does not yet
+close the complete hostile-artifact matrix, durable reducer/action trace
+protocol, crash-recoverable workspace transactions, resource budgets, or
+accessibility gates below.
 
 ## Validation gates
 

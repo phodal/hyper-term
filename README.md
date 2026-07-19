@@ -53,7 +53,11 @@ task model without giving the UI direct command or filesystem authority.
   an isolated local preview. A historical revision can be loaded as a local
   draft without replaying effects. Publishing creates an Approval Block and a
   new Rust-accepted revision compiled by pinned Deno; it does not write to the
-  workspace.
+  workspace. The panel stays hidden for Terminal and ordinary Agent tabs and
+  opens only for an ACP session with a current editable Artifact.
+- **Exact hunk apply.** The Workbench maps Artifact files to explicit workspace
+  targets, previews Rust-computed hunks without creating an operation, and lets
+  the user bind a selected multi-file set to one exact WorkspaceWrite approval.
 - **Local-first authority.** Rust owns PTYs, process lifetime, permissions,
   durable state, and accepted artifacts. WebViews render trusted projections
   and cannot spawn commands or choose arbitrary files.
@@ -95,7 +99,7 @@ UI bridge.
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
 | Multi-file Artifact editor, Diff, durable accepted-revision Time Travel, diagnostics, completion, and approved publish | Experimental |
-| Brokered exact multi-file Artifact-to-workspace apply | Experimental |
+| Brokered exact multi-file Artifact-to-workspace apply with hunk selection | Experimental |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |
 
@@ -228,9 +232,8 @@ Useful design documents:
 ## Roadmap
 
 - Harden terminal performance, accessibility, reconnect, and recovery gates.
-- Extend the brokered transactional file-set apply with hunk selection and a
-  crash-recoverable worktree journal, without giving the renderer write
-  authority.
+- Extend the brokered transactional hunk apply with a crash-recoverable
+  worktree journal, without giving the renderer write authority.
 - Extend accepted-Artifact Time Travel into journaled editor transactions,
   reducer/runtime trace checkpoints, and redacted offline bug capsules.
 - Strengthen containment for external coding-agent processes.

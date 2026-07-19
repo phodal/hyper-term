@@ -441,15 +441,19 @@ its effects into the user's working tree.
 The implemented acceptance slice applies a bounded set of one to 32 UTF-8 files
 from the current immutable GenUI Artifact to explicit, unique
 workspace-relative paths. It is one digest-bound `FileEdit / WorkspaceWrite`
-operation rather than a side effect of Artifact compilation. Review captures
-every parent directory device/inode and, for existing targets, device/inode,
-mode, content digest, and bounded content. Dispatch rechecks the complete set
-and current Artifact revision before the in-process Rust executor stages every
-member. Creation uses no-replace semantics; replacement retains a private base
-backup; a later failure rolls back already-installed members in reverse order.
-Uncertain install, rollback, or cleanup verification is reported as
-`UnknownExecution`. This does not yet implement isolated Tier 2 worktree merge,
-hunk selection, binary patches, or a cross-process crash-recovery journal.
+operation rather than a side effect of Artifact compilation. A read-only first
+phase captures every parent directory device/inode and, for existing targets,
+device/inode, mode, content digest, and bounded content, then returns stable
+Rust-computed hunk IDs without creating an approval. The submitted review digest
+and per-file selection are recomputed and validated by Rust; Rust reconstructs
+the selected files and binds only that exact result to the operation. Dispatch
+rechecks the selected set and current Artifact revision before the in-process
+Rust executor stages every member. Creation uses no-replace semantics;
+replacement retains a private base backup; a later failure rolls back already-
+installed members in reverse order. Uncertain install, rollback, or cleanup
+verification is reported as `UnknownExecution`. This does not yet implement
+isolated Tier 2 worktree merge, binary patches, or a cross-process crash-
+recovery journal.
 
 ## Approval and escalation
 

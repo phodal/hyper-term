@@ -64,9 +64,10 @@ journaled as a sequence of half-formed commands; it commits as an editor edit.
 
 The visual diff is not the patch authority. Rust computes or validates a patch
 against an exact base file digest and exposes immutable files and hunks to the
-renderer. Accepting or rejecting a hunk submits an operation proposal. The
-permission broker verifies base revision, path, selected hunks, worktree, and
-current file state before applying anything.
+renderer. Toggling hunks changes only local review state; submitting the chosen
+set creates one operation proposal. The permission broker verifies review
+digest, base revision, path, selected hunks, worktree, and current file state
+before applying anything.
 
 CodeMirror or Monaco may calculate presentation-only inline differences, but a
 renderer-produced diff never directly writes the workspace. A changed base
@@ -152,24 +153,33 @@ targets. Rust normalizes and sorts the set, then captures the exact Artifact
 source revision plus every target parent identity, existing file identity,
 mode, content digest, and bounded UTF-8 contents before producing one review.
 The renderer receives the immutable before/after set for grouped, read-only
-CodeMirror diffs but has no file API.
+CodeMirror diffs but has no file API. The first phase creates no operation:
+Rust computes a bounded Patience line diff with stable digest-derived hunk IDs,
+returns at most 256 hunks per file, and binds the complete review to the exact
+Artifact and captured workspace bases. The Workbench selects those immutable
+hunk IDs. Only its explicit “Create approval” action sends the review digest
+and full per-file selection back to Rust.
 
-The whole set is projected as one `FileEdit / WorkspaceWrite` operation with a
-canonical transaction digest and remains unchanged until the matching Approval
-Block receives `AllowOnce`. Dispatch rechecks the current Artifact and every
-workspace base. Traversal, duplicate targets, VCS metadata, symlink parents,
-special files, files over 1 MiB, changed inodes, changed modes, and changed
-digests fail closed before installation. The Rust executor then stages the
-complete set in already-open parent directories, keeps private backups of
-existing files, installs each target atomically, verifies the results, and
-rolls back already-installed members if a later member fails. Ambiguous rollback
-or cleanup is reported as `UnknownExecution`; this is guarded in-process
-recovery, not a cross-process crash journal. A gateway integration test proves
-that neither target changes before the one exact approval, and unit tests cover
-successful two-file apply, stale-member preflight, later-member rollback,
-no-replace creation, cleanup, and symlink escape rejection. Browser passes at
-480 pixels cover explicit mapping, grouped file Diff navigation, and zero
-horizontal page overflow.
+Rust recomputes the review, rejects stale, unknown, or duplicate hunk IDs, and
+reconstructs the selected UTF-8 contents itself. That selected set is projected
+as one `FileEdit / WorkspaceWrite` operation with a canonical transaction digest
+and remains unchanged until the matching Approval Block receives `AllowOnce`.
+Dispatch rechecks the current Artifact and every workspace base. Traversal,
+duplicate targets, VCS metadata, symlink parents, special files, files over 1
+MiB, changed inodes, changed modes, and changed digests fail closed before
+installation. The Rust executor then stages the selected set in already-open
+parent directories, keeps private backups of existing files, installs each
+target atomically, verifies the results, and rolls back already-installed
+members if a later member fails. Ambiguous rollback or cleanup is reported as
+`UnknownExecution`; this is guarded in-process recovery, not a cross-process
+crash journal. A gateway integration test proves that preview creates no write,
+one exact approval can apply one of two distant App hunks together with a second
+file, and the unselected App hunk remains at its captured base. Unit tests cover
+stable hunk IDs, byte-exact reconstruction including CRLF and no-final-newline
+cases, invalid selections, successful two-file apply, stale-member preflight,
+later-member rollback, no-replace creation, cleanup, and symlink escape
+rejection. Browser passes at 760 and 480 pixels cover hunk toggles, responsive
+Diff layout, action visibility, and zero horizontal page overflow.
 
 The editor no longer collapses an Artifact to its entrypoint. One Studio owns
 the complete Rust-returned virtual file map, keeps per-file CodeMirror drafts
@@ -193,10 +203,9 @@ tests cover persistence and task/current-revision fencing; a 480-pixel browser
 flow covers restore, per-file dirty state, Diff, preview reload, and overflow.
 
 A real Deno integration test separately covers Artifact approval, compilation,
-replacement, source recovery, and stale revision rejection. Hunk selection,
-durable edit-transaction/selection journaling, reducer trace checkpoints,
-cross-process crash-recoverable workspace commit, and arbitrary binary files
-remain open.
+replacement, source recovery, and stale revision rejection. Durable editor-
+transaction/selection journaling, reducer trace checkpoints, cross-process
+crash-recoverable workspace commit, and arbitrary binary files remain open.
 
 ## Validation gates
 
