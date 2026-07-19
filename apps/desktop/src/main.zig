@@ -445,6 +445,8 @@ pub const Model = struct {
     agent_block_count: usize = 0,
     agent_block_index_base: u64 = 0,
     agent_history_clipped: bool = false,
+    agent_plan: AgentBlockView = .{},
+    agent_plan_visible: bool = false,
     agent_projection_session_id: u8 = 0,
     agent_turn_status: AgentTurnStatus = .idle,
     agent_error_storage: [max_agent_error_bytes]u8 = [_]u8{0} ** max_agent_error_bytes,
@@ -491,6 +493,8 @@ pub const Model = struct {
         "agent_blocks",
         "agent_block_count",
         "agent_block_index_base",
+        "agent_plan",
+        "agent_plan_visible",
         "agent_projection_session_id",
         "agent_turn_status",
         "agent_error_storage",
@@ -697,6 +701,10 @@ pub const Model = struct {
         return model.agent_blocks[0..model.agent_block_count];
     }
 
+    pub fn agentPlan(model: *const Model) ?*const AgentBlockView {
+        return if (model.agent_plan_visible) &model.agent_plan else null;
+    }
+
     pub fn hasAgentBlocks(model: *const Model) bool {
         return model.agent_block_count > 0;
     }
@@ -845,6 +853,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .agent_config_updated => |response| applyAgentConfigResponse(model, response, fx),
         .insert_agent_command => |index| insertAgentCommand(model, index),
         .toggle_agent_block => |block_id| {
+            if (model.agent_plan_visible and model.agent_plan.id == block_id) {
+                model.agent_plan.expanded = !model.agent_plan.expanded;
+            }
             for (model.agent_blocks[0..model.agent_block_count]) |*block| {
                 if (block.id == block_id and (block.isActivity() or block.isThoughtMessage())) {
                     block.expanded = !block.expanded;
@@ -1527,6 +1538,8 @@ fn copyCapabilityText(destination: []u8, length: *usize, value: []const u8) void
 }
 
 fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
+    const previous_plan_id = model.agent_plan.id;
+    const previous_plan_expanded = model.agent_plan.expanded;
     var previous_ids = [_]u64{0} ** max_agent_blocks;
     var previous_expanded = [_]bool{false} ** max_agent_blocks;
     for (model.agent_blocks[0..model.agent_block_count], 0..) |block, index| {
@@ -1535,21 +1548,32 @@ fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
     }
     for (&model.agent_blocks) |*block| block.* = .{};
     model.agent_block_count = 0;
+    model.agent_plan = .{};
+    model.agent_plan_visible = false;
     clearGenUiArtifact(model);
-    for (blocks) |block| {
+    for (blocks, 0..) |block, block_index| {
         if (validGenUiArtifactBlock(block)) {
             projectGenUiArtifact(model, block);
+        }
+        if (renderableAgentBlock(block) and std.mem.eql(u8, block.kind, "agent_plan")) {
+            model.agent_plan.id = stableAgentBlockId(block.block_id, block_index);
+            projectAgentPlan(&model.agent_plan, block.payload.entries.?);
+            if (model.agent_plan.id == previous_plan_id) {
+                model.agent_plan.expanded = previous_plan_expanded;
+            }
+            model.agent_plan_visible = true;
         }
     }
     var block_total: usize = 0;
     for (blocks) |block| {
-        if (renderableAgentBlock(block)) block_total += 1;
+        if (renderableAgentBlock(block) and !std.mem.eql(u8, block.kind, "agent_plan")) block_total += 1;
     }
     var skip = block_total -| max_agent_blocks;
     model.agent_block_index_base = @intCast(skip);
     model.agent_history_clipped = skip > 0;
     for (blocks, 0..) |block, block_index| {
         if (!renderableAgentBlock(block)) continue;
+        if (std.mem.eql(u8, block.kind, "agent_plan")) continue;
         if (skip > 0) {
             skip -= 1;
             continue;
@@ -1567,8 +1591,6 @@ fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
             projectApprovalBlock(view, block, blocks);
         } else if (std.mem.eql(u8, block.kind, "agent_tool_call")) {
             projectAgentToolCall(view, block.payload.call.?);
-        } else {
-            projectAgentPlan(view, block.payload.entries.?);
         }
         for (previous_ids, 0..) |previous_id, previous_index| {
             if (previous_id == view.id) {
@@ -1963,6 +1985,8 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_block_count = 0;
     model.agent_block_index_base = 0;
     model.agent_history_clipped = false;
+    model.agent_plan = .{};
+    model.agent_plan_visible = false;
     model.agent_projection_session_id = session_id;
     model.agent_turn_status = .idle;
     model.agent_error_len = 0;
@@ -2230,10 +2254,17 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
         row.* = node;
     }
     const timeline = ui.virtualList(options, window, .{rows});
-    if (!model.agent_history_clipped) return timeline;
+    const transcript = if (!model.agent_history_clipped)
+        timeline
+    else
+        ui.column(.{ .grow = 1 }, .{
+            ui.text(.{ .padding = 6, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Older activity is compacted · showing the latest {d} blocks", .{max_agent_blocks})),
+            timeline,
+        });
+    if (!model.agent_plan_visible) return transcript;
     return ui.column(.{ .grow = 1 }, .{
-        ui.text(.{ .padding = 6, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Older activity is compacted · showing the latest {d} blocks", .{max_agent_blocks})),
-        timeline,
+        transcript,
+        ui.column(.{ .padding = 5 }, .{agentActivityNode(ui, &model.agent_plan)}),
     });
 }
 

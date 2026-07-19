@@ -616,15 +616,16 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
         ,
     } }, &fx);
 
-    try testing.expectEqual(@as(usize, 4), model.agentBlocks().len);
+    try testing.expectEqual(@as(usize, 3), model.agentBlocks().len);
     try testing.expectEqualStrings("Hi! What are we working on today?", model.agentBlocks()[0].content());
     try testing.expect(model.agentBlocks()[1].isActivity());
     try testing.expectEqualStrings("Edit src/lib.rs", model.agentBlocks()[1].activityTitle());
     try testing.expectEqualStrings("completed · 1 file · +1 −1", model.agentBlocks()[1].activityMeta());
     try testing.expect(!model.agentBlocks()[1].expanded);
     try testing.expectEqualStrings("Run shell command", model.agentBlocks()[2].activityTitle());
-    try testing.expect(!model.agentBlocks()[3].expanded);
-    try testing.expectEqualStrings("Plan · 1 / 2 complete", model.agentBlocks()[3].activityTitle());
+    const plan = model.agentPlan().?;
+    try testing.expect(!plan.expanded);
+    try testing.expectEqualStrings("Plan · 1 / 2 complete", plan.activityTitle());
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -639,7 +640,7 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(!findByText(tree.root, .accordion, "Edit src/lib.rs").?.state.selected);
     try testing.expect(!findByText(tree.root, .accordion, "Plan · 1 / 2 complete").?.state.selected);
 
-    main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[3].id }, &fx);
+    main.update(&model, .{ .toggle_agent_block = plan.id }, &fx);
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
