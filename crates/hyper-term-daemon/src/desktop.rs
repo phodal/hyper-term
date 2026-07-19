@@ -5,7 +5,7 @@
 //! The renderer still never spawns shells or receives a privileged bridge.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
@@ -49,6 +49,7 @@ fn run() -> Result<i32, String> {
              --codex-auth PATH         Private Codex auth.json for isolated Agent sessions\n  \
              --codex-acp PATH          Codex ACP adapter executable\n  \
              --claude-agent-acp PATH   Claude Agent ACP adapter executable\n  \
+             --claude PATH             Claude Code executable used by Claude ACP\n  \
              --deno-runtime PATH       Pinned Deno executable for brokered Agent tools\n  \
              --genui-script PATH       Bundled GenUI compiler service\n  \
              --genui-wasm PATH         Pinned esbuild-wasm compiler binary\n  \
@@ -184,6 +185,7 @@ struct Options {
     codex_auth: Option<PathBuf>,
     codex_acp: Option<PathBuf>,
     claude_agent_acp: Option<PathBuf>,
+    claude: Option<PathBuf>,
     deno_runtime: Option<PathBuf>,
     genui_script: Option<PathBuf>,
     genui_wasm: Option<PathBuf>,
@@ -218,6 +220,9 @@ impl Options {
                 Some("--claude-agent-acp") => {
                     options.claude_agent_acp =
                         Some(required_path(&mut arguments, "--claude-agent-acp")?);
+                }
+                Some("--claude") => {
+                    options.claude = Some(required_path(&mut arguments, "--claude")?);
                 }
                 Some("--deno-runtime") => {
                     options.deno_runtime = Some(required_path(&mut arguments, "--deno-runtime")?);
@@ -294,11 +299,15 @@ impl Options {
             codex_acp: self
                 .codex_acp
                 .or_else(|| std::env::var_os("HYPER_TERM_CODEX_ACP_PATH").map(PathBuf::from))
-                .or_else(|| find_executable("codex-acp", home)),
+                .or_else(|| discover_official_acp_adapter("codex-acp", home)),
             claude_agent_acp: self
                 .claude_agent_acp
                 .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_AGENT_ACP_PATH").map(PathBuf::from))
-                .or_else(|| find_executable("claude-agent-acp", home)),
+                .or_else(|| discover_official_acp_adapter("claude-agent-acp", home)),
+            claude: self
+                .claude
+                .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_PATH").map(PathBuf::from))
+                .or_else(|| find_executable("claude", home)),
             mcp: executable
                 .with_file_name("hyper-term-mcp")
                 .is_file()
@@ -318,6 +327,7 @@ struct ResolvedOptions {
     codex_auth: Option<PathBuf>,
     codex_acp: Option<PathBuf>,
     claude_agent_acp: Option<PathBuf>,
+    claude: Option<PathBuf>,
     mcp: Option<PathBuf>,
     genui_runtime: Option<ResolvedGenUiRuntime>,
 }
@@ -361,6 +371,9 @@ impl ResolvedOptions {
         }
         if let Some(claude_agent_acp) = &self.claude_agent_acp {
             validate_executable(claude_agent_acp)?;
+        }
+        if let Some(claude) = &self.claude {
+            validate_executable(claude)?;
         }
         if let Some(mcp) = &self.mcp {
             validate_executable(mcp)?;
@@ -414,11 +427,18 @@ impl ResolvedOptions {
             });
         }
         if let Some(executable) = &self.claude_agent_acp {
+            let mut environment = acp_environment(home, executable)?;
+            if let Some(claude) = &self.claude {
+                environment.insert(
+                    "CLAUDE_CODE_EXECUTABLE".into(),
+                    claude.as_os_str().to_owned(),
+                );
+            }
             providers.push(AcpAgentProviderConfig {
                 provider_id: "claude-acp".into(),
                 executable: executable.clone(),
                 arguments: Vec::new(),
-                environment: acp_environment(home, executable)?,
+                environment,
                 implementation_version: "installed".into(),
             });
         }
@@ -443,7 +463,16 @@ fn acp_environment(home: &Path, executable: &Path) -> Result<BTreeMap<String, Os
         ("HOME".into(), home.as_os_str().to_owned()),
         ("PATH".into(), path),
         ("TERM".into(), "dumb".into()),
+        ("USER".into(), desktop_user_name(home)),
+        ("LOGNAME".into(), desktop_user_name(home)),
     ]))
+}
+
+fn desktop_user_name(home: &Path) -> OsString {
+    std::env::var_os("USER")
+        .or_else(|| std::env::var_os("LOGNAME"))
+        .or_else(|| home.file_name().map(OsStr::to_owned))
+        .unwrap_or_else(|| "hyper-term".into())
 }
 
 fn required_path(
@@ -471,6 +500,30 @@ fn desktop_token() -> String {
 #[cfg(unix)]
 fn find_executable(name: &str, home: &Path) -> Option<PathBuf> {
     find_executable_in(name, home, std::env::var_os("PATH").as_deref())
+}
+
+#[cfg(unix)]
+fn discover_official_acp_adapter(name: &str, home: &Path) -> Option<PathBuf> {
+    let executable = find_executable(name, home)?;
+    official_acp_adapter_version(&executable, name).then_some(executable)
+}
+
+#[cfg(unix)]
+fn official_acp_adapter_version(executable: &Path, name: &str) -> bool {
+    let Ok(output) = Command::new(executable).arg("--version").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match name {
+        "codex-acp" => stdout.contains("@agentclientprotocol/codex-acp"),
+        "claude-agent-acp" => stdout
+            .trim()
+            .starts_with(|character: char| character.is_ascii_digit()),
+        _ => false,
+    }
 }
 
 #[cfg(unix)]
@@ -556,6 +609,8 @@ mod tests {
             "/tmp/codex-acp".into(),
             "--claude-agent-acp".into(),
             "/tmp/claude-agent-acp".into(),
+            "--claude".into(),
+            "/tmp/claude".into(),
             "--deno-runtime".into(),
             "/tmp/deno".into(),
             "--genui-script".into(),
@@ -580,6 +635,7 @@ mod tests {
             options.claude_agent_acp,
             Some(PathBuf::from("/tmp/claude-agent-acp"))
         );
+        assert_eq!(options.claude, Some(PathBuf::from("/tmp/claude")));
         assert_eq!(options.deno_runtime, Some(PathBuf::from("/tmp/deno")));
         assert_eq!(options.genui_script, Some(PathBuf::from("/tmp/genui.js")));
         assert_eq!(options.genui_wasm, Some(PathBuf::from("/tmp/esbuild.wasm")));
@@ -622,11 +678,12 @@ mod tests {
             codex: Some("/opt/homebrew/bin/codex".into()),
             codex_auth: None,
             codex_acp: Some("/opt/homebrew/bin/codex-acp".into()),
-            claude_agent_acp: None,
+            claude_agent_acp: Some("/opt/homebrew/bin/claude-agent-acp".into()),
+            claude: Some("/Users/example/.local/bin/claude".into()),
             mcp: None,
             genui_runtime: None,
         };
-        assert_eq!(resolved.agent_provider_ids(), "codex,codex-acp");
+        assert_eq!(resolved.agent_provider_ids(), "codex,codex-acp,claude-acp");
 
         let environment = acp_environment(
             Path::new("/Users/example"),
@@ -644,5 +701,36 @@ mod tests {
         );
         assert!(!environment.contains_key("ANTHROPIC_API_KEY"));
         assert!(!environment.contains_key("OPENAI_API_KEY"));
+        let providers = resolved
+            .acp_providers(Path::new("/Users/example"))
+            .expect("ACP providers");
+        assert_eq!(
+            providers[1].environment.get("CLAUDE_CODE_EXECUTABLE"),
+            Some(&OsString::from("/Users/example/.local/bin/claude"))
+        );
+    }
+
+    #[test]
+    fn automatic_acp_discovery_rejects_legacy_package_names() {
+        let temporary = tempfile::tempdir().expect("temporary adapters");
+        let official = temporary.path().join("official-codex-acp");
+        let legacy = temporary.path().join("legacy-codex-acp");
+        for (path, script) in [
+            (
+                &official,
+                "#!/bin/sh\nprintf '%s\\n' '@agentclientprotocol/codex-acp 1.1.4'\n",
+            ),
+            (
+                &legacy,
+                "#!/bin/sh\nprintf '%s\\n' 'error: unexpected argument --version' >&2\nexit 2\n",
+            ),
+        ] {
+            std::fs::write(path, script).expect("adapter probe");
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        assert!(official_acp_adapter_version(&official, "codex-acp"));
+        assert!(!official_acp_adapter_version(&legacy, "codex-acp"));
     }
 }
