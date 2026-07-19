@@ -502,7 +502,7 @@ mod tests {
         assert!(!encoded.contains("must-not-export"));
         assert!(!encoded.contains("console secret"));
         assert_eq!(capsule.runtime.events[0].name, "observation.excluded");
-        assert_eq!(capsule.editor.files[0].modified, true);
+        assert!(capsule.editor.files[0].modified);
         assert!(verify_bug_capsule(&capsule).unwrap());
 
         let mut tampered = capsule;
