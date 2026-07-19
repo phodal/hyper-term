@@ -151,6 +151,7 @@ jobs:
           name: genui-runtime
           path: dist/runtime
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 7
 
   package-macos:
@@ -235,6 +236,13 @@ jobs:
         with:
           name: genui-runtime
           path: dist/runtime
+
+      - name: Reverify downloaded ACP runtime inventory
+        run: |
+          deno run \
+            --allow-read=dist/runtime/acp \
+            --allow-run \
+            scripts/verify_acp_runtime.ts
 
       - name: Build Rust desktop supervisor
         shell: bash
