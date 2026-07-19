@@ -9,8 +9,9 @@ executors and projections of one durable human–AI task model.
 > integration and the M3 Agentic UI risk spike are active. The disposable
 > Vite/Tauri prototype has been removed. The
 > repository now contains a renderer-independent Rust protocol, journal,
-> operation reducer, Block projector, reconnectable PTY daemon, explicit Codex
-> Agent sessions, a brokered MCP gateway, and a terminal-first React Workbench
+> operation reducer, Block projector, reconnectable PTY daemon,
+> provider-neutral structured Agent sessions, real Codex ACP and Claude ACP
+> prompt gates, a brokered MCP gateway, and a terminal-first React Workbench
 > built directly by pinned Deno. The packaged Native SDK application now carries
 > a digest-checked Deno GenUI compiler. Broker-accepted artifacts are persisted
 > by Rust, projected as isolated Blocks, and served to a bounded Native WebView
@@ -129,7 +130,7 @@ when its failure, reconnect, security, and evidence gates pass.
 | --- | --- | --- |
 | **M0 — Architecture baseline** | Review the fourteen ADRs, freeze the first `EventEnvelope`, Task/Run/Operation, `BlockDocument`, `UiIntent`, terminal-stream, and artifact schemas. | Proposed ADRs are accepted, revised, or explicitly deferred; golden protocol fixtures and benchmark workloads are specified before implementation. |
 | **M1 — Durable Rust kernel (baseline implemented)** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | A direct user terminal resolves the configured login shell without renderer-supplied executables; zsh login/interactive mode, UTF-8, truecolor, foreground-job `Ctrl-C`, resize/output ordering, reconnect, cancellation, and recovery have tests and release probes. |
-| **M2 — Agent control loop and Block workbench (current)** | Add raw PTY agent compatibility, one ACP v1 adapter, an MCP host behind the broker, `BlockProjector`, attention reducer, and renderer-independent Workbench assets built by Deno. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; renderer failure loses no canonical state. |
+| **M2 — Agent control loop and Block workbench (current)** | Add raw PTY agent compatibility, a provider-neutral ACP v1 path validated with real Codex and Claude adapters, an MCP host behind the broker, `BlockProjector`, attention reducer, and renderer-independent Workbench assets built by Deno. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; renderer failure loses no canonical state. |
 | **M3 — Agentic UI and local debugging (accepted-artifact slice implemented)** | Add the brokered Deno tool runtime, persistent `esbuild-wasm` compilation, versioned UI IR/React artifacts, trusted editor adapters, isolated previews, source maps, and semantic Time Travel. | A broken generated UI keeps its last-known-good artifact, maps errors to its source revision, and replays without Shell, network, MCP, or Computer Use effects. |
 | **M4 — Computer Use, voice, and attention** | Implement observe–act–verify drivers, explicit capability and focus leases, before/after evidence, voice briefs, push-to-talk steering, local pause/takeover controls, and semantic notifications. | Stale observations and lease conflicts are rejected; every action has actor, target, capability, receipt, and result; voice never directly approves a consequential effect. |
 | **M5 — Native desktop product shell** | Use Native SDK as the default macOS host for the ordinary terminal surface and common blocks, with bounded Web/WASM islands for generated UI and previews. | Startup, key-to-present, burst throughput, 100k-block virtualization, CJK/IME/accessibility, responsive layout, crash recovery, focus, and a shared Native/Web design-token contract pass on the packaged app. |
@@ -329,7 +330,10 @@ required secrets.
 
 ACP, Codex app-server, Claude stream-json, and opaque PTY agents are separate
 transports behind one internal `AgentDriverEvent` boundary. They are not treated
-as interchangeable wire protocols. The current Codex adapter launches an exact
+as interchangeable wire protocols. `StructuredAgentClient` owns the common
+session lifecycle while provider-specific clients translate their wire values
+into bounded canonical events and inert effect proposals. Provider DTOs never
+become Block renderer authority. The current Codex adapter launches an exact
 binary digest with a cleared environment, negotiates app-server v2 over bounded
 JSONL, and turns command/file approval requests into inert
 `AgentEffectProposal` values. Only a matching, revisioned Rust operation
@@ -359,6 +363,29 @@ HYPER_TERM_CODEX_PATH=/absolute/path/to/codex \
 HYPER_TERM_CODEX_SHA256=<inspected-executable-sha256> \
 cargo test -p hyper-term-drivers --test codex_app_server -- --ignored
 ```
+
+The provider-neutral ACP gate performs a harmless model turn and rejects any
+unexpected effect proposal. Point it at an inspected official adapter artifact:
+
+```bash
+# Official Codex ACP
+HYPER_TERM_ACP_PATH=/absolute/path/to/codex-acp \
+HYPER_TERM_ACP_SHA256=<inspected-adapter-sha256> \
+HYPER_TERM_ACP_PROVIDER_ID=codex \
+CODEX_PATH=/absolute/path/to/codex \
+cargo test -p hyper-term-drivers --test acp_agent -- --ignored
+
+# Official Claude Agent ACP
+HYPER_TERM_ACP_PATH=/absolute/path/to/claude-agent-acp \
+HYPER_TERM_ACP_SHA256=<inspected-adapter-sha256> \
+HYPER_TERM_ACP_PROVIDER_ID=claude \
+CLAUDE_CODE_EXECUTABLE=/absolute/path/to/claude \
+cargo test -p hyper-term-drivers --test acp_agent -- --ignored
+```
+
+Automatic desktop discovery rejects the legacy `@zed-industries/codex-acp`
+signature. The official adapters used by the real gates are not yet bundled;
+pinning them into the signed application is a distribution gate.
 
 ## License
 

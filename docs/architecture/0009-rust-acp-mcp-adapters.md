@@ -133,6 +133,32 @@ official [MCP Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) provid
 client/server roles and multiple transports; only the minimal reviewed feature
 set is enabled per release.
 
+## Implementation status (2026-07-19)
+
+- `agent-client-protocol` 1.2.0 provides the bounded ACP v1 JSONL types and
+  framing used by the Rust driver.
+- `StructuredAgentClient` is the provider-neutral boundary shared by direct
+  Codex app-server and ACP sessions. Provider wire values are projected into
+  canonical driver events and operation proposals; they do not become
+  `BlockDocument` renderer authority.
+- Fixtures cover initialization, session creation, prompt streaming, session
+  updates, permission proposals, and MCP capability negotiation.
+- The desktop supervisor clears the adapter environment, verifies executable
+  digests, only auto-discovers adapters with the official version signature,
+  and exposes a bounded provider inventory to the Native host.
+- Native tabs are bound to their selected provider. Codex and Claude are chosen
+  explicitly from the Agent menu rather than inferred from terminal contents.
+- Ignored, credential-using integration gates completed a harmless real prompt
+  through official Codex ACP 1.1.4 and Claude Agent ACP 0.59.0 artifacts. Claude
+  subscription authentication on macOS requires the exact Claude executable
+  plus `USER` and `LOGNAME` so its Keychain entry remains visible; API keys are
+  not inherited by the adapter.
+- Distribution still needs pinned official adapter/runtime artifacts inside the
+  signed app bundle, the containment decision in ADR 0014, a terminal-auth UI,
+  and the full fuzz and protocol-upgrade matrix. The internal MCP adapter remains
+  a bounded stdio subset; adopting the complete Rust MCP SDK remains a release
+  gate.
+
 ## Validation gates
 
 - Golden fixtures cover initialization, capability negotiation, streaming,
