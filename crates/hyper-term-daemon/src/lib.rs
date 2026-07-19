@@ -62,6 +62,15 @@ pub use web_gateway::{
 const CONTROL_SUBSCRIBER_CAPACITY: usize = 512;
 const OBSERVATION_BATCH_BYTES: u64 = 64 * 1024;
 const SANDBOX_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
+const MAX_GENUI_ARTIFACT_HISTORY: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GenUiArtifactHistoryEntry {
+    pub event_sequence: u64,
+    pub recorded_at_ms: u64,
+    pub operation_id: Option<OperationId>,
+    pub artifact: AcceptedGenUiArtifact,
+}
 
 #[derive(Clone)]
 pub struct DaemonState {
@@ -759,6 +768,76 @@ impl DaemonState {
             .active_genui_artifact(task_id)?
             .filter(|artifact| artifact.artifact_id == artifact_id)
             .ok_or(DaemonError::ArtifactNotActive(artifact_id))?;
+        self.inner.artifacts.read(&accepted).map_err(Into::into)
+    }
+
+    pub(crate) fn genui_artifact_history(
+        &self,
+        task_id: TaskId,
+        expected_active_artifact_id: hyper_term_protocol::ArtifactId,
+    ) -> Result<Vec<GenUiArtifactHistoryEntry>, DaemonError> {
+        self.require_task(task_id)?;
+        let authority = lock(&self.inner.authority)?;
+        let history = authority
+            .journal
+            .all()
+            .iter()
+            .rev()
+            .filter_map(|event| {
+                if event.task_id != task_id {
+                    return None;
+                }
+                let DomainEvent::ArtifactAccepted { artifact } = &event.payload else {
+                    return None;
+                };
+                Some(GenUiArtifactHistoryEntry {
+                    event_sequence: event.sequence,
+                    recorded_at_ms: event.recorded_at_ms,
+                    operation_id: event.operation_id,
+                    artifact: artifact.clone(),
+                })
+            })
+            .take(MAX_GENUI_ARTIFACT_HISTORY)
+            .collect::<Vec<_>>();
+        if history.first().map(|entry| entry.artifact.artifact_id)
+            != Some(expected_active_artifact_id)
+        {
+            return Err(DaemonError::ArtifactNotActive(expected_active_artifact_id));
+        }
+        Ok(history)
+    }
+
+    pub(crate) fn read_genui_artifact_revision(
+        &self,
+        task_id: TaskId,
+        expected_active_artifact_id: hyper_term_protocol::ArtifactId,
+        artifact_id: hyper_term_protocol::ArtifactId,
+    ) -> Result<StoredGenUiArtifact, DaemonError> {
+        self.require_task(task_id)?;
+        let accepted = {
+            let authority = lock(&self.inner.authority)?;
+            let mut active_artifact_id = None;
+            let mut accepted = None;
+            for event in authority.journal.all().iter().rev() {
+                if event.task_id != task_id {
+                    continue;
+                }
+                let DomainEvent::ArtifactAccepted { artifact } = &event.payload else {
+                    continue;
+                };
+                active_artifact_id.get_or_insert(artifact.artifact_id);
+                if artifact.artifact_id == artifact_id {
+                    accepted = Some(artifact.clone());
+                }
+                if active_artifact_id.is_some() && accepted.is_some() {
+                    break;
+                }
+            }
+            if active_artifact_id != Some(expected_active_artifact_id) {
+                return Err(DaemonError::ArtifactNotActive(expected_active_artifact_id));
+            }
+            accepted.ok_or(DaemonError::ArtifactNotInHistory(artifact_id))?
+        };
         self.inner.artifacts.read(&accepted).map_err(Into::into)
     }
 
@@ -2202,6 +2281,8 @@ pub enum DaemonError {
     ArtifactAcceptanceRequiresGenUiCompile,
     #[error("artifact {0} is not the task's current accepted artifact")]
     ArtifactNotActive(hyper_term_protocol::ArtifactId),
+    #[error("artifact {0} is not present in the task's accepted history")]
+    ArtifactNotInHistory(hyper_term_protocol::ArtifactId),
     #[error(
         "artifact {artifact_id} revision {source_revision} is no longer the current draft base"
     )]
@@ -2270,6 +2351,7 @@ impl DaemonError {
             | Self::GenericDispatchRequiresOpaqueAction
             | Self::ArtifactAcceptanceRequiresGenUiCompile => "unsupported_action",
             Self::ArtifactNotActive(_) => "artifact_not_active",
+            Self::ArtifactNotInHistory(_) => "artifact_not_in_history",
             Self::ArtifactBaseNotCurrent { .. } => "artifact_base_not_current",
             Self::ArtifactStore(_) => "artifact_error",
             Self::SandboxWorkingDirectoryRequired

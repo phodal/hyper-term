@@ -299,6 +299,20 @@ struct AgentArtifactSourceResponse {
     files: BTreeMap<String, String>,
 }
 
+#[derive(Serialize)]
+struct AgentArtifactHistoryResponse {
+    active_artifact_id: ArtifactId,
+    entries: Vec<AgentArtifactHistoryEntry>,
+}
+
+#[derive(Serialize)]
+struct AgentArtifactHistoryEntry {
+    event_sequence: u64,
+    recorded_at_ms: u64,
+    operation_id: Option<OperationId>,
+    artifact: AcceptedGenUiArtifact,
+}
+
 #[derive(Deserialize)]
 struct AgentArtifactDraftRequest {
     base_source_revision: u64,
@@ -503,6 +517,14 @@ pub async fn spawn_agent_gateway(
             get(artifact_source_map),
         )
         .route("/agent/artifact/{artifact_id}/source", get(artifact_source))
+        .route(
+            "/agent/artifact/{artifact_id}/history",
+            get(artifact_history),
+        )
+        .route(
+            "/agent/artifact/{artifact_id}/history/{revision_id}/source",
+            get(artifact_history_source),
+        )
         .route(
             "/agent/artifact/{artifact_id}/draft",
             get(artifact_draft_status).post(propose_artifact_draft),
@@ -752,6 +774,59 @@ async fn artifact_source(
         Err(_) => status_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Artifact source could not be read",
+        ),
+    }
+}
+
+async fn artifact_history(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    match runtime.artifact_history(session_id, artifact_id) {
+        Ok(history) => json_response(StatusCode::OK, &history),
+        Err(SessionError::NotFound | SessionError::ArtifactUnavailable) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact history is unavailable")
+        }
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Artifact history could not be read",
+        ),
+    }
+}
+
+async fn artifact_history_source(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath((artifact_id, revision_id)): RoutePath<(String, String)>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let Some(artifact_id) = parse_artifact_id(&artifact_id) else {
+        return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid");
+    };
+    let Some(revision_id) = parse_artifact_id(&revision_id) else {
+        return status_response(StatusCode::BAD_REQUEST, "Revision id is invalid");
+    };
+    match runtime.artifact_history_source(session_id, artifact_id, revision_id) {
+        Ok(source) => json_response(StatusCode::OK, &source),
+        Err(SessionError::NotFound | SessionError::ArtifactUnavailable) => status_response(
+            StatusCode::NOT_FOUND,
+            "Artifact revision source is unavailable",
+        ),
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Artifact revision source could not be read",
         ),
     }
 }
@@ -1360,6 +1435,54 @@ impl AgentGatewayRuntime {
             .config
             .daemon
             .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| SessionError::ArtifactUnavailable)?;
+        if artifact.source_files.is_empty() {
+            return Err(SessionError::ArtifactUnavailable);
+        }
+        Ok(AgentArtifactSourceResponse {
+            artifact_id: artifact.metadata.artifact_id,
+            source_revision: artifact.metadata.source_revision,
+            entrypoint: artifact.metadata.entrypoint,
+            files: artifact.source_files,
+        })
+    }
+
+    fn artifact_history(
+        &self,
+        session_id: u16,
+        active_artifact_id: ArtifactId,
+    ) -> Result<AgentArtifactHistoryResponse, SessionError> {
+        let session = self.session(session_id)?;
+        let entries = self
+            .config
+            .daemon
+            .genui_artifact_history(session.task_id, active_artifact_id)
+            .map_err(|_| SessionError::ArtifactUnavailable)?
+            .into_iter()
+            .map(|entry| AgentArtifactHistoryEntry {
+                event_sequence: entry.event_sequence,
+                recorded_at_ms: entry.recorded_at_ms,
+                operation_id: entry.operation_id,
+                artifact: entry.artifact,
+            })
+            .collect();
+        Ok(AgentArtifactHistoryResponse {
+            active_artifact_id,
+            entries,
+        })
+    }
+
+    fn artifact_history_source(
+        &self,
+        session_id: u16,
+        active_artifact_id: ArtifactId,
+        revision_id: ArtifactId,
+    ) -> Result<AgentArtifactSourceResponse, SessionError> {
+        let session = self.session(session_id)?;
+        let artifact = self
+            .config
+            .daemon
+            .read_genui_artifact_revision(session.task_id, active_artifact_id, revision_id)
             .map_err(|_| SessionError::ArtifactUnavailable)?;
         if artifact.source_files.is_empty() {
             return Err(SessionError::ArtifactUnavailable);
@@ -3043,7 +3166,8 @@ mod tests {
     #[test]
     fn base_fenced_acceptance_rejects_an_artifact_replaced_during_build() {
         let temporary = tempfile::tempdir().unwrap();
-        let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
+        let daemon_state = temporary.path().join("daemon-state");
+        let daemon = DaemonState::open(&daemon_state).unwrap();
         let task_id = daemon.create_task("artifact base fence".into()).unwrap();
         let dispatch = || {
             let proposed = daemon
@@ -3127,6 +3251,34 @@ mod tests {
         assert_eq!(
             daemon.active_genui_artifact(task_id).unwrap().unwrap(),
             second
+        );
+        let history = daemon
+            .genui_artifact_history(task_id, second.artifact_id)
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].artifact, second);
+        assert_eq!(history[1].artifact, first);
+        assert!(history[0].event_sequence > history[1].event_sequence);
+        assert_eq!(
+            daemon
+                .read_genui_artifact_revision(task_id, second.artifact_id, first.artifact_id)
+                .unwrap()
+                .source_files["/App.tsx"],
+            "export default () => \"first\";"
+        );
+
+        drop(daemon);
+        let reopened = DaemonState::open(&daemon_state).unwrap();
+        let reopened_history = reopened
+            .genui_artifact_history(task_id, second.artifact_id)
+            .unwrap();
+        assert_eq!(reopened_history, history);
+        assert_eq!(
+            reopened
+                .read_genui_artifact_revision(task_id, second.artifact_id, first.artifact_id)
+                .unwrap()
+                .metadata,
+            first
         );
     }
 
@@ -4211,6 +4363,103 @@ mod tests {
                 .await
                 .0,
             StatusCode::UNAUTHORIZED.as_u16()
+        );
+        let next_operation = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.genui.compile".into(),
+                    payload_digest: "b".repeat(64),
+                },
+                "Compile second preview fixture".into(),
+                RiskClass::ReadOnly,
+                vec!["genui_compile".into()],
+            )
+            .unwrap();
+        let next_authorized = daemon
+            .decide_permission(
+                task_id,
+                next_operation.operation_id,
+                next_operation.revision,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap();
+        let next_dispatching = daemon
+            .begin_operation(
+                task_id,
+                next_operation.operation_id,
+                next_authorized.revision,
+            )
+            .unwrap();
+        let next_bundle = "globalThis.__HYPER_PREVIEW_PROBE__ = 'second';";
+        let next = daemon
+            .accept_genui_artifact_from_base(
+                task_id,
+                next_operation.operation_id,
+                next_dispatching.revision,
+                accepted.artifact_id,
+                accepted.source_revision,
+                hyper_term_protocol::GenUiArtifactCandidate {
+                    schema_version: 1,
+                    source_revision: 10,
+                    entrypoint: "/App.tsx".into(),
+                    source_files: BTreeMap::from([(
+                        "/App.tsx".into(),
+                        "export default () => <main>second</main>;".into(),
+                    )]),
+                    bundle: next_bundle.into(),
+                    css: String::new(),
+                    source_map: "{\"version\":3}".into(),
+                    content_digest: sha256_bytes(next_bundle.as_bytes()),
+                    compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                        name: "esbuild-wasm".into(),
+                        version: "0.28.1".into(),
+                    },
+                    diagnostics: Vec::new(),
+                },
+            )
+            .unwrap();
+        let history_path = format!(
+            "/agent/artifact/{}/history?token={token}&session_id=6",
+            next.artifact_id
+        );
+        let (status, history) = request_path(gateway.address(), &history_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let history: serde_json::Value = serde_json::from_slice(&history).unwrap();
+        assert_eq!(history["active_artifact_id"], next.artifact_id.to_string());
+        assert_eq!(history["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            history["entries"][0]["artifact"]["artifact_id"],
+            next.artifact_id.to_string()
+        );
+        assert_eq!(
+            history["entries"][1]["artifact"]["artifact_id"],
+            accepted.artifact_id.to_string()
+        );
+        let historical_source_path = format!(
+            "/agent/artifact/{}/history/{}/source?token={token}&session_id=6",
+            next.artifact_id, accepted.artifact_id
+        );
+        let (status, historical_source) =
+            request_path(gateway.address(), &historical_source_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let historical_source: serde_json::Value =
+            serde_json::from_slice(&historical_source).unwrap();
+        assert_eq!(historical_source["source_revision"], 9);
+        assert_eq!(
+            historical_source["files"]["/App.tsx"],
+            "export default () => <main>ready</main>;"
+        );
+        let stale_history_path = format!(
+            "/agent/artifact/{}/history?token={token}&session_id=6",
+            accepted.artifact_id
+        );
+        assert_eq!(
+            request_path(gateway.address(), &stale_history_path, "GET", b"")
+                .await
+                .0,
+            StatusCode::NOT_FOUND.as_u16()
         );
         let stale_path = format!(
             "/agent/artifact/{}/preview?token={token}&session_id=6",
