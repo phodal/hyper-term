@@ -35,6 +35,23 @@ const PROVIDER_PROBE_MAX_STDOUT_BYTES: usize = 4 * 1024;
 const ACP_RUNTIME_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const ACP_RUNTIME_MAX_FILES: usize = 8 * 1024;
 const ACP_RUNTIME_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+const DESKTOP_HELP: &str = "Hyper Term desktop host\n\nUsage: hyper-term-desktop [OPTIONS]\n\n\
+Options:\n  --ui PATH                 Native renderer executable\n  \
+--terminal-assets PATH    Built terminal renderer directory\n  \
+--workbench-assets PATH   Built trusted artifact Workbench directory\n  \
+--state-dir PATH          Durable Hyper Term state\n  \
+--shell-cwd PATH          Initial directory for new shells\n  \
+--codex PATH              Codex executable for Agent sessions\n  \
+--codex-auth PATH         Private Codex auth.json for isolated Agent sessions\n  \
+--codex-acp PATH          Codex ACP adapter executable\n  \
+--claude-agent-acp PATH   Claude Agent ACP adapter executable\n  \
+--claude PATH             Claude Code executable used by Claude ACP\n  \
+--copilot PATH            GitHub Copilot CLI used through ACP\n  \
+--deno-runtime PATH       Pinned Deno executable for brokered Agent tools\n  \
+--genui-script PATH       Bundled GenUI compiler service\n  \
+--genui-wasm PATH         Pinned esbuild-wasm compiler binary\n  \
+--genui-preview PATH      Bundled isolated GenUI preview capsule\n  \
+-h, --help                Show this help";
 
 fn main() {
     match run() {
@@ -50,25 +67,7 @@ fn main() {
 fn run() -> Result<i32, String> {
     let options = Options::parse(std::env::args_os().skip(1))?;
     if options.help {
-        println!(
-            "Hyper Term desktop host\n\nUsage: hyper-term-desktop [OPTIONS]\n\n\
-             Options:\n  --ui PATH                 Native renderer executable\n  \
-             --terminal-assets PATH    Built terminal renderer directory\n  \
-             --workbench-assets PATH   Built trusted artifact Workbench directory\n+  \
-             --state-dir PATH          Durable Hyper Term state\n  \
-             --shell-cwd PATH          Initial directory for new shells\n  \
-             --codex PATH              Codex executable for Agent sessions\n  \
-             --codex-auth PATH         Private Codex auth.json for isolated Agent sessions\n  \
-             --codex-acp PATH          Codex ACP adapter executable\n  \
-             --claude-agent-acp PATH   Claude Agent ACP adapter executable\n  \
-             --claude PATH             Claude Code executable used by Claude ACP\n  \
-             --copilot PATH            GitHub Copilot CLI used through ACP\n  \
-             --deno-runtime PATH       Pinned Deno executable for brokered Agent tools\n  \
-             --genui-script PATH       Bundled GenUI compiler service\n  \
-             --genui-wasm PATH         Pinned esbuild-wasm compiler binary\n  \
-             --genui-preview PATH      Bundled isolated GenUI preview capsule\n  \
-             -h, --help                Show this help"
-        );
+        println!("{DESKTOP_HELP}");
         return Ok(0);
     }
 
@@ -1210,6 +1209,16 @@ mod tests {
             options.genui_preview,
             Some(PathBuf::from("/tmp/genui-preview.html"))
         );
+    }
+
+    #[test]
+    fn desktop_help_does_not_include_patch_markers() {
+        assert!(
+            !DESKTOP_HELP
+                .lines()
+                .any(|line| line.trim_start().starts_with('+'))
+        );
+        assert!(DESKTOP_HELP.contains("--workbench-assets PATH"));
     }
 
     #[test]
