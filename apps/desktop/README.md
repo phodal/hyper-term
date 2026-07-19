@@ -11,6 +11,9 @@ modern coding-agent client rather than reserving a permanent sidebar. A right
 editor pane is mounted only when an ACP-backed Agent has a current editable
 artifact. That pane is the packaged Deno-built Workbench; CodeMirror, Diff, Time
 Travel, and its isolated local preview have no workspace-write authority.
+CodeMirror diagnostics and completion come from a Rust-supervised Deno LSP
+process against the current artifact's private snapshot. Draft updates travel as
+bounded LSP document changes, not filesystem writes.
 
 The native chrome, design tokens, mode selection, responsive layout, and Agent
 Block composition remain native. The terminal cell renderer is currently a child

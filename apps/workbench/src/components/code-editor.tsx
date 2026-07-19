@@ -1,8 +1,29 @@
 import { useEffect, useRef } from "react";
 import { basicSetup, EditorView } from "codemirror";
+import {
+  autocompletion,
+  type CompletionContext,
+  type CompletionResult,
+} from "@codemirror/autocomplete";
 import { javascript } from "@codemirror/lang-javascript";
-import { EditorState, StateEffect, StateField } from "@codemirror/state";
+import {
+  EditorState,
+  type Extension,
+  StateEffect,
+  StateField,
+  type Text,
+} from "@codemirror/state";
+import {
+  type Diagnostic as CodeMirrorDiagnostic,
+  linter,
+  lintGutter,
+} from "@codemirror/lint";
 import { Decoration } from "@codemirror/view";
+import type {
+  EditorCompletion,
+  EditorLanguageService,
+  EditorPosition,
+} from "../editor-language-service.ts";
 
 export interface EditorLocation {
   line: number;
@@ -15,6 +36,8 @@ interface CodeEditorProps {
   readOnly?: boolean;
   revealLocation?: EditorLocation;
   revealRequest?: number;
+  languageService?: EditorLanguageService;
+  onLanguageStatus?(status: "idle" | "checking" | "ready" | "failed"): void;
 }
 
 const setRuntimeErrorLine = StateEffect.define<number | null>();
@@ -64,15 +87,56 @@ export function CodeEditor(
     readOnly = false,
     revealLocation,
     revealRequest = 0,
+    languageService,
+    onLanguageStatus,
   }: CodeEditorProps,
 ) {
   const parent = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const onLanguageStatusRef = useRef(onLanguageStatus);
+  onLanguageStatusRef.current = onLanguageStatus;
 
   useEffect(() => {
     if (!parent.current) return;
+    const languageExtensions: Extension[] = [];
+    if (languageService) {
+      languageExtensions.push(
+        lintGutter(),
+        linter(async (editor) => {
+          onLanguageStatusRef.current?.("checking");
+          try {
+            const diagnostics = await languageService.diagnostics(
+              editor.state.doc.toString(),
+            );
+            onLanguageStatusRef.current?.("ready");
+            return diagnostics.map((diagnostic) => ({
+              from: editorOffset(editor.state.doc, diagnostic.start),
+              to: Math.max(
+                editorOffset(editor.state.doc, diagnostic.start),
+                editorOffset(editor.state.doc, diagnostic.end),
+              ),
+              severity: diagnostic.severity === "information"
+                ? "info"
+                : diagnostic.severity,
+              message: diagnostic.message,
+              source: "Deno LSP",
+            } satisfies CodeMirrorDiagnostic));
+          } catch (error) {
+            if (error instanceof DOMException && error.name === "AbortError") {
+              return [];
+            }
+            onLanguageStatusRef.current?.("failed");
+            return [];
+          }
+        }, { delay: 420 }),
+        autocompletion({
+          override: [languageCompletionSource(languageService)],
+          activateOnTyping: true,
+        }),
+      );
+    }
     const next = new EditorView({
       parent: parent.current,
       state: EditorState.create({
@@ -88,6 +152,7 @@ export function CodeEditor(
               onChangeRef.current(update.state.doc.toString());
             }
           }),
+          ...languageExtensions,
         ],
       }),
     });
@@ -96,7 +161,7 @@ export function CodeEditor(
       view.current = null;
       next.destroy();
     };
-  }, [readOnly]);
+  }, [languageService, readOnly]);
 
   useEffect(() => {
     const current = view.current;
@@ -131,4 +196,77 @@ export function CodeEditor(
   }, [revealLocation?.line, revealLocation?.column, revealRequest]);
 
   return <div className="code-editor" ref={parent} />;
+}
+
+function languageCompletionSource(languageService: EditorLanguageService) {
+  return async (
+    context: CompletionContext,
+  ): Promise<CompletionResult | null> => {
+    const token = context.matchBefore(/[\w$]*/);
+    const memberTrigger = context.pos > 0 &&
+      context.state.doc.sliceString(context.pos - 1, context.pos) === ".";
+    if (
+      !context.explicit && !memberTrigger &&
+      (!token || token.from === token.to)
+    ) return null;
+    const line = context.state.doc.lineAt(context.pos);
+    const controller = new AbortController();
+    context.addEventListener("abort", () => controller.abort(), {
+      onDocChange: true,
+    });
+    const completions = await languageService.completions(
+      context.state.doc.toString(),
+      { line: line.number - 1, character: context.pos - line.from },
+      controller.signal,
+    );
+    return {
+      from: token?.from ?? context.pos,
+      options: completions.map(toCodeMirrorCompletion),
+      validFor: /^[\w$]*$/,
+    };
+  };
+}
+
+function toCodeMirrorCompletion(completion: EditorCompletion) {
+  return {
+    label: completion.label,
+    apply: completion.insert_text,
+    detail: completion.detail,
+    type: completionType(completion.kind),
+  };
+}
+
+function completionType(kind?: number): string | undefined {
+  switch (kind) {
+    case 2:
+      return "method";
+    case 3:
+      return "function";
+    case 4:
+      return "class";
+    case 5:
+      return "property";
+    case 6:
+      return "variable";
+    case 7:
+      return "class";
+    case 8:
+      return "interface";
+    case 9:
+      return "namespace";
+    case 10:
+      return "property";
+    case 14:
+      return "keyword";
+    case 15:
+      return "text";
+    default:
+      return undefined;
+  }
+}
+
+function editorOffset(document: Text, position: EditorPosition): number {
+  const lineNumber = Math.min(Math.max(1, position.line + 1), document.lines);
+  const line = document.line(lineNumber);
+  return line.from + Math.min(Math.max(0, position.character), line.length);
 }

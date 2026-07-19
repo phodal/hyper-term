@@ -16,7 +16,9 @@
   "imports": {
     "@std/assert": "jsr:@std/assert@1.0.19",
     "@std/path": "jsr:@std/path@1.1.4",
+    "@codemirror/autocomplete": "npm:@codemirror/autocomplete@6.20.3",
     "@codemirror/lang-javascript": "npm:@codemirror/lang-javascript@6.2.5",
+    "@codemirror/lint": "npm:@codemirror/lint@6.9.7",
     "@codemirror/merge": "npm:@codemirror/merge@6.12.2",
     "@codemirror/state": "npm:@codemirror/state@6.7.1",
     "@codemirror/view": "npm:@codemirror/view@6.43.6",

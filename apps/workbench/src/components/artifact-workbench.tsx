@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { resolveHost } from "../host.ts";
+import { ArtifactLanguageService } from "../editor-language-service.ts";
 import { GenUiStudio } from "./genui-studio.tsx";
 
 interface ArtifactSourceResponse {
@@ -24,6 +25,16 @@ export function ArtifactWorkbench() {
   const host = useMemo(resolveHost, []);
   const context = useMemo(readArtifactContext, []);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const languageService = useMemo(() => {
+    if (!context || state.kind !== "ready") return undefined;
+    return new ArtifactLanguageService({
+      artifactId: context.artifactId,
+      sourceRevision: state.source.source_revision,
+      documentPath: state.source.entrypoint,
+      sessionId: context.sessionId,
+      token: context.token,
+    });
+  }, [context, state]);
 
   useEffect(() => {
     if (!context) {
@@ -106,6 +117,7 @@ export function ArtifactWorkbench() {
           baselineSource={state.source.files[state.source.entrypoint]}
           initialRevision={state.source.source_revision}
           heading={state.source.entrypoint}
+          languageService={languageService}
         />
       )}
       <footer className="artifact-surface-footer">

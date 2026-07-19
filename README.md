@@ -299,8 +299,11 @@ only while a Codex ACP, Claude ACP, or Copilot ACP session owns a current
 artifact. Its HTML/JS/WASM assets are served by the authenticated loopback Agent
 gateway, and its source fetch is still fenced by token, session, task, and
 current artifact. CodeMirror edits, Diff, Time Travel, and the local preview are
-draft-only today; applying a workspace transaction remains unavailable until
-the Rust permission-broker path is implemented.
+draft-only today. Diagnostics and completion come from a persistent,
+Rust-supervised Deno LSP process over an ACP-only artifact endpoint; the process
+sees a private accepted-source snapshot plus in-memory draft updates, never a
+WebView-selected workspace path. Applying a workspace transaction remains
+unavailable until the Rust permission-broker path is implemented.
 
 The Rust `hyper-term-drivers` crate launches the same pinned Deno executable
 with a cleared environment, dedicated cache and scratch roots, bounded framing,

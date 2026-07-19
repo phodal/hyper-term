@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { HyperTermHost } from "../host.ts";
 import type { AcceptedArtifact } from "../protocol.ts";
+import type { EditorLanguageService } from "../editor-language-service.ts";
 import { GenUiCompiler } from "../genui/compiler-client.ts";
 import {
   mapPreviewRuntimeError,
@@ -70,6 +71,7 @@ export interface GenUiStudioProps {
   baselineSource?: string;
   initialRevision?: number;
   heading?: string;
+  languageService?: EditorLanguageService;
 }
 
 export function GenUiStudio({
@@ -78,6 +80,7 @@ export function GenUiStudio({
   baselineSource = sampleOriginalSource,
   initialRevision = 0,
   heading = "Live artifact",
+  languageService,
 }: GenUiStudioProps) {
   const [source, setSource] = useState(initialSource);
   const [view, setView] = useState<StudioView>("code");
@@ -90,6 +93,9 @@ export function GenUiStudio({
   >();
   const [revealRequest, setRevealRequest] = useState(0);
   const [previewBoot, setPreviewBoot] = useState(0);
+  const [languageStatus, setLanguageStatus] = useState<
+    "idle" | "checking" | "ready" | "failed"
+  >(languageService ? "idle" : "failed");
   const [trace, setTrace] = useState<TraceEntry[]>([]);
   const compiler = useRef<GenUiCompiler | null>(null);
   const previewFrame = useRef<HTMLIFrameElement | null>(null);
@@ -256,6 +262,14 @@ export function GenUiStudio({
           </button>
         ))}
         <span className="studio-spacer" />
+        {languageService && (
+          <span
+            className={`language-status ${languageStatus}`}
+            title="Rust-supervised Deno LSP against the private artifact snapshot"
+          >
+            Deno LSP · {languageStatus}
+          </span>
+        )}
         <span className="source-revision">source r{revision.current || 1}</span>
       </div>
       <div className="studio-editor">
@@ -267,6 +281,8 @@ export function GenUiStudio({
               ? runtimeLocation
               : undefined}
             revealRequest={revealRequest}
+            languageService={languageService}
+            onLanguageStatus={setLanguageStatus}
           />
         )}
         {view === "diff" && (

@@ -146,6 +146,14 @@ or spawn `/usr/bin/touch`. Real LSP initialization and requests and a real GenUI
 compile also pass inside their profiles. Deno flags remain defense in depth;
 the test's denial evidence comes from the OS sandbox.
 
+The trusted artifact editor now uses the same pinned LSP driver through an
+authenticated ACP-only Agent endpoint. Rust materializes the accepted virtual
+source tree into a private per-artifact snapshot, keeps draft changes in LSP
+`didOpen`/`didChange` messages, and normalizes bounded diagnostics and completion
+items before returning advisory data to CodeMirror. Closing the Agent session
+shuts down the Deno process and removes that private snapshot. The WebView never
+receives a workspace path or filesystem capability.
+
 The supervisor now treats a request deadline as a lifecycle boundary. If an
 effect times out, it sends `SIGTERM` and then `SIGKILL` to the complete process
 group, retains `UnknownExecution`, and therefore forbids automatic replay. A

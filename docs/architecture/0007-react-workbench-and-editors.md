@@ -128,8 +128,14 @@ letting the WebView read the workspace. The Native host now keeps Agent tabs
 single-pane by default and mounts the packaged Workbench on the right only when
 an ACP session has a current artifact. The Workbench loads that exact source,
 then offers draft CodeMirror, Diff, Time Travel, and isolated local preview
-surfaces. Multi-file selection, transaction journaling, Deno LSP editor
-requests, and brokered apply remain open.
+surfaces. CodeMirror now obtains lint diagnostics and completion from a
+persistent Rust-supervised Deno LSP session over an authenticated, ACP-only
+artifact endpoint. Rust creates a private source snapshot, fences every request
+to the current artifact and source revision, and returns only normalized bounded
+advisory data. A real Deno integration test covers `didOpen`, `didChange`,
+diagnostics, and completion; a 360-pixel browser pass proves the editor, LSP
+status, and preview headers do not overflow. Multi-file selection, transaction
+journaling, and brokered apply remain open.
 
 ## Validation gates
 

@@ -735,6 +735,7 @@ textarea:focus-visible {
   display: grid;
   min-width: 0;
   min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto 34px minmax(210px, .95fr) auto auto minmax(180px,
     .75fr);
   background: #10130e;
@@ -746,6 +747,7 @@ textarea:focus-visible {
   height: 100%;
   min-width: 0;
   min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
   background: #10130e;
 }
@@ -876,6 +878,36 @@ textarea:focus-visible {
 }
 .studio-spacer {
   flex: 1;
+}
+.language-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #78816f;
+  font: 8px ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+}
+.language-status::before {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #68705d;
+  content: "";
+}
+.language-status.checking::before {
+  background: #d3b36f;
+}
+.language-status.ready {
+  color: #a8b29a;
+}
+.language-status.ready::before {
+  background: #b5db63;
+}
+.language-status.failed {
+  color: #b87e77;
+}
+.language-status.failed::before {
+  background: #ff8d83;
 }
 .source-revision {
   margin-bottom: 6px;
@@ -1053,5 +1085,42 @@ textarea:focus-visible {
   .approval-panel {
     align-items: stretch;
     flex-direction: column;
+  }
+}
+
+@media (max-width: 520px) {
+  [data-surface="artifact"] .studio-tabs button {
+    padding: 0 6px;
+    font-size: 8px;
+  }
+  [data-surface="artifact"] .language-status {
+    font-size: 0;
+  }
+  [data-surface="artifact"] .language-status::after {
+    font: 8px ui-monospace, SFMono-Regular, Menlo, monospace;
+    content: "LSP";
+  }
+  [data-surface="artifact"] .source-revision {
+    display: none;
+  }
+  [data-surface="artifact"] .artifact-surface-header > span,
+  [data-surface="artifact"] .artifact-surface-footer span {
+    display: none;
+  }
+  [data-surface="artifact"] .preview-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 7px;
+  }
+  [data-surface="artifact"] .preview-header > div:first-child {
+    min-width: 0;
+    width: 100%;
+  }
+  [data-surface="artifact"] .preview-header strong {
+    max-width: 100%;
+  }
+  [data-surface="artifact"] .preview-badges {
+    flex-wrap: wrap;
+    margin-left: 0;
   }
 }
