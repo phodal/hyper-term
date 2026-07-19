@@ -53,9 +53,8 @@ export function WorkspaceReview({
     (count, hunkIds) => count + hunkIds.length,
     0,
   );
-  const selectedFileCount = Object.values(selectedHunks).filter((hunkIds) =>
-    hunkIds.length > 0
-  ).length;
+  const selectedFileCount =
+    Object.values(selectedHunks).filter((hunkIds) => hunkIds.length > 0).length;
   const activeSelection = selectedHunks[active.source_path] ?? [];
   const allActiveSelected = activeSelection.length === active.hunks.length;
 
