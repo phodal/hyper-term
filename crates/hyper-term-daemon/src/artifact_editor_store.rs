@@ -435,6 +435,7 @@ fn append_transaction(
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
     file.write_all(&encoded)?;
     file.sync_all()?;
