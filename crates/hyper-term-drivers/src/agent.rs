@@ -4,6 +4,51 @@ use uuid::Uuid;
 
 use crate::DriverState;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionCapabilities {
+    pub config_options: Vec<AgentSessionConfigOption>,
+    pub available_commands: Vec<AgentAvailableCommand>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionConfigOption {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub kind: AgentSessionConfigKind,
+    pub choices: Vec<AgentSessionConfigChoice>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentSessionConfigKind {
+    Select { current_value: String },
+    Boolean { current_value: bool },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionConfigChoice {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub group: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentAvailableCommand {
+    pub name: String,
+    pub description: String,
+    pub input_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentSessionConfigValue {
+    Id { value: String },
+    Boolean { value: bool },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredAgentProtocol {

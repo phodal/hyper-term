@@ -17,9 +17,10 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentDriverEvent, AgentEffectAuthorization,
-    AgentEffectKind, CodexAppServerClient, CodexAppServerConfig, CodexContainmentConfig,
-    CodexMcpServerConfig, DenoGenUiCompiler, DenoGenUiConfig, DriverState, ExternalRequestId,
-    GenUiCompileRequest, StructuredAgentClient, StructuredAgentProtocol, sha256_file,
+    AgentEffectKind, AgentSessionCapabilities, AgentSessionConfigValue, CodexAppServerClient,
+    CodexAppServerConfig, CodexContainmentConfig, CodexMcpServerConfig, DenoGenUiCompiler,
+    DenoGenUiConfig, DriverState, ExternalRequestId, GenUiCompileRequest, StructuredAgentClient,
+    StructuredAgentProtocol, sha256_file,
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, GenUiArtifactCandidate, MessageRole,
@@ -320,7 +321,20 @@ struct AgentSnapshotResponse {
     status: AgentStatus,
     turn_id: Option<String>,
     error: Option<String>,
+    capabilities: AgentSessionCapabilities,
     document: BlockDocument,
+}
+
+#[derive(Deserialize)]
+struct AgentConfigRequest {
+    config_id: String,
+    value: AgentSessionConfigValue,
+}
+
+#[derive(Serialize)]
+struct AgentCapabilitiesResponse {
+    session_id: u16,
+    capabilities: AgentSessionCapabilities,
 }
 
 #[derive(Serialize)]
@@ -601,6 +615,7 @@ pub async fn spawn_agent_gateway(
                 .delete(close_session),
         )
         .route("/agent/session/turn", post(start_turn))
+        .route("/agent/session/config", post(set_session_config))
         .route("/agent/session/permission", post(decide_permission))
         .route(
             "/agent/artifact/{artifact_id}/preview",
@@ -1417,6 +1432,45 @@ async fn decide_permission(
     }
 }
 
+async fn set_session_config(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let request = match serde_json::from_slice::<AgentConfigRequest>(&body) {
+        Ok(request) if !request.config_id.is_empty() && request.config_id.len() <= 128 => request,
+        _ => return status_response(StatusCode::BAD_REQUEST, "Agent configuration is invalid"),
+    };
+    let result =
+        tokio::task::spawn_blocking(move || runtime.set_session_config(session_id, request)).await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::OK, &response),
+        Ok(Err(SessionError::NotFound)) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Ok(Err(SessionError::Busy)) => status_response(
+            StatusCode::CONFLICT,
+            "Agent configuration cannot change during an active turn",
+        ),
+        Ok(Err(SessionError::Unsupported)) => status_response(
+            StatusCode::CONFLICT,
+            "Agent provider does not expose session configuration",
+        ),
+        Ok(Err(SessionError::InvalidConfig)) => status_response(
+            StatusCode::BAD_REQUEST,
+            "Agent configuration value is invalid",
+        ),
+        Ok(Err(_)) | Err(_) => status_response(
+            StatusCode::BAD_GATEWAY,
+            "Agent configuration could not be updated",
+        ),
+    }
+}
+
 fn authorize(
     runtime: &AgentGatewayRuntime,
     query: &AgentSessionQuery,
@@ -1453,6 +1507,8 @@ enum SessionError {
     NotFound,
     Busy,
     PromptTooLarge,
+    InvalidConfig,
+    Unsupported,
     Lock,
     Daemon,
     Thread,
@@ -1773,11 +1829,16 @@ impl AgentGatewayRuntime {
             .daemon
             .block_snapshot(session.task_id)
             .map_err(|_| SessionError::Daemon)?;
+        let capabilities = session
+            .client
+            .session_capabilities()
+            .map_err(|_| SessionError::Driver)?;
         Ok(AgentSnapshotResponse {
             session_id,
             status,
             turn_id,
             error,
+            capabilities,
             document,
         })
     }
@@ -2712,6 +2773,45 @@ impl AgentGatewayRuntime {
         Ok(AgentTurnResponse {
             session_id,
             status: AgentStatus::Running,
+        })
+    }
+
+    fn set_session_config(
+        &self,
+        session_id: u16,
+        request: AgentConfigRequest,
+    ) -> Result<AgentCapabilitiesResponse, SessionError> {
+        let session = self.session(session_id)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(SessionError::Unsupported);
+        }
+        {
+            let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
+            if matches!(
+                progress.status,
+                AgentStatus::Running | AgentStatus::WaitingApproval
+            ) {
+                return Err(SessionError::Busy);
+            }
+        }
+        let capabilities = session
+            .client
+            .set_session_config_option(
+                &session.thread_id,
+                &request.config_id,
+                request.value,
+                START_TURN_TIMEOUT,
+            )
+            .map_err(|error| match error {
+                hyper_term_drivers::AgentClientError::Acp(
+                    hyper_term_drivers::AcpAdapterError::InvalidMessage(_),
+                ) => SessionError::InvalidConfig,
+                hyper_term_drivers::AgentClientError::Unsupported(_) => SessionError::Unsupported,
+                _ => SessionError::Driver,
+            })?;
+        Ok(AgentCapabilitiesResponse {
+            session_id,
+            capabilities,
         })
     }
 
@@ -4389,7 +4489,7 @@ mod tests {
         let fake_acp = temporary.path().join("fixture-acp");
         std::fs::write(
             &fake_acp,
-            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-session-8\"}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Provider-neutral ACP is live.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Checking workspace\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Final answer.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-session-8\",\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"fast\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"},{\"value\":\"deep\",\"name\":\"Deep\"}]}]}}' ;;\n    *'\"method\":\"session/set_config_option\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"deep\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"},{\"value\":\"deep\",\"name\":\"Deep\"}]}]}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[{\"name\":\"skills\",\"description\":\"Configure skills\"}]}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Provider-neutral ACP is live.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Checking workspace\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Final answer.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
         )
         .expect("fake ACP");
         let mut permissions = std::fs::metadata(&fake_acp).unwrap().permissions();
@@ -4431,6 +4531,28 @@ mod tests {
         assert_eq!(response["provider"], "fixture-acp");
         assert_eq!(response["protocol"], "acp-v1");
         assert_eq!(response["thread_id"], "acp-session-8");
+        let (status, body) = request(gateway.address(), &token, 8, "GET").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["capabilities"]["config_options"][0]["id"], "model");
+        assert_eq!(
+            snapshot["capabilities"]["config_options"][0]["kind"]["current_value"],
+            "fast"
+        );
+        let config_path = format!("/agent/session/config?token={token}&session_id=8");
+        let config_request = serde_json::to_vec(&serde_json::json!({
+            "config_id": "model",
+            "value": {"type": "id", "value": "deep"}
+        }))
+        .unwrap();
+        let (status, body) =
+            request_path(gateway.address(), &config_path, "POST", &config_request).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            response["capabilities"]["config_options"][0]["kind"]["current_value"],
+            "deep"
+        );
         assert_eq!(
             request_path(
                 gateway.address(),
@@ -4466,6 +4588,10 @@ mod tests {
         let blocks = snapshot["document"]["blocks"]
             .as_array()
             .expect("snapshot blocks");
+        assert_eq!(
+            snapshot["capabilities"]["available_commands"][0]["name"],
+            "skills"
+        );
         let initial_message = blocks
             .iter()
             .position(|block| {

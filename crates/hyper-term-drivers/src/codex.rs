@@ -15,10 +15,10 @@ use uuid::Uuid;
 use crate::codex_containment::compile_codex_task_sandbox;
 use crate::{
     AgentClientError, AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind,
-    AgentEffectProposal, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent,
-    DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
-    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox,
-    sha256_file,
+    AgentEffectProposal, AgentSessionCapabilities, AgentSessionConfigValue,
+    DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
+    DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
+    StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
 };
 
 const MAX_PENDING_APPROVALS: usize = 128;
@@ -514,6 +514,22 @@ impl StructuredAgentClient for CodexAppServerClient {
 
     fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AgentClientError> {
         Ok(CodexAppServerClient::next_event(self, timeout)?)
+    }
+
+    fn session_capabilities(&self) -> Result<AgentSessionCapabilities, AgentClientError> {
+        Ok(AgentSessionCapabilities::default())
+    }
+
+    fn set_session_config_option(
+        &self,
+        _session_id: &str,
+        _config_id: &str,
+        _value: AgentSessionConfigValue,
+        _timeout: Duration,
+    ) -> Result<AgentSessionCapabilities, AgentClientError> {
+        Err(AgentClientError::Unsupported(
+            "Codex app-server configuration is not exposed through ACP".into(),
+        ))
     }
 
     fn resolve_effect(

@@ -3,8 +3,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::{
-    AcpAdapterError, AgentDriverEvent, AgentEffectAuthorization, CodexAdapterError, DriverState,
-    ExternalRequestId, StructuredAgentProtocol,
+    AcpAdapterError, AgentDriverEvent, AgentEffectAuthorization, AgentSessionCapabilities,
+    AgentSessionConfigValue, CodexAdapterError, DriverState, ExternalRequestId,
+    StructuredAgentProtocol,
 };
 
 /// Renderer-independent port used by the daemon for every structured coding agent.
@@ -20,6 +21,14 @@ pub trait StructuredAgentClient: Send + Sync {
         timeout: Duration,
     ) -> Result<String, AgentClientError>;
     fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AgentClientError>;
+    fn session_capabilities(&self) -> Result<AgentSessionCapabilities, AgentClientError>;
+    fn set_session_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: AgentSessionConfigValue,
+        timeout: Duration,
+    ) -> Result<AgentSessionCapabilities, AgentClientError>;
     fn resolve_effect(
         &self,
         request_id: &ExternalRequestId,
@@ -36,4 +45,6 @@ pub enum AgentClientError {
     Acp(#[from] AcpAdapterError),
     #[error(transparent)]
     Codex(#[from] CodexAdapterError),
+    #[error("structured agent capability is unavailable: {0}")]
+    Unsupported(String),
 }
