@@ -342,7 +342,7 @@ fn trace_digest(
     Ok(hex_digest(Sha256::digest(canonical)))
 }
 
-fn replay_projection_digest(
+pub(crate) fn replay_projection_digest(
     source_revision: u64,
     events: &[GenUiRuntimeTraceEvent],
 ) -> Result<String, RuntimeTraceStoreError> {

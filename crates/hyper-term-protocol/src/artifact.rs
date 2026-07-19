@@ -124,6 +124,89 @@ pub struct GenUiRuntimeTraceProjection {
     pub events: Vec<GenUiRuntimeTraceEvent>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenUiBugCapsuleInclusion {
+    Included,
+    DigestOnly,
+    Excluded,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiBugCapsuleInventoryEntry {
+    pub category: String,
+    pub inclusion: GenUiBugCapsuleInclusion,
+    pub item_count: u64,
+    pub byte_count: u64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiBugCapsuleFile {
+    pub path: String,
+    pub byte_count: u64,
+    pub content_digest: String,
+    pub modified: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiBugCapsuleOutputs {
+    pub bundle_bytes: u64,
+    pub bundle_digest: String,
+    pub css_bytes: u64,
+    pub css_digest: String,
+    pub source_map_bytes: u64,
+    pub source_map_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiBugCapsuleEditorState {
+    pub base_source_revision: u64,
+    pub revision: u64,
+    pub state_digest: String,
+    pub active_path: String,
+    pub view: String,
+    pub files: Vec<GenUiBugCapsuleFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiBugCapsuleEnvironment {
+    pub hyper_term_version: String,
+    pub os: String,
+    pub architecture: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deno_runtime_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deno_executable_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler_script_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler_wasm_digest: Option<String>,
+}
+
+/// A bounded, default-redacted, replay-only diagnostic package.
+///
+/// Rust creates this contract from already-authoritative stores. Web clients
+/// may preview and save the exact response, but cannot add workspace data.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct GenUiBugCapsule {
+    pub schema_version: u16,
+    pub mode: String,
+    pub artifact: AcceptedGenUiArtifact,
+    pub accepted_source: Vec<GenUiBugCapsuleFile>,
+    pub outputs: GenUiBugCapsuleOutputs,
+    pub editor: GenUiBugCapsuleEditorState,
+    pub runtime: GenUiRuntimeTraceProjection,
+    pub runtime_truncated: bool,
+    pub omitted_runtime_events: u64,
+    pub environment: GenUiBugCapsuleEnvironment,
+    pub inventory: Vec<GenUiBugCapsuleInventoryEntry>,
+    pub reproduction: Vec<String>,
+    /// Digest of the serialized capsule with this field omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capsule_digest: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

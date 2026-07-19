@@ -25,9 +25,9 @@ use hyper_term_drivers::{
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, GenUiArtifactCandidate,
-    GenUiRuntimeTraceAppendRequest, GenUiRuntimeTraceProjection, MessageRole, OperationAction,
-    OperationCompletion, OperationId, OperationKind, OperationOutcome, OperationState,
-    PermissionDecision, RiskClass, TaskId,
+    GenUiBugCapsule, GenUiBugCapsuleEnvironment, GenUiRuntimeTraceAppendRequest,
+    GenUiRuntimeTraceProjection, MessageRole, OperationAction, OperationCompletion, OperationId,
+    OperationKind, OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::DaemonState;
+use crate::artifact_debug_capsule::build_bug_capsule;
 use crate::artifact_editor_store::{
     ArtifactEditorCheckpoint, ArtifactEditorCheckpointRequest, ArtifactEditorStore,
     ArtifactEditorStoreError,
@@ -649,6 +650,10 @@ pub async fn spawn_agent_gateway(
         .route(
             "/agent/artifact/{artifact_id}/runtime-trace",
             get(artifact_runtime_trace).post(append_artifact_runtime_trace),
+        )
+        .route(
+            "/agent/artifact/{artifact_id}/debug-capsule",
+            get(artifact_debug_capsule),
         )
         .route(
             "/agent/artifact/{artifact_id}/history",
@@ -1286,6 +1291,42 @@ fn artifact_runtime_trace_response(
     }
 }
 
+async fn artifact_debug_capsule(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.artifact_debug_capsule(session_id, artifact_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(capsule)) => json_response(StatusCode::OK, &capsule),
+        Ok(Err(
+            BugCapsuleRequestError::SessionUnavailable
+            | BugCapsuleRequestError::ArtifactUnavailable,
+        )) => status_response(StatusCode::NOT_FOUND, "Bug capsule is unavailable"),
+        Ok(Err(BugCapsuleRequestError::AcpRequired)) => status_response(
+            StatusCode::FORBIDDEN,
+            "Bug capsules are available only for ACP Agent artifacts",
+        ),
+        Ok(Err(BugCapsuleRequestError::Lock | BugCapsuleRequestError::Store)) | Err(_) => {
+            status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Bug capsule could not be prepared",
+            )
+        }
+    }
+}
+
 async fn artifact_history(
     State(runtime): State<AgentGatewayRuntime>,
     RoutePath(artifact_id): RoutePath<String>,
@@ -1865,6 +1906,15 @@ enum RuntimeTraceError {
 }
 
 #[derive(Debug)]
+enum BugCapsuleRequestError {
+    SessionUnavailable,
+    AcpRequired,
+    ArtifactUnavailable,
+    Lock,
+    Store,
+}
+
+#[derive(Debug)]
 enum WorkspaceProposalError {
     SessionUnavailable,
     AcpRequired,
@@ -2357,6 +2407,65 @@ impl AgentGatewayRuntime {
                 request.events,
             )
             .map_err(map_runtime_trace_store_error)
+    }
+
+    fn artifact_debug_capsule(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+    ) -> Result<GenUiBugCapsule, BugCapsuleRequestError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| BugCapsuleRequestError::SessionUnavailable)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(BugCapsuleRequestError::AcpRequired);
+        }
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| BugCapsuleRequestError::ArtifactUnavailable)?;
+        let _editor_guard = self
+            .artifact_editor_lock
+            .lock()
+            .map_err(|_| BugCapsuleRequestError::Lock)?;
+        let editor = self
+            .artifact_editor_store
+            .load(
+                session.task_id,
+                artifact_id,
+                artifact.metadata.source_revision,
+                &artifact.metadata.entrypoint,
+                &artifact.source_files,
+            )
+            .map_err(|_| BugCapsuleRequestError::Store)?;
+        let _trace_guard = self
+            .artifact_runtime_trace_lock
+            .lock()
+            .map_err(|_| BugCapsuleRequestError::Lock)?;
+        let runtime = self
+            .artifact_runtime_trace_store
+            .load(
+                session.task_id,
+                artifact_id,
+                artifact.metadata.source_revision,
+            )
+            .map_err(|_| BugCapsuleRequestError::Store)?;
+        let compiler = self.artifact_draft_compiler.as_deref();
+        let environment = GenUiBugCapsuleEnvironment {
+            hyper_term_version: env!("CARGO_PKG_VERSION").into(),
+            os: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            deno_runtime_version: compiler.map(|compiler| compiler.config.runtime_version.clone()),
+            deno_executable_digest: compiler
+                .map(|compiler| compiler.config.executable_sha256.clone()),
+            compiler_script_digest: compiler
+                .map(|compiler| compiler.config.compiler_script_sha256.clone()),
+            compiler_wasm_digest: compiler
+                .map(|compiler| compiler.config.compiler_wasm_sha256.clone()),
+        };
+        build_bug_capsule(&artifact, &editor, &runtime, environment)
+            .map_err(|_| BugCapsuleRequestError::Store)
     }
 
     fn artifact_history(
@@ -5375,6 +5484,31 @@ mod tests {
                 .0,
             StatusCode::CONFLICT.as_u16()
         );
+
+        let capsule_path = format!(
+            "/agent/artifact/{}/debug-capsule?token={token}&session_id=10",
+            accepted.artifact_id
+        );
+        let (status, body) = request_path(gateway.address(), &capsule_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let encoded_capsule = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!encoded_capsule.contains("draft amber"));
+        assert!(!encoded_capsule.contains("must-not-persist"));
+        assert!(encoded_capsule.contains("[REDACTED]"));
+        let capsule: GenUiBugCapsule = serde_json::from_str(&encoded_capsule).unwrap();
+        assert_eq!(capsule.mode, "replay_only");
+        assert_eq!(capsule.editor.files.len(), 2);
+        assert!(capsule.editor.files.iter().any(|file| file.modified));
+        assert_eq!(capsule.runtime.events.len(), 2);
+        assert_eq!(capsule.capsule_digest.as_deref().map(str::len), Some(64));
+        assert!(
+            crate::artifact_debug_capsule::verify_bug_capsule(&capsule).unwrap(),
+            "serialized capsule must verify after an offline parse"
+        );
+        assert!(capsule.inventory.iter().any(|entry| {
+            entry.category == "terminal_output"
+                && entry.inclusion == hyper_term_protocol::GenUiBugCapsuleInclusion::Excluded
+        }));
 
         let preview_path = format!(
             "/agent/artifact/{}/workspace-preview?token={token}&session_id=10",
