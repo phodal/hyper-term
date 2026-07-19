@@ -112,6 +112,31 @@ the real world is reversible. It requires stable event schemas, migration,
 checkpoint compatibility, content retention, and deterministic projection
 tests. Event volume must be controlled through batching and artifact references.
 
+## Offline bug capsule evidence (2026-07-20)
+
+The authenticated ACP Workbench can now request a Rust-generated, replay-only
+Bug Capsule for the exact current Artifact. Rust joins the accepted Artifact,
+editor checkpoint, runtime projection, and pinned compiler environment behind
+the existing task and Artifact fences. The response is bounded to 512 KiB and
+contains an integrity digest that survives JSON save, reopen, and offline
+verification.
+
+Accepted and unpublished source, bundle, CSS, and source-map bodies are excluded
+by default. Their virtual paths, byte counts, modification state, and SHA-256
+digests remain available for matching on the originating machine. Deterministic
+runtime inputs retain the Rust store's sensitive-key redaction. Console and
+error observations retain only sequence-preserving excluded placeholders.
+Terminal output, provider prompts, MCP payloads, environment values, Computer
+Use frames, and screenshots have explicit excluded inventory rows.
+
+The Time Travel tab first shows a compact export action. After preparation it
+shows the exact included, digest-only, and excluded inventory before enabling a
+user-initiated JSON download. The WebView verifies the capsule digest but cannot
+add files or other workspace data to the Rust response. Rust unit and gateway
+tests cover source and observation exclusion, sensitive runtime redaction,
+modified-editor digests, size limits, tamper detection, and offline parse plus
+digest verification.
+
 ## Implementation evidence (2026-07-19)
 
 The first durable Artifact-timeline slice now uses the existing Rust authority

@@ -29,6 +29,7 @@ import {
   type WorkspaceApplyUpdate,
   type WorkspaceHunkSelection,
 } from "../workspace-apply-publisher.ts";
+import { BugCapsuleClient } from "../debug-capsule-client.ts";
 import { GenUiStudio } from "./genui-studio.tsx";
 import { WorkspaceReview } from "./workspace-review.tsx";
 import { WorkspaceApplyComposer } from "./workspace-apply-composer.tsx";
@@ -132,6 +133,17 @@ export function ArtifactWorkbench() {
       sessionId: context.sessionId,
       token: context.token,
     });
+  }, [context, state]);
+  const prepareBugCapsule = useCallback(() => {
+    if (!context || state.kind !== "ready") {
+      return Promise.reject(new Error("Bug Capsule context is unavailable."));
+    }
+    return new BugCapsuleClient({
+      artifactId: state.source.artifact_id,
+      sourceRevision: state.source.source_revision,
+      sessionId: context.sessionId,
+      token: context.token,
+    }).prepare();
   }, [context, state]);
 
   useEffect(() => {
@@ -538,6 +550,7 @@ export function ArtifactWorkbench() {
               runtimeTraceStatus={runtimeTraceStatus}
               runtimeTraceError={runtimeTraceError}
               onRuntimeTrace={recordRuntimeTrace}
+              onPrepareBugCapsule={prepareBugCapsule}
             />
           </div>
           {workspacePanel === "mapping" && (

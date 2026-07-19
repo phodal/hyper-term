@@ -25,6 +25,10 @@ import {
 import { CodeDiff } from "./code-diff.tsx";
 import { CodeEditor } from "./code-editor.tsx";
 import { ArtifactFileTabs } from "./artifact-file-tabs.tsx";
+import {
+  type BugCapsule,
+  downloadBugCapsule,
+} from "../debug-capsule-client.ts";
 
 const sampleOriginalSource = `import React from "react";
 
@@ -131,6 +135,7 @@ export interface GenUiStudioProps {
   runtimeTraceStatus?: "loading" | "ready" | "saving" | "failed";
   runtimeTraceError?: string;
   onRuntimeTrace?: (event: RuntimeTraceInput) => void;
+  onPrepareBugCapsule?: () => Promise<BugCapsule>;
 }
 
 export function GenUiStudio({
@@ -161,6 +166,7 @@ export function GenUiStudio({
   runtimeTraceStatus = "ready",
   runtimeTraceError,
   onRuntimeTrace,
+  onPrepareBugCapsule,
 }: GenUiStudioProps) {
   const [files, setFiles] = useState<Record<string, string>>(() => ({
     ...initialFiles,
@@ -643,6 +649,7 @@ export function GenUiStudio({
             runtimeTraceError={runtimeTraceError}
             replayDisabled={draftChanged || publishBusy || !accepted}
             onReplayRuntimeTrace={replayRuntimeTrace}
+            onPrepareBugCapsule={onPrepareBugCapsule}
           />
         )}
       </div>
@@ -776,6 +783,7 @@ interface TraceTimelineProps {
   runtimeTraceError?: string;
   replayDisabled: boolean;
   onReplayRuntimeTrace: (event: RuntimeTraceEvent) => void;
+  onPrepareBugCapsule?: () => Promise<BugCapsule>;
 }
 
 function TraceTimeline({
@@ -793,15 +801,66 @@ function TraceTimeline({
   runtimeTraceError,
   replayDisabled,
   onReplayRuntimeTrace,
+  onPrepareBugCapsule,
 }: TraceTimelineProps) {
+  const [capsule, setCapsule] = useState<BugCapsule>();
+  const [capsuleStatus, setCapsuleStatus] = useState<
+    "idle" | "preparing" | "ready" | "failed"
+  >("idle");
+  const [capsuleError, setCapsuleError] = useState<string>();
+
+  const prepareCapsule = () => {
+    if (!onPrepareBugCapsule || capsuleStatus === "preparing") return;
+    setCapsuleStatus("preparing");
+    setCapsuleError(undefined);
+    onPrepareBugCapsule().then((prepared) => {
+      setCapsule(prepared);
+      setCapsuleStatus("ready");
+    }).catch((error: unknown) => {
+      setCapsuleStatus("failed");
+      setCapsuleError(error instanceof Error ? error.message : String(error));
+    });
+  };
+
   return (
     <div className="trace-timeline">
-      <div className="trace-note">
-        Rust journals accepted source, reducer events, and redacted effect
-        receipts. Replay verifies the canonical projection digest and
-        substitutes receipts; it never repeats Shell, MCP, ACP, or Computer Use
-        effects.
+      <div className="trace-capsule-toolbar">
+        <div>
+          <strong>Offline Bug Capsule</strong>
+          <span>Rust-redacted · replay only · source digest only</span>
+        </div>
+        <button
+          type="button"
+          disabled={!onPrepareBugCapsule || capsuleStatus === "preparing"}
+          onClick={capsule ? () => downloadBugCapsule(capsule) : prepareCapsule}
+        >
+          {capsule
+            ? "Download JSON"
+            : capsuleStatus === "preparing"
+            ? "Preparing…"
+            : "Preview export"}
+        </button>
       </div>
+      {capsuleError && (
+        <p className="trace-history-error" role="alert">{capsuleError}</p>
+      )}
+      {capsule && (
+        <details className="trace-capsule-inventory" open>
+          <summary>
+            Exact export inventory · {capsule.capsule_digest.slice(0, 10)}
+          </summary>
+          {capsule.inventory.map((entry) => (
+            <div key={entry.category} data-inclusion={entry.inclusion}>
+              <strong>{entry.category.replaceAll("_", " ")}</strong>
+              <span>{entry.inclusion.replaceAll("_", " ")}</span>
+              <small>
+                {entry.item_count} item(s) · {formatByteCount(entry.byte_count)}
+              </small>
+              <p>{entry.reason}</p>
+            </div>
+          ))}
+        </details>
+      )}
       <div className="trace-section-heading">
         <strong>Runtime checkpoints</strong>
         <span>{runtimeTraceStatus}</span>
@@ -931,4 +990,10 @@ function formatHistoryTime(recordedAtMs: number): string {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(recordedAtMs));
+}
+
+function formatByteCount(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
 }
