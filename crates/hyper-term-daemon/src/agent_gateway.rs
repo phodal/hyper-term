@@ -5303,14 +5303,28 @@ mod tests {
         );
         let trace_batch = serde_json::to_vec(&serde_json::json!({
             "source_revision": 3,
-            "events": [{
-                "schema_version": 1,
-                "stream_id": "77777777-7777-4777-8777-777777777777",
-                "client_sequence": 1,
-                "kind": "checkpoint",
-                "name": "agent_status.changed",
-                "payload": {"expanded": true, "access_token": "must-not-persist"}
-            }]
+            "events": [
+                {
+                    "schema_version": 1,
+                    "stream_id": "77777777-7777-4777-8777-777777777777",
+                    "client_sequence": 1,
+                    "kind": "checkpoint",
+                    "name": "agent_status.changed",
+                    "payload": {"expanded": true, "access_token": "must-not-persist"}
+                },
+                {
+                    "schema_version": 1,
+                    "stream_id": "77777777-7777-4777-8777-777777777777",
+                    "client_sequence": 2,
+                    "kind": "effect_receipt",
+                    "name": "evidence.lookup",
+                    "payload": {
+                        "input": {"id": 7},
+                        "outcome": "succeeded",
+                        "output": {"passed": true}
+                    }
+                }
+            ]
         }))
         .unwrap();
         let (status, body) =
@@ -5318,7 +5332,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
         let trace: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(trace["source_revision"], 3);
-        assert_eq!(trace["events"].as_array().unwrap().len(), 1);
+        assert_eq!(trace["events"].as_array().unwrap().len(), 2);
+        assert_eq!(trace["projection_digest"].as_str().map(str::len), Some(64));
         assert_eq!(trace["events"][0]["event_sequence"], 1);
         assert_eq!(trace["events"][0]["redacted"], true);
         assert_eq!(trace["events"][0]["payload"]["access_token"], "[REDACTED]");
@@ -5334,7 +5349,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            2
         );
         let (status, body) = request_path(gateway.address(), &runtime_trace_path, "GET", b"").await;
         assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");

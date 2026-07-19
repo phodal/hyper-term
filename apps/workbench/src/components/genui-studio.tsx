@@ -15,6 +15,7 @@ import {
   type RuntimeTraceEvent,
   type RuntimeTraceInput,
 } from "../runtime-trace-client.ts";
+import { isReplayBoundary } from "../genui/runtime-replay.ts";
 import type { EditorLanguageService } from "../editor-language-service.ts";
 import { GenUiCompiler } from "../genui/compiler-client.ts";
 import {
@@ -37,10 +38,16 @@ export default function AgentStatus() {
 `;
 
 const sampleInitialSource = `import React from "react";
-import { traceAction, traceCheckpoint } from "@hyper/runtime";
+import { traceCheckpoint, useReplayReducer } from "@hyper/runtime";
 
 export default function AgentStatus() {
-  const [expanded, setExpanded] = React.useState(false);
+  const [state, dispatch] = useReplayReducer(
+    "evidence.panel",
+    (current, action) => action.type === "toggle"
+      ? { expanded: !current.expanded }
+      : current,
+    { expanded: false },
+  );
   return (
     <main style={{ padding: 28, fontFamily: "system-ui" }}>
       <section style={{
@@ -53,10 +60,9 @@ export default function AgentStatus() {
         <h2 style={{ margin: "10px 0 4px" }}>Verification complete</h2>
         <p style={{ color: "#aeb6a1" }}>19 tests passed · 0 effects replayed</p>
         <button onClick={() => {
-          const next = !expanded;
-          traceAction("evidence.toggle", { expanded: next });
-          setExpanded(next);
-          traceCheckpoint("agent-status", { expanded: next });
+          const next = !state.expanded;
+          dispatch({ type: "toggle" });
+          traceCheckpoint("evidence.panel", { state: { expanded: next } });
         }} style={{
           marginTop: 12,
           border: 0,
@@ -66,9 +72,9 @@ export default function AgentStatus() {
           color: "#11140e",
           fontWeight: 700,
         }}>
-          {expanded ? "Hide evidence" : "Show evidence"}
+          {state.expanded ? "Hide evidence" : "Show evidence"}
         </button>
-        {expanded && <pre style={{ color: "#cbd5bc" }}>
+        {state.expanded && <pre style={{ color: "#cbd5bc" }}>
           cargo test --workspace{"\\n"}deno task check{"\\n"}deno task build
         </pre>}
       </section>
@@ -121,6 +127,7 @@ export interface GenUiStudioProps {
     signal: AbortSignal,
   ) => Promise<ArtifactHistorySource>;
   runtimeTraceEvents?: RuntimeTraceEvent[];
+  runtimeTraceProjectionDigest?: string;
   runtimeTraceStatus?: "loading" | "ready" | "saving" | "failed";
   runtimeTraceError?: string;
   onRuntimeTrace?: (event: RuntimeTraceInput) => void;
@@ -150,6 +157,7 @@ export function GenUiStudio({
   historyError,
   onLoadHistorySource,
   runtimeTraceEvents = [],
+  runtimeTraceProjectionDigest = "",
   runtimeTraceStatus = "ready",
   runtimeTraceError,
   onRuntimeTrace,
@@ -168,6 +176,7 @@ export function GenUiStudio({
   const [error, setError] = useState<string>();
   const [accepted, setAccepted] = useState<AcceptedArtifact>();
   const [previewRuntime, setPreviewRuntime] = useState("idle");
+  const [replayTarget, setReplayTarget] = useState<number>();
   const [runtimeDiagnostic, setRuntimeDiagnostic] = useState<
     RuntimeDiagnostic
   >();
@@ -214,6 +223,8 @@ export function GenUiStudio({
         channel_token?: string;
         artifact_id?: string;
         source_revision?: number;
+        replay?: boolean;
+        target_event_sequence?: number;
         generated_line?: number;
         generated_column?: number;
         event?: unknown;
@@ -228,7 +239,16 @@ export function GenUiStudio({
             message.source_revision !== accepted.source_revision)
         ) return;
         setRuntimeDiagnostic(undefined);
-        setPreviewRuntime("ready");
+        setReplayTarget(
+          message.replay && Number.isSafeInteger(message.target_event_sequence)
+            ? message.target_event_sequence
+            : undefined,
+        );
+        setPreviewRuntime(
+          message.replay && Number.isSafeInteger(message.target_event_sequence)
+            ? `replay #${message.target_event_sequence} · effects substituted`
+            : "ready",
+        );
       } else if (message.type === "hyper_term_preview_error") {
         if (
           !accepted || message.artifact_id !== accepted.artifact_id ||
@@ -456,6 +476,56 @@ export function GenUiStudio({
     );
   };
 
+  const replayRuntimeTrace = (target: RuntimeTraceEvent) => {
+    if (
+      !accepted || !isReplayBoundary(target) ||
+      !/^[0-9a-f]{64}$/.test(runtimeTraceProjectionDigest) ||
+      !sameFiles(filesRef.current, baselineFiles)
+    ) return;
+    setRuntimeDiagnostic(undefined);
+    setReplayTarget(target.event_sequence);
+    setPreviewRuntime(`verifying replay #${target.event_sequence}`);
+    previewFrame.current?.contentWindow?.postMessage({
+      type: "hyper_term_replay_artifact",
+      schema_version: 1,
+      channel_token: previewChannel,
+      artifact: {
+        artifact_id: accepted.artifact_id,
+        source_revision: accepted.source_revision,
+        content_digest: accepted.content_digest,
+        bundle: accepted.bundle,
+        css: accepted.css,
+        source_map: accepted.source_map,
+      },
+      replay: {
+        source_revision: initialRevision,
+        target_event_sequence: target.event_sequence,
+        projection_digest: runtimeTraceProjectionDigest,
+        events: runtimeTraceEvents,
+      },
+    }, "*");
+  };
+
+  const returnToLivePreview = () => {
+    if (!accepted) return;
+    setReplayTarget(undefined);
+    setRuntimeDiagnostic(undefined);
+    setPreviewRuntime("returning to live preview");
+    previewFrame.current?.contentWindow?.postMessage({
+      type: "hyper_term_render_artifact",
+      schema_version: 1,
+      channel_token: previewChannel,
+      artifact: {
+        artifact_id: accepted.artifact_id,
+        source_revision: accepted.source_revision,
+        content_digest: accepted.content_digest,
+        bundle: accepted.bundle,
+        css: accepted.css,
+        source_map: accepted.source_map,
+      },
+    }, "*");
+  };
+
   return (
     <aside className="studio" aria-label="Agentic UI Studio">
       <header className="studio-header">
@@ -568,8 +638,11 @@ export function GenUiStudio({
               ? (entry) => void loadHistoryAsDraft(entry)
               : undefined}
             runtimeTraceEvents={runtimeTraceEvents}
+            runtimeTraceProjectionDigest={runtimeTraceProjectionDigest}
             runtimeTraceStatus={runtimeTraceStatus}
             runtimeTraceError={runtimeTraceError}
+            replayDisabled={draftChanged || publishBusy || !accepted}
+            onReplayRuntimeTrace={replayRuntimeTrace}
           />
         )}
       </div>
@@ -611,6 +684,11 @@ export function GenUiStudio({
           </strong>
         </div>
         <div className="preview-badges">
+          {replayTarget !== undefined && (
+            <button type="button" onClick={returnToLivePreview}>
+              Return to live
+            </button>
+          )}
           <span
             className={previewRuntime.startsWith("runtime error") ? "bad" : ""}
           >
@@ -693,8 +771,11 @@ interface TraceTimelineProps {
   draftChanged: boolean;
   onLoadHistory?: (entry: ArtifactHistoryEntry) => void;
   runtimeTraceEvents: RuntimeTraceEvent[];
+  runtimeTraceProjectionDigest: string;
   runtimeTraceStatus: "loading" | "ready" | "saving" | "failed";
   runtimeTraceError?: string;
+  replayDisabled: boolean;
+  onReplayRuntimeTrace: (event: RuntimeTraceEvent) => void;
 }
 
 function TraceTimeline({
@@ -707,15 +788,19 @@ function TraceTimeline({
   draftChanged,
   onLoadHistory,
   runtimeTraceEvents,
+  runtimeTraceProjectionDigest,
   runtimeTraceStatus,
   runtimeTraceError,
+  replayDisabled,
+  onReplayRuntimeTrace,
 }: TraceTimelineProps) {
   return (
     <div className="trace-timeline">
       <div className="trace-note">
-        Rust journals accepted source and redacted runtime checkpoints. Loading
-        source creates a local draft; Time Travel never repeats Shell, MCP, ACP,
-        or Computer Use effects.
+        Rust journals accepted source, reducer events, and redacted effect
+        receipts. Replay verifies the canonical projection digest and
+        substitutes receipts; it never repeats Shell, MCP, ACP, or Computer Use
+        effects.
       </div>
       <div className="trace-section-heading">
         <strong>Runtime checkpoints</strong>
@@ -747,6 +832,20 @@ function TraceTimeline({
               {event.redacted ? " · redacted" : ""}
             </p>
           </div>
+          {isReplayBoundary(event) && (
+            <button
+              type="button"
+              disabled={replayDisabled || runtimeTraceStatus !== "ready" ||
+                !runtimeTraceProjectionDigest ||
+                (event.kind === "effect_receipt" && event.redacted)}
+              title={event.redacted
+                ? "Redacted receipts cannot be substituted"
+                : "Rebuild reducer state through this event without invoking live effects"}
+              onClick={() => onReplayRuntimeTrace(event)}
+            >
+              Replay to here
+            </button>
+          )}
         </div>
       ))}
       <div className="trace-section-heading">

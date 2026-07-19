@@ -40,6 +40,7 @@ Deno.test("runtime trace client appends and reloads exact Rust evidence", async 
     return Promise.resolve(Response.json({
       artifact_id: artifactId,
       source_revision: 7,
+      projection_digest: "b".repeat(64),
       events: [event],
     }));
   });
@@ -68,6 +69,7 @@ Deno.test("runtime trace client rejects stale and malformed projections", async 
       Promise.resolve(Response.json({
         artifact_id: artifactId,
         source_revision: 7,
+        projection_digest: "b".repeat(64),
         events: [{ ...input, event_sequence: 1 }],
       })),
   );

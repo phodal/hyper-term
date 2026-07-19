@@ -24,7 +24,9 @@ const CAPSULE_SOURCES = new Map([
     "@hyper/runtime",
     `export const mount=globalThis.__HYPER_MOUNT__;\n` +
     `export const traceAction=(name,payload=null)=>globalThis.__HYPER_TRACE__("action",name,payload);\n` +
-    `export const traceCheckpoint=(name,payload=null)=>globalThis.__HYPER_TRACE__("checkpoint",name,payload);`,
+    `export const traceCheckpoint=(name,payload=null)=>globalThis.__HYPER_TRACE__("checkpoint",name,payload);\n` +
+    `export const useReplayReducer=(name,reducer,initialState)=>globalThis.__HYPER_USE_REPLAY_REDUCER__(name,reducer,initialState);\n` +
+    `export const replayableEffect=(name,input,invoke)=>globalThis.__HYPER_EFFECT__(name,input,invoke);`,
   ],
 ]);
 

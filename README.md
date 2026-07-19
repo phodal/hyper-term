@@ -57,9 +57,12 @@ task model without giving the UI direct command or filesystem authority.
   operation proposal; Rust and the user authorize it before execution.
 - **Artifact Workbench.** Current artifacts can open in a CodeMirror editor with
   Diff, Rust-journaled Time Travel, source-mapped diagnostics, completion, and
-  an isolated local preview. A historical revision can be loaded as a local
-  draft without replaying effects. Publishing creates an Approval Block and a
-  new Rust-accepted revision compiled by pinned Deno; it does not write to the
+  an isolated local preview. Explicit `useReplayReducer` state can be rebuilt
+  through a selected semantic event; replay verifies the Rust projection
+  digest and substitutes ordered effect receipts without invoking their live
+  callbacks. A historical source revision can still be loaded as a local draft
+  without replaying effects. Publishing creates an Approval Block and a new
+  Rust-accepted revision compiled by pinned Deno; it does not write to the
   workspace. The panel stays hidden for Terminal and ordinary Agent tabs and
   opens only for an ACP session with a current editable Artifact.
 - **Exact hunk apply.** The Workbench maps Artifact files to explicit workspace
@@ -117,7 +120,7 @@ The important boundary is not Native versus Web. It is **who has authority**:
 | GitHub Copilot ACP discovery | Implemented baseline |
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
-| Multi-file Artifact editor, Diff, durable accepted-source/runtime evidence, diagnostics, completion, and approved publish | Experimental |
+| Multi-file Artifact editor, Diff, deterministic reducer replay, effect receipts, diagnostics, completion, and approved publish | Experimental |
 | Brokered exact multi-file Artifact-to-workspace apply with hunk selection and crash recovery | Experimental |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |
@@ -258,9 +261,8 @@ Useful design documents:
 - Extend the crash-recoverable transactional hunk apply to isolated Tier 2
   worktrees and bounded binary patches, without giving the renderer write
   authority.
-- Merge accepted-source history, editor checkpoints, and redacted runtime
-  action/checkpoint evidence into deterministic replay projections and offline
-  bug capsules.
+- Merge accepted-source history and editor checkpoints into the deterministic
+  runtime projection, then export bounded redacted offline bug capsules.
 - Strengthen containment for external coding-agent processes.
 - Publish signed and notarized Apple Silicon and Intel builds.
 - Define the supported-platform contract before expanding beyond macOS.

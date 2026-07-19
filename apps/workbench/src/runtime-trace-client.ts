@@ -1,4 +1,9 @@
-export type RuntimeTraceKind = "action" | "checkpoint" | "console" | "error";
+export type RuntimeTraceKind =
+  | "action"
+  | "checkpoint"
+  | "effect_receipt"
+  | "console"
+  | "error";
 
 export interface RuntimeTraceInput {
   schema_version: 1;
@@ -21,6 +26,7 @@ export interface RuntimeTraceEvent extends RuntimeTraceInput {
 export interface RuntimeTraceProjection {
   artifact_id: string;
   source_revision: number;
+  projection_digest: string;
   events: RuntimeTraceEvent[];
 }
 
@@ -39,6 +45,7 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const TRACE_KINDS = new Set<RuntimeTraceKind>([
   "action",
   "checkpoint",
+  "effect_receipt",
   "console",
   "error",
 ]);
@@ -126,6 +133,7 @@ function validProjection(
     !projection || typeof projection !== "object" ||
     projection.artifact_id !== context.artifactId ||
     projection.source_revision !== context.sourceRevision ||
+    !SHA256_PATTERN.test(projection.projection_digest) ||
     !Array.isArray(projection.events) ||
     projection.events.length > MAX_TRACE_EVENTS ||
     !projection.events.every((event) =>

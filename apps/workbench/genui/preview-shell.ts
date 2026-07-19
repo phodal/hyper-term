@@ -12,6 +12,12 @@ import {
   mapPreviewRuntimeError,
   MAX_RUNTIME_SOURCE_MAP_BYTES,
 } from "../src/genui/runtime-diagnostic.ts";
+import type { RuntimeTraceEvent } from "../src/runtime-trace-client.ts";
+import {
+  runReplayableEffect,
+  RuntimeReplaySession,
+  verifyReplayProjectionDigest,
+} from "../src/genui/runtime-replay.ts";
 
 interface RenderArtifactMessage {
   type: "hyper_term_render_artifact";
@@ -27,7 +33,22 @@ interface RenderArtifactMessage {
   };
 }
 
-type RuntimeTraceKind = "action" | "checkpoint" | "console" | "error";
+interface ReplayArtifactMessage extends Omit<RenderArtifactMessage, "type"> {
+  type: "hyper_term_replay_artifact";
+  replay: {
+    source_revision: number;
+    target_event_sequence: number;
+    projection_digest: string;
+    events: RuntimeTraceEvent[];
+  };
+}
+
+type RuntimeTraceKind =
+  | "action"
+  | "checkpoint"
+  | "effect_receipt"
+  | "console"
+  | "error";
 
 declare global {
   var __HYPER_REACT__: typeof React;
@@ -39,6 +60,16 @@ declare global {
     name: string,
     payload?: unknown,
   ) => void;
+  var __HYPER_USE_REPLAY_REDUCER__: <State, Action>(
+    name: string,
+    reducer: (state: State, action: Action) => State,
+    initialState: State,
+  ) => [State, React.Dispatch<Action>];
+  var __HYPER_EFFECT__: <T>(
+    name: string,
+    input: unknown,
+    invoke: () => T | Promise<T>,
+  ) => Promise<T>;
   var __HYPER_BOOTSTRAP_ARTIFACT__:
     | RenderArtifactMessage["artifact"]
     | undefined;
@@ -50,6 +81,7 @@ const MAX_RUNTIME_TRACE_NAME_BYTES = 128;
 const channelToken = location.hash.slice(1);
 let runtimeTraceStreamId = crypto.randomUUID();
 let runtimeTraceSequence = 0;
+let replaySession: RuntimeReplaySession | undefined;
 const rootElement = requiredElement("root");
 const runtimeErrorElement = requiredElement("runtime-error");
 let root: Root | undefined;
@@ -76,7 +108,8 @@ globalThis.__HYPER_MOUNT__ = (component) => {
 };
 globalThis.__HYPER_TRACE__ = (kind, name, payload = null) => {
   if (
-    !activeArtifact || !validRuntimeTraceKind(kind) || !validTraceName(name)
+    replaySession || !activeArtifact || !validRuntimeTraceKind(kind) ||
+    !validTraceName(name)
   ) {
     return;
   }
@@ -110,6 +143,43 @@ globalThis.__HYPER_TRACE__ = (kind, name, payload = null) => {
     event,
   });
 };
+globalThis.__HYPER_USE_REPLAY_REDUCER__ = <State, Action>(
+  name: string,
+  reducer: (state: State, action: Action) => State,
+  initialState: State,
+): [State, React.Dispatch<Action>] => {
+  if (!validTraceName(name)) {
+    throw new Error("Replay reducer name is invalid.");
+  }
+  if (replaySession) {
+    const [state] = React.useState(() =>
+      replaySession?.reduce(name, initialState, reducer) ?? initialState
+    );
+    return [state, () => {}];
+  }
+  const [state, dispatch] = React.useReducer(reducer, initialState);
+  const tracedDispatch = React.useCallback((action: Action) => {
+    globalThis.__HYPER_TRACE__("action", name, { action });
+    dispatch(action);
+  }, [name]);
+  return [state, tracedDispatch];
+};
+globalThis.__HYPER_EFFECT__ = async <T>(
+  name: string,
+  input: unknown,
+  invoke: () => T | Promise<T>,
+): Promise<T> => {
+  if (!validTraceName(name) || typeof invoke !== "function") {
+    throw new Error("Replayable effect contract is invalid.");
+  }
+  return await runReplayableEffect(
+    replaySession,
+    name,
+    input,
+    invoke,
+    (payload) => globalThis.__HYPER_TRACE__("effect_receipt", name, payload),
+  );
+};
 
 globalThis.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (!isRenderMessage(event.data)) {
@@ -139,9 +209,36 @@ if (globalThis.__HYPER_BOOTSTRAP_ARTIFACT__) {
   });
 }
 
-async function render(message: RenderArtifactMessage): Promise<void> {
+async function render(
+  message: RenderArtifactMessage | ReplayArtifactMessage,
+): Promise<void> {
   const { artifact } = message;
   clearRuntimeError();
+  if (message.type === "hyper_term_replay_artifact") {
+    if (
+      !await verifyReplayProjectionDigest(
+        message.replay.source_revision,
+        message.replay.events,
+        message.replay.projection_digest,
+      ) || !message.replay.events.every((event) =>
+        event.source_revision === message.replay.source_revision
+      )
+    ) {
+      reportRuntimeError("runtime replay projection digest mismatch", {
+        artifact_id: artifact.artifact_id,
+        source_revision: artifact.source_revision,
+        source_map: artifact.source_map,
+      });
+      return;
+    }
+    replaySession = new RuntimeReplaySession(
+      message.replay.events,
+      message.replay.target_event_sequence,
+      message.replay.projection_digest,
+    );
+  } else {
+    replaySession = undefined;
+  }
   // Each accepted render is a distinct semantic stream. This prevents a
   // discarded local draft from creating sequence gaps when the editor returns
   // to the Rust-accepted source revision.
@@ -187,10 +284,21 @@ async function render(message: RenderArtifactMessage): Promise<void> {
     new Blob([artifact.bundle], { type: "text/javascript" }),
   );
   try {
+    if (root) {
+      root.unmount();
+      root = undefined;
+    }
     await import(currentModule);
     report("hyper_term_preview_ready", {
       artifact_id: artifact.artifact_id,
       source_revision: artifact.source_revision,
+      ...(replaySession
+        ? {
+          replay: true,
+          target_event_sequence: replaySession.targetEventSequence,
+          projection_digest: replaySession.projectionDigest,
+        }
+        : {}),
     });
   } catch (error) {
     reportRuntimeError(error, activeArtifact);
@@ -254,21 +362,37 @@ async function sha256(value: string): Promise<string> {
     .join("");
 }
 
-function isRenderMessage(value: unknown): value is RenderArtifactMessage {
+function isRenderMessage(
+  value: unknown,
+): value is RenderArtifactMessage | ReplayArtifactMessage {
   if (!value || typeof value !== "object") return false;
-  const message = value as Partial<RenderArtifactMessage>;
-  return message.type === "hyper_term_render_artifact" &&
+  const message = value as {
+    type?: string;
+    schema_version?: number;
+    channel_token?: string;
+    artifact?: Partial<RenderArtifactMessage["artifact"]>;
+    replay?: Partial<ReplayArtifactMessage["replay"]>;
+  };
+  return (message.type === "hyper_term_render_artifact" ||
+    message.type === "hyper_term_replay_artifact") &&
     message.schema_version === 1 &&
     message.channel_token === channelToken &&
     typeof message.artifact?.artifact_id === "string" &&
     typeof message.artifact.bundle === "string" &&
     typeof message.artifact.css === "string" &&
-    typeof message.artifact.source_map === "string";
+    typeof message.artifact.source_map === "string" &&
+    (message.type !== "hyper_term_replay_artifact" ||
+      (Number.isSafeInteger(message.replay?.target_event_sequence) &&
+        Number(message.replay?.target_event_sequence) > 0 &&
+        Number.isSafeInteger(message.replay?.source_revision) &&
+        Number(message.replay?.source_revision) > 0 &&
+        typeof message.replay?.projection_digest === "string" &&
+        Array.isArray(message.replay?.events)));
 }
 
 function validRuntimeTraceKind(value: string): value is RuntimeTraceKind {
-  return value === "action" || value === "checkpoint" || value === "console" ||
-    value === "error";
+  return value === "action" || value === "checkpoint" ||
+    value === "effect_receipt" || value === "console" || value === "error";
 }
 
 function validTraceName(value: string): boolean {

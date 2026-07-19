@@ -167,12 +167,36 @@ stay labelled as non-durable, the Time Travel sections render without console
 or page errors, and both 1440-pixel and 480-pixel layouts avoid page-level
 horizontal overflow.
 
-This is accepted-source runtime evidence, not completion of the whole ADR.
-Deterministic reducer reconstruction, effect-receipt substitution, replay
-projection digests, and redacted offline bug capsules remain open. Durable
-editor transactions and selections are implemented as a separate private
-checkpoint journal, but are not yet merged with this runtime stream into one
-canonical replay projection.
+## Deterministic reducer replay evidence (2026-07-20)
+
+The explicit runtime boundary now exports `useReplayReducer` and
+`replayableEffect`. Live reducer dispatch records a bounded semantic action.
+Generated code may also record an explicit state checkpoint. A replay session
+rebuilds that named reducer from the ordered checkpoint/action range and makes
+its dispatch inert, so interacting with the historical view cannot branch the
+recorded state accidentally.
+
+`replayableEffect` records one strict success or failure receipt containing the
+JSON input and output or bounded error. Rust rejects ambiguous receipt shapes,
+redacts them with the same sensitive-key policy as every runtime event, and
+includes actions, checkpoints, and receipts in a restart-stable projection
+digest. Console/error observations and wall-clock timestamps are deliberately
+outside that digest. Payloads remain content-addressed by their individually
+verified event digests.
+
+The Workbench exposes “Replay to here” only for deterministic boundaries and
+only while the editor remains byte-equal to the Rust-accepted source. The
+isolated iframe verifies the full Rust projection digest before importing a
+fresh bundle. During replay, `replayableEffect` has no path to its live callback:
+it consumes the next exact-name, exact-input receipt in causal order and fails
+closed for missing, reordered, failed, or redacted evidence. A browser-visible
+flow proves that replaying through an action changes the rendered reducer state
+and reports `effects substituted` without a page or console error.
+
+This is still an explicit-runtime replay contract, not arbitrary React Fiber or
+browser-state rewind. Durable editor transactions and accepted-source history
+remain separate projections, and redacted offline bug capsules are not yet
+implemented.
 
 ## Validation gates
 

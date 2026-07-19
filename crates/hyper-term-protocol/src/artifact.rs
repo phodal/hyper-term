@@ -72,6 +72,7 @@ pub struct AcceptedGenUiArtifact {
 pub enum GenUiRuntimeTraceKind {
     Action,
     Checkpoint,
+    EffectReceipt,
     Console,
     Error,
 }
@@ -113,6 +114,13 @@ pub struct GenUiRuntimeTraceAppendRequest {
 pub struct GenUiRuntimeTraceProjection {
     pub artifact_id: ArtifactId,
     pub source_revision: u64,
+    /// Digest of the deterministic replay inputs in this projection.
+    ///
+    /// Wall-clock fields and observational console/error events are excluded,
+    /// so the same accepted event range produces the same digest after a
+    /// daemon restart. Rendered pixels and DOM layout are deliberately not
+    /// canonical state.
+    pub projection_digest: String,
     pub events: Vec<GenUiRuntimeTraceEvent>,
 }
 
@@ -138,5 +146,20 @@ mod tests {
                 .unwrap()
                 .contains("\"kind\":\"checkpoint\"")
         );
+
+        let receipt: GenUiRuntimeTraceInput = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "stream_id": "11111111-1111-4111-8111-111111111111",
+            "client_sequence": 2,
+            "kind": "effect_receipt",
+            "name": "weather.lookup",
+            "payload": {
+                "input": {"city": "Shanghai"},
+                "outcome": "succeeded",
+                "output": {"temperature": 31}
+            }
+        }))
+        .unwrap();
+        assert_eq!(receipt.kind, GenUiRuntimeTraceKind::EffectReceipt);
     }
 }

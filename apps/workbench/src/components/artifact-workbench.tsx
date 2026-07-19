@@ -19,6 +19,7 @@ import {
   RuntimeTraceClient,
   type RuntimeTraceEvent,
   type RuntimeTraceInput,
+  type RuntimeTraceProjection,
 } from "../runtime-trace-client.ts";
 import {
   type WorkspaceApplyMapping,
@@ -93,6 +94,8 @@ export function ArtifactWorkbench() {
   const [runtimeTraceEvents, setRuntimeTraceEvents] = useState<
     RuntimeTraceEvent[]
   >([]);
+  const [runtimeTraceProjectionDigest, setRuntimeTraceProjectionDigest] =
+    useState("");
   const [runtimeTraceStatus, setRuntimeTraceStatus] = useState<
     "loading" | "ready" | "saving" | "failed"
   >("loading");
@@ -206,6 +209,7 @@ export function ArtifactWorkbench() {
         generation !== runtimeTraceGeneration.current
       ) return;
       setRuntimeTraceEvents(projection.events);
+      setRuntimeTraceProjectionDigest(projection.projection_digest);
       setRuntimeTraceStatus("ready");
     }).catch((error: unknown) => {
       if (controller.signal.aborted) return;
@@ -251,6 +255,7 @@ export function ArtifactWorkbench() {
           );
           if (generation !== runtimeTraceGeneration.current) return;
           setRuntimeTraceEvents(projection.events);
+          setRuntimeTraceProjectionDigest(projection.projection_digest);
           setRuntimeTraceStatus("ready");
         } catch (error) {
           if (generation !== runtimeTraceGeneration.current) return;
@@ -529,6 +534,7 @@ export function ArtifactWorkbench() {
                 : undefined}
               onLoadHistorySource={loadHistorySource}
               runtimeTraceEvents={runtimeTraceEvents}
+              runtimeTraceProjectionDigest={runtimeTraceProjectionDigest}
               runtimeTraceStatus={runtimeTraceStatus}
               runtimeTraceError={runtimeTraceError}
               onRuntimeTrace={recordRuntimeTrace}
@@ -632,7 +638,7 @@ function workspaceApplyLabel(
 async function appendRuntimeTraceWithRetry(
   client: RuntimeTraceClient,
   events: RuntimeTraceInput[],
-): Promise<{ events: RuntimeTraceEvent[] }> {
+): Promise<RuntimeTraceProjection> {
   try {
     return await client.append(events);
   } catch {

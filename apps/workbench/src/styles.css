@@ -1592,6 +1592,20 @@ textarea:focus-visible {
   font-size: 7px;
   text-transform: uppercase;
 }
+.preview-badges button {
+  padding: 3px 6px;
+  border: 1px solid #566a42;
+  border-radius: 5px;
+  background: #1a2116;
+  color: #c8e79c;
+  cursor: pointer;
+  font: 700 7px ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-transform: uppercase;
+}
+.preview-badges button:hover {
+  border-color: #8bab5f;
+  color: var(--acid);
+}
 .preview-badges span.bad {
   border-color: #683a34;
   color: var(--red);
@@ -1654,6 +1668,8 @@ textarea:focus-visible {
   padding: 7px 0;
 }
 .trace-entry.runtime {
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
   border-bottom: 1px solid #20251d;
 }
 .trace-entry.durable {
@@ -1661,7 +1677,8 @@ textarea:focus-visible {
   align-items: center;
   border-bottom: 1px solid #252b21;
 }
-.trace-entry.durable button {
+.trace-entry.durable button,
+.trace-entry.runtime button {
   height: 25px;
   padding: 0 8px;
   border: 1px solid #46543a;
@@ -1672,11 +1689,13 @@ textarea:focus-visible {
   font: 700 8px ui-monospace, SFMono-Regular, Menlo, monospace;
   white-space: nowrap;
 }
-.trace-entry.durable button:hover:not(:disabled) {
+.trace-entry.durable button:hover:not(:disabled),
+.trace-entry.runtime button:hover:not(:disabled) {
   border-color: #71834e;
   color: #d7ff72;
 }
-.trace-entry.durable button:disabled {
+.trace-entry.durable button:disabled,
+.trace-entry.runtime button:disabled {
   opacity: .48;
   cursor: default;
 }

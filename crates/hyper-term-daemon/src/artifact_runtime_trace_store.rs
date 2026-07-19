@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hyper_term_protocol::{
-    ArtifactId, GenUiRuntimeTraceEvent, GenUiRuntimeTraceInput, GenUiRuntimeTraceProjection, TaskId,
+    ArtifactId, GenUiRuntimeTraceEvent, GenUiRuntimeTraceInput, GenUiRuntimeTraceKind,
+    GenUiRuntimeTraceProjection, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -53,14 +54,17 @@ impl ArtifactRuntimeTraceStore {
     ) -> Result<GenUiRuntimeTraceProjection, RuntimeTraceStoreError> {
         let events = self.read_events(task_id, artifact_id, source_revision)?;
         let keep_from = events.len().saturating_sub(MAX_TRACE_EVENTS_PROJECTED);
+        let events = events
+            .into_iter()
+            .skip(keep_from)
+            .map(|stored| stored.event)
+            .collect::<Vec<_>>();
+        let projection_digest = replay_projection_digest(source_revision, &events)?;
         Ok(GenUiRuntimeTraceProjection {
             artifact_id,
             source_revision,
-            events: events
-                .into_iter()
-                .skip(keep_from)
-                .map(|stored| stored.event)
-                .collect(),
+            projection_digest,
+            events,
         })
     }
 
@@ -264,6 +268,9 @@ fn prepare_input(input: GenUiRuntimeTraceInput) -> Result<PreparedInput, Runtime
     {
         return Err(RuntimeTraceStoreError::InvalidEvent);
     }
+    if input.kind == GenUiRuntimeTraceKind::EffectReceipt {
+        validate_effect_receipt(&input.payload)?;
+    }
     let mut nodes = 0;
     let mut redacted = false;
     let payload = sanitize_value(input.payload, 0, &mut nodes, &mut redacted)?;
@@ -296,6 +303,27 @@ fn prepare_input(input: GenUiRuntimeTraceInput) -> Result<PreparedInput, Runtime
     })
 }
 
+fn validate_effect_receipt(payload: &Value) -> Result<(), RuntimeTraceStoreError> {
+    let object = payload
+        .as_object()
+        .ok_or(RuntimeTraceStoreError::InvalidEvent)?;
+    if !object.contains_key("input")
+        || object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "input" | "outcome" | "output" | "error"))
+    {
+        return Err(RuntimeTraceStoreError::InvalidEvent);
+    }
+    match object.get("outcome").and_then(Value::as_str) {
+        Some("succeeded") if object.contains_key("output") && !object.contains_key("error") => {}
+        Some("failed")
+            if object.get("error").is_some_and(Value::is_string)
+                && !object.contains_key("output") => {}
+        _ => return Err(RuntimeTraceStoreError::InvalidEvent),
+    }
+    Ok(())
+}
+
 fn trace_digest(
     stream_id: Uuid,
     client_sequence: u64,
@@ -311,6 +339,37 @@ fn trace_digest(
         name,
         payload,
     ))?;
+    Ok(hex_digest(Sha256::digest(canonical)))
+}
+
+fn replay_projection_digest(
+    source_revision: u64,
+    events: &[GenUiRuntimeTraceEvent],
+) -> Result<String, RuntimeTraceStoreError> {
+    let deterministic = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                GenUiRuntimeTraceKind::Action
+                    | GenUiRuntimeTraceKind::Checkpoint
+                    | GenUiRuntimeTraceKind::EffectReceipt
+            )
+        })
+        .map(|event| {
+            (
+                event.event_sequence,
+                event.stream_id,
+                event.client_sequence,
+                event.kind,
+                &event.name,
+                &event.payload_digest,
+                event.redacted,
+            )
+        })
+        .collect::<Vec<_>>();
+    let canonical =
+        serde_json::to_vec(&(RUNTIME_TRACE_SCHEMA_VERSION, source_revision, deterministic))?;
     Ok(hex_digest(Sha256::digest(canonical)))
 }
 
@@ -599,6 +658,64 @@ mod tests {
         assert!(matches!(
             store.load(task_id, artifact_id, 4),
             Err(RuntimeTraceStoreError::ContextMismatch)
+        ));
+    }
+
+    #[test]
+    fn runtime_trace_validates_receipts_and_replays_to_a_stable_projection_digest() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ArtifactRuntimeTraceStore::open(temporary.path()).unwrap();
+        let task_id = TaskId::new();
+        let artifact_id = ArtifactId::new();
+        let stream_id = Uuid::new_v4();
+        let mut receipt = input(
+            stream_id,
+            1,
+            serde_json::json!({
+                "input": {"city": "Shanghai"},
+                "outcome": "succeeded",
+                "output": {"temperature": 31}
+            }),
+        );
+        receipt.kind = GenUiRuntimeTraceKind::EffectReceipt;
+        receipt.name = "weather.lookup".into();
+        let first = store
+            .append(task_id, artifact_id, 8, vec![receipt])
+            .unwrap();
+        assert!(is_sha256(&first.projection_digest));
+        let mut observation = input(
+            stream_id,
+            2,
+            serde_json::json!({"message": "layout-only observation"}),
+        );
+        observation.kind = GenUiRuntimeTraceKind::Console;
+        observation.name = "preview.debug".into();
+        let with_observation = store
+            .append(task_id, artifact_id, 8, vec![observation])
+            .unwrap();
+        assert_eq!(with_observation.projection_digest, first.projection_digest);
+        assert_eq!(
+            ArtifactRuntimeTraceStore::open(temporary.path())
+                .unwrap()
+                .load(task_id, artifact_id, 8)
+                .unwrap()
+                .projection_digest,
+            first.projection_digest
+        );
+
+        let mut malformed = input(
+            Uuid::new_v4(),
+            1,
+            serde_json::json!({
+                "input": {},
+                "outcome": "succeeded",
+                "error": "ambiguous receipt"
+            }),
+        );
+        malformed.kind = GenUiRuntimeTraceKind::EffectReceipt;
+        assert!(matches!(
+            store.append(task_id, ArtifactId::new(), 8, vec![malformed]),
+            Err(RuntimeTraceStoreError::InvalidEvent)
         ));
     }
 }
