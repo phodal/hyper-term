@@ -24,7 +24,7 @@ use hyper_term_drivers::{
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, GenUiArtifactCandidate, MessageRole,
     OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
-    PermissionDecision, RiskClass, TaskId,
+    OperationState, PermissionDecision, RiskClass, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,8 +36,11 @@ use tokio::task::JoinHandle;
 use crate::DaemonState;
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
 use crate::workspace_apply::{
-    MAX_WORKSPACE_APPLY_FILES, WorkspaceApplyError, WorkspaceApplySetPlan,
-    apply_workspace_set_plan, prepare_workspace_apply_set, select_workspace_apply_set,
+    DurableWorkspaceApplyResult, MAX_WORKSPACE_APPLY_FILES, WorkspaceApplyError,
+    WorkspaceApplySetPlan, WorkspaceRecoveryReport, WorkspaceTransactionContext,
+    WorkspaceTransactionOutcome, WorkspaceTransactionReceipt, acknowledge_workspace_transaction,
+    apply_workspace_set_plan_durable, prepare_workspace_apply_set, recover_workspace_transactions,
+    select_workspace_apply_set,
 };
 use crate::workspace_diff::{
     MAX_WORKSPACE_HUNKS_PER_FILE, WorkspaceDiffHunk, WorkspaceDiffReview, review_workspace_diff,
@@ -145,6 +148,8 @@ pub enum AgentGatewayError {
     InvalidGenUiRuntime(String),
     #[error("agent gateway Workbench assets are invalid: {0}")]
     InvalidWorkbenchAssets(PathBuf),
+    #[error("agent gateway workspace recovery failed: {0}")]
+    WorkspaceRecovery(String),
     #[error("agent gateway ACP provider is invalid: {0}")]
     InvalidAcpProvider(String),
     #[error("agent gateway I/O failed: {0}")]
@@ -163,6 +168,7 @@ struct AgentGatewayRuntime {
     artifact_draft_compiler: Option<Arc<ArtifactDraftCompiler>>,
     artifact_drafts: Arc<Mutex<HashMap<OperationId, ArtifactDraftRecord>>>,
     workspace_applies: Arc<Mutex<HashMap<OperationId, WorkspaceApplyRecord>>>,
+    workspace_recovery_block: Arc<Mutex<Option<String>>>,
 }
 
 struct ArtifactDraftCompiler {
@@ -547,6 +553,11 @@ pub async fn spawn_agent_gateway(
         })
         .transpose()?;
 
+    let recovery = recover_workspace_transactions(&config.workspace, &config.state_directory)
+        .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?;
+    let workspace_recovery_block =
+        reconcile_workspace_recovery(&config.daemon, &config.state_directory, recovery);
+
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
     let runtime = AgentGatewayRuntime {
@@ -558,6 +569,7 @@ pub async fn spawn_agent_gateway(
         artifact_draft_compiler,
         artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
         workspace_applies: Arc::new(Mutex::new(HashMap::new())),
+        workspace_recovery_block: Arc::new(Mutex::new(workspace_recovery_block)),
     };
     let router = Router::new()
         .route(
@@ -1087,6 +1099,10 @@ async fn propose_workspace_apply(
                 "Workspace apply no longer matches the current revision",
             )
         }
+        Ok(Err(WorkspaceProposalError::RecoveryRequired)) => status_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Workspace apply is blocked until an interrupted transaction is recovered",
+        ),
         Ok(Err(WorkspaceProposalError::NoChanges)) => status_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Workspace target already matches the artifact source",
@@ -1161,6 +1177,7 @@ async fn preview_workspace_apply(
         }
         Ok(Err(
             WorkspaceProposalError::Busy
+            | WorkspaceProposalError::RecoveryRequired
             | WorkspaceProposalError::Daemon
             | WorkspaceProposalError::Lock,
         ))
@@ -1361,13 +1378,90 @@ enum WorkspaceProposalError {
     UnsafeTarget,
     NoChanges,
     Busy,
+    RecoveryRequired,
     Daemon,
     Lock,
 }
 
-enum WorkspaceExecutionError {
-    Failed(String),
-    UnknownExecution(String),
+fn reconcile_workspace_recovery(
+    daemon: &DaemonState,
+    state_directory: &Path,
+    report: WorkspaceRecoveryReport,
+) -> Option<String> {
+    let mut blocked = report.blocked;
+    for receipt in report.receipts {
+        if let Err(error) = reconcile_workspace_receipt(daemon, state_directory, &receipt) {
+            blocked.push(format!(
+                "workspace transaction {} could not reconcile its operation receipt: {error}",
+                receipt.transaction_id
+            ));
+        }
+    }
+    if blocked.is_empty() {
+        None
+    } else {
+        Some(bounded_error(&blocked.join("; ")))
+    }
+}
+
+fn reconcile_workspace_receipt(
+    daemon: &DaemonState,
+    state_directory: &Path,
+    receipt: &WorkspaceTransactionReceipt,
+) -> Result<(), String> {
+    let operation = daemon
+        .operation(receipt.operation_id)
+        .map_err(|error| error.to_string())?;
+    if operation.task_id != receipt.task_id
+        || operation.revision < receipt.operation_revision
+        || !matches!(
+            &operation.action,
+            OperationAction::Opaque { kind, .. } if kind == "hyper_term.workspace.apply"
+        )
+    {
+        return Err("durable receipt does not match the brokered operation".into());
+    }
+    let expected_terminal = match receipt.outcome {
+        WorkspaceTransactionOutcome::Committed => OperationState::Succeeded,
+        WorkspaceTransactionOutcome::RolledBack => OperationState::Failed,
+    };
+    if matches!(
+        operation.state,
+        OperationState::Dispatching | OperationState::UnknownExecution
+    ) {
+        let succeeded = receipt.outcome == WorkspaceTransactionOutcome::Committed;
+        daemon
+            .complete_operation(
+                receipt.task_id,
+                receipt.operation_id,
+                operation.revision,
+                OperationCompletion {
+                    executor: "hyper-term-workspace-recovery".into(),
+                    succeeded,
+                    outcome: Some(if succeeded {
+                        OperationOutcome::Succeeded
+                    } else {
+                        OperationOutcome::Failed
+                    }),
+                    summary: receipt.failure_summary.clone().unwrap_or_else(|| {
+                        if succeeded {
+                            "recovered a fully committed workspace transaction".into()
+                        } else {
+                            "recovered and rolled back an interrupted workspace transaction".into()
+                        }
+                    }),
+                    result_digest: succeeded.then(|| receipt.result_digest.clone()),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+    } else if operation.state != expected_terminal {
+        return Err(format!(
+            "operation is {:?}, expected {:?}",
+            operation.state, expected_terminal
+        ));
+    }
+    acknowledge_workspace_transaction(state_directory, receipt.transaction_id)
+        .map_err(|error| error.to_string())
 }
 
 impl AgentGatewayRuntime {
@@ -1953,6 +2047,14 @@ impl AgentGatewayRuntime {
         artifact_id: ArtifactId,
         request: AgentWorkspaceApplyRequest,
     ) -> Result<AgentWorkspaceApplyResponse, WorkspaceProposalError> {
+        if self
+            .workspace_recovery_block
+            .lock()
+            .map_err(|_| WorkspaceProposalError::Lock)?
+            .is_some()
+        {
+            return Err(WorkspaceProposalError::RecoveryRequired);
+        }
         let session = self
             .session(session_id)
             .map_err(|_| WorkspaceProposalError::SessionUnavailable)?;
@@ -2143,87 +2245,72 @@ impl AgentGatewayRuntime {
                 return;
             }
         };
-        let result: Result<String, WorkspaceExecutionError> = (|| {
+        let validation: Result<(), String> = (|| {
             let current = self
                 .config
                 .daemon
                 .read_active_genui_artifact(record.task_id, record.artifact_id)
-                .map_err(|_| {
-                    WorkspaceExecutionError::Failed("artifact is no longer current".into())
-                })?;
+                .map_err(|_| "artifact is no longer current".to_owned())?;
             if current.metadata.source_revision != record.artifact_source_revision {
-                return Err(WorkspaceExecutionError::Failed(
-                    "artifact source revision is no longer current".into(),
-                ));
+                return Err("artifact source revision is no longer current".into());
             }
             if record.source_paths.len() != record.plan.plans.len()
                 || record.artifact_source_digests.len() != record.plan.plans.len()
             {
-                return Err(WorkspaceExecutionError::Failed(
-                    "workspace apply source mapping is inconsistent".into(),
-                ));
+                return Err("workspace apply source mapping is inconsistent".into());
             }
             for (source_path, artifact_source_digest) in record
                 .source_paths
                 .iter()
                 .zip(&record.artifact_source_digests)
             {
-                let current_source = current.source_files.get(source_path).ok_or_else(|| {
-                    WorkspaceExecutionError::Failed(
-                        "artifact source path is no longer current".into(),
-                    )
-                })?;
+                let current_source = current
+                    .source_files
+                    .get(source_path)
+                    .ok_or_else(|| "artifact source path is no longer current".to_owned())?;
                 if sha256_bytes(current_source.as_bytes()) != *artifact_source_digest {
-                    return Err(WorkspaceExecutionError::Failed(
-                        "artifact source digest is no longer current".into(),
-                    ));
+                    return Err("artifact source digest is no longer current".into());
                 }
             }
-            apply_workspace_set_plan(&self.config.workspace, &record.plan).map_err(|error| {
-                match error {
-                    WorkspaceApplyError::UnknownExecution(message) => {
-                        WorkspaceExecutionError::UnknownExecution(message)
-                    }
-                    error => WorkspaceExecutionError::Failed(error.to_string()),
-                }
-            })
+            Ok(())
         })();
-        match result {
-            Ok(result_digest) => {
-                let completion = OperationCompletion {
+        if let Err(message) = validation {
+            let summary = bounded_error(&message);
+            let _ = self.config.daemon.complete_operation(
+                record.task_id,
+                operation_id,
+                dispatching.revision,
+                OperationCompletion {
                     executor: "hyper-term-workspace-apply".into(),
-                    succeeded: true,
-                    outcome: Some(OperationOutcome::Succeeded),
-                    summary: format!(
-                        "applied {} selected hunk(s) across {} Artifact source file(s) to the workspace",
-                        record.selected_hunk_count,
-                        record.plan.plans.len(),
-                    ),
-                    result_digest: Some(result_digest),
-                };
-                if let Err(error) = self.config.daemon.complete_operation(
-                    record.task_id,
-                    operation_id,
-                    dispatching.revision,
-                    completion,
-                ) {
-                    self.set_workspace_apply_unknown(operation_id, &error.to_string());
-                    return;
-                }
-                if let Ok(mut applies) = self.workspace_applies.lock()
-                    && let Some(record) = applies.get_mut(&operation_id)
-                {
-                    record.state = WorkspaceApplyState::Applied;
-                }
+                    succeeded: false,
+                    outcome: Some(OperationOutcome::Failed),
+                    summary: summary.clone(),
+                    result_digest: None,
+                },
+            );
+            self.set_workspace_apply_failed(operation_id, &summary);
+            return;
+        }
+
+        let durable = apply_workspace_set_plan_durable(
+            &self.config.workspace,
+            &self.config.state_directory,
+            WorkspaceTransactionContext {
+                task_id: record.task_id,
+                operation_id,
+                operation_revision: dispatching.revision,
+            },
+            &record.plan,
+        );
+        match durable {
+            Ok(DurableWorkspaceApplyResult::Committed(receipt)) => {
+                self.finish_workspace_transaction(&record, receipt);
+            }
+            Ok(DurableWorkspaceApplyResult::RolledBack(receipt)) => {
+                self.finish_workspace_transaction(&record, receipt);
             }
             Err(error) => {
-                let (message, outcome) = match error {
-                    WorkspaceExecutionError::Failed(message) => (message, OperationOutcome::Failed),
-                    WorkspaceExecutionError::UnknownExecution(message) => {
-                        (message, OperationOutcome::UnknownExecution)
-                    }
-                };
-                let summary = bounded_error(&message);
+                let summary = bounded_error(&error.to_string());
                 let _ = self.config.daemon.complete_operation(
                     record.task_id,
                     operation_id,
@@ -2231,17 +2318,70 @@ impl AgentGatewayRuntime {
                     OperationCompletion {
                         executor: "hyper-term-workspace-apply".into(),
                         succeeded: false,
-                        outcome: Some(outcome),
+                        outcome: Some(OperationOutcome::UnknownExecution),
                         summary: summary.clone(),
                         result_digest: None,
                     },
                 );
-                if outcome == OperationOutcome::UnknownExecution {
-                    self.set_workspace_apply_unknown(operation_id, &summary);
-                } else {
-                    self.set_workspace_apply_failed(operation_id, &summary);
-                }
+                self.set_workspace_apply_unknown(operation_id, &summary);
             }
+        }
+    }
+
+    fn finish_workspace_transaction(
+        &self,
+        record: &WorkspaceApplyRecord,
+        receipt: WorkspaceTransactionReceipt,
+    ) {
+        let committed = receipt.outcome == WorkspaceTransactionOutcome::Committed;
+        let summary = if committed {
+            format!(
+                "applied {} selected hunk(s) across {} Artifact source file(s) to the workspace",
+                record.selected_hunk_count,
+                record.plan.plans.len(),
+            )
+        } else {
+            bounded_error(
+                receipt
+                    .failure_summary
+                    .as_deref()
+                    .unwrap_or("workspace transaction was rolled back"),
+            )
+        };
+        let completion = OperationCompletion {
+            executor: "hyper-term-workspace-apply".into(),
+            succeeded: committed,
+            outcome: Some(if committed {
+                OperationOutcome::Succeeded
+            } else {
+                OperationOutcome::Failed
+            }),
+            summary: summary.clone(),
+            result_digest: committed.then(|| receipt.result_digest.clone()),
+        };
+        if let Err(error) = self.config.daemon.complete_operation(
+            receipt.task_id,
+            receipt.operation_id,
+            receipt.operation_revision,
+            completion,
+        ) {
+            self.set_workspace_apply_unknown(receipt.operation_id, &error.to_string());
+            return;
+        }
+        if let Err(error) =
+            acknowledge_workspace_transaction(&self.config.state_directory, receipt.transaction_id)
+        {
+            self.set_workspace_apply_unknown(receipt.operation_id, &error.to_string());
+            return;
+        }
+        if committed {
+            if let Ok(mut applies) = self.workspace_applies.lock()
+                && let Some(record) = applies.get_mut(&receipt.operation_id)
+            {
+                record.state = WorkspaceApplyState::Applied;
+            }
+        } else {
+            self.set_workspace_apply_failed(receipt.operation_id, &summary);
         }
     }
 
@@ -2258,6 +2398,9 @@ impl AgentGatewayRuntime {
             && let Some(record) = applies.get_mut(&operation_id)
         {
             record.state = WorkspaceApplyState::UnknownExecution(bounded_error(message));
+        }
+        if let Ok(mut blocked) = self.workspace_recovery_block.lock() {
+            *blocked = Some(bounded_error(message));
         }
     }
 
@@ -3503,6 +3646,142 @@ mod tests {
             css: String::new(),
             source_map: "{}".into(),
         }
+    }
+
+    #[test]
+    fn daemon_restart_reconciles_a_durable_workspace_commit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let daemon_state = temporary.path().join("daemon-state");
+        let gateway_state = temporary.path().join("gateway-state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&gateway_state).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("App.tsx"), "before\n").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let daemon = DaemonState::open(&daemon_state).unwrap();
+        let (task_id, operation_id, dispatching) = workspace_dispatch(&daemon);
+        let set =
+            prepare_workspace_apply_set(&workspace, vec![("App.tsx".into(), "after\n".into())])
+                .unwrap();
+        let result = apply_workspace_set_plan_durable(
+            &workspace,
+            &gateway_state,
+            WorkspaceTransactionContext {
+                task_id,
+                operation_id,
+                operation_revision: dispatching.revision,
+            },
+            &set,
+        )
+        .unwrap();
+        assert!(matches!(result, DurableWorkspaceApplyResult::Committed(_)));
+        drop(daemon);
+
+        let daemon = DaemonState::open(&daemon_state).unwrap();
+        assert_eq!(
+            daemon.operation(operation_id).unwrap().state,
+            OperationState::UnknownExecution
+        );
+        let recovery = recover_workspace_transactions(&workspace, &gateway_state).unwrap();
+        assert!(reconcile_workspace_recovery(&daemon, &gateway_state, recovery).is_none());
+        assert_eq!(
+            daemon.operation(operation_id).unwrap().state,
+            OperationState::Succeeded
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
+            "after\n"
+        );
+        assert!(
+            std::fs::read_dir(gateway_state.join("workspace-transactions"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn daemon_restart_reconciles_a_safely_rolled_back_workspace_apply() {
+        let temporary = tempfile::tempdir().unwrap();
+        let daemon_state = temporary.path().join("daemon-state");
+        let gateway_state = temporary.path().join("gateway-state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&gateway_state).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("one.ts"), "one before\n").unwrap();
+        std::fs::write(workspace.join("two.ts"), "two before\n").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let daemon = DaemonState::open(&daemon_state).unwrap();
+        let (task_id, operation_id, dispatching) = workspace_dispatch(&daemon);
+        let set = prepare_workspace_apply_set(
+            &workspace,
+            vec![
+                ("one.ts".into(), "one after\n".into()),
+                ("two.ts".into(), "two after\n".into()),
+            ],
+        )
+        .unwrap();
+        std::fs::write(workspace.join("two.ts"), "external writer\n").unwrap();
+        let result = apply_workspace_set_plan_durable(
+            &workspace,
+            &gateway_state,
+            WorkspaceTransactionContext {
+                task_id,
+                operation_id,
+                operation_revision: dispatching.revision,
+            },
+            &set,
+        )
+        .unwrap();
+        assert!(matches!(result, DurableWorkspaceApplyResult::RolledBack(_)));
+        drop(daemon);
+
+        let daemon = DaemonState::open(&daemon_state).unwrap();
+        let recovery = recover_workspace_transactions(&workspace, &gateway_state).unwrap();
+        assert!(reconcile_workspace_recovery(&daemon, &gateway_state, recovery).is_none());
+        assert_eq!(
+            daemon.operation(operation_id).unwrap().state,
+            OperationState::Failed
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one before\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "external writer\n"
+        );
+    }
+
+    fn workspace_dispatch(
+        daemon: &DaemonState,
+    ) -> (TaskId, OperationId, hyper_term_core::OperationRecord) {
+        let task_id = daemon.create_task("workspace recovery".into()).unwrap();
+        let proposed = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::FileEdit,
+                OperationAction::Opaque {
+                    kind: "hyper_term.workspace.apply".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                "apply artifact".into(),
+                RiskClass::WorkspaceWrite,
+                vec!["workspace_write".into()],
+            )
+            .unwrap();
+        let authorized = daemon
+            .decide_permission(
+                task_id,
+                proposed.operation_id,
+                proposed.revision,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap();
+        let dispatching = daemon
+            .begin_operation(task_id, proposed.operation_id, authorized.revision)
+            .unwrap();
+        (task_id, proposed.operation_id, dispatching)
     }
 
     #[test]
@@ -5315,6 +5594,7 @@ mod tests {
             artifact_draft_compiler: None,
             artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
             workspace_applies: Arc::new(Mutex::new(HashMap::new())),
+            workspace_recovery_block: Arc::new(Mutex::new(None)),
         };
         let session_root = state_directory.join("agents/session-7");
         let config = runtime

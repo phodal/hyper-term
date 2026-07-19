@@ -286,6 +286,7 @@ pub(crate) fn apply_workspace_plan(
     apply_workspace_set_plan(workspace, &set)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_workspace_set_plan(
     workspace: &Path,
     set: &WorkspaceApplySetPlan,
@@ -848,6 +849,7 @@ fn stage_durable_workspace_plan(
         plan: plan.clone(),
         parent,
         stage_name,
+        #[cfg(test)]
         backup_name,
         installed: false,
     })
@@ -1038,17 +1040,48 @@ fn cleanup_manifest_files(
         let parent_fd = parent.directory.as_raw_fd();
         let stage_name = CString::new(member.stage_name.as_str())
             .map_err(|_| WorkspaceApplyError::InvalidPath)?;
-        unlink_at_if_exists(parent_fd, &stage_name)?;
+        unlink_manifest_file_if_matches(
+            parent_fd,
+            &stage_name,
+            member.staged.as_ref(),
+            Some((&member.proposed_digest, member.proposed_mode)),
+        )?;
         if let Some(backup_name) = member.backup_name.as_deref() {
             let backup_name =
                 CString::new(backup_name).map_err(|_| WorkspaceApplyError::InvalidPath)?;
-            unlink_at_if_exists(parent_fd, &backup_name)?;
+            unlink_manifest_file_if_matches(
+                parent_fd,
+                &backup_name,
+                member.backup.as_ref().or(member.base.as_ref()),
+                None,
+            )?;
         }
         parent.directory.sync_all()?;
     }
     Ok(())
 }
 
+fn unlink_manifest_file_if_matches(
+    parent_fd: RawFd,
+    name: &CStr,
+    expected: Option<&WorkspaceRecoveryIdentity>,
+    preparing_stage: Option<(&str, u32)>,
+) -> Result<(), WorkspaceApplyError> {
+    let Some(current) = read_target_at(parent_fd, name)? else {
+        return Ok(());
+    };
+    let exact_identity = expected.is_some_and(|identity| identity.matches(&current));
+    let exact_preparing_stage = preparing_stage
+        .is_some_and(|(digest, mode)| current.digest == digest && current.mode & 0o7777 == mode);
+    if !exact_identity && !exact_preparing_stage {
+        return Err(WorkspaceApplyError::RecoveryRequired(
+            "transaction cleanup entry changed identity".into(),
+        ));
+    }
+    unlink_at_if_exists(parent_fd, name)
+}
+
+#[cfg(test)]
 fn apply_single_workspace_plan(
     workspace: &Path,
     plan: &WorkspaceApplyPlan,
@@ -1115,10 +1148,12 @@ struct StagedWorkspacePlan {
     plan: WorkspaceApplyPlan,
     parent: OpenParent,
     stage_name: CString,
+    #[cfg(test)]
     backup_name: Option<CString>,
     installed: bool,
 }
 
+#[cfg(test)]
 fn apply_workspace_transaction(
     workspace: &Path,
     set: &WorkspaceApplySetPlan,
@@ -1169,6 +1204,7 @@ fn apply_workspace_transaction(
     Ok(())
 }
 
+#[cfg(test)]
 fn stage_workspace_plan(
     workspace: &Path,
     plan: &WorkspaceApplyPlan,
@@ -1257,6 +1293,7 @@ fn install_transaction_plan(staged: &mut StagedWorkspacePlan) -> Result<(), Work
     Ok(())
 }
 
+#[cfg(test)]
 fn rollback_workspace_transaction(
     staged: &mut [StagedWorkspacePlan],
 ) -> Result<(), WorkspaceApplyError> {
@@ -1297,6 +1334,7 @@ fn rollback_workspace_transaction(
     Ok(())
 }
 
+#[cfg(test)]
 fn cleanup_staged_workspace_plans(staged: &[StagedWorkspacePlan]) {
     for staged_plan in staged {
         let parent_fd = staged_plan.parent.directory.as_raw_fd();
@@ -1459,7 +1497,7 @@ fn create_stage(parent_fd: RawFd, stage_name: &CStr) -> Result<File, WorkspaceAp
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn install_stage(
     parent_fd: RawFd,
     stage_name: &CStr,
@@ -1644,7 +1682,7 @@ fn replace_target_at(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 fn install_stage(
     parent_fd: RawFd,
     stage_name: &CStr,
@@ -1714,6 +1752,7 @@ fn unlink_at(parent_fd: RawFd, name: &CStr) {
     let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
 }
 
+#[cfg(test)]
 fn unlink_at_checked(parent_fd: RawFd, name: &CStr) -> Result<(), WorkspaceApplyError> {
     // SAFETY: name is bounded and relative to an open directory descriptor.
     let result = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
@@ -2131,7 +2170,7 @@ mod tests {
         write_workspace_transaction_manifest(&root, &manifest).unwrap();
         fs::write(
             workspace.join(&manifest.members[0].stage_name),
-            "incomplete stage",
+            "one after\n",
         )
         .unwrap();
 
