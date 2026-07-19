@@ -1231,6 +1231,48 @@ test "terminal web pane accepts only the authenticated fixed loopback shape" {
     try testing.expectEqual(@as(usize, 0), main.terminalPanes(&model, &panes));
 }
 
+test "Rust-verified Bug Capsule opens as a dedicated read-only Native tab" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    const capsule_url = "http://127.0.0.1:55321/agent/workbench/?surface=capsule&token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithDesktopServices(
+        terminal_url,
+        agent_url,
+        "codex",
+        "",
+        capsule_url,
+    );
+    try testing.expectEqual(main.SessionMode.capsule, model.activeSession().mode);
+    try testing.expect(model.isCapsule());
+    try testing.expectEqualStrings("Capsule", model.activeSession().title);
+    try testing.expectEqualStrings(capsule_url, model.genUiWorkbenchUrl());
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(tree.root, "Offline Bug Capsule") != null);
+    try testing.expect(findByLabel(tree.root, main.genui_view_anchor) != null);
+    try testing.expect(findByLabel(tree.root, "Agent conversation") == null);
+    try testing.expect(containsText(tree.root, "replay only"));
+    try testing.expect(containsText(tree.root, "Rust verified"));
+
+    var panes: [2]main.HyperTermApp.WebViewPane = undefined;
+    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings("zero://inline", panes[0].url);
+    try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
+    try testing.expectEqualStrings(capsule_url, panes[1].url);
+
+    model = main.initialModelWithDesktopServices(
+        terminal_url,
+        agent_url,
+        "codex",
+        "",
+        "http://127.0.0.1:55321/agent/workbench/?surface=capsule&token=wrongwrongwrongwrongwrongwrongwrongwrong",
+    );
+    try testing.expectEqual(main.SessionMode.terminal, model.activeSession().mode);
+    try testing.expect(!model.isCapsule());
+}
+
 test "Agent gateway accepts only an authenticated dynamic loopback shape" {
     try testing.expect(!main.trustedAgentUrl("https://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789"));
     try testing.expect(!main.trustedAgentUrl("http://127.0.0.1:0/?token=abcdef0123456789abcdef0123456789"));
@@ -1242,6 +1284,10 @@ test "Agent gateway accepts only an authenticated dynamic loopback shape" {
         main.trustedAgentOrigin("http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789").?,
     );
     try testing.expect(main.trustedAgentOrigin("http://127.0.0.1:55321.evil/?token=abcdef0123456789abcdef0123456789") == null);
+    try testing.expect(main.trustedBugCapsuleUrl(
+        "http://127.0.0.1:55321/agent/workbench/?surface=capsule&token=abcdef0123456789abcdef0123456789",
+        "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789",
+    ));
 }
 
 test "new terminal tabs switch reconnect namespaces without exceeding the bound" {

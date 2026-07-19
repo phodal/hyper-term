@@ -119,6 +119,7 @@ pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 pub const SessionMode = enum {
     terminal,
     agent,
+    capsule,
 };
 
 pub const AgentProvider = enum {
@@ -551,6 +552,10 @@ pub const Model = struct {
 
     pub fn isTerminal(model: *const Model) bool {
         return model.activeSession().mode == .terminal;
+    }
+
+    pub fn isCapsule(model: *const Model) bool {
+        return model.activeSession().mode == .capsule;
     }
 
     pub fn terminalReady(model: *const Model) bool {
@@ -2839,6 +2844,35 @@ pub fn initialModelWithProviderStatus(
     return model;
 }
 
+pub fn initialModelWithDesktopServices(
+    terminal_url: []const u8,
+    agent_url: []const u8,
+    providers: []const u8,
+    provider_status: []const u8,
+    bug_capsule_url: []const u8,
+) Model {
+    var model = initialModelWithProviderStatus(
+        terminal_url,
+        agent_url,
+        providers,
+        provider_status,
+    );
+    if (trustedBugCapsuleUrl(bug_capsule_url, agent_url)) {
+        model.session_slots[0] = .{
+            .id = 1,
+            .mode = .capsule,
+            .title = "Capsule",
+            .icon = "circle-dot",
+        };
+        @memcpy(
+            model.genui_workbench_url_storage[0..bug_capsule_url.len],
+            bug_capsule_url,
+        );
+        model.genui_workbench_url_len = bug_capsule_url.len;
+    }
+    return model;
+}
+
 fn providerBit(provider: AgentProvider) u8 {
     return switch (provider) {
         .codex => 1,
@@ -3011,7 +3045,7 @@ pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize 
         .url = "zero://inline",
     };
     if (out.len == 1) return 1;
-    out[1] = if (model.hasAgentEditor()) .{
+    out[1] = if (model.isCapsule() or model.hasAgentEditor()) .{
         .label = genui_view_label,
         .anchor = genui_view_anchor,
         .url = model.genUiWorkbenchUrl(),
@@ -3075,6 +3109,21 @@ pub fn trustedAgentOrigin(url: []const u8) ?[]const u8 {
     return url[0..marker_index];
 }
 
+pub fn trustedBugCapsuleUrl(url: []const u8, agent_url: []const u8) bool {
+    if (url.len == 0 or url.len > genui_url_capacity) return false;
+    const origin = trustedAgentOrigin(agent_url) orelse return false;
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, agent_url, marker) orelse return false;
+    const token = agent_url[marker_index + marker.len ..];
+    var expected_storage: [genui_url_capacity]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        expected_storage[0..],
+        "{s}/agent/workbench/?surface=capsule&token={s}",
+        .{ origin, token },
+    ) catch return false;
+    return std.mem.eql(u8, url, expected);
+}
+
 fn trustedGatewayToken(token: []const u8) bool {
     if (token.len < 32 or token.len > max_gateway_token_bytes) return false;
     for (token) |character| {
@@ -3088,6 +3137,7 @@ pub fn main(init: std.process.Init) !void {
     const agent_url = init.environ_map.get("HYPER_TERM_AGENT_URL") orelse "";
     const agent_providers = init.environ_map.get("HYPER_TERM_AGENT_PROVIDERS") orelse "";
     const agent_provider_status = init.environ_map.get("HYPER_TERM_AGENT_PROVIDER_STATUS") orelse "";
+    const bug_capsule_url = init.environ_map.get("HYPER_TERM_BUG_CAPSULE_URL") orelse "";
     const ui_font_path = preferredUiFontPath(init.environ_map.get("HYPER_TERM_UI_FONT_PATH"));
     const ui_font_bytes = std.Io.Dir.cwd().readFileAlloc(
         init.io,
@@ -3139,11 +3189,12 @@ pub fn main(init: std.process.Init) !void {
             null,
     });
     defer app_state.destroy();
-    app_state.model = initialModelWithProviderStatus(
+    app_state.model = initialModelWithDesktopServices(
         terminal_url,
         agent_url,
         agent_providers,
         agent_provider_status,
+        bug_capsule_url,
     );
     app_state.model.ui_font_registered = app_fonts.len > 0;
 

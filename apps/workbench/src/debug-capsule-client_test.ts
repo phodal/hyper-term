@@ -3,6 +3,7 @@ import {
   type BugCapsule,
   BugCapsuleClient,
   digestUnsignedBugCapsule,
+  OfflineBugCapsuleClient,
 } from "./debug-capsule-client.ts";
 
 const artifactId = "55555555-5555-4555-8555-555555555555";
@@ -25,8 +26,22 @@ async function fixture(): Promise<BugCapsule> {
       compiler: { name: "esbuild-wasm", version: "0.28.1" },
     },
     accepted_source: [],
-    outputs: {},
-    editor: {},
+    outputs: {
+      bundle_bytes: 0,
+      bundle_digest: "d".repeat(64),
+      css_bytes: 0,
+      css_digest: "e".repeat(64),
+      source_map_bytes: 0,
+      source_map_digest: "f".repeat(64),
+    },
+    editor: {
+      base_source_revision: 7,
+      revision: 0,
+      state_digest: "c".repeat(64),
+      active_path: "/App.tsx",
+      view: "trace",
+      files: [],
+    },
     runtime: {
       artifact_id: artifactId,
       source_revision: 7,
@@ -35,7 +50,11 @@ async function fixture(): Promise<BugCapsule> {
     },
     runtime_truncated: false,
     omitted_runtime_events: 0,
-    environment: {},
+    environment: {
+      hyper_term_version: "0.1.0",
+      os: "macos",
+      architecture: "aarch64",
+    },
     inventory: [{
       category: "terminal_output",
       inclusion: "excluded",
@@ -81,4 +100,22 @@ Deno.test("Bug Capsule client rejects tampering before UI export", async () => {
     Error,
     "failed offline integrity verification",
   );
+});
+
+Deno.test("offline Bug Capsule client opens without an Agent session context", async () => {
+  const capsule = await fixture();
+  const requests: Request[] = [];
+  const client = new OfflineBugCapsuleClient(
+    { token: context.token },
+    (request, init) => {
+      requests.push(
+        new Request(new URL(String(request), "http://hyper.test"), init),
+      );
+      return Promise.resolve(Response.json(capsule));
+    },
+  );
+
+  assertEquals(await client.open(), capsule);
+  assertEquals(new URL(requests[0].url).pathname, "/agent/debug-capsule");
+  assertEquals(new URL(requests[0].url).searchParams.has("session_id"), false);
 });

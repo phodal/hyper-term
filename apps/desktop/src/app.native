@@ -243,14 +243,28 @@
     </column>
   </if>
   <else>
-    <if test="{hasAgentEditor}">
-      <split value="{agent_split}" on-resize="agent_split_resized" resize-duration="120" resize-easing="standard" grow="1">
-        <use template="agent-thread" />
-        <use template="agent-editor" />
-      </split>
+    <if test="{isCapsule}">
+      <column grow="1" background="background" label="Offline Bug Capsule">
+        <row gap="7" padding="7" cross="center" background="surface_subtle">
+          <icon name="circle-dot" width="13" height="13" foreground="accent" />
+          <text grow="1"><span weight="medium">Offline Bug Capsule</span></text>
+          <badge variant="secondary">replay only</badge>
+          <badge variant="secondary">Rust verified</badge>
+        </row>
+        <separator />
+        <column grow="1" background="background" label="Agent artifact editor viewport"></column>
+      </column>
     </if>
     <else>
-      <use template="agent-thread" />
+      <if test="{hasAgentEditor}">
+        <split value="{agent_split}" on-resize="agent_split_resized" resize-duration="120" resize-easing="standard" grow="1">
+          <use template="agent-thread" />
+          <use template="agent-editor" />
+        </split>
+      </if>
+      <else>
+        <use template="agent-thread" />
+      </else>
     </else>
   </else>
 </column>

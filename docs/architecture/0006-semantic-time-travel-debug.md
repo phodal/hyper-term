@@ -137,6 +137,22 @@ tests cover source and observation exclusion, sensitive runtime redaction,
 modified-editor digests, size limits, tamper detection, and offline parse plus
 digest verification.
 
+The desktop supervisor now also accepts `--bug-capsule PATH`. Rust requires an
+absolute, regular, non-symlink file bounded to 512 KiB, parses it without
+following links, and revalidates the complete contract. In addition to the
+capsule digest, import recomputes the deterministic replay projection digest;
+an attacker cannot replace semantic event identity and merely sign the changed
+JSON with a new outer digest.
+
+After validation, the Agent gateway exposes exactly one read-only
+`/agent/debug-capsule` projection behind the per-launch desktop token. This
+route needs no ACP session ID because opening a capsule must not start or depend
+on a provider. Native creates a dedicated `Capsule` tab and the packaged
+Workbench renders metadata, the exact inventory, and a prefix cursor over
+action, checkpoint, and effect-receipt events. No live effects, Agent prompt,
+shell, MCP, Computer Use, source body, or arbitrary file-open capability is
+available in this mode.
+
 ## Implementation evidence (2026-07-19)
 
 The first durable Artifact-timeline slice now uses the existing Rust authority
@@ -220,8 +236,9 @@ and reports `effects substituted` without a page or console error.
 
 This is still an explicit-runtime replay contract, not arbitrary React Fiber or
 browser-state rewind. Durable editor transactions and accepted-source history
-remain separate projections, and redacted offline bug capsules are not yet
-implemented.
+remain separate projections. The offline capsule joins bounded snapshots of
+those projections for inspection; schema migration and cross-version replay
+compatibility remain future work.
 
 ## Validation gates
 

@@ -1,16 +1,18 @@
 import { useMemo, useState } from "react";
 import { BlockWorkbench } from "./components/block-workbench.tsx";
 import { ArtifactWorkbench } from "./components/artifact-workbench.tsx";
+import { CapsuleWorkbench } from "./components/capsule-workbench.tsx";
 import { GenUiStudio } from "./components/genui-studio.tsx";
 import { resolveHost } from "./host.ts";
 import type { UiIntent } from "./protocol.ts";
 import { sampleDocument } from "./sample-document.ts";
 
 export function App() {
-  if (
-    new URLSearchParams(globalThis.location.search).get("surface") ===
-      "artifact"
-  ) {
+  const surface = new URLSearchParams(globalThis.location.search).get(
+    "surface",
+  );
+  if (surface === "capsule") return <CapsuleWorkbench />;
+  if (surface === "artifact") {
     return <ArtifactWorkbench />;
   }
   return <DemoWorkbench />;

@@ -70,6 +70,12 @@ task model without giving the UI direct command or filesystem authority.
   the user bind a selected multi-file set to one exact WorkspaceWrite approval.
   Rust journals the staged transaction outside the workspace and recovers an
   interrupted commit or rollback before another workspace apply can begin.
+- **Offline Bug Capsule replay.** A Rust-generated capsule can be reopened with
+  `--bug-capsule`; Rust validates its schema, projection identity, inventory,
+  and integrity digest before exposing it through a token-only read endpoint.
+  Native opens a dedicated Capsule tab, while the Workbench can inspect and
+  scrub semantic replay events without a live Agent, shell, MCP, or filesystem
+  authority.
 - **Local-first authority.** Rust owns PTYs, process lifetime, permissions,
   durable state, and accepted artifacts. WebViews render trusted projections
   and cannot spawn commands or choose arbitrary files.
@@ -122,6 +128,7 @@ The important boundary is not Native versus Web. It is **who has authority**:
 | Generated artifact storage and isolated preview | Implemented baseline |
 | Multi-file Artifact editor, Diff, deterministic reducer replay, effect receipts, diagnostics, completion, and approved publish | Experimental |
 | Brokered exact multi-file Artifact-to-workspace apply with hunk selection and crash recovery | Experimental |
+| Bounded offline Bug Capsule export, verified open, and replay-only viewer | Experimental |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |
 
@@ -172,6 +179,19 @@ explicit provider path when needed; see `hyper-term-desktop --help` for the
 available flags. A stable global install of `@zed-industries/codex-acp` or
 `@agentclientprotocol/codex-acp` is discovered automatically; Hyper Term does
 not invoke a networked `npx` install during application startup.
+
+Open a previously exported Bug Capsule without starting an Agent session:
+
+```bash
+cargo run -p hyper-term-daemon --bin hyper-term-desktop -- \
+  --ui "$PWD/apps/desktop/zig-out/bin/hyper-term" \
+  --terminal-assets "$PWD/dist/terminal" \
+  --workbench-assets "$PWD/dist/workbench" \
+  --bug-capsule /absolute/path/to/report.bug-capsule.json
+```
+
+The path is opened only by Rust. The Native/WebView surfaces receive a bounded
+authenticated projection and cannot select or read arbitrary local files.
 
 ### Build the macOS application
 
@@ -261,8 +281,8 @@ Useful design documents:
 - Extend the crash-recoverable transactional hunk apply to isolated Tier 2
   worktrees and bounded binary patches, without giving the renderer write
   authority.
-- Merge accepted-source history and editor checkpoints into the deterministic
-  runtime projection, then export bounded redacted offline bug capsules.
+- Version and migrate accepted-source, editor, runtime, and Bug Capsule schemas
+  while preserving deterministic replay across Hyper Term upgrades.
 - Strengthen containment for external coding-agent processes.
 - Publish signed and notarized Apple Silicon and Intel builds.
 - Define the supported-platform contract before expanding beyond macOS.

@@ -51,6 +51,18 @@ Native renderer. Without that exact local URL the app keeps an honest
 disconnected Terminal placeholder. A future native cell-grid renderer can
 replace the WebView without changing the Rust PTY or reconnect protocol.
 
+To inspect an exported Bug Capsule without starting an ACP provider, append an
+absolute path to the integrated launch command:
+
+```sh
+--bug-capsule /absolute/path/to/report.bug-capsule.json
+```
+
+Rust opens and verifies the file before launching the renderer. Native then uses
+a dedicated Capsule tab whose Workbench pane is replay-only; the pane gets the
+launch token and bounded capsule projection, never the local path or direct
+filesystem authority.
+
 Build an ad-hoc signed macOS application from the repository root:
 
 ```sh

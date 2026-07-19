@@ -10,6 +10,13 @@ export interface BugCapsuleInventoryEntry {
   reason: string;
 }
 
+export interface BugCapsuleFile {
+  path: string;
+  byte_count: number;
+  content_digest: string;
+  modified: boolean;
+}
+
 export interface BugCapsule {
   schema_version: 1;
   mode: "replay_only";
@@ -20,10 +27,36 @@ export interface BugCapsule {
     content_digest: string;
     compiler: { name: string; version: string };
   };
+  accepted_source: BugCapsuleFile[];
+  outputs: {
+    bundle_bytes: number;
+    bundle_digest: string;
+    css_bytes: number;
+    css_digest: string;
+    source_map_bytes: number;
+    source_map_digest: string;
+  };
+  editor: {
+    base_source_revision: number;
+    revision: number;
+    state_digest: string;
+    active_path: string;
+    view: string;
+    files: BugCapsuleFile[];
+  };
   runtime: RuntimeTraceProjection;
   runtime_truncated: boolean;
   omitted_runtime_events: number;
   inventory: BugCapsuleInventoryEntry[];
+  environment: {
+    hyper_term_version: string;
+    os: string;
+    architecture: string;
+    deno_runtime_version?: string;
+    deno_executable_digest?: string;
+    compiler_script_digest?: string;
+    compiler_wasm_digest?: string;
+  };
   reproduction: string[];
   capsule_digest: string;
   [key: string]: unknown;
@@ -33,6 +66,10 @@ interface BugCapsuleContext {
   artifactId: string;
   sourceRevision: number;
   sessionId: number;
+  token: string;
+}
+
+interface OfflineBugCapsuleContext {
   token: string;
 }
 
@@ -69,27 +106,53 @@ export class BugCapsuleClient {
         `Rust Bug Capsule endpoint returned ${response.status}.`,
       );
     }
-    const encoded = await response.text();
-    if (new TextEncoder().encode(encoded).byteLength > MAX_CAPSULE_BYTES) {
-      throw new Error("Rust Bug Capsule exceeded its bounded export size.");
-    }
-    let capsule: BugCapsule;
-    try {
-      capsule = JSON.parse(encoded) as BugCapsule;
-    } catch {
-      throw new Error("Rust Bug Capsule is not valid JSON.");
-    }
-    if (!validCapsule(capsule, this.context)) {
-      throw new Error("Rust Bug Capsule violated its replay-only contract.");
-    }
-    const digest = await digestUnsignedBugCapsule(capsule);
-    if (digest !== capsule.capsule_digest) {
+    return await decodeAndVerifyBugCapsule(await response.text(), this.context);
+  }
+}
+
+export class OfflineBugCapsuleClient {
+  constructor(
+    private readonly context: OfflineBugCapsuleContext,
+    private readonly fetcher: Fetch = (input, init) =>
+      globalThis.fetch(input, init),
+  ) {}
+
+  async open(signal?: AbortSignal): Promise<BugCapsule> {
+    const query = new URLSearchParams({ token: this.context.token });
+    const response = await this.fetcher(`/agent/debug-capsule?${query}`, {
+      cache: "no-store",
+      signal,
+    });
+    if (!response.ok) {
       throw new Error(
-        "Rust Bug Capsule failed offline integrity verification.",
+        `Rust offline Bug Capsule endpoint returned ${response.status}.`,
       );
     }
-    return capsule;
+    return await decodeAndVerifyBugCapsule(await response.text());
   }
+}
+
+async function decodeAndVerifyBugCapsule(
+  encoded: string,
+  context?: BugCapsuleContext,
+): Promise<BugCapsule> {
+  if (new TextEncoder().encode(encoded).byteLength > MAX_CAPSULE_BYTES) {
+    throw new Error("Rust Bug Capsule exceeded its bounded export size.");
+  }
+  let capsule: BugCapsule;
+  try {
+    capsule = JSON.parse(encoded) as BugCapsule;
+  } catch {
+    throw new Error("Rust Bug Capsule is not valid JSON.");
+  }
+  if (!validCapsule(capsule, context)) {
+    throw new Error("Rust Bug Capsule violated its replay-only contract.");
+  }
+  const digest = await digestUnsignedBugCapsule(capsule);
+  if (digest !== capsule.capsule_digest) {
+    throw new Error("Rust Bug Capsule failed offline integrity verification.");
+  }
+  return capsule;
 }
 
 export async function digestUnsignedBugCapsule(
@@ -121,18 +184,20 @@ export function downloadBugCapsule(capsule: BugCapsule): void {
 
 function validCapsule(
   value: unknown,
-  context: BugCapsuleContext,
+  context?: BugCapsuleContext,
 ): value is BugCapsule {
   if (!value || typeof value !== "object") return false;
   const capsule = value as Partial<BugCapsule>;
   const artifact = capsule.artifact;
   const runtime = capsule.runtime;
   return capsule.schema_version === 1 && capsule.mode === "replay_only" &&
-    Boolean(artifact) && artifact?.artifact_id === context.artifactId &&
-    artifact.source_revision === context.sourceRevision &&
+    Boolean(artifact) && typeof artifact?.artifact_id === "string" &&
+    (!context || artifact.artifact_id === context.artifactId) &&
+    Number.isSafeInteger(artifact.source_revision) &&
+    (!context || artifact.source_revision === context.sourceRevision) &&
     SHA256_PATTERN.test(artifact.content_digest) &&
-    Boolean(runtime) && runtime?.artifact_id === context.artifactId &&
-    runtime.source_revision === context.sourceRevision &&
+    Boolean(runtime) && runtime?.artifact_id === artifact.artifact_id &&
+    runtime.source_revision === artifact.source_revision &&
     SHA256_PATTERN.test(runtime.projection_digest) &&
     Array.isArray(runtime.events) && runtime.events.length <= 256 &&
     typeof capsule.runtime_truncated === "boolean" &&
