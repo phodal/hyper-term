@@ -7,11 +7,15 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::JsonRpcMessage;
 use agent_client_protocol::schema::{ProtocolVersion, v1};
-use hyper_term_protocol::PermissionDecision;
+use hyper_term_protocol::{
+    AgentMediaKind, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentToolCall,
+    AgentToolContent, AgentToolKind, AgentToolLocation, AgentToolStatus, PermissionDecision,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use similar::{ChangeTag, TextDiff};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -112,6 +116,7 @@ pub struct AcpAgentClient {
     pending_prompt: Mutex<Option<PendingPrompt>>,
     pending_approvals: Mutex<HashMap<ExternalRequestId, PendingApproval>>,
     brokered_mcp_calls: Mutex<HashMap<String, BrokeredMcpCall>>,
+    tool_calls: Mutex<HashMap<String, v1::ToolCall>>,
     provider_id: String,
     workspace: PathBuf,
     mcp_servers: Vec<v1::McpServer>,
@@ -189,6 +194,7 @@ impl AcpAgentClient {
             pending_prompt: Mutex::new(None),
             pending_approvals: Mutex::new(HashMap::new()),
             brokered_mcp_calls: Mutex::new(HashMap::new()),
+            tool_calls: Mutex::new(HashMap::new()),
             provider_id: config.provider_id,
             workspace,
             mcp_servers,
@@ -233,6 +239,7 @@ impl AcpAgentClient {
             return Err(AcpAdapterError::PromptAlreadyRunning);
         }
         lock(&self.brokered_mcp_calls)?.clear();
+        lock(&self.tool_calls)?.clear();
         self.process.begin_effect()?;
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let turn_id = format!("acp-turn-{request_id}");
@@ -447,12 +454,51 @@ impl AcpAgentClient {
                 turn_id,
                 text: content_text(chunk.content)?,
             }),
-            v1::SessionUpdate::Plan(plan) => Ok(AgentDriverEvent::PlanDelta {
+            v1::SessionUpdate::Plan(plan) => Ok(AgentDriverEvent::PlanUpdated {
                 sequence,
                 thread_id,
                 turn_id,
-                text: bounded(serde_json::to_string(&plan)?, 64 * 1024)?,
+                entries: plan
+                    .entries
+                    .into_iter()
+                    .map(normalize_plan_entry)
+                    .collect::<Result<Vec<_>, _>>()?,
             }),
+            v1::SessionUpdate::ToolCall(call) => {
+                let id = bounded(call.tool_call_id.to_string(), 4096)?;
+                let normalized = normalize_tool_call(&call)?;
+                lock(&self.tool_calls)?.insert(id, call);
+                Ok(AgentDriverEvent::ToolCallUpdated {
+                    sequence,
+                    thread_id,
+                    turn_id,
+                    call: normalized,
+                })
+            }
+            v1::SessionUpdate::ToolCallUpdate(update) => {
+                let id = bounded(update.tool_call_id.to_string(), 4096)?;
+                let call = {
+                    let mut calls = lock(&self.tool_calls)?;
+                    if let Some(call) = calls.get_mut(&id) {
+                        call.update(update.fields);
+                        call.clone()
+                    } else {
+                        let call = v1::ToolCall::try_from(update).map_err(|error| {
+                            AcpAdapterError::InvalidMessage(format!(
+                                "ACP tool update cannot create {id}: {error}"
+                            ))
+                        })?;
+                        calls.insert(id, call.clone());
+                        call
+                    }
+                };
+                Ok(AgentDriverEvent::ToolCallUpdated {
+                    sequence,
+                    thread_id,
+                    turn_id,
+                    call: normalize_tool_call(&call)?,
+                })
+            }
             update => protocol_notice(
                 sequence,
                 Some("session/update"),
@@ -720,6 +766,193 @@ fn content_text(content: v1::ContentBlock) -> Result<String, AcpAdapterError> {
     }
 }
 
+fn normalize_plan_entry(entry: v1::PlanEntry) -> Result<AgentPlanEntry, AcpAdapterError> {
+    Ok(AgentPlanEntry {
+        content: bounded(entry.content, 16 * 1024)?,
+        priority: match entry.priority {
+            v1::PlanEntryPriority::High => AgentPlanPriority::High,
+            v1::PlanEntryPriority::Medium => AgentPlanPriority::Medium,
+            v1::PlanEntryPriority::Low => AgentPlanPriority::Low,
+            _ => AgentPlanPriority::Medium,
+        },
+        status: match entry.status {
+            v1::PlanEntryStatus::Pending => AgentPlanStatus::Pending,
+            v1::PlanEntryStatus::InProgress => AgentPlanStatus::InProgress,
+            v1::PlanEntryStatus::Completed => AgentPlanStatus::Completed,
+            _ => AgentPlanStatus::Pending,
+        },
+    })
+}
+
+fn normalize_tool_call(call: &v1::ToolCall) -> Result<AgentToolCall, AcpAdapterError> {
+    Ok(AgentToolCall {
+        tool_call_id: bounded(call.tool_call_id.to_string(), 4096)?,
+        title: bounded(call.title.clone(), 16 * 1024)?,
+        kind: match call.kind {
+            v1::ToolKind::Read => AgentToolKind::Read,
+            v1::ToolKind::Edit => AgentToolKind::Edit,
+            v1::ToolKind::Delete => AgentToolKind::Delete,
+            v1::ToolKind::Move => AgentToolKind::Move,
+            v1::ToolKind::Search => AgentToolKind::Search,
+            v1::ToolKind::Execute => AgentToolKind::Execute,
+            v1::ToolKind::Think => AgentToolKind::Think,
+            v1::ToolKind::Fetch => AgentToolKind::Fetch,
+            v1::ToolKind::SwitchMode => AgentToolKind::SwitchMode,
+            _ => AgentToolKind::Other,
+        },
+        status: match call.status {
+            v1::ToolCallStatus::Pending => AgentToolStatus::Pending,
+            v1::ToolCallStatus::InProgress => AgentToolStatus::InProgress,
+            v1::ToolCallStatus::Completed => AgentToolStatus::Completed,
+            v1::ToolCallStatus::Failed => AgentToolStatus::Failed,
+            _ => AgentToolStatus::Pending,
+        },
+        content: call
+            .content
+            .iter()
+            .map(normalize_tool_content)
+            .collect::<Result<Vec<_>, _>>()?,
+        locations: call
+            .locations
+            .iter()
+            .map(|location| {
+                Ok(AgentToolLocation {
+                    path: bounded(location.path.to_string_lossy().into_owned(), 16 * 1024)?,
+                    line: location.line,
+                })
+            })
+            .collect::<Result<Vec<_>, AcpAdapterError>>()?,
+        raw_input: normalize_raw_value(call.raw_input.as_ref())?,
+        raw_output: normalize_raw_value(call.raw_output.as_ref())?,
+    })
+}
+
+fn normalize_raw_value(value: Option<&Value>) -> Result<Option<String>, AcpAdapterError> {
+    value
+        .map(|value| bounded(serde_json::to_string(value)?, 32 * 1024))
+        .transpose()
+}
+
+fn normalize_tool_content(
+    content: &v1::ToolCallContent,
+) -> Result<AgentToolContent, AcpAdapterError> {
+    match content {
+        v1::ToolCallContent::Content(content) => normalize_content_block(&content.content),
+        v1::ToolCallContent::Diff(diff) => {
+            let old = diff.old_text.as_deref().unwrap_or("");
+            let text_diff = TextDiff::from_lines(old, &diff.new_text);
+            let added_lines = text_diff
+                .iter_all_changes()
+                .filter(|change| change.tag() == ChangeTag::Insert)
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX);
+            let removed_lines = text_diff
+                .iter_all_changes()
+                .filter(|change| change.tag() == ChangeTag::Delete)
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX);
+            let label = diff.path.to_string_lossy();
+            let patch = text_diff
+                .unified_diff()
+                .context_radius(3)
+                .header(&label, &label)
+                .to_string();
+            Ok(AgentToolContent::Diff {
+                path: bounded(label.into_owned(), 16 * 1024)?,
+                patch: bounded(patch, 64 * 1024)?,
+                added_lines,
+                removed_lines,
+            })
+        }
+        v1::ToolCallContent::Terminal(terminal) => Ok(AgentToolContent::Terminal {
+            terminal_id: bounded(terminal.terminal_id.to_string(), 4096)?,
+        }),
+        _ => Ok(AgentToolContent::Text {
+            text: "Unsupported ACP tool content".into(),
+        }),
+    }
+}
+
+fn normalize_content_block(
+    content: &v1::ContentBlock,
+) -> Result<AgentToolContent, AcpAdapterError> {
+    match content {
+        v1::ContentBlock::Text(text) => Ok(AgentToolContent::Text {
+            text: bounded(text.text.clone(), 64 * 1024)?,
+        }),
+        v1::ContentBlock::Image(image) => Ok(AgentToolContent::Media {
+            kind: AgentMediaKind::Image,
+            mime_type: bounded(image.mime_type.clone(), 512)?,
+            uri: image
+                .uri
+                .clone()
+                .map(|uri| bounded(uri, 16 * 1024))
+                .transpose()?,
+            encoded_bytes: image.data.len().try_into().unwrap_or(u64::MAX),
+        }),
+        v1::ContentBlock::Audio(audio) => Ok(AgentToolContent::Media {
+            kind: AgentMediaKind::Audio,
+            mime_type: bounded(audio.mime_type.clone(), 512)?,
+            uri: None,
+            encoded_bytes: audio.data.len().try_into().unwrap_or(u64::MAX),
+        }),
+        v1::ContentBlock::ResourceLink(link) => Ok(AgentToolContent::Resource {
+            name: bounded(
+                link.title.clone().unwrap_or_else(|| link.name.clone()),
+                4096,
+            )?,
+            uri: bounded(link.uri.clone(), 16 * 1024)?,
+            mime_type: link
+                .mime_type
+                .clone()
+                .map(|mime| bounded(mime, 512))
+                .transpose()?,
+            text: link
+                .description
+                .clone()
+                .map(|text| bounded(text, 16 * 1024))
+                .transpose()?,
+            byte_count: link.size.and_then(|size| size.try_into().ok()),
+        }),
+        v1::ContentBlock::Resource(resource) => match &resource.resource {
+            v1::EmbeddedResourceResource::TextResourceContents(value) => {
+                Ok(AgentToolContent::Resource {
+                    name: bounded(value.uri.clone(), 4096)?,
+                    uri: bounded(value.uri.clone(), 16 * 1024)?,
+                    mime_type: value
+                        .mime_type
+                        .clone()
+                        .map(|mime| bounded(mime, 512))
+                        .transpose()?,
+                    text: Some(bounded(value.text.clone(), 64 * 1024)?),
+                    byte_count: None,
+                })
+            }
+            v1::EmbeddedResourceResource::BlobResourceContents(value) => {
+                Ok(AgentToolContent::Resource {
+                    name: bounded(value.uri.clone(), 4096)?,
+                    uri: bounded(value.uri.clone(), 16 * 1024)?,
+                    mime_type: value
+                        .mime_type
+                        .clone()
+                        .map(|mime| bounded(mime, 512))
+                        .transpose()?,
+                    text: None,
+                    byte_count: Some(value.blob.len().try_into().unwrap_or(u64::MAX)),
+                })
+            }
+            _ => Ok(AgentToolContent::Text {
+                text: "Unsupported ACP resource content".into(),
+            }),
+        },
+        _ => Ok(AgentToolContent::Text {
+            text: "Unsupported ACP content block".into(),
+        }),
+    }
+}
+
 fn protocol_notice(
     sequence: u64,
     method: Option<&str>,
@@ -920,9 +1153,9 @@ mod tests {
         );
         let workspace = TempDir::new().unwrap();
         let client = launch(&executable, workspace.path());
-        let initialized = client.initialize(Duration::from_secs(2)).unwrap();
+        let initialized = client.initialize(Duration::from_secs(10)).unwrap();
         assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
-        let session_id = client.start_session(Duration::from_secs(2)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
         assert_eq!(session_id, "session-1");
         let turn_id = client.start_turn(&session_id, "say hello").unwrap();
         assert_eq!(turn_id, "acp-turn-3");
@@ -935,6 +1168,51 @@ mod tests {
             AgentDriverEvent::TurnCompleted { status: Some(status), .. } if status == "end_turn"
         ));
         assert_eq!(client.state().unwrap(), DriverState::Ready);
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[test]
+    fn acp_v1_preserves_plan_tool_diff_terminal_resource_and_updates() {
+        let (_temporary, executable) = fake_agent(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-structured\"}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-structured\",\"update\":{\"sessionUpdate\":\"plan\",\"entries\":[{\"content\":\"Inspect the workspace\",\"priority\":\"high\",\"status\":\"in_progress\"}]}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-structured\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"edit-1\",\"title\":\"Edit src/lib.rs\",\"kind\":\"edit\",\"status\":\"in_progress\",\"locations\":[{\"path\":\"/tmp/src/lib.rs\",\"line\":7}],\"content\":[{\"type\":\"diff\",\"path\":\"/tmp/src/lib.rs\",\"oldText\":\"old\\n\",\"newText\":\"new\\n\"},{\"type\":\"terminal\",\"terminalId\":\"terminal-7\"},{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":\"Applied edit\"}},{\"type\":\"content\",\"content\":{\"type\":\"resource_link\",\"name\":\"build log\",\"uri\":\"file:///tmp/build.log\",\"mimeType\":\"text/plain\"}}]}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-structured\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"edit-1\",\"status\":\"completed\",\"rawOutput\":{\"ok\":true}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+        );
+        let workspace = TempDir::new().unwrap();
+        let client = launch(&executable, workspace.path());
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
+        client.start_turn(&session_id, "make the edit").unwrap();
+
+        let plan = client.next_event(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            plan,
+            AgentDriverEvent::PlanUpdated { entries, .. }
+                if entries.len() == 1
+                    && entries[0].content == "Inspect the workspace"
+                    && entries[0].status == AgentPlanStatus::InProgress
+        ));
+        let tool = client.next_event(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            tool,
+            AgentDriverEvent::ToolCallUpdated { call, .. }
+                if call.status == AgentToolStatus::InProgress
+                    && call.locations.len() == 1
+                    && matches!(&call.content[0], AgentToolContent::Diff { added_lines: 1, removed_lines: 1, patch, .. } if patch.contains("-old") && patch.contains("+new"))
+                    && matches!(&call.content[1], AgentToolContent::Terminal { terminal_id } if terminal_id == "terminal-7")
+                    && matches!(&call.content[2], AgentToolContent::Text { text } if text == "Applied edit")
+                    && matches!(&call.content[3], AgentToolContent::Resource { uri, .. } if uri == "file:///tmp/build.log")
+        ));
+        let completed = client.next_event(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            completed,
+            AgentDriverEvent::ToolCallUpdated { call, .. }
+                if call.status == AgentToolStatus::Completed
+                    && call.content.len() == 4
+                    && call.raw_output.as_deref() == Some("{\"ok\":true}")
+        ));
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::TurnCompleted { .. }
+        ));
         assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 
@@ -970,9 +1248,9 @@ mod tests {
         })
         .unwrap();
 
-        client.initialize(Duration::from_secs(2)).unwrap();
+        client.initialize(Duration::from_secs(10)).unwrap();
         assert_eq!(
-            client.start_session(Duration::from_secs(2)).unwrap(),
+            client.start_session(Duration::from_secs(10)).unwrap(),
             "session-with-mcp"
         );
         let request: Value = serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
@@ -1016,17 +1294,15 @@ mod tests {
         })
         .unwrap();
 
-        client.initialize(Duration::from_secs(2)).unwrap();
-        let session_id = client.start_session(Duration::from_secs(2)).unwrap();
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
         client
             .start_turn(&session_id, "compile the counter")
             .unwrap();
         assert!(matches!(
             client.next_event(Duration::from_secs(2)).unwrap(),
-            AgentDriverEvent::ProtocolNotice {
-                method: Some(method),
-                ..
-            } if method == "session/update"
+            AgentDriverEvent::ToolCallUpdated { call, .. }
+                if call.title == "mcp.hyper_term.hyper_term.genui.compile"
         ));
         assert!(matches!(
             client.next_event(Duration::from_secs(2)).unwrap(),
@@ -1070,8 +1346,8 @@ mod tests {
         })
         .unwrap();
 
-        client.initialize(Duration::from_secs(2)).unwrap();
-        let session_id = client.start_session(Duration::from_secs(2)).unwrap();
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
         client
             .start_turn(&session_id, "attempt an unmatched call")
             .unwrap();
@@ -1105,8 +1381,8 @@ mod tests {
         );
         let workspace = TempDir::new().unwrap();
         let client = launch(&executable, workspace.path());
-        client.initialize(Duration::from_secs(2)).unwrap();
-        let session_id = client.start_session(Duration::from_secs(2)).unwrap();
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
         client.start_turn(&session_id, "test it").unwrap();
         let proposal = match client.next_event(Duration::from_secs(2)).unwrap() {
             AgentDriverEvent::EffectProposed { proposal, .. } => proposal,

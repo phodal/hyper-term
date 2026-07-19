@@ -434,6 +434,56 @@ impl BlockProjector {
                 block.attention = AttentionState::Failed;
                 vec![self.upsert(block, event.sequence)?]
             }
+            DomainEvent::AgentToolCallUpdated { turn_id, call } => {
+                let block_id = stable_block_id(
+                    "agent-tool-call",
+                    format!("{turn_id}:{}", call.tool_call_id),
+                );
+                let mut block = BlockEnvelope::new(
+                    block_id,
+                    self.task_id,
+                    BlockKind::AgentToolCall,
+                    event.sequence,
+                    BlockPayload::AgentToolCall {
+                        turn_id: turn_id.clone(),
+                        call: call.clone(),
+                    },
+                );
+                block.lifecycle = match call.status {
+                    hyper_term_protocol::AgentToolStatus::Pending => BlockLifecycle::Queued,
+                    hyper_term_protocol::AgentToolStatus::InProgress => BlockLifecycle::Running,
+                    hyper_term_protocol::AgentToolStatus::Completed => BlockLifecycle::Succeeded,
+                    hyper_term_protocol::AgentToolStatus::Failed => BlockLifecycle::Failed,
+                };
+                block.attention = if call.status == hyper_term_protocol::AgentToolStatus::Failed {
+                    AttentionState::Failed
+                } else {
+                    AttentionState::None
+                };
+                vec![self.upsert(block, event.sequence)?]
+            }
+            DomainEvent::AgentPlanUpdated { turn_id, entries } => {
+                let block_id = stable_block_id("agent-plan", turn_id.clone());
+                let mut block = BlockEnvelope::new(
+                    block_id,
+                    self.task_id,
+                    BlockKind::AgentPlan,
+                    event.sequence,
+                    BlockPayload::AgentPlan {
+                        turn_id: turn_id.clone(),
+                        entries: entries.clone(),
+                    },
+                );
+                block.lifecycle = if entries
+                    .iter()
+                    .all(|entry| entry.status == hyper_term_protocol::AgentPlanStatus::Completed)
+                {
+                    BlockLifecycle::Succeeded
+                } else {
+                    BlockLifecycle::Running
+                };
+                vec![self.upsert(block, event.sequence)?]
+            }
         };
 
         self.revision = event.sequence;
@@ -626,8 +676,10 @@ pub enum ProjectorError {
 #[cfg(test)]
 mod tests {
     use hyper_term_protocol::{
-        AcceptedGenUiArtifact, ArtifactId, EVENT_SCHEMA_VERSION, EventEnvelope, EventId,
-        GenUiCompilerIdentity, MessageRole, OperationId, OperationKind, RiskClass,
+        AcceptedGenUiArtifact, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentToolCall,
+        AgentToolContent, AgentToolKind, AgentToolLocation, AgentToolStatus, ArtifactId,
+        EVENT_SCHEMA_VERSION, EventEnvelope, EventId, GenUiCompilerIdentity, MessageRole,
+        OperationId, OperationKind, RiskClass,
     };
 
     use super::*;
@@ -808,5 +860,87 @@ mod tests {
         assert_eq!(artifacts[0].0.trust_class, TrustClass::IsolatedArtifact);
         assert_eq!(artifacts[0].0.render_slot, RenderSlot::Inspector);
         assert_eq!(artifacts[0].0.block_revision, 2);
+    }
+
+    #[test]
+    fn agent_plan_and_tool_updates_keep_stable_blocks_and_lifecycle() {
+        let task_id = TaskId::new();
+        let tool_call = |status| AgentToolCall {
+            tool_call_id: "read-cargo".into(),
+            title: "Read Cargo.toml".into(),
+            kind: AgentToolKind::Read,
+            status,
+            content: vec![AgentToolContent::Text {
+                text: "workspace members".into(),
+            }],
+            locations: vec![AgentToolLocation {
+                path: "Cargo.toml".into(),
+                line: Some(1),
+            }],
+            raw_input: None,
+            raw_output: None,
+        };
+        let events = [
+            event(
+                1,
+                task_id,
+                None,
+                DomainEvent::TaskCreated {
+                    title: "ACP projection".into(),
+                },
+            ),
+            event(
+                2,
+                task_id,
+                None,
+                DomainEvent::AgentPlanUpdated {
+                    turn_id: "turn-1".into(),
+                    entries: vec![AgentPlanEntry {
+                        content: "Inspect the workspace".into(),
+                        priority: AgentPlanPriority::High,
+                        status: AgentPlanStatus::InProgress,
+                    }],
+                },
+            ),
+            event(
+                3,
+                task_id,
+                None,
+                DomainEvent::AgentToolCallUpdated {
+                    turn_id: "turn-1".into(),
+                    call: tool_call(AgentToolStatus::InProgress),
+                },
+            ),
+            event(
+                4,
+                task_id,
+                None,
+                DomainEvent::AgentToolCallUpdated {
+                    turn_id: "turn-1".into(),
+                    call: tool_call(AgentToolStatus::Completed),
+                },
+            ),
+        ];
+
+        let snapshot = BlockProjector::replay(task_id, &events)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let tools = snapshot
+            .blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::AgentToolCall)
+            .collect::<Vec<_>>();
+        let plans = snapshot
+            .blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::AgentPlan)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].block_revision, 2);
+        assert_eq!(tools[0].lifecycle, BlockLifecycle::Succeeded);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].lifecycle, BlockLifecycle::Running);
     }
 }

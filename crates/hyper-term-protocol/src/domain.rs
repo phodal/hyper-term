@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedGenUiArtifact, ActionDigest, BlockId, CompiledSandboxProfile, EVENT_SCHEMA_VERSION,
-    EventId, OperationId, RunId, SandboxLeaseId, SandboxProfileDigest, SandboxReceipt,
-    SandboxViolation, TaskId, TerminalId,
+    AcceptedGenUiArtifact, ActionDigest, AgentPlanEntry, AgentToolCall, BlockId,
+    CompiledSandboxProfile, EVENT_SCHEMA_VERSION, EventId, OperationId, RunId, SandboxLeaseId,
+    SandboxProfileDigest, SandboxReceipt, SandboxViolation, TaskId, TerminalId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -261,6 +261,14 @@ pub enum DomainEvent {
     Diagnostic {
         code: String,
         message: String,
+    },
+    AgentToolCallUpdated {
+        turn_id: String,
+        call: AgentToolCall,
+    },
+    AgentPlanUpdated {
+        turn_id: String,
+        entries: Vec<AgentPlanEntry>,
     },
 }
 

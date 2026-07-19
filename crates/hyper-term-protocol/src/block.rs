@@ -18,6 +18,110 @@ pub enum BlockKind {
     Terminal,
     Review,
     Diagnostic,
+    AgentToolCall,
+    AgentPlan,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMediaKind {
+    Image,
+    Audio,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentToolContent {
+    Text {
+        text: String,
+    },
+    Diff {
+        path: String,
+        patch: String,
+        added_lines: u32,
+        removed_lines: u32,
+    },
+    Terminal {
+        terminal_id: String,
+    },
+    Media {
+        kind: AgentMediaKind,
+        mime_type: String,
+        uri: Option<String>,
+        encoded_bytes: u64,
+    },
+    Resource {
+        name: String,
+        uri: String,
+        mime_type: Option<String>,
+        text: Option<String>,
+        byte_count: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentToolLocation {
+    pub path: String,
+    pub line: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentToolCall {
+    pub tool_call_id: String,
+    pub title: String,
+    pub kind: AgentToolKind,
+    pub status: AgentToolStatus,
+    pub content: Vec<AgentToolContent>,
+    pub locations: Vec<AgentToolLocation>,
+    pub raw_input: Option<String>,
+    pub raw_output: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPlanPriority {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentPlanEntry {
+    pub content: String,
+    pub priority: AgentPlanPriority,
+    pub status: AgentPlanStatus,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -121,6 +225,14 @@ pub enum BlockPayload {
     Diagnostic {
         code: String,
         message: String,
+    },
+    AgentToolCall {
+        turn_id: String,
+        call: AgentToolCall,
+    },
+    AgentPlan {
+        turn_id: String,
+        entries: Vec<AgentPlanEntry>,
     },
 }
 

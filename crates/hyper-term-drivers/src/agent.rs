@@ -1,4 +1,4 @@
-use hyper_term_protocol::{OperationId, PermissionDecision};
+use hyper_term_protocol::{AgentPlanEntry, AgentToolCall, OperationId, PermissionDecision};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -72,6 +72,18 @@ pub enum AgentDriverEvent {
         thread_id: String,
         turn_id: String,
         text: String,
+    },
+    PlanUpdated {
+        sequence: u64,
+        thread_id: String,
+        turn_id: String,
+        entries: Vec<AgentPlanEntry>,
+    },
+    ToolCallUpdated {
+        sequence: u64,
+        thread_id: String,
+        turn_id: String,
+        call: AgentToolCall,
     },
     ThoughtDelta {
         sequence: u64,

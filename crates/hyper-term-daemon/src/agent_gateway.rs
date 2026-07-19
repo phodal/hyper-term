@@ -260,6 +260,7 @@ struct AgentTurnProjection {
     agent_block_id: BlockId,
     plan_block_id: BlockId,
     agent_message_bytes: usize,
+    agent_message_interrupted: bool,
     plan_bytes: usize,
 }
 
@@ -3578,6 +3579,7 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
             agent_block_id: BlockId::new(),
             plan_block_id: BlockId::new(),
             agent_message_bytes: 0,
+            agent_message_interrupted: false,
             plan_bytes: 0,
         },
     );
@@ -3613,9 +3615,18 @@ fn continue_turn(
                 if text.is_empty() {
                     continue;
                 }
+                let separator = if projection.agent_message_interrupted
+                    && projection.agent_message_bytes > 0
+                    && !text.starts_with('\n')
+                {
+                    "\n\n"
+                } else {
+                    ""
+                };
                 projection.agent_message_bytes = match projection
                     .agent_message_bytes
-                    .checked_add(text.len())
+                    .checked_add(separator.len())
+                    .and_then(|total| total.checked_add(text.len()))
                 {
                     Some(total) if total <= MAX_AGENT_MESSAGE_BYTES => total,
                     _ => {
@@ -3630,7 +3641,7 @@ fn continue_turn(
                         projection.agent_block_id,
                         MessageRole::Agent,
                         Some(projection.turn_id.clone()),
-                        text,
+                        format!("{separator}{text}"),
                     )
                     .is_err()
                 {
@@ -3638,6 +3649,7 @@ fn continue_turn(
                     let _ = session.client.close();
                     return;
                 }
+                projection.agent_message_interrupted = false;
             }
             AgentDriverEvent::PlanDelta {
                 thread_id,
@@ -3645,6 +3657,7 @@ fn continue_turn(
                 text,
                 ..
             } if thread_id == session.thread_id && event_turn_id == projection.turn_id => {
+                projection.agent_message_interrupted |= projection.agent_message_bytes > 0;
                 if text.is_empty() {
                     continue;
                 }
@@ -3660,12 +3673,45 @@ fn continue_turn(
                     text,
                 );
             }
+            AgentDriverEvent::PlanUpdated {
+                thread_id,
+                turn_id: event_turn_id,
+                entries,
+                ..
+            } if thread_id == session.thread_id && event_turn_id == projection.turn_id => {
+                projection.agent_message_interrupted |= projection.agent_message_bytes > 0;
+                if daemon
+                    .update_agent_plan(session.task_id, projection.turn_id.clone(), entries)
+                    .is_err()
+                {
+                    set_progress_failed(&session, "Agent plan could not be journaled");
+                    let _ = session.client.close();
+                    return;
+                }
+            }
+            AgentDriverEvent::ToolCallUpdated {
+                thread_id,
+                turn_id: event_turn_id,
+                call,
+                ..
+            } if thread_id == session.thread_id && event_turn_id == projection.turn_id => {
+                projection.agent_message_interrupted |= projection.agent_message_bytes > 0;
+                if daemon
+                    .update_agent_tool_call(session.task_id, projection.turn_id.clone(), call)
+                    .is_err()
+                {
+                    set_progress_failed(&session, "Agent tool call could not be journaled");
+                    let _ = session.client.close();
+                    return;
+                }
+            }
             AgentDriverEvent::ThoughtDelta {
                 thread_id,
                 turn_id: event_turn_id,
                 text,
                 ..
             } if thread_id == session.thread_id && event_turn_id == projection.turn_id => {
+                projection.agent_message_interrupted |= projection.agent_message_bytes > 0;
                 if text.is_empty() {
                     continue;
                 }
@@ -3682,6 +3728,7 @@ fn continue_turn(
                 );
             }
             AgentDriverEvent::EffectProposed { proposal, .. } => {
+                projection.agent_message_interrupted |= projection.agent_message_bytes > 0;
                 let (kind, risk) = operation_kind_and_risk(proposal.kind);
                 let operation = match daemon.propose_operation(
                     session.task_id,
@@ -4339,7 +4386,7 @@ mod tests {
         let fake_acp = temporary.path().join("fixture-acp");
         std::fs::write(
             &fake_acp,
-            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-session-8\"}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Provider-neutral ACP is live.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-session-8\"}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Provider-neutral ACP is live.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Checking workspace\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Final answer.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
         )
         .expect("fake ACP");
         let mut permissions = std::fs::metadata(&fake_acp).unwrap().permissions();
@@ -4418,7 +4465,8 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|block| block["payload"]["text"] == "Provider-neutral ACP is live.")
+                .any(|block| block["payload"]["text"]
+                    == "Provider-neutral ACP is live.\n\nFinal answer.")
         );
         assert_eq!(
             std::fs::read_dir(gateway_state.join("agents"))

@@ -276,6 +276,59 @@ impl DaemonState {
         })
     }
 
+    pub fn update_agent_tool_call(
+        &self,
+        task_id: TaskId,
+        turn_id: String,
+        call: hyper_term_protocol::AgentToolCall,
+    ) -> Result<(), DaemonError> {
+        self.require_task(task_id)?;
+        if turn_id.is_empty() || turn_id.len() > 4096 {
+            return Err(DaemonError::InvalidAgentProjection(
+                "Agent turn id is empty or too large".into(),
+            ));
+        }
+        validate_agent_tool_call(&call)?;
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: None,
+            causation_id: None,
+            correlation_id: None,
+            payload: DomainEvent::AgentToolCallUpdated { turn_id, call },
+        })
+    }
+
+    pub fn update_agent_plan(
+        &self,
+        task_id: TaskId,
+        turn_id: String,
+        entries: Vec<hyper_term_protocol::AgentPlanEntry>,
+    ) -> Result<(), DaemonError> {
+        self.require_task(task_id)?;
+        if turn_id.is_empty() || turn_id.len() > 4096 || entries.len() > 128 {
+            return Err(DaemonError::InvalidAgentProjection(
+                "Agent plan identity or entry count is invalid".into(),
+            ));
+        }
+        if entries
+            .iter()
+            .any(|entry| entry.content.is_empty() || entry.content.len() > 16 * 1024)
+        {
+            return Err(DaemonError::InvalidAgentProjection(
+                "Agent plan entry is empty or too large".into(),
+            ));
+        }
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: None,
+            causation_id: None,
+            correlation_id: None,
+            payload: DomainEvent::AgentPlanUpdated { turn_id, entries },
+        })
+    }
+
     pub fn propose_operation(
         &self,
         task_id: TaskId,
@@ -1677,6 +1730,28 @@ fn validate_action_kind(kind: &OperationKind, action: &OperationAction) -> Resul
     Ok(())
 }
 
+fn validate_agent_tool_call(call: &hyper_term_protocol::AgentToolCall) -> Result<(), DaemonError> {
+    if call.tool_call_id.is_empty()
+        || call.tool_call_id.len() > 4096
+        || call.title.is_empty()
+        || call.title.len() > 16 * 1024
+        || call.content.len() > 128
+        || call.locations.len() > 128
+    {
+        return Err(DaemonError::InvalidAgentProjection(
+            "Agent tool call identity, title, or collection count is invalid".into(),
+        ));
+    }
+    let encoded = serde_json::to_vec(call)
+        .map_err(|error| DaemonError::InvalidAgentProjection(error.to_string()))?;
+    if encoded.len() > 512 * 1024 {
+        return Err(DaemonError::InvalidAgentProjection(
+            "Agent tool call exceeds the 512 KiB journal bound".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_operation_scope(
     record: &OperationRecord,
     task_id: TaskId,
@@ -2260,6 +2335,8 @@ pub enum DaemonError {
     MessageTooLarge(usize),
     #[error("external message id exceeds the 4096-byte bound")]
     ExternalMessageIdTooLarge,
+    #[error("invalid Agent projection: {0}")]
+    InvalidAgentProjection(String),
     #[error("task {0} does not exist")]
     TaskNotFound(TaskId),
     #[error("task {0} appears more than once in the journal")]
@@ -2370,7 +2447,8 @@ impl DaemonError {
             | Self::InconsistentOperationOutcome
             | Self::EmptyMessage
             | Self::MessageTooLarge(_)
-            | Self::ExternalMessageIdTooLarge => "invalid_request",
+            | Self::ExternalMessageIdTooLarge
+            | Self::InvalidAgentProjection(_) => "invalid_request",
             Self::InputLeaseHeld(_) => "input_lease_held",
             Self::InputLeaseMissing(_) | Self::InputLeaseMismatch(_) => "input_lease_mismatch",
             Self::ClientIdentityMismatch => "client_identity_mismatch",
