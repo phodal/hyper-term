@@ -82,6 +82,7 @@ struct DaemonInner {
     sandbox_executions: Mutex<HashMap<TerminalId, SandboxExecutionContext>>,
     state_directory: PathBuf,
     artifacts: ArtifactStore,
+    artifact_acceptance: Mutex<()>,
     scratch_root: PathBuf,
 }
 
@@ -196,6 +197,7 @@ impl DaemonState {
                 sandbox_executions: Mutex::new(HashMap::new()),
                 state_directory,
                 artifacts,
+                artifact_acceptance: Mutex::new(()),
                 scratch_root,
             }),
         };
@@ -660,6 +662,36 @@ impl DaemonState {
         expected_revision: u64,
         candidate: GenUiArtifactCandidate,
     ) -> Result<AcceptedGenUiArtifact, DaemonError> {
+        self.accept_genui_artifact_inner(task_id, operation_id, expected_revision, None, candidate)
+    }
+
+    pub(crate) fn accept_genui_artifact_from_base(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        base_artifact_id: hyper_term_protocol::ArtifactId,
+        base_source_revision: u64,
+        candidate: GenUiArtifactCandidate,
+    ) -> Result<AcceptedGenUiArtifact, DaemonError> {
+        self.accept_genui_artifact_inner(
+            task_id,
+            operation_id,
+            expected_revision,
+            Some((base_artifact_id, base_source_revision)),
+            candidate,
+        )
+    }
+
+    fn accept_genui_artifact_inner(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        required_base: Option<(hyper_term_protocol::ArtifactId, u64)>,
+        candidate: GenUiArtifactCandidate,
+    ) -> Result<AcceptedGenUiArtifact, DaemonError> {
+        let _acceptance = lock(&self.inner.artifact_acceptance)?;
         let record = self.operation(operation_id)?;
         validate_operation_scope(&record, task_id, expected_revision)?;
         if record.state != OperationState::Dispatching {
@@ -672,6 +704,19 @@ impl DaemonState {
             )
         {
             return Err(DaemonError::ArtifactAcceptanceRequiresGenUiCompile);
+        }
+        if let Some((base_artifact_id, base_source_revision)) = required_base {
+            let current = self
+                .active_genui_artifact(task_id)?
+                .filter(|artifact| {
+                    artifact.artifact_id == base_artifact_id
+                        && artifact.source_revision == base_source_revision
+                })
+                .ok_or(DaemonError::ArtifactBaseNotCurrent {
+                    artifact_id: base_artifact_id,
+                    source_revision: base_source_revision,
+                })?;
+            debug_assert_eq!(current.artifact_id, base_artifact_id);
         }
         let accepted = self.inner.artifacts.persist(candidate)?;
         self.record(NewEvent {
@@ -2156,6 +2201,13 @@ pub enum DaemonError {
     ArtifactAcceptanceRequiresGenUiCompile,
     #[error("artifact {0} is not the task's current accepted artifact")]
     ArtifactNotActive(hyper_term_protocol::ArtifactId),
+    #[error(
+        "artifact {artifact_id} revision {source_revision} is no longer the current draft base"
+    )]
+    ArtifactBaseNotCurrent {
+        artifact_id: hyper_term_protocol::ArtifactId,
+        source_revision: u64,
+    },
     #[error("{label} must contain between 1 and {maximum} bytes")]
     InvalidBoundedText { label: &'static str, maximum: usize },
     #[error("operation result digest must be a lowercase SHA-256 value")]
@@ -2217,6 +2269,7 @@ impl DaemonError {
             | Self::GenericDispatchRequiresOpaqueAction
             | Self::ArtifactAcceptanceRequiresGenUiCompile => "unsupported_action",
             Self::ArtifactNotActive(_) => "artifact_not_active",
+            Self::ArtifactBaseNotCurrent { .. } => "artifact_base_not_current",
             Self::ArtifactStore(_) => "artifact_error",
             Self::SandboxWorkingDirectoryRequired
             | Self::InvalidSandboxWorkingDirectory { .. }

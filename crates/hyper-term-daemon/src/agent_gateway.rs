@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,14 +17,17 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentDriverEvent, AgentEffectAuthorization,
-    AgentEffectKind, CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig, DriverState,
-    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, sha256_file,
+    AgentEffectKind, CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig,
+    DenoGenUiCompiler, DenoGenUiConfig, DriverState, ExternalRequestId, GenUiCompileRequest,
+    StructuredAgentClient, StructuredAgentProtocol, sha256_file,
 };
 use hyper_term_protocol::{
-    ArtifactId, BlockDocument, BlockId, MessageRole, OperationAction, OperationId, OperationKind,
+    AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, GenUiArtifactCandidate, MessageRole,
+    OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
     PermissionDecision, RiskClass, TaskId,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -47,6 +51,8 @@ const WORKBENCH_PREVIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inli
 const MAX_PREVIEW_SHELL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_WORKBENCH_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EDITOR_LSP_BODY_BYTES: usize = 1024 * 1024 + 64 * 1024;
+const MAX_ARTIFACT_DRAFT_FILES: usize = 100;
+const MAX_ARTIFACT_DRAFT_SOURCE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_BOOTSTRAP_MARKER: &str = "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->";
 
 #[derive(Clone)]
@@ -146,6 +152,33 @@ struct AgentGatewayRuntime {
     preview_shell: Option<Arc<str>>,
     workbench_assets: Option<Arc<PathBuf>>,
     editor_lsp: Option<Arc<EditorLspService>>,
+    artifact_draft_compiler: Option<Arc<ArtifactDraftCompiler>>,
+    artifact_drafts: Arc<Mutex<HashMap<OperationId, ArtifactDraftRecord>>>,
+}
+
+struct ArtifactDraftCompiler {
+    config: DenoGenUiConfig,
+    compiler: Mutex<Option<Arc<DenoGenUiCompiler>>>,
+}
+
+#[derive(Clone)]
+struct ArtifactDraftRecord {
+    session_id: u16,
+    task_id: TaskId,
+    base_artifact_id: ArtifactId,
+    base_source_revision: u64,
+    waiting_revision: u64,
+    request: GenUiCompileRequest,
+    state: ArtifactDraftState,
+}
+
+#[derive(Clone)]
+enum ArtifactDraftState {
+    WaitingApproval,
+    Compiling,
+    Accepted(AcceptedGenUiArtifact),
+    Rejected,
+    Failed(String),
 }
 
 struct AgentSession {
@@ -241,6 +274,41 @@ struct AgentArtifactSourceResponse {
 }
 
 #[derive(Deserialize)]
+struct AgentArtifactDraftRequest {
+    base_source_revision: u64,
+    entrypoint: String,
+    files: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct AgentArtifactDraftStatusQuery {
+    token: Option<String>,
+    session_id: Option<u16>,
+    operation_id: Option<OperationId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactDraftStatus {
+    WaitingApproval,
+    Compiling,
+    Accepted,
+    Rejected,
+    Failed,
+}
+
+#[derive(Serialize)]
+struct AgentArtifactDraftResponse {
+    operation_id: OperationId,
+    operation_revision: u64,
+    status: ArtifactDraftStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<AcceptedGenUiArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct AgentPermissionRequest {
     operation_id: OperationId,
     expected_revision: u64,
@@ -318,6 +386,12 @@ pub async fn spawn_agent_gateway(
             .map_err(|error| AgentGatewayError::InvalidGenUiRuntime(error.to_string()))
         })
         .transpose()?;
+    let artifact_draft_compiler = config
+        .genui_runtime
+        .as_ref()
+        .map(|runtime| ArtifactDraftCompiler::new(runtime, &config.state_directory))
+        .transpose()?
+        .map(Arc::new);
     let workbench_assets = config
         .workbench_assets
         .take()
@@ -340,6 +414,8 @@ pub async fn spawn_agent_gateway(
         preview_shell,
         workbench_assets,
         editor_lsp,
+        artifact_draft_compiler,
+        artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
     };
     let router = Router::new()
         .route(
@@ -359,6 +435,10 @@ pub async fn spawn_agent_gateway(
             get(artifact_source_map),
         )
         .route("/agent/artifact/{artifact_id}/source", get(artifact_source))
+        .route(
+            "/agent/artifact/{artifact_id}/draft",
+            get(artifact_draft_status).post(propose_artifact_draft),
+        )
         .route(
             "/agent/artifact/{artifact_id}/lsp",
             post(artifact_editor_lsp),
@@ -660,6 +740,97 @@ async fn artifact_editor_lsp(
     }
 }
 
+async fn propose_artifact_draft(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let request = match serde_json::from_slice::<AgentArtifactDraftRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return status_response(StatusCode::BAD_REQUEST, "Artifact draft is invalid"),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.propose_artifact_draft(session_id, artifact_id, request)
+    })
+    .await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::ACCEPTED, &response),
+        Ok(Err(ArtifactDraftError::SessionUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Ok(Err(ArtifactDraftError::AcpRequired)) => status_response(
+            StatusCode::FORBIDDEN,
+            "Artifact publishing is available only for ACP Agent artifacts",
+        ),
+        Ok(Err(ArtifactDraftError::ArtifactUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
+        }
+        Ok(Err(ArtifactDraftError::StaleRevision | ArtifactDraftError::Busy)) => status_response(
+            StatusCode::CONFLICT,
+            "Artifact draft no longer matches the current revision",
+        ),
+        Ok(Err(ArtifactDraftError::InvalidRequest)) => {
+            status_response(StatusCode::BAD_REQUEST, "Artifact draft is invalid")
+        }
+        Ok(Err(ArtifactDraftError::NoChanges)) => status_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Artifact draft has no changes",
+        ),
+        Ok(Err(ArtifactDraftError::RuntimeUnavailable)) => status_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Rust-supervised Deno artifact publishing is unavailable",
+        ),
+        Ok(Err(ArtifactDraftError::Daemon | ArtifactDraftError::Lock)) | Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Artifact draft could not enter the permission broker",
+        ),
+    }
+}
+
+async fn artifact_draft_status(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentArtifactDraftStatusQuery>,
+) -> Response {
+    let session_id = match authorize(
+        &runtime,
+        &AgentSessionQuery {
+            token: query.token,
+            session_id: query.session_id,
+            provider: None,
+        },
+    ) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let Some(operation_id) = query.operation_id else {
+        return status_response(StatusCode::BAD_REQUEST, "Draft operation id is invalid");
+    };
+    match runtime.artifact_draft_status(session_id, artifact_id, operation_id) {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(ArtifactDraftError::SessionUnavailable | ArtifactDraftError::ArtifactUnavailable) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact draft is unavailable")
+        }
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Artifact draft status could not be read",
+        ),
+    }
+}
+
 async fn start_turn(
     State(runtime): State<AgentGatewayRuntime>,
     Query(query): Query<AgentSessionQuery>,
@@ -785,6 +956,20 @@ enum EditorRequestError {
     InvalidRequest,
     RuntimeUnavailable,
     Driver,
+}
+
+#[derive(Debug)]
+enum ArtifactDraftError {
+    SessionUnavailable,
+    AcpRequired,
+    ArtifactUnavailable,
+    StaleRevision,
+    InvalidRequest,
+    NoChanges,
+    Busy,
+    RuntimeUnavailable,
+    Daemon,
+    Lock,
 }
 
 impl AgentGatewayRuntime {
@@ -993,6 +1178,217 @@ impl AgentGatewayRuntime {
         })
     }
 
+    fn propose_artifact_draft(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        draft: AgentArtifactDraftRequest,
+    ) -> Result<AgentArtifactDraftResponse, ArtifactDraftError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| ArtifactDraftError::SessionUnavailable)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(ArtifactDraftError::AcpRequired);
+        }
+        if self.artifact_draft_compiler.is_none() {
+            return Err(ArtifactDraftError::RuntimeUnavailable);
+        }
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| ArtifactDraftError::ArtifactUnavailable)?;
+        let request = validate_artifact_draft(&artifact, draft)?;
+        let payload =
+            serde_json::to_vec(&request).map_err(|_| ArtifactDraftError::InvalidRequest)?;
+        let payload_digest = sha256_bytes(&payload);
+        let mut drafts = self
+            .artifact_drafts
+            .lock()
+            .map_err(|_| ArtifactDraftError::Lock)?;
+        drafts.retain(|_, record| {
+            record.session_id != session_id
+                || matches!(
+                    record.state,
+                    ArtifactDraftState::WaitingApproval | ArtifactDraftState::Compiling
+                )
+        });
+        if drafts.values().any(|record| {
+            record.session_id == session_id
+                && matches!(
+                    record.state,
+                    ArtifactDraftState::WaitingApproval | ArtifactDraftState::Compiling
+                )
+        }) {
+            return Err(ArtifactDraftError::Busy);
+        }
+        let operation = self
+            .config
+            .daemon
+            .propose_operation(
+                session.task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.genui.compile".into(),
+                    payload_digest,
+                },
+                format!(
+                    "Publish edited GenUI artifact revision {}",
+                    request.source_revision
+                ),
+                RiskClass::ReadOnly,
+                vec![
+                    "artifact_build".into(),
+                    "deno_runtime".into(),
+                    "artifact_publish".into(),
+                ],
+            )
+            .map_err(|_| ArtifactDraftError::Daemon)?;
+        let record = ArtifactDraftRecord {
+            session_id,
+            task_id: session.task_id,
+            base_artifact_id: artifact_id,
+            base_source_revision: artifact.metadata.source_revision,
+            waiting_revision: operation.revision,
+            request,
+            state: ArtifactDraftState::WaitingApproval,
+        };
+        let response = artifact_draft_response(operation.operation_id, operation.revision, &record);
+        drafts.insert(operation.operation_id, record);
+        Ok(response)
+    }
+
+    fn artifact_draft_status(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        operation_id: OperationId,
+    ) -> Result<AgentArtifactDraftResponse, ArtifactDraftError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| ArtifactDraftError::SessionUnavailable)?;
+        let drafts = self
+            .artifact_drafts
+            .lock()
+            .map_err(|_| ArtifactDraftError::Lock)?;
+        let record = drafts
+            .get(&operation_id)
+            .filter(|record| {
+                record.session_id == session_id
+                    && record.task_id == session.task_id
+                    && record.base_artifact_id == artifact_id
+            })
+            .ok_or(ArtifactDraftError::ArtifactUnavailable)?;
+        let revision = self
+            .config
+            .daemon
+            .operation(operation_id)
+            .map(|operation| operation.revision)
+            .unwrap_or(record.waiting_revision);
+        Ok(artifact_draft_response(operation_id, revision, record))
+    }
+
+    fn execute_artifact_draft(&self, operation_id: OperationId, authorized_revision: u64) {
+        let record = match self
+            .artifact_drafts
+            .lock()
+            .ok()
+            .and_then(|drafts| drafts.get(&operation_id).cloned())
+        {
+            Some(record) => record,
+            None => return,
+        };
+        let dispatching = match self.config.daemon.begin_operation(
+            record.task_id,
+            operation_id,
+            authorized_revision,
+        ) {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.set_artifact_draft_failed(operation_id, &error.to_string());
+                return;
+            }
+        };
+        let result = (|| {
+            let current = self
+                .config
+                .daemon
+                .read_active_genui_artifact(record.task_id, record.base_artifact_id)
+                .map_err(|_| "base artifact is no longer current".to_owned())?;
+            if current.metadata.source_revision != record.base_source_revision {
+                return Err("base artifact revision is no longer current".to_owned());
+            }
+            let compiler = self
+                .artifact_draft_compiler
+                .as_ref()
+                .ok_or_else(|| "Rust-supervised Deno compiler is unavailable".to_owned())?;
+            let candidate = compiler.compile(record.request.clone())?;
+            self.config
+                .daemon
+                .accept_genui_artifact_from_base(
+                    record.task_id,
+                    operation_id,
+                    dispatching.revision,
+                    record.base_artifact_id,
+                    record.base_source_revision,
+                    candidate,
+                )
+                .map_err(|error| error.to_string())
+        })();
+        match result {
+            Ok(artifact) => {
+                let completion = OperationCompletion {
+                    executor: "hyper-term-artifact-draft".into(),
+                    succeeded: true,
+                    outcome: Some(OperationOutcome::Succeeded),
+                    summary: format!(
+                        "published GenUI artifact revision {}",
+                        artifact.source_revision
+                    ),
+                    result_digest: Some(artifact.content_digest.clone()),
+                };
+                if let Err(error) = self.config.daemon.complete_operation(
+                    record.task_id,
+                    operation_id,
+                    dispatching.revision,
+                    completion,
+                ) {
+                    self.set_artifact_draft_failed(operation_id, &error.to_string());
+                    return;
+                }
+                if let Ok(mut drafts) = self.artifact_drafts.lock()
+                    && let Some(record) = drafts.get_mut(&operation_id)
+                {
+                    record.state = ArtifactDraftState::Accepted(artifact);
+                }
+            }
+            Err(message) => {
+                let summary = bounded_error(&message);
+                let _ = self.config.daemon.complete_operation(
+                    record.task_id,
+                    operation_id,
+                    dispatching.revision,
+                    OperationCompletion {
+                        executor: "hyper-term-artifact-draft".into(),
+                        succeeded: false,
+                        outcome: Some(OperationOutcome::Failed),
+                        summary: summary.clone(),
+                        result_digest: None,
+                    },
+                );
+                self.set_artifact_draft_failed(operation_id, &summary);
+            }
+        }
+    }
+
+    fn set_artifact_draft_failed(&self, operation_id: OperationId, message: &str) {
+        if let Ok(mut drafts) = self.artifact_drafts.lock()
+            && let Some(record) = drafts.get_mut(&operation_id)
+        {
+            record.state = ArtifactDraftState::Failed(bounded_error(message));
+        }
+    }
+
     fn editor_lsp_query(
         &self,
         session_id: u16,
@@ -1115,6 +1511,66 @@ impl AgentGatewayRuntime {
                 && !allowable_brokered_mcp_operation(&operation)
             {
                 return Err(SessionError::UnsafeApproval);
+            }
+            let draft = self
+                .artifact_drafts
+                .lock()
+                .map_err(|_| SessionError::Lock)?
+                .get(&request.operation_id)
+                .cloned();
+            if let Some(draft) = draft {
+                if draft.session_id != session_id
+                    || draft.task_id != session.task_id
+                    || draft.waiting_revision != request.expected_revision
+                    || !matches!(draft.state, ArtifactDraftState::WaitingApproval)
+                {
+                    return Err(SessionError::StalePermission);
+                }
+                let decided = self
+                    .config
+                    .daemon
+                    .decide_permission(
+                        session.task_id,
+                        request.operation_id,
+                        request.expected_revision,
+                        request.decision,
+                    )
+                    .map_err(|_| SessionError::StalePermission)?;
+                {
+                    let mut drafts = self
+                        .artifact_drafts
+                        .lock()
+                        .map_err(|_| SessionError::Lock)?;
+                    let record = drafts
+                        .get_mut(&request.operation_id)
+                        .ok_or(SessionError::StalePermission)?;
+                    record.state = if request.decision == PermissionDecision::AllowOnce {
+                        ArtifactDraftState::Compiling
+                    } else {
+                        ArtifactDraftState::Rejected
+                    };
+                }
+                if request.decision == PermissionDecision::AllowOnce {
+                    let runtime = self.clone();
+                    std::thread::Builder::new()
+                        .name(format!("hyper-term-artifact-draft-{session_id}"))
+                        .spawn(move || {
+                            runtime.execute_artifact_draft(request.operation_id, decided.revision)
+                        })
+                        .map_err(|_| {
+                            self.set_artifact_draft_failed(
+                                request.operation_id,
+                                "Artifact draft worker could not start",
+                            );
+                            SessionError::Thread
+                        })?;
+                }
+                let status = session
+                    .progress
+                    .lock()
+                    .map_err(|_| SessionError::Lock)?
+                    .status;
+                return Ok(AgentTurnResponse { session_id, status });
             }
             self.config
                 .daemon
@@ -1271,6 +1727,7 @@ impl AgentGatewayRuntime {
     }
 
     fn close_session(&self, session_id: u16) {
+        self.close_artifact_drafts(session_id);
         let session = self
             .sessions
             .lock()
@@ -1286,6 +1743,14 @@ impl AgentGatewayRuntime {
     }
 
     fn close_all(&self) {
+        let session_ids = self
+            .sessions
+            .lock()
+            .map(|sessions| sessions.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for session_id in session_ids {
+            self.close_artifact_drafts(session_id);
+        }
         let sessions = if let Ok(mut sessions) = self.sessions.lock() {
             sessions.drain().map(|(_, session)| session).collect()
         } else {
@@ -1298,7 +1763,215 @@ impl AgentGatewayRuntime {
         if let Some(editor_lsp) = &self.editor_lsp {
             editor_lsp.close_all();
         }
+        if let Some(compiler) = &self.artifact_draft_compiler {
+            compiler.close();
+        }
     }
+
+    fn close_artifact_drafts(&self, session_id: u16) {
+        let waiting = self
+            .artifact_drafts
+            .lock()
+            .map(|drafts| {
+                drafts
+                    .iter()
+                    .filter_map(|(operation_id, record)| {
+                        (record.session_id == session_id
+                            && matches!(record.state, ArtifactDraftState::WaitingApproval))
+                        .then_some((*operation_id, record.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (operation_id, record) in waiting {
+            let _ = self.config.daemon.decide_permission(
+                record.task_id,
+                operation_id,
+                record.waiting_revision,
+                PermissionDecision::Cancelled,
+            );
+        }
+        if let Ok(mut drafts) = self.artifact_drafts.lock() {
+            drafts.retain(|_, record| record.session_id != session_id);
+        }
+    }
+}
+
+impl ArtifactDraftCompiler {
+    fn new(
+        runtime: &AgentGenUiRuntimeConfig,
+        state_directory: &Path,
+    ) -> Result<Self, AgentGatewayError> {
+        let root = state_directory.join("artifact-drafts");
+        create_private_runtime_root(&root)?;
+        let cache_directory = root.join("cache");
+        let scratch_directory = root.join("scratch");
+        create_private_runtime_root(&cache_directory)?;
+        create_private_runtime_root(&scratch_directory)?;
+        let executable_sha256 = sha256_file(&runtime.deno_executable)
+            .map_err(|error| AgentGatewayError::InvalidGenUiRuntime(error.to_string()))?;
+        let compiler_script_sha256 = sha256_file(&runtime.compiler_script)
+            .map_err(|error| AgentGatewayError::InvalidGenUiRuntime(error.to_string()))?;
+        let compiler_wasm_sha256 = sha256_file(&runtime.compiler_wasm)
+            .map_err(|error| AgentGatewayError::InvalidGenUiRuntime(error.to_string()))?;
+        Ok(Self {
+            config: DenoGenUiConfig {
+                executable: runtime.deno_executable.clone(),
+                executable_sha256,
+                runtime_version: runtime.runtime_version.clone(),
+                compiler_script: runtime.compiler_script.clone(),
+                compiler_script_sha256,
+                compiler_wasm: runtime.compiler_wasm.clone(),
+                compiler_wasm_sha256,
+                compiler_version: runtime.compiler_version.clone(),
+                cache_directory,
+                scratch_directory,
+            },
+            compiler: Mutex::new(None),
+        })
+    }
+
+    fn compile(&self, request: GenUiCompileRequest) -> Result<GenUiArtifactCandidate, String> {
+        let compiler = {
+            let mut compiler = self
+                .compiler
+                .lock()
+                .map_err(|_| "Artifact compiler lock is poisoned".to_owned())?;
+            if compiler
+                .as_ref()
+                .is_some_and(|compiler| compiler.state().is_ok_and(DriverState::is_terminal))
+            {
+                compiler.take();
+            }
+            if compiler.is_none() {
+                *compiler = Some(Arc::new(
+                    DenoGenUiCompiler::launch(self.config.clone(), Duration::from_secs(10))
+                        .map_err(|error| error.to_string())?,
+                ));
+            }
+            Arc::clone(
+                compiler
+                    .as_ref()
+                    .expect("artifact compiler was initialized"),
+            )
+        };
+        let result = compiler
+            .compile(request.clone(), Duration::from_secs(15))
+            .map_err(|error| error.to_string());
+        if compiler.state().is_ok_and(DriverState::is_terminal)
+            && let Ok(mut active) = self.compiler.lock()
+            && active
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &compiler))
+        {
+            active.take();
+        }
+        let candidate = result?;
+        Ok(GenUiArtifactCandidate {
+            schema_version: candidate.schema_version as u16,
+            source_revision: candidate.source_revision,
+            entrypoint: candidate.entrypoint,
+            source_files: request.files,
+            bundle: candidate.bundle,
+            css: candidate.css,
+            source_map: candidate.source_map,
+            content_digest: candidate.content_digest,
+            compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                name: candidate.compiler.name,
+                version: candidate.compiler.version,
+            },
+            diagnostics: candidate
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| hyper_term_protocol::GenUiCompileDiagnostic {
+                    severity: diagnostic.severity,
+                    text: diagnostic.text,
+                    file: diagnostic.file,
+                    line: diagnostic.line,
+                    column: diagnostic.column,
+                })
+                .collect(),
+        })
+    }
+
+    fn close(&self) {
+        if let Ok(mut compiler) = self.compiler.lock()
+            && let Some(compiler) = compiler.take()
+        {
+            let _ = compiler.shutdown();
+        }
+    }
+}
+
+fn validate_artifact_draft(
+    artifact: &crate::artifact_store::StoredGenUiArtifact,
+    draft: AgentArtifactDraftRequest,
+) -> Result<GenUiCompileRequest, ArtifactDraftError> {
+    if draft.base_source_revision != artifact.metadata.source_revision {
+        return Err(ArtifactDraftError::StaleRevision);
+    }
+    if draft.entrypoint != artifact.metadata.entrypoint
+        || draft.files.is_empty()
+        || draft.files.len() > MAX_ARTIFACT_DRAFT_FILES
+        || !draft.files.contains_key(&draft.entrypoint)
+        || !draft.files.keys().eq(artifact.source_files.keys())
+    {
+        return Err(ArtifactDraftError::InvalidRequest);
+    }
+    let source_bytes = draft
+        .files
+        .values()
+        .try_fold(0_usize, |total, source| total.checked_add(source.len()));
+    if source_bytes.is_none_or(|bytes| bytes > MAX_ARTIFACT_DRAFT_SOURCE_BYTES) {
+        return Err(ArtifactDraftError::InvalidRequest);
+    }
+    if draft.files == artifact.source_files {
+        return Err(ArtifactDraftError::NoChanges);
+    }
+    let source_revision = artifact
+        .metadata
+        .source_revision
+        .checked_add(1)
+        .ok_or(ArtifactDraftError::StaleRevision)?;
+    Ok(GenUiCompileRequest {
+        source_revision,
+        entrypoint: draft.entrypoint,
+        files: draft.files,
+    })
+}
+
+fn artifact_draft_response(
+    operation_id: OperationId,
+    operation_revision: u64,
+    record: &ArtifactDraftRecord,
+) -> AgentArtifactDraftResponse {
+    let (status, artifact, error) = match &record.state {
+        ArtifactDraftState::WaitingApproval => (ArtifactDraftStatus::WaitingApproval, None, None),
+        ArtifactDraftState::Compiling => (ArtifactDraftStatus::Compiling, None, None),
+        ArtifactDraftState::Accepted(artifact) => {
+            (ArtifactDraftStatus::Accepted, Some(artifact.clone()), None)
+        }
+        ArtifactDraftState::Rejected => (ArtifactDraftStatus::Rejected, None, None),
+        ArtifactDraftState::Failed(error) => {
+            (ArtifactDraftStatus::Failed, None, Some(error.clone()))
+        }
+    };
+    AgentArtifactDraftResponse {
+        operation_id,
+        operation_revision,
+        status,
+        artifact,
+        error,
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut digest, byte| {
+            let _ = write!(digest, "{byte:02x}");
+            digest
+        })
 }
 
 fn canonical_runtime_asset(path: &std::path::Path) -> Result<PathBuf, AgentGatewayError> {
@@ -1702,6 +2375,176 @@ mod tests {
 
     use super::*;
 
+    fn draft_fixture() -> crate::artifact_store::StoredGenUiArtifact {
+        crate::artifact_store::StoredGenUiArtifact {
+            metadata: hyper_term_protocol::AcceptedGenUiArtifact {
+                artifact_id: ArtifactId::new(),
+                source_revision: 7,
+                entrypoint: "/App.tsx".into(),
+                content_digest: "a".repeat(64),
+                compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                    name: "esbuild-wasm".into(),
+                    version: "0.28.1".into(),
+                },
+            },
+            source_files: BTreeMap::from([
+                ("/App.tsx".into(), "export default () => null;".into()),
+                ("/theme.ts".into(), "export const accent = 'green';".into()),
+            ]),
+            bundle: "globalThis.fixture=true;".into(),
+            css: String::new(),
+            source_map: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn artifact_drafts_require_the_current_revision_and_rust_owned_file_set() {
+        let artifact = draft_fixture();
+        let changed = BTreeMap::from([
+            (
+                "/App.tsx".into(),
+                "export default () => <main>Live</main>;".into(),
+            ),
+            ("/theme.ts".into(), "export const accent = 'green';".into()),
+        ]);
+        let request = validate_artifact_draft(
+            &artifact,
+            AgentArtifactDraftRequest {
+                base_source_revision: 7,
+                entrypoint: "/App.tsx".into(),
+                files: changed.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(request.source_revision, 8);
+        assert_eq!(request.files, changed);
+        assert!(matches!(
+            validate_artifact_draft(
+                &artifact,
+                AgentArtifactDraftRequest {
+                    base_source_revision: 6,
+                    entrypoint: "/App.tsx".into(),
+                    files: request.files.clone(),
+                }
+            ),
+            Err(ArtifactDraftError::StaleRevision)
+        ));
+        let mut escaped = request.files;
+        escaped.insert("/invented.ts".into(), "export {};".into());
+        assert!(matches!(
+            validate_artifact_draft(
+                &artifact,
+                AgentArtifactDraftRequest {
+                    base_source_revision: 7,
+                    entrypoint: "/App.tsx".into(),
+                    files: escaped,
+                }
+            ),
+            Err(ArtifactDraftError::InvalidRequest)
+        ));
+        assert!(matches!(
+            validate_artifact_draft(
+                &artifact,
+                AgentArtifactDraftRequest {
+                    base_source_revision: 7,
+                    entrypoint: "/App.tsx".into(),
+                    files: artifact.source_files.clone(),
+                }
+            ),
+            Err(ArtifactDraftError::NoChanges)
+        ));
+    }
+
+    #[test]
+    fn base_fenced_acceptance_rejects_an_artifact_replaced_during_build() {
+        let temporary = tempfile::tempdir().unwrap();
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
+        let task_id = daemon.create_task("artifact base fence".into()).unwrap();
+        let dispatch = || {
+            let proposed = daemon
+                .propose_operation(
+                    task_id,
+                    OperationKind::McpTool,
+                    OperationAction::Opaque {
+                        kind: "hyper_term.genui.compile".into(),
+                        payload_digest: "a".repeat(64),
+                    },
+                    "compile artifact".into(),
+                    RiskClass::ReadOnly,
+                    vec!["artifact_build".into()],
+                )
+                .unwrap();
+            let authorized = daemon
+                .decide_permission(
+                    task_id,
+                    proposed.operation_id,
+                    proposed.revision,
+                    PermissionDecision::AllowOnce,
+                )
+                .unwrap();
+            daemon
+                .begin_operation(task_id, proposed.operation_id, authorized.revision)
+                .unwrap()
+        };
+        let candidate = |revision: u64, label: &str| {
+            let bundle = format!("globalThis.label={label:?};");
+            GenUiArtifactCandidate {
+                schema_version: 1,
+                source_revision: revision,
+                entrypoint: "/App.tsx".into(),
+                source_files: BTreeMap::from([(
+                    "/App.tsx".into(),
+                    format!("export default () => {label:?};"),
+                )]),
+                content_digest: sha256_bytes(bundle.as_bytes()),
+                bundle,
+                css: String::new(),
+                source_map: "{}".into(),
+                compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                    name: "esbuild-wasm".into(),
+                    version: "0.28.1".into(),
+                },
+                diagnostics: Vec::new(),
+            }
+        };
+        let first_operation = dispatch();
+        let first = daemon
+            .accept_genui_artifact(
+                task_id,
+                first_operation.operation_id,
+                first_operation.revision,
+                candidate(1, "first"),
+            )
+            .unwrap();
+        let second_operation = dispatch();
+        let second = daemon
+            .accept_genui_artifact_from_base(
+                task_id,
+                second_operation.operation_id,
+                second_operation.revision,
+                first.artifact_id,
+                first.source_revision,
+                candidate(2, "second"),
+            )
+            .unwrap();
+        let stale_operation = dispatch();
+        assert!(matches!(
+            daemon.accept_genui_artifact_from_base(
+                task_id,
+                stale_operation.operation_id,
+                stale_operation.revision,
+                first.artifact_id,
+                first.source_revision,
+                candidate(2, "stale"),
+            ),
+            Err(crate::DaemonError::ArtifactBaseNotCurrent { .. })
+        ));
+        assert_eq!(
+            daemon.active_genui_artifact(task_id).unwrap().unwrap(),
+            second
+        );
+    }
+
     #[test]
     fn preview_bootstrap_is_inline_escaped_and_keeps_the_runtime_capsule() {
         let artifact_id = ArtifactId::new();
@@ -2097,6 +2940,240 @@ mod tests {
             response["completions"]
                 .as_array()
                 .is_some_and(|items| !items.is_empty())
+        );
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires HYPER_TERM_DENO_PATH and built dist/runtime GenUI assets"]
+    async fn approved_artifact_draft_is_recompiled_by_deno_and_replaces_the_revision() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
+        let fake_acp = temporary.path().join("fixture-acp");
+        std::fs::write(
+            &fake_acp,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"draft-session\"}}' ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_acp).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_acp, permissions).unwrap();
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let deno =
+            PathBuf::from(std::env::var_os("HYPER_TERM_DENO_PATH").expect("HYPER_TERM_DENO_PATH"))
+                .canonicalize()
+                .unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace,
+            state_directory: temporary.path().join("gateway-state"),
+            daemon: daemon.clone(),
+            codex_executable: None,
+            codex_auth_file: None,
+            acp_providers: vec![AcpAgentProviderConfig {
+                provider_id: "fixture-acp".into(),
+                executable: fake_acp,
+                arguments: Vec::new(),
+                environment: BTreeMap::new(),
+                implementation_version: "fixture-1".into(),
+            }],
+            mcp_executable: None,
+            genui_runtime: Some(AgentGenUiRuntimeConfig {
+                deno_executable: deno,
+                runtime_version: "2.9.3".into(),
+                compiler_script: repository.join("dist/runtime/genui-compiler.js"),
+                compiler_wasm: repository.join("dist/runtime/esbuild.wasm"),
+                preview_shell: repository.join("dist/runtime/genui/preview.html"),
+                compiler_version: "0.28.1".into(),
+            }),
+            workbench_assets: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .unwrap();
+        let session_path =
+            format!("/agent/session?token={token}&session_id=9&provider=fixture-acp");
+        let (status, body) = request_path(gateway.address(), &session_path, "POST", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id: TaskId = serde_json::from_value(session["task_id"].clone()).unwrap();
+        let initial_operation = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.genui.compile".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                "Seed draft fixture".into(),
+                RiskClass::ReadOnly,
+                vec!["artifact_build".into()],
+            )
+            .unwrap();
+        let authorized = daemon
+            .decide_permission(
+                task_id,
+                initial_operation.operation_id,
+                initial_operation.revision,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap();
+        let dispatching = daemon
+            .begin_operation(task_id, initial_operation.operation_id, authorized.revision)
+            .unwrap();
+        let initial_source = "export default function App(){return <main>Initial</main>;}";
+        let bundle = "globalThis.initialArtifact=true;";
+        let accepted = daemon
+            .accept_genui_artifact(
+                task_id,
+                initial_operation.operation_id,
+                dispatching.revision,
+                GenUiArtifactCandidate {
+                    schema_version: 1,
+                    source_revision: 1,
+                    entrypoint: "/App.tsx".into(),
+                    source_files: BTreeMap::from([("/App.tsx".into(), initial_source.into())]),
+                    bundle: bundle.into(),
+                    css: String::new(),
+                    source_map: "{\"version\":3}".into(),
+                    content_digest: sha256_bytes(bundle.as_bytes()),
+                    compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                        name: "esbuild-wasm".into(),
+                        version: "0.28.1".into(),
+                    },
+                    diagnostics: Vec::new(),
+                },
+            )
+            .unwrap();
+        daemon
+            .complete_operation(
+                task_id,
+                initial_operation.operation_id,
+                dispatching.revision,
+                OperationCompletion {
+                    executor: "fixture".into(),
+                    succeeded: true,
+                    outcome: Some(OperationOutcome::Succeeded),
+                    summary: "seeded fixture".into(),
+                    result_digest: Some(accepted.content_digest.clone()),
+                },
+            )
+            .unwrap();
+        let edited_source = "export default function App(){return <main>Published by Deno</main>;}";
+        let draft_path = format!(
+            "/agent/artifact/{}/draft?token={token}&session_id=9",
+            accepted.artifact_id
+        );
+        let draft_body = serde_json::to_vec(&serde_json::json!({
+            "base_source_revision": 1,
+            "entrypoint": "/App.tsx",
+            "files": {"/App.tsx": edited_source}
+        }))
+        .unwrap();
+        let (status, body) =
+            request_path(gateway.address(), &draft_path, "POST", &draft_body).await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
+        let rejected: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rejected_operation: OperationId =
+            serde_json::from_value(rejected["operation_id"].clone()).unwrap();
+        let rejection = serde_json::to_vec(&serde_json::json!({
+            "operation_id": rejected_operation,
+            "expected_revision": rejected["operation_revision"],
+            "decision": "reject_once"
+        }))
+        .unwrap();
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                &format!("/agent/session/permission?token={token}&session_id=9"),
+                "POST",
+                &rejection,
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+        let rejected_path = format!("{draft_path}&operation_id={rejected_operation}");
+        let (status, body) = request_path(gateway.address(), &rejected_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"],
+            "rejected"
+        );
+        assert_eq!(
+            daemon.active_genui_artifact(task_id).unwrap().unwrap(),
+            accepted
+        );
+        let (status, body) =
+            request_path(gateway.address(), &draft_path, "POST", &draft_body).await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
+        let proposed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(proposed["status"], "waiting_approval");
+        let operation_id: OperationId =
+            serde_json::from_value(proposed["operation_id"].clone()).unwrap();
+        let operation_revision = proposed["operation_revision"].as_u64().unwrap();
+        let snapshot = serde_json::to_string(&daemon.block_snapshot(task_id).unwrap()).unwrap();
+        assert!(snapshot.contains("\"type\":\"approval\""));
+        assert!(snapshot.contains(&operation_id.to_string()));
+        let permission = serde_json::to_vec(&serde_json::json!({
+            "operation_id": operation_id,
+            "expected_revision": operation_revision,
+            "decision": "allow_once"
+        }))
+        .unwrap();
+        let (status, body) = request_path(
+            gateway.address(),
+            &format!("/agent/session/permission?token={token}&session_id=9"),
+            "POST",
+            &permission,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
+        let status_path = format!("{draft_path}&operation_id={operation_id}");
+        let mut published = None;
+        for _ in 0..200 {
+            let (status, body) = request_path(gateway.address(), &status_path, "GET", b"").await;
+            assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if response["status"] == "accepted" {
+                published = Some(response);
+                break;
+            }
+            assert!(matches!(
+                response["status"].as_str(),
+                Some("waiting_approval" | "compiling")
+            ));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let published = published.expect("Deno artifact draft accepted within five seconds");
+        let published_id = published["artifact"]["artifact_id"].as_str().unwrap();
+        assert_eq!(published["artifact"]["source_revision"], 2);
+        let source_path =
+            format!("/agent/artifact/{published_id}/source?token={token}&session_id=9");
+        let (status, body) = request_path(gateway.address(), &source_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let source: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(source["files"]["/App.tsx"], edited_source);
+        assert_eq!(source["source_revision"], 2);
+        let stale = serde_json::to_vec(&serde_json::json!({
+            "base_source_revision": 1,
+            "entrypoint": "/App.tsx",
+            "files": {"/App.tsx": "export default () => null;"}
+        }))
+        .unwrap();
+        let stale_path = format!("/agent/artifact/{published_id}/draft?token={token}&session_id=9");
+        assert_eq!(
+            request_path(gateway.address(), &stale_path, "POST", &stale)
+                .await
+                .0,
+            StatusCode::CONFLICT.as_u16()
         );
         gateway.shutdown().await.unwrap();
     }
@@ -2678,6 +3755,8 @@ mod tests {
             preview_shell: None,
             workbench_assets: None,
             editor_lsp: None,
+            artifact_draft_compiler: None,
+            artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
         };
         let session_root = state_directory.join("agents/session-7");
         let config = runtime
