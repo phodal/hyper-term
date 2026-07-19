@@ -13,7 +13,8 @@ executors and projections of one durable human–AI task model.
 > provider-neutral structured Agent sessions, real Codex ACP and Claude ACP
 > prompt gates, a brokered MCP gateway, and a terminal-first React Workbench
 > built directly by pinned Deno. The packaged Native SDK application now carries
-> a digest-checked Deno GenUI compiler. Broker-accepted artifacts are persisted
+> a digest-checked Deno GenUI compiler and frozen official Codex/Claude ACP
+> adapters without bundling Node. Broker-accepted artifacts are persisted
 > by Rust, projected as isolated Blocks, and served to a bounded Native WebView
 > pane without replacing the last-known-good revision on failure. Deno LSP and
 > GenUI now run in digest-bound macOS Seatbelt task profiles, and timed-out
@@ -372,20 +373,23 @@ unexpected effect proposal. Point it at an inspected official adapter artifact:
 HYPER_TERM_ACP_PATH=/absolute/path/to/codex-acp \
 HYPER_TERM_ACP_SHA256=<inspected-adapter-sha256> \
 HYPER_TERM_ACP_PROVIDER_ID=codex \
-CODEX_PATH=/absolute/path/to/codex \
+HYPER_TERM_CODEX_PATH=/absolute/path/to/codex \
 cargo test -p hyper-term-drivers --test acp_agent -- --ignored
 
 # Official Claude Agent ACP
 HYPER_TERM_ACP_PATH=/absolute/path/to/claude-agent-acp \
 HYPER_TERM_ACP_SHA256=<inspected-adapter-sha256> \
 HYPER_TERM_ACP_PROVIDER_ID=claude \
-CLAUDE_CODE_EXECUTABLE=/absolute/path/to/claude \
+HYPER_TERM_CLAUDE_PATH=/absolute/path/to/claude \
 cargo test -p hyper-term-drivers --test acp_agent -- --ignored
 ```
 
 Automatic desktop discovery rejects the legacy `@zed-industries/codex-acp`
-signature. The official adapters used by the real gates are not yet bundled;
-pinning them into the signed application is a distribution gate.
+signature. Packaged applications instead prefer official Codex ACP 1.1.4 and
+Claude Agent ACP 0.59.0 from the per-file digest-verified, Deno-locked offline
+runtime. The large provider binaries are deliberately excluded: a provider is
+shown only when the corresponding locally authenticated `codex` or `claude`
+executable is available.
 
 ## License
 

@@ -153,11 +153,15 @@ set is enabled per release.
   subscription authentication on macOS requires the exact Claude executable
   plus `USER` and `LOGNAME` so its Keychain entry remains visible; API keys are
   not inherited by the adapter.
-- Distribution still needs pinned official adapter/runtime artifacts inside the
-  signed app bundle, the containment decision in ADR 0014, a terminal-auth UI,
-  and the full fuzz and protocol-upgrade matrix. The internal MCP adapter remains
-  a bounded stdio subset; adopting the complete Rust MCP SDK remains a release
-  gate.
+- The signed app build now materializes both official adapter packages through
+  a frozen Deno lockfile, removes their redundant provider binaries, records a
+  bounded per-file digest inventory, and runs the offline entrypoints with the
+  already bundled Deno runtime. Real prompt gates pass through this exact pruned
+  artifact for both providers.
+- Distribution still needs the containment decision in ADR 0014, a
+  terminal-auth UI, and the full fuzz and protocol-upgrade matrix. The internal
+  MCP adapter remains a bounded stdio subset; adopting the complete Rust MCP SDK
+  remains a release gate.
 
 ## Validation gates
 

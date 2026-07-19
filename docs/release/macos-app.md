@@ -13,18 +13,30 @@ The final bundle contains:
 - `Contents/MacOS/hyper-term`: the Rust desktop supervisor and PTY authority;
 - `Contents/MacOS/hyper-term-ui`: the Native SDK window and renderer;
 - `Contents/MacOS/hyper-term-mcp`: the Agent-mode-only, brokered stdio MCP connector;
-- `Contents/Resources/terminal`: the built terminal WebView assets.
+- `Contents/Resources/terminal`: the built terminal WebView assets;
 - `Contents/Resources/runtime/deno`: the pinned, supervised Deno sidecar;
 - `Contents/Resources/runtime/genui-compiler.js` and `esbuild.wasm`: the
-  digest-checked cold-path GenUI compiler used only after broker approval.
+  digest-checked cold-path GenUI compiler used only after broker approval;
+- `Contents/Resources/runtime/acp`: the frozen production dependency trees for
+  official Codex ACP 1.1.4 and Claude Agent ACP 0.59.0, plus a per-file digest
+  manifest and the Deno lockfile used to reproduce them.
 
 Native SDK first creates an unsigned `.app`. The workflow then composes the
 complete bundle, signs every Mach-O executable and the outer bundle, submits it
 to Apple's notary service, staples the ticket, and finally creates the release
 ZIP. Modifying the bundle after the signing step invalidates its signature.
 The bundled Deno executable is re-signed with the reviewed V8/JIT entitlements
-in `runtime/deno.entitlements.plist`; Rust still clears its environment and
-starts it without shell, network, write, FFI, or workspace permissions.
+in `runtime/deno.entitlements.plist`. Rust gives the GenUI compiler no shell,
+network, FFI, or workspace authority. The ACP adapters use the same pinned Deno
+binary and an offline local dependency tree, but still launch the user's
+authenticated Codex or Claude executable; binding those provider processes to
+the Tier 2 containment policy remains the release gate in ADR 0014.
+
+The application does not bundle Node or the large provider CLI binaries. It
+only offers a bundled ACP provider when the matching `codex` or `claude`
+executable is available locally. Rust verifies all ACP runtime files before
+advertising that provider, clears inherited API keys, and passes the exact
+discovered executable path to the adapter.
 
 For pipeline testing, a pre-release tag may run without Apple secrets. In that
 case the workflow ad-hoc signs the bundle and gives the asset an explicit
