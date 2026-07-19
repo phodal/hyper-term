@@ -258,6 +258,7 @@ struct LaunchedAgentProvider {
 struct AgentTurnProjection {
     turn_id: String,
     agent_block_id: BlockId,
+    agent_message_phase: u32,
     plan_block_id: BlockId,
     agent_message_bytes: usize,
     agent_message_interrupted: bool,
@@ -3577,6 +3578,7 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
         AgentTurnProjection {
             turn_id,
             agent_block_id: BlockId::new(),
+            agent_message_phase: 0,
             plan_block_id: BlockId::new(),
             agent_message_bytes: 0,
             agent_message_interrupted: false,
@@ -3615,18 +3617,16 @@ fn continue_turn(
                 if text.is_empty() {
                     continue;
                 }
-                let separator = if projection.agent_message_interrupted
-                    && projection.agent_message_bytes > 0
-                    && !text.starts_with('\n')
-                {
-                    "\n\n"
-                } else {
-                    ""
-                };
+                if projection.agent_message_interrupted && projection.agent_message_bytes > 0 {
+                    projection.agent_message_phase = projection
+                        .agent_message_phase
+                        .checked_add(1)
+                        .unwrap_or(u32::MAX);
+                    projection.agent_block_id = BlockId::new();
+                }
                 projection.agent_message_bytes = match projection
                     .agent_message_bytes
-                    .checked_add(separator.len())
-                    .and_then(|total| total.checked_add(text.len()))
+                    .checked_add(text.len())
                 {
                     Some(total) if total <= MAX_AGENT_MESSAGE_BYTES => total,
                     _ => {
@@ -3640,8 +3640,11 @@ fn continue_turn(
                         session.task_id,
                         projection.agent_block_id,
                         MessageRole::Agent,
-                        Some(projection.turn_id.clone()),
-                        format!("{separator}{text}"),
+                        Some(format!(
+                            "{}-message-{}",
+                            projection.turn_id, projection.agent_message_phase
+                        )),
+                        text,
                     )
                     .is_err()
                 {
@@ -4460,14 +4463,31 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert!(
-            snapshot["document"]["blocks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|block| block["payload"]["text"]
-                    == "Provider-neutral ACP is live.\n\nFinal answer.")
-        );
+        let blocks = snapshot["document"]["blocks"]
+            .as_array()
+            .expect("snapshot blocks");
+        let initial_message = blocks
+            .iter()
+            .position(|block| {
+                block["payload"]["role"] == "agent"
+                    && block["payload"]["text"] == "Provider-neutral ACP is live."
+            })
+            .expect("initial Agent message");
+        let thought = blocks
+            .iter()
+            .position(|block| {
+                block["payload"]["role"] == "thought"
+                    && block["payload"]["text"] == "Checking workspace"
+            })
+            .expect("Agent thought");
+        let final_message = blocks
+            .iter()
+            .position(|block| {
+                block["payload"]["role"] == "agent" && block["payload"]["text"] == "Final answer."
+            })
+            .expect("final Agent message");
+        assert!(initial_message < thought);
+        assert!(thought < final_message);
         assert_eq!(
             std::fs::read_dir(gateway_state.join("agents"))
                 .unwrap()
