@@ -32,6 +32,7 @@ const AGENT_PROVIDERS_ENV: &str = "HYPER_TERM_AGENT_PROVIDERS";
 const AGENT_PROVIDER_STATUS_ENV: &str = "HYPER_TERM_AGENT_PROVIDER_STATUS";
 const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const PROVIDER_PROBE_MAX_STDOUT_BYTES: usize = 4 * 1024;
+const ACP_PACKAGE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
 const ACP_RUNTIME_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const ACP_RUNTIME_MAX_FILES: usize = 8 * 1024;
 const ACP_RUNTIME_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
@@ -344,28 +345,23 @@ impl Options {
             .codex_acp
             .or_else(|| std::env::var_os("HYPER_TERM_CODEX_ACP_PATH").map(PathBuf::from))
             .map(ResolvedAcpAdapter::installed)
+            .or_else(|| discover_known_acp_adapter("codex-acp", home))
             .or_else(|| {
                 codex
                     .is_some()
                     .then(|| bundled_acp.get("codex-acp").cloned())
                     .flatten()
-            })
-            .or_else(|| {
-                discover_official_acp_adapter("codex-acp", home).map(ResolvedAcpAdapter::installed)
             });
         let claude_agent_acp = self
             .claude_agent_acp
             .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_AGENT_ACP_PATH").map(PathBuf::from))
             .map(ResolvedAcpAdapter::installed)
+            .or_else(|| discover_known_acp_adapter("claude-agent-acp", home))
             .or_else(|| {
                 claude
                     .is_some()
                     .then(|| bundled_acp.get("claude-acp").cloned())
                     .flatten()
-            })
-            .or_else(|| {
-                discover_official_acp_adapter("claude-agent-acp", home)
-                    .map(ResolvedAcpAdapter::installed)
             });
         Ok(ResolvedOptions {
             ui: self
@@ -479,10 +475,14 @@ enum ProbeOutcome {
 
 impl ResolvedAcpAdapter {
     fn installed(executable: PathBuf) -> Self {
+        Self::installed_version(executable, "installed")
+    }
+
+    fn installed_version(executable: PathBuf, implementation_version: impl Into<String>) -> Self {
         Self {
             executable,
             arguments: Vec::new(),
-            implementation_version: "installed".into(),
+            implementation_version: implementation_version.into(),
         }
     }
 }
@@ -1058,28 +1058,115 @@ fn find_executable(name: &str, home: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn discover_official_acp_adapter(name: &str, home: &Path) -> Option<PathBuf> {
+fn discover_known_acp_adapter(name: &str, home: &Path) -> Option<ResolvedAcpAdapter> {
     let executable = find_executable(name, home)?;
-    official_acp_adapter_version(&executable, name).then_some(executable)
+    resolve_known_acp_adapter(executable, name)
 }
 
 #[cfg(unix)]
-fn official_acp_adapter_version(executable: &Path, name: &str) -> bool {
-    let Ok(ProbeOutcome::Exited {
-        success: true,
-        stdout,
-    }) = run_bounded_probe(executable, &["--version"], None, PROVIDER_PROBE_TIMEOUT)
-    else {
+fn resolve_known_acp_adapter(executable: PathBuf, name: &str) -> Option<ResolvedAcpAdapter> {
+    let version = match name {
+        "codex-acp" => known_npm_acp_package_version(
+            &executable,
+            "codex-acp",
+            &[
+                "@zed-industries/codex-acp",
+                "@agentclientprotocol/codex-acp",
+            ],
+        ),
+        "claude-agent-acp" => known_npm_acp_package_version(
+            &executable,
+            "claude-agent-acp",
+            &["@agentclientprotocol/claude-agent-acp"],
+        ),
+        _ => None,
+    }?;
+    Some(ResolvedAcpAdapter::installed_version(executable, version))
+}
+
+#[derive(Deserialize)]
+struct NpmAcpPackageManifest {
+    name: String,
+    version: String,
+    bin: BTreeMap<String, String>,
+}
+
+#[cfg(unix)]
+fn known_npm_acp_package_version(
+    executable: &Path,
+    bin_name: &str,
+    known_packages: &[&str],
+) -> Option<String> {
+    let executable = executable.canonicalize().ok()?;
+    let executable_parent = executable.parent()?;
+    let package_root = [executable_parent, executable_parent.parent()?]
+        .into_iter()
+        .find(|directory| directory.join("package.json").exists())?;
+    let manifest_path = package_root.join("package.json");
+    let manifest_metadata = std::fs::symlink_metadata(&manifest_path).ok()?;
+    if manifest_metadata.file_type().is_symlink()
+        || !manifest_metadata.is_file()
+        || manifest_metadata.len() == 0
+        || manifest_metadata.len() > ACP_PACKAGE_MANIFEST_MAX_BYTES
+    {
+        return None;
+    }
+    let manifest_bytes = std::fs::read(&manifest_path).ok()?;
+    let manifest: NpmAcpPackageManifest = serde_json::from_slice(&manifest_bytes).ok()?;
+    if !known_packages.contains(&manifest.name.as_str())
+        || !npm_package_root_matches(package_root, &manifest.name)
+        || !valid_package_version(&manifest.version)
+    {
+        return None;
+    }
+    let declared_bin = validate_bundled_relative_path(manifest.bin.get(bin_name)?).ok()?;
+    let declared_executable = package_root.join(declared_bin).canonicalize().ok()?;
+    if declared_executable != executable {
+        return None;
+    }
+    Some(format!("{}@{}", manifest.name, manifest.version))
+}
+
+fn npm_package_root_matches(package_root: &Path, package_name: &str) -> bool {
+    let mut package_segments = package_name.split('/');
+    let Some(scope) = package_segments.next() else {
         return false;
     };
-    let stdout = String::from_utf8_lossy(&stdout);
-    match name {
-        "codex-acp" => stdout.contains("@agentclientprotocol/codex-acp"),
-        "claude-agent-acp" => stdout
-            .trim()
-            .starts_with(|character: char| character.is_ascii_digit()),
-        _ => false,
+    let Some(name) = package_segments.next() else {
+        return false;
+    };
+    if package_segments.next().is_some() || !scope.starts_with('@') {
+        return false;
     }
+    package_root.file_name() == Some(OsStr::new(name))
+        && package_root.parent().and_then(Path::file_name) == Some(OsStr::new(scope))
+        && package_root
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            == Some(OsStr::new("node_modules"))
+}
+
+fn valid_package_version(version: &str) -> bool {
+    if version.is_empty()
+        || version.len() > 128
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+        || !version
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return false;
+    }
+    let core_end = version.find(['-', '+']).unwrap_or(version.len());
+    let mut core = version[..core_end].split('.');
+    let parts = [core.next(), core.next(), core.next()];
+    core.next().is_none()
+        && parts.into_iter().all(|part| {
+            part.is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 
 #[cfg(unix)]
@@ -1358,27 +1445,155 @@ mod tests {
     }
 
     #[test]
-    fn automatic_acp_discovery_rejects_legacy_package_names() {
+    fn automatic_codex_acp_discovery_accepts_only_known_npm_entrypoints() {
         let temporary = tempfile::tempdir().expect("temporary adapters");
-        let official = temporary.path().join("official-codex-acp");
-        let legacy = temporary.path().join("legacy-codex-acp");
-        for (path, script) in [
-            (
-                &official,
-                "#!/bin/sh\nprintf '%s\\n' '@agentclientprotocol/codex-acp 1.1.4'\n",
-            ),
-            (
-                &legacy,
-                "#!/bin/sh\nprintf '%s\\n' 'error: unexpected argument --version' >&2\nexit 2\n",
-            ),
+        for (package, version, entrypoint) in [
+            ("@zed-industries/codex-acp", "0.15.0", "bin/codex-acp.js"),
+            ("@agentclientprotocol/codex-acp", "1.1.4", "dist/index.js"),
         ] {
-            std::fs::write(path, script).expect("adapter probe");
+            let package_root = temporary.path().join("node_modules").join(package);
+            let executable = package_root.join(entrypoint);
+            std::fs::create_dir_all(executable.parent().unwrap()).expect("adapter package");
+            std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("adapter entrypoint");
+            let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions).unwrap();
+            std::fs::write(
+                package_root.join("package.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": package,
+                    "version": version,
+                    "bin": { "codex-acp": entrypoint }
+                }))
+                .unwrap(),
+            )
+            .expect("adapter manifest");
+
+            let resolved = resolve_known_acp_adapter(executable, "codex-acp")
+                .expect("known Codex ACP package");
+            assert_eq!(
+                resolved.implementation_version,
+                format!("{package}@{version}")
+            );
+        }
+
+        let spoofed = temporary.path().join("spoofed-codex-acp");
+        std::fs::write(
+            &spoofed,
+            "#!/bin/sh\nprintf '%s\\n' '@agentclientprotocol/codex-acp 1.1.4'\n",
+        )
+        .expect("spoofed adapter");
+        let mut permissions = std::fs::metadata(&spoofed).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&spoofed, permissions).unwrap();
+        assert!(resolve_known_acp_adapter(spoofed, "codex-acp").is_none());
+
+        let pretender_root = temporary.path().join("pretender");
+        let pretender = pretender_root.join("codex-acp.js");
+        std::fs::create_dir_all(&pretender_root).expect("pretender package");
+        std::fs::write(&pretender, "#!/bin/sh\nexit 0\n").expect("pretender entrypoint");
+        let mut permissions = std::fs::metadata(&pretender).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&pretender, permissions).unwrap();
+        std::fs::write(
+            pretender_root.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@zed-industries/codex-acp",
+                "version": "0.15.0",
+                "bin": { "codex-acp": "codex-acp.js" }
+            }))
+            .unwrap(),
+        )
+        .expect("pretender manifest");
+        assert!(resolve_known_acp_adapter(pretender, "codex-acp").is_none());
+    }
+
+    #[test]
+    fn automatic_claude_acp_discovery_requires_the_known_npm_entrypoint() {
+        let temporary = tempfile::tempdir().expect("temporary adapter");
+        let package_root = temporary
+            .path()
+            .join("node_modules/@agentclientprotocol/claude-agent-acp");
+        let executable = package_root.join("dist/index.js");
+        std::fs::create_dir_all(executable.parent().unwrap()).expect("adapter package");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("adapter entrypoint");
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(
+            package_root.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@agentclientprotocol/claude-agent-acp",
+                "version": "0.59.0",
+                "bin": { "claude-agent-acp": "dist/index.js" }
+            }))
+            .unwrap(),
+        )
+        .expect("adapter manifest");
+
+        let resolved = resolve_known_acp_adapter(executable, "claude-agent-acp")
+            .expect("known Claude ACP package");
+        assert_eq!(
+            resolved.implementation_version,
+            "@agentclientprotocol/claude-agent-acp@0.59.0"
+        );
+    }
+
+    #[test]
+    fn automatic_codex_acp_discovery_rejects_manifest_bin_mismatch() {
+        let temporary = tempfile::tempdir().expect("temporary adapter");
+        let package_root = temporary
+            .path()
+            .join("node_modules/@zed-industries/codex-acp");
+        let executable = package_root.join("bin/codex-acp.js");
+        let other = package_root.join("bin/other.js");
+        std::fs::create_dir_all(executable.parent().unwrap()).expect("adapter package");
+        for path in [&executable, &other] {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").expect("adapter entrypoint");
             let mut permissions = std::fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).unwrap();
         }
-        assert!(official_acp_adapter_version(&official, "codex-acp"));
-        assert!(!official_acp_adapter_version(&legacy, "codex-acp"));
+        std::fs::write(
+            package_root.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@zed-industries/codex-acp",
+                "version": "0.15.0",
+                "bin": { "codex-acp": "bin/other.js" }
+            }))
+            .unwrap(),
+        )
+        .expect("adapter manifest");
+        assert!(resolve_known_acp_adapter(executable, "codex-acp").is_none());
+    }
+
+    #[test]
+    fn automatic_acp_discovery_accepts_only_bounded_semver_versions() {
+        for version in ["0.15.0", "1.2.3-beta.1", "2.0.0+darwin-arm64"] {
+            assert!(valid_package_version(version), "{version}");
+        }
+        for version in ["", "1", "1.2", "1.2.3.4", "1..3", "1.2.3-"] {
+            assert!(!valid_package_version(version), "{version}");
+        }
+        assert!(!valid_package_version(&"1".repeat(129)));
+    }
+
+    #[test]
+    #[ignore = "requires HYPER_TERM_ACP_PATH to select an installed known Codex ACP package"]
+    fn installed_codex_acp_is_bound_to_its_npm_package() {
+        let executable = std::env::var_os("HYPER_TERM_ACP_PATH")
+            .map(PathBuf::from)
+            .expect("HYPER_TERM_ACP_PATH");
+        let resolved = resolve_known_acp_adapter(executable, "codex-acp")
+            .expect("known installed Codex ACP package");
+        assert!(
+            resolved
+                .implementation_version
+                .starts_with("@zed-industries/codex-acp@")
+                || resolved
+                    .implementation_version
+                    .starts_with("@agentclientprotocol/codex-acp@")
+        );
     }
 
     #[test]

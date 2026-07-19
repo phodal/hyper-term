@@ -10,34 +10,25 @@ use hyper_term_protocol::{OperationId, PermissionDecision};
 use tempfile::TempDir;
 
 #[test]
+#[ignore = "requires HYPER_TERM_ACP_PATH, HYPER_TERM_ACP_SHA256, and an installed ACP adapter"]
+fn installed_acp_agent_completes_a_real_initialize_handshake() {
+    let (client, _workspace) = launch_installed_acp_agent();
+    client
+        .initialize(Duration::from_secs(20))
+        .unwrap_or_else(|error| panic_with_stderr(&client, "initialize", error));
+    assert_eq!(client.state().unwrap(), DriverState::Ready);
+    assert_eq!(client.close().unwrap(), DriverState::Closed);
+}
+
+#[test]
 #[ignore = "requires HYPER_TERM_ACP_PATH, HYPER_TERM_ACP_SHA256, and an authenticated ACP adapter"]
 fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
-    let executable = required_path("HYPER_TERM_ACP_PATH");
-    let executable = executable
-        .canonicalize()
-        .expect("HYPER_TERM_ACP_PATH must resolve to the inspected adapter");
-    let digest = std::env::var("HYPER_TERM_ACP_SHA256")
-        .expect("HYPER_TERM_ACP_SHA256 must identify that exact adapter");
-    let provider_id =
-        std::env::var("HYPER_TERM_ACP_PROVIDER_ID").unwrap_or_else(|_| "test-acp".into());
+    let (client, _workspace) = launch_installed_acp_agent();
     let expected = std::env::var("HYPER_TERM_ACP_EXPECTED_TEXT")
         .unwrap_or_else(|_| "HYPER_TERM_ACP_OK".into());
     let prompt = std::env::var("HYPER_TERM_ACP_PROMPT").unwrap_or_else(|_| {
         format!("Reply with exactly {expected}. Do not use tools or modify files.")
     });
-    let workspace = TempDir::new().expect("temporary ACP workspace");
-    let arguments = adapter_arguments();
-    let client = AcpAgentClient::launch(AcpAgentConfig {
-        executable: executable.clone(),
-        executable_sha256: digest,
-        arguments,
-        environment: adapter_environment(&executable),
-        implementation_version: "installed-e2e".into(),
-        provider_id,
-        workspace: workspace.path().canonicalize().unwrap(),
-        brokered_mcp_server: None,
-    })
-    .expect("launch inspected ACP adapter");
 
     client
         .initialize(Duration::from_secs(20))
@@ -94,6 +85,31 @@ fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
         client.stderr_tail().unwrap_or_default()
     );
     assert_eq!(client.close().unwrap(), DriverState::Closed);
+}
+
+fn launch_installed_acp_agent() -> (AcpAgentClient, TempDir) {
+    let executable = required_path("HYPER_TERM_ACP_PATH");
+    let executable = executable
+        .canonicalize()
+        .expect("HYPER_TERM_ACP_PATH must resolve to the inspected adapter");
+    let digest = std::env::var("HYPER_TERM_ACP_SHA256")
+        .expect("HYPER_TERM_ACP_SHA256 must identify that exact adapter");
+    let provider_id =
+        std::env::var("HYPER_TERM_ACP_PROVIDER_ID").unwrap_or_else(|_| "test-acp".into());
+    let workspace = TempDir::new().expect("temporary ACP workspace");
+    let arguments = adapter_arguments();
+    let client = AcpAgentClient::launch(AcpAgentConfig {
+        executable: executable.clone(),
+        executable_sha256: digest,
+        arguments,
+        environment: adapter_environment(&executable),
+        implementation_version: "installed-e2e".into(),
+        provider_id,
+        workspace: workspace.path().canonicalize().unwrap(),
+        brokered_mcp_server: None,
+    })
+    .expect("launch inspected ACP adapter");
+    (client, workspace)
 }
 
 fn adapter_arguments() -> Vec<OsString> {
