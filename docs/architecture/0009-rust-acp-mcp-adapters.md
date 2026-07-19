@@ -152,10 +152,18 @@ set is enabled per release.
   registrations chosen explicitly from the Agent menu rather than inferred
   from terminal contents. Disabled menu entries retain the reason they cannot
   start; the Native layer never probes credentials or launches a provider.
-- The packaged Codex adapter is the current `@agentclientprotocol/codex-acp`.
-  An explicit adapter path remains compatible with the older
-  `@zed-industries/codex-acp` executable, while automatic discovery does not
-  silently prefer it over the bundled successor.
+- ACP resolution is explicit path first, then a recognized installed package,
+  then the digest-inventoried bundled runtime. Codex accepts both
+  `@zed-industries/codex-acp` and `@agentclientprotocol/codex-acp`; Claude
+  accepts `@agentclientprotocol/claude-agent-acp`. Automatic discovery
+  canonicalizes the executable and requires its bounded, non-symlinked
+  `package.json`, scoped `node_modules` location, semantic version, and declared
+  `bin` entry to agree. A same-named executable or forged `--version` output is
+  not enough. Explicit paths remain available for reviewed standalone builds.
+- The signed package retains `@agentclientprotocol/codex-acp` as the offline
+  Codex fallback, so a machine without an installed adapter still works when
+  the matching Codex CLI is authenticated. The selected executable digest and
+  package/version identity are recorded in the driver manifest.
 - Ignored, credential-using integration gates completed a harmless real prompt
   through official Codex ACP 1.1.4 and Claude Agent ACP 0.59.0 artifacts. Claude
   subscription authentication on macOS requires the exact Claude executable

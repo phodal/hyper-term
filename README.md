@@ -42,7 +42,10 @@ task model without giving the UI direct command or filesystem authority.
   output.
 - **Codex, Claude, and Copilot adapters.** Hyper Term discovers locally
   installed provider CLIs and connects through provider-specific, supervised
-  adapters. Provider binaries and credentials are never bundled.
+  adapters. Known installed Codex ACP packages from Zed or Agent Client
+  Protocol are preferred over the offline bundled fallback; package identity,
+  version, and executable entrypoint must agree. Provider binaries and
+  credentials are never bundled.
 - **Generated UI artifacts.** Agents can propose React/TypeScript interfaces
   that are compiled by a pinned Deno runtime, content-addressed by Rust, and
   shown in a network-closed preview.
@@ -148,7 +151,9 @@ cargo run -p hyper-term-daemon --bin hyper-term-desktop -- \
 This starts an ordinary terminal without requiring an Agent provider. To use an
 Agent tab, install and authenticate a supported provider CLI first, then pass an
 explicit provider path when needed; see `hyper-term-desktop --help` for the
-available flags.
+available flags. A stable global install of `@zed-industries/codex-acp` or
+`@agentclientprotocol/codex-acp` is discovered automatically; Hyper Term does
+not invoke a networked `npx` install during application startup.
 
 ### Build the macOS application
 

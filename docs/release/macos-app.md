@@ -39,6 +39,11 @@ CLI directly as `copilot --acp --stdio`. Rust verifies all bundled ACP runtime
 files before advertising them, clears inherited API keys, bounds provider
 readiness probes, and passes exact discovered executable paths to the gateway.
 The Native renderer receives status metadata only and cannot launch providers.
+When a known global ACP package is present, the supervisor prefers that stable
+installed entrypoint over the fallback bundle. Codex recognizes both the Zed
+and Agent Client Protocol packages; Claude recognizes its Agent Client Protocol
+package. Recognition is bound to the canonical npm package root, manifest
+identity, semantic version, and declared `bin` path rather than process output.
 
 For pipeline testing, a pre-release tag may run without Apple secrets. In that
 case the workflow ad-hoc signs the bundle and gives the asset an explicit
