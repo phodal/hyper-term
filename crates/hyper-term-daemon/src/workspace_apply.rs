@@ -7,7 +7,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
+use hyper_term_protocol::{OperationId, TaskId};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -16,6 +17,9 @@ pub(crate) const MAX_WORKSPACE_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_WORKSPACE_APPLY_FILES: usize = 32;
 pub(crate) const MAX_WORKSPACE_APPLY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TARGET_PATH_BYTES: usize = 4096;
+const WORKSPACE_TRANSACTION_SCHEMA_VERSION: u32 = 1;
+const MAX_WORKSPACE_TRANSACTION_MANIFEST_BYTES: u64 = 256 * 1024;
+const WORKSPACE_TRANSACTION_DIRECTORY: &str = "workspace-transactions";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct WorkspaceFileSnapshot {
@@ -55,6 +59,105 @@ pub(crate) struct WorkspaceApplySetPlan {
     pub result_digest: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceTransactionContext {
+    pub task_id: TaskId,
+    pub operation_id: OperationId,
+    pub operation_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceTransactionPhase {
+    Preparing,
+    Prepared,
+    RollingBack,
+    Committed,
+    RolledBack,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceTransactionOutcome {
+    Committed,
+    RolledBack,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceTransactionReceipt {
+    pub transaction_id: Uuid,
+    pub task_id: TaskId,
+    pub operation_id: OperationId,
+    pub operation_revision: u64,
+    pub result_digest: String,
+    pub outcome: WorkspaceTransactionOutcome,
+    pub failure_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DurableWorkspaceApplyResult {
+    Committed(WorkspaceTransactionReceipt),
+    RolledBack(WorkspaceTransactionReceipt),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WorkspaceRecoveryReport {
+    pub receipts: Vec<WorkspaceTransactionReceipt>,
+    pub blocked: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WorkspaceRecoveryIdentity {
+    digest: String,
+    device: u64,
+    inode: u64,
+    mode: u32,
+}
+
+impl WorkspaceRecoveryIdentity {
+    fn from_snapshot(snapshot: &WorkspaceFileSnapshot) -> Self {
+        Self {
+            digest: snapshot.digest.clone(),
+            device: snapshot.device,
+            inode: snapshot.inode,
+            mode: snapshot.mode,
+        }
+    }
+
+    fn matches(&self, snapshot: &WorkspaceFileSnapshot) -> bool {
+        self.digest == snapshot.digest
+            && self.device == snapshot.device
+            && self.inode == snapshot.inode
+            && self.mode == snapshot.mode
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WorkspaceTransactionMember {
+    target_path: String,
+    parent_device: u64,
+    parent_inode: u64,
+    stage_name: String,
+    backup_name: Option<String>,
+    base: Option<WorkspaceRecoveryIdentity>,
+    proposed_digest: String,
+    proposed_mode: u32,
+    staged: Option<WorkspaceRecoveryIdentity>,
+    backup: Option<WorkspaceRecoveryIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WorkspaceTransactionManifest {
+    schema_version: u32,
+    transaction_id: Uuid,
+    task_id: TaskId,
+    operation_id: OperationId,
+    operation_revision: u64,
+    result_digest: String,
+    phase: WorkspaceTransactionPhase,
+    failure_summary: Option<String>,
+    members: Vec<WorkspaceTransactionMember>,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum WorkspaceApplyError {
     #[error("workspace target path is invalid")]
@@ -71,6 +174,8 @@ pub(crate) enum WorkspaceApplyError {
     StaleBase,
     #[error("workspace apply may have executed but could not be verified: {0}")]
     UnknownExecution(String),
+    #[error("workspace transaction recovery is required: {0}")]
+    RecoveryRequired(String),
     #[error("workspace target already matches the artifact")]
     NoChanges,
     #[error("workspace apply I/O failed: {0}")]
@@ -185,12 +290,7 @@ pub(crate) fn apply_workspace_set_plan(
     workspace: &Path,
     set: &WorkspaceApplySetPlan,
 ) -> Result<String, WorkspaceApplyError> {
-    if set.plans.is_empty()
-        || set.plans.len() > MAX_WORKSPACE_APPLY_FILES
-        || workspace_set_digest(&set.plans) != set.result_digest
-    {
-        return Err(WorkspaceApplyError::InvalidPath);
-    }
+    validate_workspace_set(set)?;
     if set.plans.len() == 1 {
         apply_single_workspace_plan(workspace, &set.plans[0])?;
         return Ok(set.result_digest.clone());
@@ -242,6 +342,711 @@ pub(crate) fn select_workspace_apply_set(
         plans,
         result_digest,
     })
+}
+
+pub(crate) fn apply_workspace_set_plan_durable(
+    workspace: &Path,
+    state_directory: &Path,
+    context: WorkspaceTransactionContext,
+    set: &WorkspaceApplySetPlan,
+) -> Result<DurableWorkspaceApplyResult, WorkspaceApplyError> {
+    validate_workspace_set(set)?;
+    let transaction_root = workspace_transaction_root(state_directory)?;
+    let mut manifest = WorkspaceTransactionManifest::new(context, set);
+    write_workspace_transaction_manifest(&transaction_root, &manifest)?;
+
+    let mut staged = Vec::with_capacity(set.plans.len());
+    for (index, plan) in set.plans.iter().enumerate() {
+        match stage_durable_workspace_plan(workspace, plan, &mut manifest.members[index]) {
+            Ok(candidate) => staged.push(candidate),
+            Err(error) => {
+                cleanup_manifest_files(workspace, &manifest)?;
+                for member in &mut manifest.members {
+                    member.staged = None;
+                    member.backup = None;
+                }
+                manifest.phase = WorkspaceTransactionPhase::RolledBack;
+                manifest.failure_summary = Some(error.to_string());
+                write_workspace_transaction_manifest(&transaction_root, &manifest)?;
+                return Ok(DurableWorkspaceApplyResult::RolledBack(manifest.receipt()));
+            }
+        }
+    }
+
+    manifest.phase = WorkspaceTransactionPhase::Prepared;
+    write_workspace_transaction_manifest(&transaction_root, &manifest)?;
+    for (index, staged_plan) in staged.iter_mut().enumerate() {
+        let staged_snapshot = read_target_at(
+            staged_plan.parent.directory.as_raw_fd(),
+            &staged_plan.stage_name,
+        )?
+        .ok_or_else(|| {
+            WorkspaceApplyError::RecoveryRequired("prepared stage disappeared".into())
+        })?;
+        if !manifest.members[index]
+            .staged
+            .as_ref()
+            .is_some_and(|identity| identity.matches(&staged_snapshot))
+        {
+            return Err(WorkspaceApplyError::RecoveryRequired(
+                "prepared stage identity changed".into(),
+            ));
+        }
+        if let Err(error) = install_transaction_plan(staged_plan) {
+            manifest.phase = WorkspaceTransactionPhase::RollingBack;
+            manifest.failure_summary = Some(error.to_string());
+            write_workspace_transaction_manifest(&transaction_root, &manifest).map_err(
+                |write| {
+                    WorkspaceApplyError::UnknownExecution(format!(
+                        "{error}; could not persist rollback intent: {write}"
+                    ))
+                },
+            )?;
+            rollback_workspace_manifest(workspace, &manifest).map_err(|rollback| {
+                WorkspaceApplyError::UnknownExecution(format!(
+                    "{error}; rollback could not be verified: {rollback}"
+                ))
+            })?;
+            manifest.phase = WorkspaceTransactionPhase::RolledBack;
+            write_workspace_transaction_manifest(&transaction_root, &manifest)?;
+            cleanup_manifest_files(workspace, &manifest)?;
+            return Ok(DurableWorkspaceApplyResult::RolledBack(manifest.receipt()));
+        }
+    }
+
+    manifest.phase = WorkspaceTransactionPhase::Committed;
+    write_workspace_transaction_manifest(&transaction_root, &manifest).map_err(|error| {
+        WorkspaceApplyError::UnknownExecution(format!(
+            "workspace targets were installed but commit could not be persisted: {error}"
+        ))
+    })?;
+    cleanup_manifest_files(workspace, &manifest).map_err(|error| {
+        WorkspaceApplyError::UnknownExecution(format!(
+            "workspace transaction committed but cleanup failed: {error}"
+        ))
+    })?;
+    Ok(DurableWorkspaceApplyResult::Committed(manifest.receipt()))
+}
+
+pub(crate) fn recover_workspace_transactions(
+    workspace: &Path,
+    state_directory: &Path,
+) -> Result<WorkspaceRecoveryReport, WorkspaceApplyError> {
+    let transaction_root = workspace_transaction_root(state_directory)?;
+    let mut entries = fs::read_dir(&transaction_root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut report = WorkspaceRecoveryReport::default();
+    for entry in entries {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            report
+                .blocked
+                .push("workspace transaction journal contains a non-UTF-8 entry".into());
+            continue;
+        };
+        if file_name.starts_with('.') && file_name.ends_with(".tmp") {
+            if let Err(error) = fs::remove_file(entry.path())
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                report.blocked.push(format!(
+                    "workspace transaction temporary manifest {file_name} could not be removed"
+                ));
+            }
+            continue;
+        }
+        let Some(id_text) = file_name.strip_suffix(".json") else {
+            report.blocked.push(format!(
+                "workspace transaction journal contains unexpected entry {file_name}"
+            ));
+            continue;
+        };
+        let Ok(transaction_id) = Uuid::parse_str(id_text) else {
+            report.blocked.push(format!(
+                "workspace transaction manifest name is invalid: {file_name}"
+            ));
+            continue;
+        };
+        let mut manifest = match read_workspace_transaction_manifest(&entry.path()) {
+            Ok(manifest) if manifest.transaction_id == transaction_id => manifest,
+            Ok(_) => {
+                report.blocked.push(format!(
+                    "workspace transaction manifest id does not match {file_name}"
+                ));
+                continue;
+            }
+            Err(error) => {
+                report.blocked.push(format!(
+                    "workspace transaction manifest {file_name} is unreadable: {error}"
+                ));
+                continue;
+            }
+        };
+        match recover_workspace_transaction(workspace, &transaction_root, &mut manifest) {
+            Ok(receipt) => report.receipts.push(receipt),
+            Err(error) => report.blocked.push(format!(
+                "workspace transaction {} requires manual recovery: {error}",
+                manifest.transaction_id
+            )),
+        }
+    }
+    transaction_root_file(&transaction_root)?.sync_all()?;
+    Ok(report)
+}
+
+pub(crate) fn acknowledge_workspace_transaction(
+    state_directory: &Path,
+    transaction_id: Uuid,
+) -> Result<(), WorkspaceApplyError> {
+    let transaction_root = workspace_transaction_root(state_directory)?;
+    let path = workspace_transaction_manifest_path(&transaction_root, transaction_id);
+    match fs::remove_file(path) {
+        Ok(()) => transaction_root_file(&transaction_root)?
+            .sync_all()
+            .map_err(Into::into),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+impl WorkspaceTransactionManifest {
+    fn new(context: WorkspaceTransactionContext, set: &WorkspaceApplySetPlan) -> Self {
+        let transaction_id = Uuid::new_v4();
+        let members = set
+            .plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| WorkspaceTransactionMember {
+                target_path: plan.target_path.clone(),
+                parent_device: plan.parent_device,
+                parent_inode: plan.parent_inode,
+                stage_name: workspace_stage_name(transaction_id, index),
+                backup_name: plan
+                    .base
+                    .as_ref()
+                    .map(|_| workspace_backup_name(transaction_id, index)),
+                base: plan
+                    .base
+                    .as_ref()
+                    .map(WorkspaceRecoveryIdentity::from_snapshot),
+                proposed_digest: plan.proposed_digest.clone(),
+                proposed_mode: plan
+                    .base
+                    .as_ref()
+                    .map(|base| base.mode & 0o7777)
+                    .unwrap_or(0o644),
+                staged: None,
+                backup: None,
+            })
+            .collect();
+        Self {
+            schema_version: WORKSPACE_TRANSACTION_SCHEMA_VERSION,
+            transaction_id,
+            task_id: context.task_id,
+            operation_id: context.operation_id,
+            operation_revision: context.operation_revision,
+            result_digest: set.result_digest.clone(),
+            phase: WorkspaceTransactionPhase::Preparing,
+            failure_summary: None,
+            members,
+        }
+    }
+
+    fn receipt(&self) -> WorkspaceTransactionReceipt {
+        let outcome = match self.phase {
+            WorkspaceTransactionPhase::Committed => WorkspaceTransactionOutcome::Committed,
+            WorkspaceTransactionPhase::RolledBack => WorkspaceTransactionOutcome::RolledBack,
+            _ => unreachable!("only terminal transaction manifests yield receipts"),
+        };
+        WorkspaceTransactionReceipt {
+            transaction_id: self.transaction_id,
+            task_id: self.task_id,
+            operation_id: self.operation_id,
+            operation_revision: self.operation_revision,
+            result_digest: self.result_digest.clone(),
+            outcome,
+            failure_summary: self.failure_summary.clone(),
+        }
+    }
+}
+
+fn validate_workspace_set(set: &WorkspaceApplySetPlan) -> Result<(), WorkspaceApplyError> {
+    if set.plans.is_empty()
+        || set.plans.len() > MAX_WORKSPACE_APPLY_FILES
+        || workspace_set_digest(&set.plans) != set.result_digest
+    {
+        return Err(WorkspaceApplyError::InvalidPath);
+    }
+    Ok(())
+}
+
+fn workspace_transaction_root(state_directory: &Path) -> Result<PathBuf, WorkspaceApplyError> {
+    let root = state_directory.join(WORKSPACE_TRANSACTION_DIRECTORY);
+    if root.exists() {
+        let metadata = fs::symlink_metadata(&root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkspaceApplyError::RecoveryRequired(
+                "transaction journal root is not a private directory".into(),
+            ));
+        }
+    } else {
+        fs::create_dir(&root)?;
+    }
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    transaction_root_file(&root)?.sync_all()?;
+    Ok(root)
+}
+
+fn transaction_root_file(root: &Path) -> Result<File, WorkspaceApplyError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+        .map_err(Into::into)
+}
+
+fn workspace_transaction_manifest_path(root: &Path, transaction_id: Uuid) -> PathBuf {
+    root.join(format!("{transaction_id}.json"))
+}
+
+fn write_workspace_transaction_manifest(
+    root: &Path,
+    manifest: &WorkspaceTransactionManifest,
+) -> Result<(), WorkspaceApplyError> {
+    validate_workspace_transaction_manifest(manifest)?;
+    let bytes = serde_json::to_vec(manifest).map_err(|error| {
+        WorkspaceApplyError::RecoveryRequired(format!(
+            "transaction manifest could not be serialized: {error}"
+        ))
+    })?;
+    if bytes.len() as u64 > MAX_WORKSPACE_TRANSACTION_MANIFEST_BYTES {
+        return Err(WorkspaceApplyError::TooLarge);
+    }
+    let temporary = root.join(format!(
+        ".{}.{}.tmp",
+        manifest.transaction_id,
+        Uuid::new_v4()
+    ));
+    let target = workspace_transaction_manifest_path(root, manifest.transaction_id);
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &target)?;
+        transaction_root_file(root)?.sync_all()?;
+        Ok::<(), WorkspaceApplyError>(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn read_workspace_transaction_manifest(
+    path: &Path,
+) -> Result<WorkspaceTransactionManifest, WorkspaceApplyError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_WORKSPACE_TRANSACTION_MANIFEST_BYTES {
+        return Err(WorkspaceApplyError::RecoveryRequired(
+            "transaction manifest is not a bounded regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_WORKSPACE_TRANSACTION_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_WORKSPACE_TRANSACTION_MANIFEST_BYTES {
+        return Err(WorkspaceApplyError::TooLarge);
+    }
+    let manifest: WorkspaceTransactionManifest =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            WorkspaceApplyError::RecoveryRequired(format!(
+                "transaction manifest is invalid JSON: {error}"
+            ))
+        })?;
+    validate_workspace_transaction_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_workspace_transaction_manifest(
+    manifest: &WorkspaceTransactionManifest,
+) -> Result<(), WorkspaceApplyError> {
+    if manifest.schema_version != WORKSPACE_TRANSACTION_SCHEMA_VERSION
+        || manifest.operation_revision == 0
+        || !is_sha256(&manifest.result_digest)
+        || manifest.members.is_empty()
+        || manifest.members.len() > MAX_WORKSPACE_APPLY_FILES
+        || manifest
+            .failure_summary
+            .as_ref()
+            .is_some_and(|summary| summary.len() > 16 * 1024)
+    {
+        return Err(WorkspaceApplyError::RecoveryRequired(
+            "transaction manifest header is invalid".into(),
+        ));
+    }
+    let needs_staged_identity = matches!(
+        manifest.phase,
+        WorkspaceTransactionPhase::Prepared
+            | WorkspaceTransactionPhase::RollingBack
+            | WorkspaceTransactionPhase::Committed
+    );
+    let rolled_back_without_preparation = manifest.phase == WorkspaceTransactionPhase::RolledBack
+        && manifest
+            .members
+            .iter()
+            .all(|member| member.staged.is_none() && member.backup.is_none());
+    let requires_staged_identity = needs_staged_identity
+        || (manifest.phase == WorkspaceTransactionPhase::RolledBack
+            && !rolled_back_without_preparation);
+    let mut targets = BTreeSet::new();
+    for (index, member) in manifest.members.iter().enumerate() {
+        validate_target_path(&member.target_path)?;
+        if !targets.insert(&member.target_path)
+            || member.stage_name != workspace_stage_name(manifest.transaction_id, index)
+            || member.backup_name
+                != member
+                    .base
+                    .as_ref()
+                    .map(|_| workspace_backup_name(manifest.transaction_id, index))
+            || !is_sha256(&member.proposed_digest)
+            || member.proposed_mode > 0o7777
+            || requires_staged_identity != member.staged.is_some()
+            || (member.staged.is_some() && member.base.is_some() != member.backup.is_some())
+            || member
+                .base
+                .as_ref()
+                .is_some_and(|identity| !is_sha256(&identity.digest))
+            || member
+                .staged
+                .as_ref()
+                .is_some_and(|identity| !is_sha256(&identity.digest))
+            || member
+                .backup
+                .as_ref()
+                .is_some_and(|identity| !is_sha256(&identity.digest))
+        {
+            return Err(WorkspaceApplyError::RecoveryRequired(
+                "transaction manifest member is invalid".into(),
+            ));
+        }
+        if let Some(staged) = member.staged.as_ref()
+            && (staged.digest != member.proposed_digest
+                || staged.mode & 0o7777 != member.proposed_mode)
+        {
+            return Err(WorkspaceApplyError::RecoveryRequired(
+                "transaction staged identity does not match the proposal".into(),
+            ));
+        }
+        if let (Some(base), Some(backup)) = (member.base.as_ref(), member.backup.as_ref())
+            && base != backup
+        {
+            return Err(WorkspaceApplyError::RecoveryRequired(
+                "transaction backup identity does not match the reviewed base".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn workspace_stage_name(transaction_id: Uuid, index: usize) -> String {
+    format!(".hyper-term-apply-{transaction_id}-{index}.tmp")
+}
+
+fn workspace_backup_name(transaction_id: Uuid, index: usize) -> String {
+    format!(".hyper-term-apply-{transaction_id}-{index}.base")
+}
+
+fn stage_durable_workspace_plan(
+    workspace: &Path,
+    plan: &WorkspaceApplyPlan,
+    member: &mut WorkspaceTransactionMember,
+) -> Result<StagedWorkspacePlan, WorkspaceApplyError> {
+    let relative = validate_target_path(&plan.target_path)?;
+    let parent = open_parent(workspace, &relative)?;
+    if parent.device != plan.parent_device
+        || parent.inode != plan.parent_inode
+        || parent.device != member.parent_device
+        || parent.inode != member.parent_inode
+    {
+        return Err(WorkspaceApplyError::ParentChanged);
+    }
+    let parent_fd = parent.directory.as_raw_fd();
+    let current = read_target_at(parent_fd, &parent.file_name)?;
+    if !same_file_state(current.as_ref(), plan.base.as_ref()) {
+        return Err(WorkspaceApplyError::StaleBase);
+    }
+
+    let stage_name =
+        CString::new(member.stage_name.as_str()).map_err(|_| WorkspaceApplyError::InvalidPath)?;
+    let backup_name = member
+        .backup_name
+        .as_deref()
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| WorkspaceApplyError::InvalidPath)?;
+    let result = (|| {
+        let mut stage = create_stage(parent_fd, &stage_name)?;
+        stage.write_all(plan.proposed_content.as_bytes())?;
+        stage.set_permissions(fs::Permissions::from_mode(member.proposed_mode))?;
+        stage.sync_all()?;
+        drop(stage);
+        let staged = read_target_at(parent_fd, &stage_name)?.ok_or(
+            WorkspaceApplyError::RecoveryRequired("staged transaction member disappeared".into()),
+        )?;
+        if staged.digest != member.proposed_digest || staged.mode & 0o7777 != member.proposed_mode {
+            return Err(WorkspaceApplyError::RecoveryRequired(
+                "staged transaction member could not be verified".into(),
+            ));
+        }
+        member.staged = Some(WorkspaceRecoveryIdentity::from_snapshot(&staged));
+        if let Some(backup_name) = backup_name.as_ref() {
+            link_target_at(parent_fd, &parent.file_name, backup_name)?;
+            let backup = read_target_at(parent_fd, backup_name)?.ok_or(
+                WorkspaceApplyError::RecoveryRequired(
+                    "transaction backup disappeared while staging".into(),
+                ),
+            )?;
+            let expected = member
+                .base
+                .as_ref()
+                .ok_or(WorkspaceApplyError::RecoveryRequired(
+                    "transaction backup has no reviewed base".into(),
+                ))?;
+            if !expected.matches(&backup) {
+                return Err(WorkspaceApplyError::RecoveryRequired(
+                    "transaction backup identity changed while staging".into(),
+                ));
+            }
+            member.backup = Some(WorkspaceRecoveryIdentity::from_snapshot(&backup));
+        }
+        let latest = read_target_at(parent_fd, &parent.file_name)?;
+        if !same_file_state(latest.as_ref(), plan.base.as_ref()) {
+            return Err(WorkspaceApplyError::StaleBase);
+        }
+        parent.directory.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        unlink_at(parent_fd, &stage_name);
+        if let Some(backup_name) = backup_name.as_ref() {
+            unlink_at(parent_fd, backup_name);
+        }
+        let _ = parent.directory.sync_all();
+        member.staged = None;
+        member.backup = None;
+        return Err(error);
+    }
+    Ok(StagedWorkspacePlan {
+        plan: plan.clone(),
+        parent,
+        stage_name,
+        backup_name,
+        installed: false,
+    })
+}
+
+fn recover_workspace_transaction(
+    workspace: &Path,
+    transaction_root: &Path,
+    manifest: &mut WorkspaceTransactionManifest,
+) -> Result<WorkspaceTransactionReceipt, WorkspaceApplyError> {
+    match manifest.phase {
+        WorkspaceTransactionPhase::Preparing => {
+            cleanup_manifest_files(workspace, manifest)?;
+            manifest.phase = WorkspaceTransactionPhase::RolledBack;
+            manifest.failure_summary.get_or_insert_with(|| {
+                "recovered an interrupted transaction before installation began".into()
+            });
+            write_workspace_transaction_manifest(transaction_root, manifest)?;
+        }
+        WorkspaceTransactionPhase::Prepared => {
+            if all_manifest_targets_match(workspace, manifest, ManifestTargetState::Proposed)? {
+                manifest.phase = WorkspaceTransactionPhase::Committed;
+                write_workspace_transaction_manifest(transaction_root, manifest)?;
+                cleanup_manifest_files(workspace, manifest)?;
+            } else {
+                manifest.phase = WorkspaceTransactionPhase::RollingBack;
+                manifest.failure_summary.get_or_insert_with(|| {
+                    "recovered an interrupted partial workspace transaction".into()
+                });
+                write_workspace_transaction_manifest(transaction_root, manifest)?;
+                rollback_workspace_manifest(workspace, manifest)?;
+                manifest.phase = WorkspaceTransactionPhase::RolledBack;
+                write_workspace_transaction_manifest(transaction_root, manifest)?;
+                cleanup_manifest_files(workspace, manifest)?;
+            }
+        }
+        WorkspaceTransactionPhase::RollingBack => {
+            rollback_workspace_manifest(workspace, manifest)?;
+            manifest.phase = WorkspaceTransactionPhase::RolledBack;
+            manifest.failure_summary.get_or_insert_with(|| {
+                "continued rollback after an interrupted workspace transaction".into()
+            });
+            write_workspace_transaction_manifest(transaction_root, manifest)?;
+            cleanup_manifest_files(workspace, manifest)?;
+        }
+        WorkspaceTransactionPhase::Committed => {
+            if !all_manifest_targets_match(workspace, manifest, ManifestTargetState::Proposed)? {
+                return Err(WorkspaceApplyError::RecoveryRequired(
+                    "committed targets no longer match the durable transaction".into(),
+                ));
+            }
+            cleanup_manifest_files(workspace, manifest)?;
+        }
+        WorkspaceTransactionPhase::RolledBack => {
+            cleanup_manifest_files(workspace, manifest)?;
+        }
+    }
+    Ok(manifest.receipt())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManifestTargetState {
+    Base,
+    Proposed,
+    Unknown,
+}
+
+fn all_manifest_targets_match(
+    workspace: &Path,
+    manifest: &WorkspaceTransactionManifest,
+    expected: ManifestTargetState,
+) -> Result<bool, WorkspaceApplyError> {
+    for member in &manifest.members {
+        if classify_manifest_target(workspace, member)? != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn classify_manifest_target(
+    workspace: &Path,
+    member: &WorkspaceTransactionMember,
+) -> Result<ManifestTargetState, WorkspaceApplyError> {
+    let relative = validate_target_path(&member.target_path)?;
+    let parent = open_parent(workspace, &relative)?;
+    if parent.device != member.parent_device || parent.inode != member.parent_inode {
+        return Err(WorkspaceApplyError::ParentChanged);
+    }
+    let current = read_target_at(parent.directory.as_raw_fd(), &parent.file_name)?;
+    let is_base = match (current.as_ref(), member.base.as_ref()) {
+        (None, None) => true,
+        (Some(current), Some(base)) => base.matches(current),
+        _ => false,
+    };
+    if is_base {
+        return Ok(ManifestTargetState::Base);
+    }
+    if let (Some(current), Some(staged)) = (current.as_ref(), member.staged.as_ref())
+        && staged.matches(current)
+    {
+        return Ok(ManifestTargetState::Proposed);
+    }
+    Ok(ManifestTargetState::Unknown)
+}
+
+fn rollback_workspace_manifest(
+    workspace: &Path,
+    manifest: &WorkspaceTransactionManifest,
+) -> Result<(), WorkspaceApplyError> {
+    for member in manifest.members.iter().rev() {
+        match classify_manifest_target(workspace, member)? {
+            ManifestTargetState::Base => continue,
+            ManifestTargetState::Unknown => {
+                return Err(WorkspaceApplyError::RecoveryRequired(format!(
+                    "target {} matches neither reviewed base nor staged proposal",
+                    member.target_path
+                )));
+            }
+            ManifestTargetState::Proposed => {}
+        }
+        let relative = validate_target_path(&member.target_path)?;
+        let parent = open_parent(workspace, &relative)?;
+        if parent.device != member.parent_device || parent.inode != member.parent_inode {
+            return Err(WorkspaceApplyError::ParentChanged);
+        }
+        let parent_fd = parent.directory.as_raw_fd();
+        match (member.base.as_ref(), member.backup_name.as_deref()) {
+            (Some(base), Some(backup_name)) => {
+                let backup_name =
+                    CString::new(backup_name).map_err(|_| WorkspaceApplyError::InvalidPath)?;
+                let backup = read_target_at(parent_fd, &backup_name)?.ok_or(
+                    WorkspaceApplyError::RecoveryRequired(format!(
+                        "backup for {} is missing",
+                        member.target_path
+                    )),
+                )?;
+                if !base.matches(&backup) {
+                    return Err(WorkspaceApplyError::RecoveryRequired(format!(
+                        "backup for {} changed identity",
+                        member.target_path
+                    )));
+                }
+                replace_target_at(parent_fd, &backup_name, &parent.file_name)?;
+                let restored = read_target_at(parent_fd, &parent.file_name)?.ok_or(
+                    WorkspaceApplyError::RecoveryRequired(format!(
+                        "restored target {} disappeared",
+                        member.target_path
+                    )),
+                )?;
+                if !base.matches(&restored) {
+                    return Err(WorkspaceApplyError::RecoveryRequired(format!(
+                        "restored target {} has the wrong identity",
+                        member.target_path
+                    )));
+                }
+            }
+            (None, None) => {
+                unlink_at_if_exists(parent_fd, &parent.file_name)?;
+                if read_target_at(parent_fd, &parent.file_name)?.is_some() {
+                    return Err(WorkspaceApplyError::RecoveryRequired(format!(
+                        "created target {} could not be removed",
+                        member.target_path
+                    )));
+                }
+            }
+            _ => {
+                return Err(WorkspaceApplyError::RecoveryRequired(
+                    "transaction backup shape is invalid".into(),
+                ));
+            }
+        }
+        parent.directory.sync_all()?;
+    }
+    Ok(())
+}
+
+fn cleanup_manifest_files(
+    workspace: &Path,
+    manifest: &WorkspaceTransactionManifest,
+) -> Result<(), WorkspaceApplyError> {
+    for member in &manifest.members {
+        let relative = validate_target_path(&member.target_path)?;
+        let parent = open_parent(workspace, &relative)?;
+        if parent.device != member.parent_device || parent.inode != member.parent_inode {
+            return Err(WorkspaceApplyError::ParentChanged);
+        }
+        let parent_fd = parent.directory.as_raw_fd();
+        let stage_name = CString::new(member.stage_name.as_str())
+            .map_err(|_| WorkspaceApplyError::InvalidPath)?;
+        unlink_at_if_exists(parent_fd, &stage_name)?;
+        if let Some(backup_name) = member.backup_name.as_deref() {
+            let backup_name =
+                CString::new(backup_name).map_err(|_| WorkspaceApplyError::InvalidPath)?;
+            unlink_at_if_exists(parent_fd, &backup_name)?;
+        }
+        parent.directory.sync_all()?;
+    }
+    Ok(())
 }
 
 fn apply_single_workspace_plan(
@@ -919,6 +1724,20 @@ fn unlink_at_checked(parent_fd: RawFd, name: &CStr) -> Result<(), WorkspaceApply
     }
 }
 
+fn unlink_at_if_exists(parent_fd: RawFd, name: &CStr) -> Result<(), WorkspaceApplyError> {
+    // SAFETY: name is bounded and relative to an open directory descriptor.
+    let result = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(())
+    } else {
+        Err(WorkspaceApplyError::Io(error))
+    }
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     sha256_digest(Sha256::digest(bytes))
 }
@@ -929,6 +1748,13 @@ fn sha256_digest(bytes: impl AsRef<[u8]>) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -1173,6 +1999,234 @@ mod tests {
             "external writer\n"
         );
         assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn durable_apply_keeps_a_terminal_receipt_until_the_daemon_acknowledges_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let state = temporary.path().join("state");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        fs::write(workspace.join("one.ts"), "one before\n").unwrap();
+        fs::write(workspace.join("two.ts"), "two before\n").unwrap();
+        let set = prepared_two_file_set(&workspace);
+        let context = transaction_context();
+
+        let result = apply_workspace_set_plan_durable(&workspace, &state, context, &set).unwrap();
+        let DurableWorkspaceApplyResult::Committed(receipt) = result else {
+            panic!("durable apply should commit");
+        };
+        assert_eq!(receipt.operation_id, context.operation_id);
+        assert_eq!(receipt.outcome, WorkspaceTransactionOutcome::Committed);
+        assert_eq!(receipt.result_digest, set.result_digest);
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one after\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "two after\n"
+        );
+        assert!(!contains_transaction_file(&workspace));
+        let manifest = workspace_transaction_manifest_path(
+            &state.join(WORKSPACE_TRANSACTION_DIRECTORY),
+            receipt.transaction_id,
+        );
+        assert!(manifest.is_file());
+
+        acknowledge_workspace_transaction(&state, receipt.transaction_id).unwrap();
+        assert!(!manifest.exists());
+    }
+
+    #[test]
+    fn recovery_rolls_back_a_partially_installed_prepared_transaction() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_test_roots(&temporary);
+        let (root, manifest, mut staged) = stage_prepared_transaction(&workspace, &state, &set);
+        install_transaction_plan(&mut staged[0]).unwrap();
+        drop(staged);
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(report.receipts.len(), 1);
+        assert_eq!(
+            report.receipts[0].outcome,
+            WorkspaceTransactionOutcome::RolledBack
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one before\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "two before\n"
+        );
+        assert!(workspace_transaction_manifest_path(&root, manifest.transaction_id).is_file());
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn recovery_commits_when_every_prepared_target_was_installed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_test_roots(&temporary);
+        let (_root, _manifest, mut staged) = stage_prepared_transaction(&workspace, &state, &set);
+        for candidate in &mut staged {
+            install_transaction_plan(candidate).unwrap();
+        }
+        drop(staged);
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(report.receipts.len(), 1);
+        assert_eq!(
+            report.receipts[0].outcome,
+            WorkspaceTransactionOutcome::Committed
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one after\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "two after\n"
+        );
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn recovery_continues_an_interrupted_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_test_roots(&temporary);
+        let (root, mut manifest, mut staged) = stage_prepared_transaction(&workspace, &state, &set);
+        install_transaction_plan(&mut staged[0]).unwrap();
+        manifest.phase = WorkspaceTransactionPhase::RollingBack;
+        manifest.failure_summary = Some("injected install failure".into());
+        write_workspace_transaction_manifest(&root, &manifest).unwrap();
+        drop(staged);
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(
+            report.receipts[0].outcome,
+            WorkspaceTransactionOutcome::RolledBack
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one before\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "two before\n"
+        );
+    }
+
+    #[test]
+    fn recovery_cleans_an_interrupted_preparing_transaction_without_touching_targets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_test_roots(&temporary);
+        let root = workspace_transaction_root(&state).unwrap();
+        let manifest = WorkspaceTransactionManifest::new(transaction_context(), &set);
+        write_workspace_transaction_manifest(&root, &manifest).unwrap();
+        fs::write(
+            workspace.join(&manifest.members[0].stage_name),
+            "incomplete stage",
+        )
+        .unwrap();
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(
+            report.receipts[0].outcome,
+            WorkspaceTransactionOutcome::RolledBack
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one before\n"
+        );
+        assert!(!workspace.join(&manifest.members[0].stage_name).exists());
+    }
+
+    #[test]
+    fn recovery_blocks_when_an_external_writer_changed_a_prepared_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_test_roots(&temporary);
+        let (root, manifest, mut staged) = stage_prepared_transaction(&workspace, &state, &set);
+        install_transaction_plan(&mut staged[0]).unwrap();
+        fs::write(workspace.join("two.ts"), "external writer\n").unwrap();
+        drop(staged);
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.receipts.is_empty());
+        assert_eq!(report.blocked.len(), 1);
+        assert!(workspace_transaction_manifest_path(&root, manifest.transaction_id).is_file());
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one after\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "external writer\n"
+        );
+    }
+
+    fn durable_test_roots(
+        temporary: &tempfile::TempDir,
+    ) -> (PathBuf, PathBuf, WorkspaceApplySetPlan) {
+        let workspace = temporary.path().join("workspace");
+        let state = temporary.path().join("state");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        fs::write(workspace.join("one.ts"), "one before\n").unwrap();
+        fs::write(workspace.join("two.ts"), "two before\n").unwrap();
+        let set = prepared_two_file_set(&workspace);
+        (workspace, state, set)
+    }
+
+    fn prepared_two_file_set(workspace: &Path) -> WorkspaceApplySetPlan {
+        prepare_workspace_apply_set(
+            workspace,
+            vec![
+                ("one.ts".into(), "one after\n".into()),
+                ("two.ts".into(), "two after\n".into()),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn transaction_context() -> WorkspaceTransactionContext {
+        WorkspaceTransactionContext {
+            task_id: TaskId::new(),
+            operation_id: OperationId::new(),
+            operation_revision: 5,
+        }
+    }
+
+    fn stage_prepared_transaction(
+        workspace: &Path,
+        state: &Path,
+        set: &WorkspaceApplySetPlan,
+    ) -> (
+        PathBuf,
+        WorkspaceTransactionManifest,
+        Vec<StagedWorkspacePlan>,
+    ) {
+        let root = workspace_transaction_root(state).unwrap();
+        let mut manifest = WorkspaceTransactionManifest::new(transaction_context(), set);
+        write_workspace_transaction_manifest(&root, &manifest).unwrap();
+        let staged = set
+            .plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                stage_durable_workspace_plan(workspace, plan, &mut manifest.members[index]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        manifest.phase = WorkspaceTransactionPhase::Prepared;
+        write_workspace_transaction_manifest(&root, &manifest).unwrap();
+        (root, manifest, staged)
     }
 
     fn contains_transaction_file(root: &Path) -> bool {

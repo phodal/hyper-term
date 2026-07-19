@@ -2994,7 +2994,8 @@ fn map_workspace_prepare_error(error: WorkspaceApplyError) -> WorkspaceProposalE
         | WorkspaceApplyError::UnsupportedTarget
         | WorkspaceApplyError::TooLarge
         | WorkspaceApplyError::StaleBase
-        | WorkspaceApplyError::UnknownExecution(_) => WorkspaceProposalError::UnsafeTarget,
+        | WorkspaceApplyError::UnknownExecution(_)
+        | WorkspaceApplyError::RecoveryRequired(_) => WorkspaceProposalError::UnsafeTarget,
         WorkspaceApplyError::Io(_) => WorkspaceProposalError::Daemon,
     }
 }
