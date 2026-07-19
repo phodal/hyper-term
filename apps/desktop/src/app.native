@@ -1,7 +1,7 @@
 <!-- Hyper Term product shell. This native view is trusted application code.
      Agent-authored content enters later as versioned Block data, never markup. -->
 <column background="background">
-  <row gap="8" padding="10" height="{titlebar_height}" cross="center" background="surface" window-drag="true" label="Session bar">
+  <row gap="8" padding="8" height="{titlebar_height}" cross="center" background="surface" window-drag="true" label="Session bar">
     <spacer width="{chrome_leading}" />
     <row gap="7" cross="center" grow="1">
       <icon name="terminal" width="15" height="15" foreground="accent" />
@@ -25,11 +25,11 @@
       <button size="sm" variant="outline" icon="plus" on-press="choose_terminal" label="New Terminal tab">Terminal</button>
       <stack>
         <button-group gap="0" label="New Agent session">
-          <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" label="New Agent tab">{agentButtonLabel}</button>
+          <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" label="New Agent tab">Agent</button>
           <button size="sm" variant="outline" icon="chevron-down" on-press="toggle_agent_provider_picker" disabled="{agentProviderUnavailable}" label="Choose provider for a new Agent tab"></button>
         </button-group>
         <if test="{agent_provider_picker_open}">
-          <dropdown-menu anchor="below" anchor-alignment="end" on-dismiss="dismiss_agent_provider_picker">
+          <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="12" on-dismiss="dismiss_agent_provider_picker">
             <if test="{codexProviderAvailable}">
               <menu-item selected="{selected_agent_provider == 'codex'}" disabled="{codexProviderDisabled}" on-press="choose_codex_agent">{codexProviderMenuLabel}</menu-item>
             </if>

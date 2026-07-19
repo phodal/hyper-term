@@ -99,7 +99,7 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
     .min_width = window_min_width,
     .min_height = window_min_height,
     .restore_state = true,
-    .titlebar = .hidden_inset_tall,
+    .titlebar = .hidden_inset,
     .views = &shell_views,
 }};
 pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
@@ -502,24 +502,6 @@ pub const Model = struct {
 
     pub fn copilotAcpProviderMenuLabel(model: *const Model) []const u8 {
         return providerMenuLabel(model, .copilot_acp);
-    }
-
-    pub fn agentButtonLabel(model: *const Model) []const u8 {
-        if (model.agentProviderUnavailable()) return "Agent unavailable";
-        if (!model.agentProviderReady(model.selected_agent_provider)) {
-            return switch (model.selected_agent_provider) {
-                .codex => "Agent · Codex · sign in",
-                .codex_acp => "Agent · Codex ACP · sign in",
-                .claude_acp => "Agent · Claude ACP · sign in",
-                .copilot_acp => "Agent · Copilot ACP · unavailable",
-            };
-        }
-        return switch (model.selected_agent_provider) {
-            .codex => "Agent · Codex",
-            .codex_acp => "Agent · Codex ACP",
-            .claude_acp => "Agent · Claude ACP",
-            .copilot_acp => "Agent · Copilot ACP",
-        };
     }
 
     pub fn activeAgentProviderLabel(model: *const Model) []const u8 {

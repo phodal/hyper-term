@@ -53,6 +53,7 @@ fn containsText(widget: canvas.Widget, value: []const u8) bool {
 
 test "default session is an ordinary terminal" {
     var model = main.initialModel();
+    try testing.expectEqualStrings("hidden_inset", @tagName(main.shell_scene.windows[0].titlebar));
     try testing.expectEqual(main.SessionMode.terminal, model.activeSession().mode);
     try testing.expectEqual(@as(usize, 1), model.openSessions().len);
 
@@ -74,6 +75,7 @@ test "session bar exposes direct Terminal and Agent creation" {
 
     var model = main.initialModel();
     var tree = try buildTree(arena, &model);
+    try testing.expectEqualStrings("Agent", findByLabel(tree.root, "New Agent tab").?.text);
     const terminal_tab = findByText(tree.root, .button, "zsh 1").?;
     const close_from_menu = tree.msgForContextMenu(terminal_tab.id, 0).?;
     switch (close_from_menu) {
