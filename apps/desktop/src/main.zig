@@ -7,7 +7,6 @@
 //! has no JavaScript bridge and never spawns a shell.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 
@@ -827,7 +826,10 @@ pub const Msg = union(enum) {
     pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_config_updated", "agent_permission_decided", "agent_poll", "system_appearance", "chrome_changed" };
 };
 
-const dev_markup_reload = builtin.mode == .Debug;
+// Runtime markup currently replaces the Zig `rootView` instead of composing
+// through it. Keep it disabled until Native SDK exposes fragment hot reload;
+// otherwise Debug builds silently drop the builder-owned Agent timeline.
+const dev_markup_reload = false;
 pub const HyperTermApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = dev_markup_reload });
 pub const Effects = HyperTermApp.Effects;
 
