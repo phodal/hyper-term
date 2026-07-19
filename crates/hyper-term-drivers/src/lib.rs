@@ -4,6 +4,7 @@ mod acp;
 mod agent;
 mod codec;
 mod codex;
+mod codex_containment;
 mod deno_containment;
 mod deno_genui;
 mod deno_lsp;

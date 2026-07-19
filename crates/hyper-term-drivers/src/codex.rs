@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::codex_containment::compile_codex_task_sandbox;
 use crate::{
     AgentClientError, AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind,
     AgentEffectProposal, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent,
@@ -36,6 +37,20 @@ pub struct CodexMcpServerConfig {
     pub arguments: Vec<OsString>,
 }
 
+/// Rust-selected containment inputs for one Direct Codex process tree.
+///
+/// `credentialed_proxy_url` is intentionally kept out of the serializable
+/// sandbox profile. It is bound into the exact command action digest and only
+/// injected into the child environment.
+pub struct CodexContainmentConfig {
+    pub proxy_url: String,
+    pub credentialed_proxy_url: String,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_unix_sockets: Vec<PathBuf>,
+    pub read_paths: Vec<PathBuf>,
+    pub write_paths: Vec<PathBuf>,
+}
+
 pub struct CodexAppServerConfig {
     pub executable: PathBuf,
     pub executable_sha256: String,
@@ -47,6 +62,7 @@ pub struct CodexAppServerConfig {
     /// On Unix this is staged as a private symlink after ownership and mode checks.
     pub auth_file: Option<PathBuf>,
     pub brokered_mcp_server: Option<CodexMcpServerConfig>,
+    pub containment: Option<CodexContainmentConfig>,
 }
 
 pub struct CodexAppServerClient {
@@ -80,19 +96,64 @@ impl CodexAppServerClient {
             .to_owned();
         let codex_home = config.codex_home.canonicalize()?;
         let scratch = config.scratch_directory.canonicalize()?;
+        let auth_read_path = config.auth_file.clone();
         let staged_auth_file = stage_auth_file(config.auth_file.as_ref(), &codex_home)?;
-        let environment = BTreeMap::from([
+        let mut environment = BTreeMap::from([
             ("CODEX_HOME".into(), codex_home.into_os_string()),
             ("HOME".into(), scratch.clone().into_os_string()),
             ("NO_COLOR".into(), OsString::from("1")),
+            (
+                "PATH".into(),
+                OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
+            ),
             ("RUST_BACKTRACE".into(), OsString::from("0")),
             ("TERM".into(), OsString::from("dumb")),
             ("TMPDIR".into(), scratch.into_os_string()),
         ]);
+        let authority_environment = environment.clone();
+        if let Some(containment) = &config.containment {
+            apply_managed_proxy_environment(&mut environment, &containment.credentialed_proxy_url);
+        }
+        let driver_id = Uuid::new_v4();
         let arguments = codex_arguments(config.brokered_mcp_server.as_ref())?;
+        let sandbox = match config.containment.as_ref() {
+            Some(containment) => {
+                let mut read_paths = containment.read_paths.clone();
+                if let Some(auth_file) = auth_read_path {
+                    read_paths.push(auth_file);
+                }
+                if let Some(mcp) = &config.brokered_mcp_server {
+                    read_paths.push(mcp.executable.clone());
+                }
+                match compile_codex_task_sandbox(
+                    driver_id,
+                    &config.executable,
+                    &arguments,
+                    &workspace,
+                    &environment,
+                    &authority_environment,
+                    &containment.proxy_url,
+                    &containment.allowed_hosts,
+                    &containment.allowed_unix_sockets,
+                    read_paths,
+                    containment.write_paths.clone(),
+                ) {
+                    Ok(plan) => Some(plan),
+                    Err(error) => {
+                        remove_staged_auth_file(staged_auth_file.as_ref());
+                        return Err(error.into());
+                    }
+                }
+            }
+            None => None,
+        };
+        let permission_profile = sandbox
+            .as_ref()
+            .map(crate::sandbox_permission_profile)
+            .unwrap_or_else(|| "codex-proposal-only-v1".into());
         let process = match DriverProcess::spawn(DriverSpec {
             manifest: DriverManifest {
-                driver_id: Uuid::new_v4(),
+                driver_id,
                 kind: DriverKind::CodexAppServer,
                 implementation_version: config.implementation_version,
                 protocol_version: "codex-app-server-v2".into(),
@@ -104,13 +165,13 @@ impl CodexAppServerClient {
                 ],
                 transport: "stdio-jsonl".into(),
                 executable_sha256: config.executable_sha256,
-                permission_profile: "codex-proposal-only-v1".into(),
+                permission_profile,
             },
             executable: config.executable,
             arguments,
             working_directory: workspace,
             environment,
-            sandbox: None,
+            sandbox,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: CODEX_FRAME_BYTES,
             max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
@@ -407,6 +468,17 @@ impl CodexAppServerClient {
             }),
         }
     }
+}
+
+fn apply_managed_proxy_environment(
+    environment: &mut BTreeMap<String, OsString>,
+    credentialed_proxy_url: &str,
+) {
+    for name in ["HTTP_PROXY", "HTTPS_PROXY", "WS_PROXY", "WSS_PROXY"] {
+        environment.insert(name.into(), credentialed_proxy_url.into());
+    }
+    environment.insert("NO_PROXY".into(), OsString::new());
+    environment.insert("NODE_USE_ENV_PROXY".into(), "1".into());
 }
 
 impl Drop for CodexAppServerClient {
@@ -740,10 +812,54 @@ pub enum CodexAdapterError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_fake_app_server_completes_initialization() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let runtime = temporary.path().join("runtime");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        let executable = temporary.path().join("codex");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nwhile IFS= read -r line; do case \"$line\" in *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake\"}}';; esac; done\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let client = CodexAppServerClient::launch(CodexAppServerConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            implementation_version: "test".into(),
+            workspace,
+            codex_home: runtime.join("codex-home"),
+            scratch_directory: runtime.join("scratch"),
+            auth_file: None,
+            brokered_mcp_server: None,
+            containment: Some(CodexContainmentConfig {
+                proxy_url: proxy_url.clone(),
+                credentialed_proxy_url: proxy_url,
+                allowed_hosts: vec!["api.openai.com".into()],
+                allowed_unix_sockets: Vec::new(),
+                read_paths: Vec::new(),
+                write_paths: vec![runtime],
+            }),
+        })
+        .unwrap();
+        let response = client.initialize(Duration::from_secs(10)).unwrap();
+        assert_eq!(response["result"]["userAgent"], "fake");
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
 
     #[test]
     fn command_approval_becomes_a_bounded_effect_proposal() {

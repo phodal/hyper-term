@@ -1,0 +1,157 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use hyper_term_core::{SandboxCompileRequest, SandboxLaunchPlan, SandboxLauncher};
+use hyper_term_protocol::{
+    Actor, OperationId, SandboxEnforcement, SandboxEnvironmentPolicy, SandboxFileSystemPolicy,
+    SandboxLifetime, SandboxNetworkPolicy, SandboxPathAccess, SandboxPathRule,
+    SandboxProcessPolicy, SandboxProfile, SandboxResourceLimits, TerminalCommand,
+};
+use hyper_term_sandbox::MacOsSeatbeltLauncher;
+use uuid::Uuid;
+
+use crate::DriverError;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_codex_task_sandbox(
+    driver_id: Uuid,
+    executable: &Path,
+    arguments: &[OsString],
+    working_directory: &Path,
+    command_environment: &BTreeMap<String, OsString>,
+    authority_environment: &BTreeMap<String, OsString>,
+    proxy_url: &str,
+    allowed_hosts: &[String],
+    allowed_unix_sockets: &[PathBuf],
+    read_paths: impl IntoIterator<Item = PathBuf>,
+    write_paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<SandboxLaunchPlan, DriverError> {
+    let command = TerminalCommand {
+        program: utf8_path(executable, "Codex executable")?,
+        args: arguments
+            .iter()
+            .map(|argument| utf8_os(argument, "Codex argument"))
+            .collect::<Result<Vec<_>, _>>()?,
+        cwd: Some(working_directory.to_path_buf()),
+        env: utf8_environment(command_environment)?,
+    };
+    let mut rules = ["/System", "/usr", "/bin", "/sbin", "/Library"]
+        .into_iter()
+        .map(|path| SandboxPathRule {
+            path: PathBuf::from(path),
+            access: SandboxPathAccess::Read,
+        })
+        .collect::<Vec<_>>();
+    rules.push(SandboxPathRule {
+        path: executable.to_path_buf(),
+        access: SandboxPathAccess::Read,
+    });
+    rules.push(SandboxPathRule {
+        path: working_directory.to_path_buf(),
+        access: SandboxPathAccess::Read,
+    });
+    rules.extend(read_paths.into_iter().map(|path| SandboxPathRule {
+        path,
+        access: SandboxPathAccess::Read,
+    }));
+    rules.extend(write_paths.into_iter().map(|path| SandboxPathRule {
+        path,
+        access: SandboxPathAccess::Write,
+    }));
+    let profile = SandboxProfile {
+        enforcement: SandboxEnforcement::Native,
+        filesystem: SandboxFileSystemPolicy { rules },
+        network: SandboxNetworkPolicy::ProxyOnly {
+            proxy_url: proxy_url.to_owned(),
+            allowed_hosts: allowed_hosts.to_vec(),
+            allowed_unix_sockets: allowed_unix_sockets.to_vec(),
+        },
+        environment: SandboxEnvironmentPolicy {
+            clear_inherited: true,
+            variables: utf8_environment(authority_environment)?,
+        },
+        process: SandboxProcessPolicy {
+            allow_child_processes: true,
+            allow_any_executable: true,
+            allowed_executables: Vec::new(),
+        },
+        resources: SandboxResourceLimits::default(),
+        lifetime: SandboxLifetime::OneTask,
+    };
+    MacOsSeatbeltLauncher
+        .compile(&SandboxCompileRequest {
+            operation_id: OperationId::from_uuid(driver_id),
+            operation_revision: 1,
+            actor: Actor::System,
+            command,
+            profile,
+        })
+        .map_err(|error| DriverError::InvalidContainment(error.to_string()))
+}
+
+fn utf8_environment(
+    environment: &BTreeMap<String, OsString>,
+) -> Result<BTreeMap<String, String>, DriverError> {
+    environment
+        .iter()
+        .map(|(name, value)| {
+            utf8_os(value, "Codex environment value").map(|value| (name.clone(), value))
+        })
+        .collect()
+}
+
+fn utf8_path(path: &Path, label: &str) -> Result<String, DriverError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| DriverError::InvalidContainment(format!("{label} path is not UTF-8")))
+}
+
+fn utf8_os(value: &OsString, label: &str) -> Result<String, DriverError> {
+    value
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| DriverError::InvalidContainment(format!("{label} is not UTF-8")))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn proxy_credentials_bind_the_action_without_entering_the_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let runtime = temporary.path().join("runtime");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
+        let executable = PathBuf::from("/usr/bin/true").canonicalize().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let credentialed = endpoint.replacen("http://", "http://hyper-term:secret-token@", 1);
+        let authority_environment =
+            BTreeMap::from([("HOME".into(), runtime.clone().into_os_string())]);
+        let mut command_environment = authority_environment.clone();
+        command_environment.insert("HTTPS_PROXY".into(), credentialed.clone().into());
+        let plan = compile_codex_task_sandbox(
+            Uuid::new_v4(),
+            &executable,
+            &[],
+            &workspace,
+            &command_environment,
+            &authority_environment,
+            &endpoint,
+            &["api.openai.com".into()],
+            &[],
+            [],
+            [runtime],
+        )
+        .unwrap();
+
+        let serialized_profile = serde_json::to_string(&plan.compiled.profile).unwrap();
+        assert!(!serialized_profile.contains("secret-token"));
+        assert_eq!(plan.command.env.get("HTTPS_PROXY"), Some(&credentialed));
+    }
+}

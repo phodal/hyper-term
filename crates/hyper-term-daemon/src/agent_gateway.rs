@@ -17,9 +17,9 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentDriverEvent, AgentEffectAuthorization,
-    AgentEffectKind, CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig,
-    DenoGenUiCompiler, DenoGenUiConfig, DriverState, ExternalRequestId, GenUiCompileRequest,
-    StructuredAgentClient, StructuredAgentProtocol, sha256_file,
+    AgentEffectKind, CodexAppServerClient, CodexAppServerConfig, CodexContainmentConfig,
+    CodexMcpServerConfig, DenoGenUiCompiler, DenoGenUiConfig, DriverState, ExternalRequestId,
+    GenUiCompileRequest, StructuredAgentClient, StructuredAgentProtocol, sha256_file,
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, GenUiArtifactCandidate, MessageRole,
@@ -39,6 +39,7 @@ use crate::artifact_editor_store::{
     ArtifactEditorStoreError,
 };
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
+use crate::network_proxy::ManagedConnectProxy;
 use crate::workspace_apply::{
     DurableWorkspaceApplyResult, MAX_WORKSPACE_APPLY_FILES, WorkspaceApplyError,
     WorkspaceApplySetPlan, WorkspaceRecoveryReport, WorkspaceTransactionContext,
@@ -69,6 +70,7 @@ const MAX_EDITOR_LSP_BODY_BYTES: usize = 1024 * 1024 + 64 * 1024;
 const MAX_ARTIFACT_DRAFT_FILES: usize = 100;
 const MAX_ARTIFACT_DRAFT_SOURCE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_BOOTSTRAP_MARKER: &str = "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->";
+const CODEX_NETWORK_ALLOWED_HOSTS: &[&str] = &["api.openai.com", "auth.openai.com", "chatgpt.com"];
 
 #[derive(Clone)]
 pub struct AgentGatewayConfig {
@@ -244,6 +246,12 @@ struct AgentSession {
     runtime_root: PathBuf,
     progress: Mutex<AgentProgress>,
     pending_effect: Mutex<Option<PendingAgentEffect>>,
+    _managed_proxy: Option<ManagedConnectProxy>,
+}
+
+struct LaunchedAgentProvider {
+    client: Arc<dyn StructuredAgentClient>,
+    managed_proxy: Option<ManagedConnectProxy>,
 }
 
 #[derive(Clone)]
@@ -1624,24 +1632,24 @@ impl AgentGatewayRuntime {
                 return Err(error);
             }
         };
-        let client = match self.launch_provider(provider_id, &session_root, mcp) {
-            Ok(client) => client,
+        let launched = match self.launch_provider(provider_id, &session_root, mcp) {
+            Ok(launched) => launched,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&session_root);
                 return Err(error);
             }
         };
-        let protocol = client.protocol();
-        let thread_id = match client.initialize_session(INITIALIZE_TIMEOUT) {
+        let protocol = launched.client.protocol();
+        let thread_id = match launched.client.initialize_session(INITIALIZE_TIMEOUT) {
             Ok(thread_id) => thread_id,
             Err(_) => {
-                let _ = client.close();
+                let _ = launched.client.close();
                 let _ = std::fs::remove_dir_all(&session_root);
                 return Err(StartError::Driver);
             }
         };
         let session = Arc::new(AgentSession {
-            client,
+            client: launched.client,
             provider_id: provider_id.to_owned(),
             protocol,
             task_id,
@@ -1653,6 +1661,7 @@ impl AgentGatewayRuntime {
                 error: None,
             }),
             pending_effect: Mutex::new(None),
+            _managed_proxy: launched.managed_proxy,
         });
         let response = ready_response(session_id, &session);
         sessions.insert(session_id, session);
@@ -1664,7 +1673,7 @@ impl AgentGatewayRuntime {
         provider_id: &str,
         session_root: &std::path::Path,
         mcp: Option<BrokeredMcpLaunch>,
-    ) -> Result<Arc<dyn StructuredAgentClient>, StartError> {
+    ) -> Result<LaunchedAgentProvider, StartError> {
         if provider_id == "codex" {
             let executable = self
                 .config
@@ -1674,6 +1683,25 @@ impl AgentGatewayRuntime {
                 .canonicalize()
                 .map_err(|_| StartError::Unavailable)?;
             let executable_sha256 = sha256_file(&executable).map_err(|_| StartError::Driver)?;
+            let managed_proxy = ManagedConnectProxy::start(
+                CODEX_NETWORK_ALLOWED_HOSTS
+                    .iter()
+                    .map(|host| (*host).to_owned()),
+            )
+            .map_err(|_| StartError::Driver)?;
+            let endpoint = managed_proxy.endpoint();
+            let allowed_unix_sockets = mcp
+                .as_ref()
+                .map(|_| vec![self.config.control_socket.clone()])
+                .unwrap_or_default();
+            let mut read_paths = Vec::new();
+            if let Some(runtime) = &self.config.genui_runtime {
+                read_paths.extend([
+                    runtime.deno_executable.clone(),
+                    runtime.compiler_script.clone(),
+                    runtime.compiler_wasm.clone(),
+                ]);
+            }
             let client = CodexAppServerClient::launch(CodexAppServerConfig {
                 executable,
                 executable_sha256,
@@ -1687,9 +1715,20 @@ impl AgentGatewayRuntime {
                     executable_sha256: mcp.executable_sha256,
                     arguments: mcp.arguments,
                 }),
+                containment: Some(CodexContainmentConfig {
+                    proxy_url: endpoint.proxy_url.clone(),
+                    credentialed_proxy_url: managed_proxy.credentialed_proxy_url().to_owned(),
+                    allowed_hosts: endpoint.allowed_hosts.clone(),
+                    allowed_unix_sockets,
+                    read_paths,
+                    write_paths: vec![session_root.to_path_buf()],
+                }),
             })
             .map_err(|_| StartError::Driver)?;
-            return Ok(Arc::new(client));
+            return Ok(LaunchedAgentProvider {
+                client: Arc::new(client),
+                managed_proxy: Some(managed_proxy),
+            });
         }
         let provider = self
             .config
@@ -1714,7 +1753,10 @@ impl AgentGatewayRuntime {
             }),
         })
         .map_err(|_| StartError::Driver)?;
-        Ok(Arc::new(client))
+        Ok(LaunchedAgentProvider {
+            client: Arc::new(client),
+            managed_proxy: None,
+        })
     }
 
     fn snapshot(&self, session_id: u16) -> Result<AgentSnapshotResponse, SessionError> {

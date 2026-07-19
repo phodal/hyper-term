@@ -31,6 +31,7 @@ fn installed_codex_app_server_starts_an_authenticated_isolated_thread() {
         scratch_directory: scratch.path().canonicalize().unwrap(),
         auth_file: Some(auth_file),
         brokered_mcp_server: None,
+        containment: None,
     })
     .unwrap();
     let response = client.initialize(Duration::from_secs(10)).unwrap();
