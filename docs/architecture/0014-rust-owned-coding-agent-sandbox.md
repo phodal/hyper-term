@@ -438,18 +438,18 @@ its effects into the user's working tree.
 - cancellation or environment destruction does not imply that a remote effect
   was rolled back.
 
-The first implemented acceptance slice applies one UTF-8 file from the current
-immutable GenUI Artifact to one explicit workspace-relative path. It is a new
-`FileEdit / WorkspaceWrite` operation rather than a side effect of Artifact
-compilation. Review captures the parent directory device/inode and, for an
-existing target, its device/inode, mode, content digest, and bounded content.
-Dispatch rechecks those values and the current Artifact revision before an
-in-process Rust executor performs the macOS directory-FD-relative atomic
-install. Creation uses no-replace semantics; replacement uses swap and verifies
-the displaced file against the approved base before deleting it. Uncertain
-post-install verification is reported as `UnknownExecution`. This does not yet
-implement Tier 2 multi-file worktree acceptance, binary patches, or a
-crash-recovery journal.
+The implemented acceptance slice applies a bounded set of one to 32 UTF-8 files
+from the current immutable GenUI Artifact to explicit, unique
+workspace-relative paths. It is one digest-bound `FileEdit / WorkspaceWrite`
+operation rather than a side effect of Artifact compilation. Review captures
+every parent directory device/inode and, for existing targets, device/inode,
+mode, content digest, and bounded content. Dispatch rechecks the complete set
+and current Artifact revision before the in-process Rust executor stages every
+member. Creation uses no-replace semantics; replacement retains a private base
+backup; a later failure rolls back already-installed members in reverse order.
+Uncertain install, rollback, or cleanup verification is reported as
+`UnknownExecution`. This does not yet implement isolated Tier 2 worktree merge,
+hunk selection, binary patches, or a cross-process crash-recovery journal.
 
 ## Approval and escalation
 

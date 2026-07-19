@@ -159,8 +159,9 @@ rebound to the selected document, and every live `esbuild-wasm` compile receives
 the complete snapshot plus the Rust-selected entrypoint. Artifact publish sends
 the complete file set and rejects local attempts to add or drop paths. Runtime
 source-map failures select the owning file when it is present. Workspace apply
-also binds to the explicitly selected Artifact source path rather than assuming
-`/App.tsx`.
+maps an explicit bounded subset of Artifact source paths to unique
+workspace-relative targets rather than assuming `/App.tsx` or writing the
+whole Artifact implicitly.
 
 The Time Travel surface reads those durable accepted revisions newest-first.
 Loading an older source creates an ordinary local multi-file draft, switches to
@@ -172,8 +173,9 @@ recovered from the journal and private Artifact store.
 This closes the first accepted-artifact, last-known-good delivery, initial
 runtime-error mapping, source-recovery, fixed-file-tree editor navigation, and
 accepted-revision replay slices. It does not yet close the complete hostile-
-artifact matrix, durable reducer/action trace protocol, resource budgets,
-multi-file workspace acceptance, or accessibility gates below.
+artifact matrix, durable reducer/action trace protocol, hunk selection,
+crash-recoverable workspace transactions, resource budgets, or accessibility
+gates below.
 
 ## Validation gates
 

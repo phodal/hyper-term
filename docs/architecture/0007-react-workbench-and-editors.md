@@ -146,23 +146,29 @@ operation through dispatch, recompiles with the digest-pinned Deno and
 receipt, and refreshes the Workbench from Rust source. The browser's 260 ms
 compiler remains advisory local preview only. Publishing an Artifact still
 does not write to the workspace. Instead, the accepted Artifact can now enter a
-second, independent `hyper_term.workspace.apply` transaction. The user provides
-an explicit workspace-relative target; Rust captures the exact Artifact source
-revision, source path, target parent identity, existing file identity, mode,
-content digest, and bounded UTF-8 contents before producing the review. The
-renderer receives the immutable before/after pair for a read-only CodeMirror
-diff but has no file API.
+second, independent `hyper_term.workspace.apply` transaction. The user maps a
+bounded set of one to 32 Artifact source paths to unique workspace-relative
+targets. Rust normalizes and sorts the set, then captures the exact Artifact
+source revision plus every target parent identity, existing file identity,
+mode, content digest, and bounded UTF-8 contents before producing one review.
+The renderer receives the immutable before/after set for grouped, read-only
+CodeMirror diffs but has no file API.
 
-The operation is projected as `FileEdit / WorkspaceWrite` and remains unchanged
-until the matching Approval Block receives `AllowOnce`. Dispatch rechecks the
-current Artifact and workspace base. Traversal, VCS metadata, symlink parents,
+The whole set is projected as one `FileEdit / WorkspaceWrite` operation with a
+canonical transaction digest and remains unchanged until the matching Approval
+Block receives `AllowOnce`. Dispatch rechecks the current Artifact and every
+workspace base. Traversal, duplicate targets, VCS metadata, symlink parents,
 special files, files over 1 MiB, changed inodes, changed modes, and changed
-digests fail closed. On macOS the executor stages in the already-open parent
-directory and uses atomic exclusive rename for a new target or atomic swap plus
-displaced-base verification for an existing target. A gateway integration test
-proves that no write occurs before the exact approval and unit tests cover stale
-identity, no-replace creation, and symlink escape rejection. Browser passes at
-480 pixels cover review, returning to the editor during polling, and zero
+digests fail closed before installation. The Rust executor then stages the
+complete set in already-open parent directories, keeps private backups of
+existing files, installs each target atomically, verifies the results, and
+rolls back already-installed members if a later member fails. Ambiguous rollback
+or cleanup is reported as `UnknownExecution`; this is guarded in-process
+recovery, not a cross-process crash journal. A gateway integration test proves
+that neither target changes before the one exact approval, and unit tests cover
+successful two-file apply, stale-member preflight, later-member rollback,
+no-replace creation, cleanup, and symlink escape rejection. Browser passes at
+480 pixels cover explicit mapping, grouped file Diff navigation, and zero
 horizontal page overflow.
 
 The editor no longer collapses an Artifact to its entrypoint. One Studio owns
@@ -173,8 +179,8 @@ files and the declared entrypoint, so editing an imported module immediately
 updates the isolated preview. Publishing sends the complete fixed path set;
 local additions or removals are rejected before the request. A 480-pixel
 browser flow proves a two-file relative import, per-file LSP readiness, draft
-retention across file and review switches, and current-file Workspace Apply
-mapping without page overflow.
+retention across file and review switches, and explicit multi-file Workspace
+Apply mapping without page overflow.
 
 Time Travel no longer depends on the lifetime of that mounted React tree. The
 Workbench requests a bounded newest-first Artifact projection from the Rust
@@ -187,10 +193,10 @@ tests cover persistence and task/current-revision fencing; a 480-pixel browser
 flow covers restore, per-file dirty state, Diff, preview reload, and overflow.
 
 A real Deno integration test separately covers Artifact approval, compilation,
-replacement, source recovery, and stale revision rejection. Multi-file/hunk
-workspace acceptance, durable edit-transaction/selection journaling, reducer
-trace checkpoints, crash-recoverable multi-file commit, and arbitrary binary
-files remain open.
+replacement, source recovery, and stale revision rejection. Hunk selection,
+durable edit-transaction/selection journaling, reducer trace checkpoints,
+cross-process crash-recoverable workspace commit, and arbitrary binary files
+remain open.
 
 ## Validation gates
 
