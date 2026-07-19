@@ -125,6 +125,7 @@ The important boundary is not Native versus Web. It is **who has authority**:
 | Codex and Claude packaged ACP adapters | Implemented baseline |
 | GitHub Copilot ACP discovery | Implemented baseline |
 | macOS Seatbelt plus managed proxy for Codex and ACP control processes | Implemented Tier 1 baseline |
+| Rust-owned exact-commit Tier 2 worktree lifecycle | Experimental foundation |
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
 | Multi-file Artifact editor, Diff, deterministic reducer replay, effect receipts, diagnostics, completion, and approved publish | Experimental |
@@ -279,13 +280,15 @@ Useful design documents:
 ## Roadmap
 
 - Harden terminal performance, accessibility, reconnect, and recovery gates.
-- Extend the crash-recoverable transactional hunk apply to isolated Tier 2
-  worktrees and bounded binary patches, without giving the renderer write
-  authority.
+- Connect the exact-commit Tier 2 worktree lifecycle to an ephemeral
+  container/VM runner, bounded diff export, restart recovery, and the existing
+  crash-recoverable acceptance operation; add bounded binary patches without
+  giving the renderer write authority.
 - Version and migrate accepted-source, editor, runtime, and Bug Capsule schemas
   while preserving deterministic replay across Hyper Term upgrades.
-- Add isolated Tier 2 worktrees/containers for opaque provider-internal
-  execution; keep the implemented macOS Tier 1 ACP control process read-only.
+- Move opaque provider-internal execution from the read-only macOS Tier 1
+  control-process boundary into the Tier 2 runner once its container/VM and
+  resource-limit gates pass.
 - Publish signed and notarized Apple Silicon and Intel builds.
 - Define the supported-platform contract before expanding beyond macOS.
 

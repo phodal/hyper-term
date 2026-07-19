@@ -5,5 +5,7 @@
 //! silently falls back to an ordinary process spawn.
 
 mod macos;
+mod worktree;
 
 pub use macos::*;
+pub use worktree::*;

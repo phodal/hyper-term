@@ -918,6 +918,9 @@ version = "0.1.0"
 dependencies = [
  "hyper-term-core",
  "hyper-term-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
 ]

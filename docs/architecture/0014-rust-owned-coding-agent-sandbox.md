@@ -557,6 +557,37 @@ execution, hermetic dependencies, resource isolation, and review-only
 acceptance still require Tier 2; protocol tool requests continue through the
 Rust broker instead of inheriting workspace write authority.
 
+### Implemented Tier 2 source-isolation foundation
+
+`hyper-term-sandbox` now owns the first Tier 2 lifecycle boundary: creating and
+destroying a private detached Git worktree for one exact source commit. It does
+not copy the user's live working tree, so tracked dirty edits and untracked
+files never enter the environment. The source repository and private state root
+cannot contain one another, task identifiers are path-safe, environment names
+are digest-derived, and a collision fails closed.
+
+The manager asks Git only to register a `--no-checkout` worktree and populate
+its index. Rust then reads the commit tree and blobs directly, with bounded file
+count, per-file size, total size, and Git diagnostic output. This intentionally
+does not run checkout filters, smudge commands, repository hooks, or filesystem
+copies from the user's checkout. Tree paths and modes are validated; submodules
+and unsupported entries fail closed, while symlinks are accepted only when
+their lexical target remains inside the isolated worktree. A test installs a
+hostile checkout hook and smudge filter and proves neither executes.
+
+Each environment has a mode-0600 manifest binding the source repository, full
+commit ID, task, worktree path, bounded inventory, byte count, and inventory
+digest. Explicit cleanup rereads that manifest, validates the exact state-root
+relationship, removes the registered worktree, and preserves unrelated dirty
+source state. Tests cover clean commit identity, source/worktree independence,
+private manifests, unsafe identifiers and nested roots, escaping symlinks,
+failed-creation cleanup, and worktree registry cleanup.
+
+This slice is not yet a Tier 2 execution claim. The ephemeral container or VM,
+resource and network enforcement, restart-time environment recovery, bounded
+diff export, and exact acceptance operation still have to be wired on top of
+this worktree identity.
+
 ## Audit and observability
 
 Every execution records a `SandboxReceipt` containing at least:

@@ -9,6 +9,9 @@ version.workspace = true
 [dependencies]
 hyper-term-core = { path = "../hyper-term-core" }
 hyper-term-protocol = { path = "../hyper-term-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
