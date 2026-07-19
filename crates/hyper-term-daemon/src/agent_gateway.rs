@@ -30,6 +30,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::DaemonState;
+use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
@@ -44,6 +45,7 @@ const WORKBENCH_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-
 const WORKBENCH_PREVIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 const MAX_PREVIEW_SHELL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_WORKBENCH_ASSET_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EDITOR_LSP_BODY_BYTES: usize = 1024 * 1024 + 64 * 1024;
 const ARTIFACT_BOOTSTRAP_MARKER: &str = "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->";
 
 #[derive(Clone)]
@@ -142,6 +144,7 @@ struct AgentGatewayRuntime {
     sessions: Arc<Mutex<HashMap<u16, Arc<AgentSession>>>>,
     preview_shell: Option<Arc<str>>,
     workbench_assets: Option<Arc<PathBuf>>,
+    editor_lsp: Option<Arc<EditorLspService>>,
 }
 
 struct AgentSession {
@@ -294,6 +297,25 @@ pub async fn spawn_agent_gateway(
         .map(|runtime| read_preview_shell(&runtime.preview_shell))
         .transpose()?
         .map(Arc::<str>::from);
+    let editor_lsp = config
+        .genui_runtime
+        .as_ref()
+        .map(|runtime| {
+            let digest = sha256_file(&runtime.deno_executable).map_err(|error| {
+                AgentGatewayError::InvalidGenUiRuntime(format!(
+                    "cannot digest editor Deno runtime: {error}"
+                ))
+            })?;
+            EditorLspService::new(
+                runtime.deno_executable.clone(),
+                digest,
+                runtime.runtime_version.clone(),
+                &config.state_directory,
+            )
+            .map(Arc::new)
+            .map_err(|error| AgentGatewayError::InvalidGenUiRuntime(error.to_string()))
+        })
+        .transpose()?;
     let workbench_assets = config
         .workbench_assets
         .take()
@@ -315,6 +337,7 @@ pub async fn spawn_agent_gateway(
         sessions: Arc::new(Mutex::new(HashMap::new())),
         preview_shell,
         workbench_assets,
+        editor_lsp,
     };
     let router = Router::new()
         .route(
@@ -334,10 +357,16 @@ pub async fn spawn_agent_gateway(
             get(artifact_source_map),
         )
         .route("/agent/artifact/{artifact_id}/source", get(artifact_source))
+        .route(
+            "/agent/artifact/{artifact_id}/lsp",
+            post(artifact_editor_lsp),
+        )
         .route("/agent/workbench", get(workbench_index))
         .route("/agent/workbench/", get(workbench_index))
         .route("/agent/workbench/{*path}", get(workbench_asset))
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_PROMPT_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            MAX_EDITOR_LSP_BODY_BYTES,
+        ))
         .with_state(runtime.clone());
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -573,6 +602,62 @@ async fn artifact_source(
     }
 }
 
+async fn artifact_editor_lsp(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let request = match serde_json::from_slice::<EditorLspRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return status_response(StatusCode::BAD_REQUEST, "Editor LSP request is invalid");
+        }
+    };
+    if request.validate().is_err() {
+        return status_response(StatusCode::BAD_REQUEST, "Editor LSP request is invalid");
+    }
+    match tokio::task::spawn_blocking(move || {
+        runtime.editor_lsp_query(session_id, artifact_id, request)
+    })
+    .await
+    {
+        Ok(Ok(response)) => json_response(StatusCode::OK, &response),
+        Ok(Err(EditorRequestError::SessionUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Ok(Err(EditorRequestError::AcpRequired)) => status_response(
+            StatusCode::FORBIDDEN,
+            "Editor LSP is available only for ACP Agent artifacts",
+        ),
+        Ok(Err(EditorRequestError::ArtifactUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
+        }
+        Ok(Err(EditorRequestError::StaleRevision)) => status_response(
+            StatusCode::CONFLICT,
+            "Editor source revision is no longer current",
+        ),
+        Ok(Err(EditorRequestError::InvalidRequest)) => {
+            status_response(StatusCode::BAD_REQUEST, "Editor LSP request is invalid")
+        }
+        Ok(Err(EditorRequestError::RuntimeUnavailable)) => {
+            status_response(StatusCode::SERVICE_UNAVAILABLE, "Editor LSP is unavailable")
+        }
+        Ok(Err(EditorRequestError::Driver)) | Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Editor LSP request could not be completed",
+        ),
+    }
+}
+
 async fn start_turn(
     State(runtime): State<AgentGatewayRuntime>,
     Query(query): Query<AgentSessionQuery>,
@@ -687,6 +772,17 @@ enum SessionError {
     UnsafeApproval,
     Driver,
     ArtifactUnavailable,
+}
+
+#[derive(Debug)]
+enum EditorRequestError {
+    SessionUnavailable,
+    AcpRequired,
+    ArtifactUnavailable,
+    StaleRevision,
+    InvalidRequest,
+    RuntimeUnavailable,
+    Driver,
 }
 
 impl AgentGatewayRuntime {
@@ -874,6 +970,39 @@ impl AgentGatewayRuntime {
             entrypoint: artifact.metadata.entrypoint,
             files: artifact.source_files,
         })
+    }
+
+    fn editor_lsp_query(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        request: EditorLspRequest,
+    ) -> Result<EditorLspResponse, EditorRequestError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| EditorRequestError::SessionUnavailable)?;
+        if session.protocol != StructuredAgentProtocol::Acp {
+            return Err(EditorRequestError::AcpRequired);
+        }
+        let artifact = self
+            .config
+            .daemon
+            .read_active_genui_artifact(session.task_id, artifact_id)
+            .map_err(|_| EditorRequestError::ArtifactUnavailable)?;
+        let service = self
+            .editor_lsp
+            .as_ref()
+            .ok_or(EditorRequestError::RuntimeUnavailable)?;
+        service
+            .query(session_id, &artifact, request)
+            .map_err(|error| match error {
+                EditorLspError::StaleRevision => EditorRequestError::StaleRevision,
+                EditorLspError::InvalidRequest(_) | EditorLspError::DocumentUnavailable => {
+                    EditorRequestError::InvalidRequest
+                }
+                EditorLspError::InvalidRuntime => EditorRequestError::RuntimeUnavailable,
+                _ => EditorRequestError::Driver,
+            })
     }
 
     fn submit_turn(
@@ -1117,6 +1246,9 @@ impl AgentGatewayRuntime {
         {
             let _ = session.client.close();
         }
+        if let Some(editor_lsp) = &self.editor_lsp {
+            editor_lsp.close_session(session_id);
+        }
     }
 
     fn close_all(&self) {
@@ -1127,6 +1259,9 @@ impl AgentGatewayRuntime {
         };
         for session in sessions {
             let _ = session.client.close();
+        }
+        if let Some(editor_lsp) = &self.editor_lsp {
+            editor_lsp.close_all();
         }
     }
 }
@@ -1746,6 +1881,179 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires HYPER_TERM_DENO_PATH and HYPER_TERM_DENO_SHA256"]
+    async fn authenticated_acp_artifact_editor_queries_the_real_deno_lsp() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
+        let fake_acp = temporary.path().join("fixture-acp");
+        std::fs::write(
+            &fake_acp,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"editor-session\"}}' ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_acp).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_acp, permissions).unwrap();
+        let compiler_script = temporary.path().join("genui-compiler.js");
+        let compiler_wasm = temporary.path().join("esbuild.wasm");
+        let preview_shell = temporary.path().join("genui-preview.html");
+        std::fs::write(&compiler_script, "compiler").unwrap();
+        std::fs::write(&compiler_wasm, "wasm").unwrap();
+        std::fs::write(
+            &preview_shell,
+            format!(
+                "<html><head>{ARTIFACT_BOOTSTRAP_MARKER}<script>hyper_term_preview_boot</script></head></html>"
+            ),
+        )
+        .unwrap();
+        let deno =
+            PathBuf::from(std::env::var_os("HYPER_TERM_DENO_PATH").expect("HYPER_TERM_DENO_PATH"))
+                .canonicalize()
+                .unwrap();
+        assert_eq!(
+            sha256_file(&deno).unwrap(),
+            std::env::var("HYPER_TERM_DENO_SHA256").expect("HYPER_TERM_DENO_SHA256")
+        );
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace,
+            state_directory: temporary.path().join("gateway-state"),
+            daemon: daemon.clone(),
+            codex_executable: None,
+            codex_auth_file: None,
+            acp_providers: vec![AcpAgentProviderConfig {
+                provider_id: "fixture-acp".into(),
+                executable: fake_acp,
+                arguments: Vec::new(),
+                environment: BTreeMap::new(),
+                implementation_version: "fixture-1".into(),
+            }],
+            mcp_executable: None,
+            genui_runtime: Some(AgentGenUiRuntimeConfig {
+                deno_executable: deno,
+                runtime_version: "2.9.3".into(),
+                compiler_script,
+                compiler_wasm,
+                preview_shell,
+                compiler_version: "0.28.1".into(),
+            }),
+            workbench_assets: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .unwrap();
+        let (status, body) = request_path(
+            gateway.address(),
+            &format!("/agent/session?token={token}&session_id=8&provider=fixture-acp"),
+            "POST",
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id: TaskId = serde_json::from_value(response["task_id"].clone()).unwrap();
+        let proposed = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.genui.compile".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                "Compile editor LSP fixture".into(),
+                RiskClass::ReadOnly,
+                vec!["genui_compile".into()],
+            )
+            .unwrap();
+        let authorized = daemon
+            .decide_permission(
+                task_id,
+                proposed.operation_id,
+                proposed.revision,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap();
+        let dispatching = daemon
+            .begin_operation(task_id, proposed.operation_id, authorized.revision)
+            .unwrap();
+        let bundle = "globalThis.editorLsp = true;";
+        let css = "";
+        let mut digest = Sha256::new();
+        digest.update(bundle.as_bytes());
+        digest.update(css.as_bytes());
+        let accepted = daemon
+            .accept_genui_artifact(
+                task_id,
+                proposed.operation_id,
+                dispatching.revision,
+                hyper_term_protocol::GenUiArtifactCandidate {
+                    schema_version: 1,
+                    source_revision: 4,
+                    entrypoint: "/main.ts".into(),
+                    source_files: BTreeMap::from([(
+                        "/main.ts".into(),
+                        "const answer: string = 42;\n".into(),
+                    )]),
+                    bundle: bundle.into(),
+                    css: css.into(),
+                    source_map: "{\"version\":3}".into(),
+                    content_digest: digest
+                        .finalize()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    compiler: hyper_term_protocol::GenUiCompilerIdentity {
+                        name: "esbuild-wasm".into(),
+                        version: "0.28.1".into(),
+                    },
+                    diagnostics: Vec::new(),
+                },
+            )
+            .unwrap();
+        let lsp_path = format!(
+            "/agent/artifact/{}/lsp?token={token}&session_id=8",
+            accepted.artifact_id
+        );
+        let diagnostics = serde_json::to_vec(&serde_json::json!({
+            "source_revision": 4,
+            "document_path": "/main.ts",
+            "source": "const answer: string = 42;\n",
+            "kind": "diagnostics"
+        }))
+        .unwrap();
+        let (status, body) = request_path(gateway.address(), &lsp_path, "POST", &diagnostics).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            response["diagnostics"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        let completion = serde_json::to_vec(&serde_json::json!({
+            "source_revision": 4,
+            "document_path": "/main.ts",
+            "source": "const value = \"ok\";\nvalue.\n",
+            "kind": "completion",
+            "position": {"line": 1, "character": 6}
+        }))
+        .unwrap();
+        let (status, body) = request_path(gateway.address(), &lsp_path, "POST", &completion).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["document_version"], 2);
+        assert!(
+            response["completions"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn accepted_artifact_preview_is_authenticated_current_and_network_closed() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
@@ -1969,6 +2277,23 @@ mod tests {
         assert_eq!(
             source["files"]["/App.tsx"],
             "export default () => <main>ready</main>;"
+        );
+        let lsp_path = format!(
+            "/agent/artifact/{}/lsp?token={token}&session_id=6",
+            accepted.artifact_id
+        );
+        let lsp_request = serde_json::to_vec(&serde_json::json!({
+            "source_revision": 9,
+            "document_path": "/App.tsx",
+            "source": "export default () => <main>ready</main>;",
+            "kind": "diagnostics"
+        }))
+        .unwrap();
+        assert_eq!(
+            request_path(gateway.address(), &lsp_path, "POST", &lsp_request,)
+                .await
+                .0,
+            StatusCode::FORBIDDEN.as_u16()
         );
         let unauthorized_source_path = format!(
             "/agent/artifact/{}/source?token=wrong&session_id=6",
@@ -2293,6 +2618,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             preview_shell: None,
             workbench_assets: None,
+            editor_lsp: None,
         };
         let session_root = state_directory.join("agents/session-7");
         let config = runtime

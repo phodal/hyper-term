@@ -240,6 +240,63 @@ impl DenoLspClient {
         Ok(self.process.recv_timeout(timeout)?)
     }
 
+    pub fn wait_for_notification(
+        &self,
+        method: &str,
+        timeout: Duration,
+    ) -> Result<Value, DenoLspError> {
+        if method.is_empty() || method.len() > 256 {
+            return Err(DenoLspError::InvalidConfig(
+                "LSP notification method is empty or oversized".into(),
+            ));
+        }
+        let _gate = lock(&self.request_gate)?;
+        if self.process.state()? != DriverState::Ready {
+            return Err(DenoLspError::NotReady);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DenoLspError::NotificationTimeout {
+                    method: method.into(),
+                });
+            }
+            let event = if let Some(event) = lock(&self.inbox)?.pop_front() {
+                event
+            } else {
+                match self.process.recv_timeout(remaining) {
+                    Ok(event) => event,
+                    Err(DriverError::Timeout | DriverError::EffectTimedOut { .. }) => {
+                        return Err(DenoLspError::NotificationTimeout {
+                            method: method.into(),
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            match event {
+                DriverEvent::Message { ref payload, .. }
+                    if server_request_response(payload, &self.workspace_uri).is_some() =>
+                {
+                    let response = server_request_response(payload, &self.workspace_uri)
+                        .expect("guard checked the response");
+                    self.process.send_json(&response)?;
+                }
+                DriverEvent::Message { payload, .. }
+                    if payload.get("method").and_then(Value::as_str) == Some(method) =>
+                {
+                    return Ok(payload);
+                }
+                DriverEvent::ProtocolError { message } => {
+                    return Err(DenoLspError::Protocol(message));
+                }
+                DriverEvent::Exited { state, .. } => return Err(DenoLspError::Exited(state)),
+                _ => {}
+            }
+        }
+    }
+
     pub fn state(&self) -> Result<DriverState, DenoLspError> {
         Ok(self.process.state()?)
     }
@@ -375,6 +432,8 @@ pub enum DenoLspError {
     NotReady,
     #[error("Deno LSP request {request_id} timed out")]
     Timeout { request_id: u64 },
+    #[error("Deno LSP notification {method} timed out")]
+    NotificationTimeout { method: String },
     #[error("Deno LSP request {request_id} failed: {error}")]
     Remote { request_id: u64, error: Value },
     #[error("Deno LSP protocol failed: {0}")]

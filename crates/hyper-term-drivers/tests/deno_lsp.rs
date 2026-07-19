@@ -48,6 +48,15 @@ fn pinned_deno_lsp_completes_a_real_initialize_handshake() {
             }),
         )
         .unwrap();
+    let diagnostics = client
+        .wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(diagnostics["params"]["uri"], source_uri);
+    assert!(
+        diagnostics["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
     let symbols = client
         .request(
             "textDocument/documentSymbol",

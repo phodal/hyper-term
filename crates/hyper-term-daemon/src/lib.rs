@@ -35,6 +35,7 @@ mod agent_gateway;
 mod artifact_store;
 #[cfg(unix)]
 mod client;
+mod editor_lsp;
 #[cfg(unix)]
 mod mcp_gateway;
 mod web_gateway;
