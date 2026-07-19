@@ -4,7 +4,9 @@ This is the macOS-first Native SDK product shell. The default view is a normal
 Terminal. `New` creates another ordinary Terminal tab, while the adjacent
 `Agent` action explicitly creates a brokered Agent tab. Every tab exposes its
 own close control and context-menu action; Command-W closes the active tab
-through the same Rust-owned session lifecycle.
+through the same Rust-owned session lifecycle. The terminal surface adds
+Command-F scrollback search and persistent Command-Plus / Command-Minus zoom
+without claiming Ctrl-C or other shell input.
 
 Agent tabs are single-pane by default, matching the disclosure behavior of a
 modern coding-agent client rather than reserving a permanent sidebar. A right

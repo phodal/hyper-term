@@ -33,7 +33,8 @@ task model without giving the UI direct command or filesystem authority.
 
 - **A real terminal first.** New tabs open the user's login shell with job
   control, resize, `Ctrl-C`, UTF-8, CJK/IME input, truecolor, ordered output,
-  and reconnectable scrollback.
+  reconnectable scrollback, `Command-F` history search, and persistent
+  `Command-Plus` / `Command-Minus` font zoom.
 - **Explicit Agent mode.** Agent sessions live in their own tabs; opening a
   normal terminal never starts a model or changes shell behavior.
 - **Structured coding-agent sessions.** ACP adapters turn messages, plans, tool
