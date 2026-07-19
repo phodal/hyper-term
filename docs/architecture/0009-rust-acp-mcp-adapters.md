@@ -174,8 +174,13 @@ set is enabled per release.
 - The signed app build now materializes both official adapter packages through
   a frozen Deno lockfile, removes their redundant provider binaries, records a
   bounded per-file digest inventory, and runs the offline entrypoints with the
-  already bundled Deno runtime. Real prompt gates pass through this exact pruned
-  artifact for both providers.
+  already bundled Deno runtime. It follows Deno's production package links but
+  omits the top-level `.pnpm` installer store instead of copying the same
+  packages and provider binaries twice. Build and verification share the Rust
+  desktop loader's 8,192-file and 128-MiB limits. The current arm64 probe is
+  5,972 ACP files; both offline version probes pass and the complete ad-hoc app
+  is 184 MiB instead of 1.9 GiB. Real prompt gates pass through this exact
+  pruned artifact for both providers.
 - ACP v1 `session/new` and direct Codex sessions now receive the same
   digest-pinned `hyper-term-mcp` stdio server. Its enabled catalog is derived
   from the exact runtime configuration: Diff is always bounded and read-only;

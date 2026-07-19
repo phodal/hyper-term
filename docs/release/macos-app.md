@@ -21,6 +21,16 @@ The final bundle contains:
   official Codex ACP 1.1.4 and Claude Agent ACP 0.59.0, plus a per-file digest
   manifest and the Deno lockfile used to reproduce them.
 
+The ACP runtime build follows Deno's production links into one self-contained
+tree but excludes the top-level `.pnpm` content store and installer metadata.
+Those files duplicate the same dependencies and provider binaries and are not
+runtime inputs. Both build and verification enforce the desktop loader's limit
+of 8,192 files and 128 MiB before packaging. The 2026-07-20 arm64 ad-hoc package
+probe contained 5,972 verified ACP files and reduced the complete application
+from 1.9 GiB to 184 MiB while both offline adapter `--version` probes passed.
+These figures are evidence for that toolchain snapshot, not a permanent package
+size guarantee.
+
 Native SDK first creates an unsigned `.app`. The workflow then composes the
 complete bundle, signs every Mach-O executable and the outer bundle, submits it
 to Apple's notary service, staples the ticket, and finally creates the release

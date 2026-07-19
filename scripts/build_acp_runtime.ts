@@ -5,6 +5,8 @@ const sourceRoot = join(repository, "runtime", "acp");
 const source = join(sourceRoot, "node_modules");
 const output = join(repository, "dist", "runtime", "acp");
 const outputModules = join(output, "node_modules");
+const maxRuntimeFiles = 8 * 1024;
+const maxRuntimeBytes = 128 * 1024 * 1024;
 
 const adapters = [
   {
@@ -43,6 +45,12 @@ for await (const path of regularFiles(output)) {
   });
 }
 files.sort((left, right) => left.path.localeCompare(right.path));
+const runtimeBytes = files.reduce((total, file) => total + file.bytes, 0);
+if (files.length > maxRuntimeFiles || runtimeBytes > maxRuntimeBytes) {
+  throw new Error(
+    `ACP runtime exceeds its release budget: ${files.length} files, ${runtimeBytes} bytes`,
+  );
+}
 
 const resolvedAdapters = [];
 for (const adapter of adapters) {
@@ -84,7 +92,11 @@ await Deno.writeTextFile(
 
 async function copyProductionTree(from: string, to: string): Promise<void> {
   for await (const entry of Deno.readDir(from)) {
-    if (from === source && (entry.name === ".deno" || entry.name === ".bin")) {
+    // Deno's manual node_modules layout keeps its pnpm content store and
+    // installer metadata beside the production links. Following the links
+    // below already materializes a self-contained runtime; copying the store
+    // as well duplicates provider binaries and can inflate the app by >1 GiB.
+    if (from === source && entry.name.startsWith(".")) {
       continue;
     }
     const destinationScope = relative(outputModules, to).split(SEPARATOR).join(

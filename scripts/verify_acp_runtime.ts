@@ -8,6 +8,8 @@ import {
 } from "@std/path";
 
 const deno = Deno.execPath();
+const maxRuntimeFiles = 8 * 1024;
+const maxRuntimeBytes = 128 * 1024 * 1024;
 const root = Deno.args[0]
   ? resolve(Deno.args[0])
   : fromFileUrl(new URL("../dist/runtime/acp/", import.meta.url));
@@ -31,12 +33,16 @@ if (
 ) {
   throw new Error("ACP runtime manifest does not match the build runtime");
 }
-if (manifest.adapters.length !== 2 || manifest.files.length === 0) {
+if (
+  manifest.adapters.length !== 2 || manifest.files.length === 0 ||
+  manifest.files.length > maxRuntimeFiles
+) {
   throw new Error("ACP runtime manifest is incomplete");
 }
 
 const canonicalRoot = await Deno.realPath(root);
 const fileDigests = new Map<string, string>();
+let runtimeBytes = 0;
 for (const file of manifest.files) {
   if (
     !validManifestPath(file.path) || !Number.isSafeInteger(file.bytes) ||
@@ -46,6 +52,10 @@ for (const file of manifest.files) {
   }
   if (fileDigests.has(file.path)) {
     throw new Error(`ACP runtime file is duplicated: ${file.path}`);
+  }
+  runtimeBytes += file.bytes;
+  if (!Number.isSafeInteger(runtimeBytes) || runtimeBytes > maxRuntimeBytes) {
+    throw new Error("ACP runtime exceeds its release byte budget");
   }
   const path = join(canonicalRoot, ...file.path.split("/"));
   const canonicalPath = await Deno.realPath(path).catch((error) => {
