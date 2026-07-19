@@ -289,6 +289,10 @@ pub const Session = struct {
     pub fn closeLabel(session: *const Session, arena: std.mem.Allocator) []const u8 {
         return std.fmt.allocPrint(arena, "Close {s} {d}", .{ session.title, session.id }) catch "Close tab";
     }
+
+    pub fn tabGroupLabel(session: *const Session, arena: std.mem.Allocator) []const u8 {
+        return std.fmt.allocPrint(arena, "{s} tab {d}", .{ session.title, session.id }) catch "Session tab";
+    }
 };
 
 pub const Model = struct {
@@ -425,7 +429,12 @@ pub const Model = struct {
     }
 
     pub fn agentButtonLabel(model: *const Model) []const u8 {
-        return if (model.agentProviderUnavailable()) "Agent unavailable" else model.selected_agent_provider.label();
+        if (model.agentProviderUnavailable()) return "Agent unavailable";
+        return switch (model.selected_agent_provider) {
+            .codex => "Agent · Codex",
+            .codex_acp => "Agent · Codex ACP",
+            .claude_acp => "Agent · Claude ACP",
+        };
     }
 
     pub fn activeAgentProviderLabel(model: *const Model) []const u8 {
@@ -1249,6 +1258,9 @@ fn selectSession(model: *Model, session_id: u8) void {
 pub fn command(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "hyper-term.new-terminal")) return .choose_terminal;
     if (std.mem.eql(u8, name, "hyper-term.new-agent")) return .choose_agent;
+    if (std.mem.eql(u8, name, "hyper-term.new-codex-agent")) return .choose_codex_agent;
+    if (std.mem.eql(u8, name, "hyper-term.new-codex-acp-agent")) return .choose_codex_acp_agent;
+    if (std.mem.eql(u8, name, "hyper-term.new-claude-acp-agent")) return .choose_claude_acp_agent;
     if (std.mem.eql(u8, name, "hyper-term.close-session")) return .close_active_session;
     return null;
 }
@@ -1302,6 +1314,8 @@ pub fn hyperTermTokens(model: *const Model) canvas.DesignTokens {
         });
         tokens.controls.tabs_indicator = .underline;
         tokens.metrics.tabs_gap = 4;
+        tokens.controls.button_group_style = .segmented;
+        tokens.metrics.button_group_gap = 0;
         return tokens;
     }
 
@@ -1366,6 +1380,8 @@ pub fn hyperTermTokens(model: *const Model) canvas.DesignTokens {
     tokens.radius = .{ .sm = 4, .md = 6, .lg = 8, .xl = 12 };
     tokens.controls.tabs_indicator = .underline;
     tokens.metrics.tabs_gap = 4;
+    tokens.controls.button_group_style = .segmented;
+    tokens.metrics.button_group_gap = 0;
     return tokens;
 }
 

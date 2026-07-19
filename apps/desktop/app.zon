@@ -15,12 +15,20 @@
     },
     .menus = .{
         .{
-            .title = "Shell",
+            .title = "File",
             .items = .{
                 .{ .label = "New Terminal Tab", .command = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
                 .{ .label = "New Agent Tab", .command = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },
                 .{ .separator = true },
                 .{ .label = "Close Tab", .command = "hyper-term.close-session", .key = "w", .modifiers = .{"primary"} },
+            },
+        },
+        .{
+            .title = "Agent",
+            .items = .{
+                .{ .label = "New Codex Agent Tab", .command = "hyper-term.new-codex-agent" },
+                .{ .label = "New Codex ACP Agent Tab", .command = "hyper-term.new-codex-acp-agent" },
+                .{ .label = "New Claude ACP Agent Tab", .command = "hyper-term.new-claude-acp-agent" },
             },
         },
     },

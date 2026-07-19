@@ -7,37 +7,37 @@
       <icon name="terminal" width="15" height="15" foreground="accent" />
       <text><span weight="medium">Hyper Term</span></text>
       <separator height="16" />
-      <tabs gap="4" grow="1" label="Open sessions">
+      <row gap="4" grow="1" cross="center" label="Open sessions">
         <for each="openSessions" key="id" as="session">
-          <button size="sm" selected="{session.id == active_session_id}" on-press="select_session:{session.id}">
-            {session.title} {session.id}
-            <context-menu>
-              <menu-item on-press="close_session:{session.id}">Close Tab</menu-item>
-            </context-menu>
-          </button>
-          <if test="{session.id == active_session_id}">
-            <toggle-button size="sm" variant="ghost" icon="x" on-toggle="close_session:{session.id}" label="{session.closeLabel}"></toggle-button>
-          </if>
+          <button-group gap="0" label="{session.tabGroupLabel}">
+            <button size="sm" variant="ghost" icon="{session.icon}" selected="{session.id == active_session_id}" on-press="select_session:{session.id}">
+              {session.title} {session.id}
+              <context-menu>
+                <menu-item on-press="close_session:{session.id}">Close Tab</menu-item>
+              </context-menu>
+            </button>
+            <button size="sm" variant="ghost" icon="x" selected="{session.id == active_session_id}" on-press="close_session:{session.id}" label="{session.closeLabel}"></button>
+          </button-group>
         </for>
-      </tabs>
+      </row>
     </row>
     <row gap="4" cross="center" label="New session">
-      <button size="sm" variant="outline" icon="plus" on-press="choose_terminal" label="New Terminal tab">New</button>
+      <button size="sm" variant="outline" icon="plus" on-press="choose_terminal" label="New Terminal tab">Terminal</button>
       <stack>
         <button-group gap="0" label="New Agent session">
           <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" label="New Agent tab">{agentButtonLabel}</button>
-          <button size="sm" variant="outline" icon="chevron-down" on-press="toggle_agent_provider_picker" disabled="{agentProviderUnavailable}" label="Choose Agent provider"></button>
+          <button size="sm" variant="outline" icon="chevron-down" on-press="toggle_agent_provider_picker" disabled="{agentProviderUnavailable}" label="Choose provider for a new Agent tab"></button>
         </button-group>
         <if test="{agent_provider_picker_open}">
           <dropdown-menu anchor="below" anchor-alignment="end" on-dismiss="dismiss_agent_provider_picker">
             <if test="{codexProviderAvailable}">
-              <menu-item selected="{selected_agent_provider == 'codex'}" on-press="choose_codex_agent">Codex app-server</menu-item>
+              <menu-item selected="{selected_agent_provider == 'codex'}" on-press="choose_codex_agent">New Agent Tab · Codex app-server</menu-item>
             </if>
             <if test="{codexAcpProviderAvailable}">
-              <menu-item selected="{selected_agent_provider == 'codex_acp'}" on-press="choose_codex_acp_agent">Codex ACP</menu-item>
+              <menu-item selected="{selected_agent_provider == 'codex_acp'}" on-press="choose_codex_acp_agent">New Agent Tab · Codex ACP</menu-item>
             </if>
             <if test="{claudeAcpProviderAvailable}">
-              <menu-item selected="{selected_agent_provider == 'claude_acp'}" on-press="choose_claude_acp_agent">Claude ACP</menu-item>
+              <menu-item selected="{selected_agent_provider == 'claude_acp'}" on-press="choose_claude_acp_agent">New Agent Tab · Claude ACP</menu-item>
             </if>
           </dropdown-menu>
         </if>

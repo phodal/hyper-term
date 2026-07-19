@@ -74,7 +74,7 @@ test "session bar exposes direct Terminal and Agent creation" {
 
     var model = main.initialModel();
     var tree = try buildTree(arena, &model);
-    const terminal_tab = findByText(tree.root, .segmented_control, "zsh 1").?;
+    const terminal_tab = findByText(tree.root, .button, "zsh 1").?;
     const close_from_menu = tree.msgForContextMenu(terminal_tab.id, 0).?;
     switch (close_from_menu) {
         .close_session => |session_id| try testing.expectEqual(@as(u8, 1), session_id),
@@ -113,12 +113,12 @@ test "Agent provider picker creates a provider-bound ACP tab" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var tree = try buildTree(arena, &model);
-    const picker = findByLabel(tree.root, "Choose Agent provider").?;
+    const picker = findByLabel(tree.root, "Choose provider for a new Agent tab").?;
     main.update(&model, tree.msgForPointer(picker.id, .up).?, &fx);
     try testing.expect(model.agent_provider_picker_open);
 
     tree = try buildTree(arena, &model);
-    const codex_acp = findAnyByText(tree.root, "Codex ACP").?;
+    const codex_acp = findAnyByText(tree.root, "New Agent Tab · Codex ACP").?;
     main.update(&model, tree.msgForPointer(codex_acp.id, .up).?, &fx);
 
     try testing.expect(!model.agent_provider_picker_open);
@@ -453,6 +453,8 @@ test "tabs expose close controls and close the active session like a desktop ter
     try testing.expectEqual(@as(u8, 3), model.active_session_id);
 
     var tree = try buildTree(arena, &model);
+    try testing.expect(findByLabel(tree.root, "Close zsh 1") != null);
+    try testing.expect(findByLabel(tree.root, "Close zsh 2") != null);
     const close_agent = findByLabel(tree.root, "Close Codex 3").?;
     main.update(&model, tree.msgForPointer(close_agent.id, .up).?, &fx);
     try testing.expectEqual(@as(usize, 2), model.openSessions().len);
@@ -495,6 +497,9 @@ test "native menu commands map to explicit tab lifecycles" {
     const terminal = main.command("hyper-term.new-terminal") orelse return error.TestUnexpectedResult;
     const agent = main.command("hyper-term.new-agent") orelse return error.TestUnexpectedResult;
     const close = main.command("hyper-term.close-session") orelse return error.TestUnexpectedResult;
+    const codex = main.command("hyper-term.new-codex-agent") orelse return error.TestUnexpectedResult;
+    const codex_acp = main.command("hyper-term.new-codex-acp-agent") orelse return error.TestUnexpectedResult;
+    const claude_acp = main.command("hyper-term.new-claude-acp-agent") orelse return error.TestUnexpectedResult;
 
     switch (terminal) {
         .choose_terminal => {},
@@ -508,6 +513,9 @@ test "native menu commands map to explicit tab lifecycles" {
         .close_active_session => {},
         else => return error.TestUnexpectedResult,
     }
+    try testing.expect(codex == .choose_codex_agent);
+    try testing.expect(codex_acp == .choose_codex_acp_agent);
+    try testing.expect(claude_acp == .choose_claude_acp_agent);
     try testing.expect(main.command("hyper-term.new-session") == null);
 }
 
