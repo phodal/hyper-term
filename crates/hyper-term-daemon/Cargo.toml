@@ -30,6 +30,7 @@ hyper-term-core = { path = "../hyper-term-core" }
 hyper-term-drivers = { path = "../hyper-term-drivers" }
 hyper-term-protocol = { path = "../hyper-term-protocol" }
 hyper-term-sandbox = { path = "../hyper-term-sandbox" }
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

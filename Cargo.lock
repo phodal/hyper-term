@@ -860,6 +860,7 @@ dependencies = [
  "hyper-term-drivers",
  "hyper-term-protocol",
  "hyper-term-sandbox",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

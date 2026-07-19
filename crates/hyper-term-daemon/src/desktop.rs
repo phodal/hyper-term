@@ -6,9 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus};
-use std::time::Duration;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -21,12 +23,15 @@ use hyper_term_daemon::{
 use uuid::Uuid;
 
 use hyper_term_drivers::sha256_file;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const DESKTOP_TERMINAL_ADDRESS: &str = "127.0.0.1:47437";
 const TERMINAL_URL_ENV: &str = "HYPER_TERM_TERMINAL_URL";
 const AGENT_URL_ENV: &str = "HYPER_TERM_AGENT_URL";
 const AGENT_PROVIDERS_ENV: &str = "HYPER_TERM_AGENT_PROVIDERS";
+const AGENT_PROVIDER_STATUS_ENV: &str = "HYPER_TERM_AGENT_PROVIDER_STATUS";
+const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const PROVIDER_PROBE_MAX_STDOUT_BYTES: usize = 4 * 1024;
 const ACP_RUNTIME_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const ACP_RUNTIME_MAX_FILES: usize = 8 * 1024;
 const ACP_RUNTIME_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
@@ -56,6 +61,7 @@ fn run() -> Result<i32, String> {
              --codex-acp PATH          Codex ACP adapter executable\n  \
              --claude-agent-acp PATH   Claude Agent ACP adapter executable\n  \
              --claude PATH             Claude Code executable used by Claude ACP\n  \
+             --copilot PATH            GitHub Copilot CLI used through ACP\n  \
              --deno-runtime PATH       Pinned Deno executable for brokered Agent tools\n  \
              --genui-script PATH       Bundled GenUI compiler service\n  \
              --genui-wasm PATH         Pinned esbuild-wasm compiler binary\n  \
@@ -101,16 +107,36 @@ fn run() -> Result<i32, String> {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let acp_providers = resolved.acp_providers(&home)?;
-        let agent_provider_ids = resolved.agent_provider_ids();
+        let provider_inventory = resolved.agent_provider_inventory(&home)?;
+        let agent_provider_ids = provider_inventory
+            .iter()
+            .filter(|provider| provider.usable())
+            .map(|provider| provider.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let provider_status = serde_json::to_string(&provider_inventory)
+            .map_err(|error| format!("cannot serialize Agent provider status: {error}"))?;
+        let codex_ready = provider_inventory.iter().any(|provider| {
+            provider.id == "codex" && provider.readiness == AgentProviderReadiness::Authenticated
+        });
+        let ready_acp_providers = provider_inventory
+            .iter()
+            .filter(|provider| provider.usable())
+            .map(|provider| provider.id.as_str())
+            .collect::<Vec<_>>();
+        let acp_providers = resolved
+            .acp_providers(&home)?
+            .into_iter()
+            .filter(|provider| ready_acp_providers.contains(&provider.provider_id.as_str()))
+            .collect();
         let agent_gateway = spawn_agent_gateway(AgentGatewayConfig {
             bind: "127.0.0.1:0".parse().expect("agent loopback bind is valid"),
             token: agent_token.clone(),
             workspace: resolved.shell_cwd.clone(),
             state_directory: resolved.state_directory.join("agent-runtime"),
             daemon: daemon.clone(),
-            codex_executable: resolved.codex.clone(),
-            codex_auth_file: resolved.codex_auth.clone(),
+            codex_executable: codex_ready.then(|| resolved.codex.clone()).flatten(),
+            codex_auth_file: codex_ready.then(|| resolved.codex_auth.clone()).flatten(),
             acp_providers,
             mcp_executable: resolved.mcp.clone(),
             genui_runtime: resolved
@@ -134,6 +160,7 @@ fn run() -> Result<i32, String> {
             .env(TERMINAL_URL_ENV, terminal_url)
             .env(AGENT_URL_ENV, agent_url)
             .env(AGENT_PROVIDERS_ENV, agent_provider_ids)
+            .env(AGENT_PROVIDER_STATUS_ENV, provider_status)
             .spawn()
             .map_err(|error| format!("cannot start native renderer: {error}"))?;
         let status = wait_for_renderer(&mut renderer).await?;
@@ -192,6 +219,7 @@ struct Options {
     codex_acp: Option<PathBuf>,
     claude_agent_acp: Option<PathBuf>,
     claude: Option<PathBuf>,
+    copilot: Option<PathBuf>,
     deno_runtime: Option<PathBuf>,
     genui_script: Option<PathBuf>,
     genui_wasm: Option<PathBuf>,
@@ -229,6 +257,9 @@ impl Options {
                 }
                 Some("--claude") => {
                     options.claude = Some(required_path(&mut arguments, "--claude")?);
+                }
+                Some("--copilot") => {
+                    options.copilot = Some(required_path(&mut arguments, "--copilot")?);
                 }
                 Some("--deno-runtime") => {
                     options.deno_runtime = Some(required_path(&mut arguments, "--deno-runtime")?);
@@ -291,6 +322,10 @@ impl Options {
             .claude
             .or_else(|| std::env::var_os("HYPER_TERM_CLAUDE_PATH").map(PathBuf::from))
             .or_else(|| find_executable("claude", home));
+        let copilot = self
+            .copilot
+            .or_else(|| std::env::var_os("HYPER_TERM_COPILOT_PATH").map(PathBuf::from))
+            .or_else(|| find_executable("copilot", home));
         let bundled_acp = load_bundled_acp_runtime(&runtime_resources, &deno_executable)?;
         let codex_acp = self
             .codex_acp
@@ -338,6 +373,7 @@ impl Options {
             codex_acp,
             claude_agent_acp,
             claude,
+            copilot,
             mcp: executable
                 .with_file_name("hyper-term-mcp")
                 .is_file()
@@ -358,6 +394,7 @@ struct ResolvedOptions {
     codex_acp: Option<ResolvedAcpAdapter>,
     claude_agent_acp: Option<ResolvedAcpAdapter>,
     claude: Option<PathBuf>,
+    copilot: Option<PathBuf>,
     mcp: Option<PathBuf>,
     genui_runtime: Option<ResolvedGenUiRuntime>,
 }
@@ -375,6 +412,54 @@ struct ResolvedAcpAdapter {
     executable: PathBuf,
     arguments: Vec<OsString>,
     implementation_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentProviderReadiness {
+    Authenticated,
+    Available,
+    LoginRequired,
+    ProviderMissing,
+    ProbeFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentProviderContainment {
+    ExternalEnforcementPending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct DesktopAgentProviderStatus {
+    id: String,
+    protocol: String,
+    readiness: AgentProviderReadiness,
+    containment: AgentProviderContainment,
+}
+
+impl DesktopAgentProviderStatus {
+    fn new(id: &str, protocol: &str, readiness: AgentProviderReadiness) -> Self {
+        Self {
+            id: id.into(),
+            protocol: protocol.into(),
+            readiness,
+            containment: AgentProviderContainment::ExternalEnforcementPending,
+        }
+    }
+
+    fn usable(&self) -> bool {
+        matches!(
+            self.readiness,
+            AgentProviderReadiness::Authenticated | AgentProviderReadiness::Available
+        )
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProbeOutcome {
+    Exited { success: bool, stdout: Vec<u8> },
+    TimedOut,
 }
 
 impl ResolvedAcpAdapter {
@@ -422,6 +507,9 @@ impl ResolvedOptions {
         if let Some(claude) = &self.claude {
             validate_executable(claude)?;
         }
+        if let Some(copilot) = &self.copilot {
+            validate_executable(copilot)?;
+        }
         if let Some(mcp) = &self.mcp {
             validate_executable(mcp)?;
         }
@@ -443,22 +531,72 @@ impl ResolvedOptions {
         Ok(())
     }
 
-    fn agent_provider_ids(&self) -> String {
-        let mut providers = Vec::with_capacity(3);
+    fn agent_provider_inventory(
+        &self,
+        home: &Path,
+    ) -> Result<Vec<DesktopAgentProviderStatus>, String> {
+        let codex_readiness = self
+            .codex
+            .as_deref()
+            .map(|executable| {
+                probe_agent_authentication(
+                    executable,
+                    &["login", "status"],
+                    home,
+                    self.codex_auth.as_deref().and_then(Path::parent),
+                )
+            })
+            .transpose()?
+            .unwrap_or(AgentProviderReadiness::ProviderMissing);
+        let claude_readiness = self
+            .claude
+            .as_deref()
+            .map(|executable| {
+                probe_agent_authentication(executable, &["auth", "status"], home, None)
+            })
+            .transpose()?
+            .unwrap_or(AgentProviderReadiness::ProviderMissing);
+        let copilot_readiness = self
+            .copilot
+            .as_deref()
+            .map(probe_copilot_availability)
+            .transpose()?
+            .unwrap_or(AgentProviderReadiness::ProviderMissing);
+
+        let mut providers = Vec::with_capacity(4);
         if self.codex.is_some() {
-            providers.push("codex");
+            providers.push(DesktopAgentProviderStatus::new(
+                "codex",
+                "codex-app-server-v2",
+                codex_readiness,
+            ));
         }
         if self.codex_acp.is_some() {
-            providers.push("codex-acp");
+            providers.push(DesktopAgentProviderStatus::new(
+                "codex-acp",
+                "acp-v1",
+                codex_readiness,
+            ));
         }
         if self.claude_agent_acp.is_some() {
-            providers.push("claude-acp");
+            providers.push(DesktopAgentProviderStatus::new(
+                "claude-acp",
+                "acp-v1",
+                claude_readiness,
+            ));
         }
-        providers.join(",")
+        if self.copilot.is_some() {
+            providers.push(DesktopAgentProviderStatus::new(
+                "copilot-acp",
+                "acp-v1",
+                copilot_readiness,
+            ));
+        }
+        Ok(providers)
     }
 
     fn acp_providers(&self, home: &Path) -> Result<Vec<AcpAgentProviderConfig>, String> {
-        let mut providers = Vec::with_capacity(2);
+        let mut providers = Vec::with_capacity(3);
         if let Some(adapter) = &self.codex_acp {
             let mut environment = acp_environment(home, &adapter.executable)?;
             environment.insert("NO_BROWSER".into(), "1".into());
@@ -491,6 +629,25 @@ impl ResolvedOptions {
                 arguments: adapter.arguments.clone(),
                 environment,
                 implementation_version: adapter.implementation_version.clone(),
+            });
+        }
+        if let Some(copilot) = &self.copilot {
+            let environment = acp_environment(home, copilot)?;
+            providers.push(AcpAgentProviderConfig {
+                provider_id: "copilot-acp".into(),
+                executable: copilot.clone(),
+                arguments: [
+                    "--acp",
+                    "--stdio",
+                    "--no-auto-update",
+                    "--no-remote",
+                    "--no-remote-export",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+                environment,
+                implementation_version: "installed".into(),
             });
         }
         Ok(providers)
@@ -707,6 +864,142 @@ fn acp_environment(home: &Path, executable: &Path) -> Result<BTreeMap<String, Os
     ]))
 }
 
+fn probe_agent_authentication(
+    executable: &Path,
+    arguments: &[&str],
+    home: &Path,
+    tool_home: Option<&Path>,
+) -> Result<AgentProviderReadiness, String> {
+    let mut environment = acp_environment(home, executable)?;
+    if let Some(tool_home) = tool_home {
+        environment.insert("CODEX_HOME".into(), tool_home.as_os_str().to_owned());
+    }
+    match run_bounded_probe(
+        executable,
+        arguments,
+        Some(&environment),
+        PROVIDER_PROBE_TIMEOUT,
+    )? {
+        ProbeOutcome::Exited { success: true, .. } => Ok(AgentProviderReadiness::Authenticated),
+        ProbeOutcome::Exited { success: false, .. } => Ok(AgentProviderReadiness::LoginRequired),
+        ProbeOutcome::TimedOut => Ok(AgentProviderReadiness::ProbeFailed),
+    }
+}
+
+fn probe_copilot_availability(executable: &Path) -> Result<AgentProviderReadiness, String> {
+    match run_bounded_probe(executable, &["--version"], None, PROVIDER_PROBE_TIMEOUT)? {
+        ProbeOutcome::Exited {
+            success: true,
+            stdout,
+        } if String::from_utf8_lossy(&stdout).contains("GitHub Copilot CLI") => {
+            // Copilot has no read-only login-status command. Its ACP server
+            // advertises and performs authentication as part of the session.
+            Ok(AgentProviderReadiness::Available)
+        }
+        ProbeOutcome::Exited { .. } | ProbeOutcome::TimedOut => {
+            Ok(AgentProviderReadiness::ProbeFailed)
+        }
+    }
+}
+
+fn run_bounded_probe(
+    executable: &Path,
+    arguments: &[&str],
+    environment: Option<&BTreeMap<String, OsString>>,
+    timeout: Duration,
+) -> Result<ProbeOutcome, String> {
+    let mut command = Command::new(executable);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    if let Some(environment) = environment {
+        command.env_clear().envs(environment);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "cannot start provider probe {}: {error}",
+            executable.display()
+        )
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "provider probe stdout is unavailable".to_owned())?;
+    let reader = thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut retained = Vec::with_capacity(PROVIDER_PROBE_MAX_STDOUT_BYTES);
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let remaining = PROVIDER_PROBE_MAX_STDOUT_BYTES.saturating_sub(retained.len());
+                    retained.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                Err(_) => break,
+            }
+        }
+        retained
+    });
+
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                break ProbeOutcome::Exited {
+                    success: status.success(),
+                    stdout: Vec::new(),
+                };
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                terminate_probe(&mut child);
+                break ProbeOutcome::TimedOut;
+            }
+            Err(error) => {
+                terminate_probe(&mut child);
+                let _ = reader.join();
+                return Err(format!(
+                    "cannot inspect provider probe {}: {error}",
+                    executable.display()
+                ));
+            }
+        }
+    };
+    let retained = reader
+        .join()
+        .map_err(|_| "provider probe output reader panicked".to_owned())?;
+    Ok(match outcome {
+        ProbeOutcome::Exited { success, .. } => ProbeOutcome::Exited {
+            success,
+            stdout: retained,
+        },
+        ProbeOutcome::TimedOut => ProbeOutcome::TimedOut,
+    })
+}
+
+fn terminate_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The probe starts in its own process group, so a stuck adapter cannot
+        // keep inherited stdout open through an unobserved descendant.
+        let process_group = -(child.id() as i32);
+        // SAFETY: `process_group` names only the child group created above.
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn desktop_user_name(home: &Path) -> OsString {
     std::env::var_os("USER")
         .or_else(|| std::env::var_os("LOGNAME"))
@@ -749,13 +1042,14 @@ fn discover_official_acp_adapter(name: &str, home: &Path) -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn official_acp_adapter_version(executable: &Path, name: &str) -> bool {
-    let Ok(output) = Command::new(executable).arg("--version").output() else {
+    let Ok(ProbeOutcome::Exited {
+        success: true,
+        stdout,
+    }) = run_bounded_probe(executable, &["--version"], None, PROVIDER_PROBE_TIMEOUT)
+    else {
         return false;
     };
-    if !output.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout);
     match name {
         "codex-acp" => stdout.contains("@agentclientprotocol/codex-acp"),
         "claude-agent-acp" => stdout
@@ -850,6 +1144,8 @@ mod tests {
             "/tmp/claude-agent-acp".into(),
             "--claude".into(),
             "/tmp/claude".into(),
+            "--copilot".into(),
+            "/tmp/copilot".into(),
             "--deno-runtime".into(),
             "/tmp/deno".into(),
             "--genui-script".into(),
@@ -875,6 +1171,7 @@ mod tests {
             Some(PathBuf::from("/tmp/claude-agent-acp"))
         );
         assert_eq!(options.claude, Some(PathBuf::from("/tmp/claude")));
+        assert_eq!(options.copilot, Some(PathBuf::from("/tmp/copilot")));
         assert_eq!(options.deno_runtime, Some(PathBuf::from("/tmp/deno")));
         assert_eq!(options.genui_script, Some(PathBuf::from("/tmp/genui.js")));
         assert_eq!(options.genui_wasm, Some(PathBuf::from("/tmp/esbuild.wasm")));
@@ -909,12 +1206,32 @@ mod tests {
 
     #[test]
     fn provider_inventory_and_acp_environment_are_explicit() {
+        let temporary = tempfile::tempdir().expect("temporary providers");
+        let codex = temporary.path().join("codex");
+        let claude = temporary.path().join("claude");
+        let copilot = temporary.path().join("copilot");
+        for (path, script) in [
+            (&codex, "#!/bin/sh\n[ \"$1 $2\" = \"login status\" ]\n"),
+            (
+                &claude,
+                "#!/bin/sh\n[ \"$1 $2\" = \"auth status\" ] && exit 1\nexit 2\n",
+            ),
+            (
+                &copilot,
+                "#!/bin/sh\n[ \"$1\" = \"--version\" ] && printf '%s\\n' 'GitHub Copilot CLI 1.0.69'\n",
+            ),
+        ] {
+            std::fs::write(path, script).expect("fake provider");
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
         let resolved = ResolvedOptions {
             ui: "/tmp/ui".into(),
             terminal_assets: "/tmp/terminal".into(),
             state_directory: "/tmp/state".into(),
             shell_cwd: "/tmp".into(),
-            codex: Some("/opt/homebrew/bin/codex".into()),
+            codex: Some(codex.clone()),
             codex_auth: None,
             codex_acp: Some(ResolvedAcpAdapter::installed(
                 "/opt/homebrew/bin/codex-acp".into(),
@@ -922,11 +1239,25 @@ mod tests {
             claude_agent_acp: Some(ResolvedAcpAdapter::installed(
                 "/opt/homebrew/bin/claude-agent-acp".into(),
             )),
-            claude: Some("/Users/example/.local/bin/claude".into()),
+            claude: Some(claude.clone()),
+            copilot: Some(copilot.clone()),
             mcp: None,
             genui_runtime: None,
         };
-        assert_eq!(resolved.agent_provider_ids(), "codex,codex-acp,claude-acp");
+        assert_eq!(
+            resolved
+                .agent_provider_inventory(temporary.path())
+                .expect("provider inventory")
+                .into_iter()
+                .map(|provider| (provider.id, provider.readiness))
+                .collect::<Vec<_>>(),
+            vec![
+                ("codex".into(), AgentProviderReadiness::Authenticated),
+                ("codex-acp".into(), AgentProviderReadiness::Authenticated),
+                ("claude-acp".into(), AgentProviderReadiness::LoginRequired),
+                ("copilot-acp".into(), AgentProviderReadiness::Available),
+            ]
+        );
 
         let environment = acp_environment(
             Path::new("/Users/example"),
@@ -949,8 +1280,40 @@ mod tests {
             .expect("ACP providers");
         assert_eq!(
             providers[1].environment.get("CLAUDE_CODE_EXECUTABLE"),
-            Some(&OsString::from("/Users/example/.local/bin/claude"))
+            Some(&claude.as_os_str().to_owned())
         );
+        assert_eq!(providers[2].provider_id, "copilot-acp");
+        assert_eq!(
+            providers[2].arguments,
+            [
+                "--acp",
+                "--stdio",
+                "--no-auto-update",
+                "--no-remote",
+                "--no-remote-export",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn provider_probe_times_out_and_kills_a_stuck_process() {
+        let temporary = tempfile::tempdir().expect("temporary provider");
+        let executable = temporary.path().join("stuck-provider");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 5\n").expect("fake provider");
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(
+            run_bounded_probe(&executable, &["--version"], None, Duration::from_millis(50))
+                .expect("probe"),
+            ProbeOutcome::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
