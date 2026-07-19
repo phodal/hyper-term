@@ -499,7 +499,7 @@ enum AgentProviderReadiness {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AgentProviderContainment {
-    ExternalEnforcementPending,
+    NativeSeatbelt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -516,7 +516,7 @@ impl DesktopAgentProviderStatus {
             id: id.into(),
             protocol: protocol.into(),
             readiness,
-            containment: AgentProviderContainment::ExternalEnforcementPending,
+            containment: AgentProviderContainment::NativeSeatbelt,
         }
     }
 

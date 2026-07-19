@@ -166,16 +166,17 @@ test "Agent provider status disables unready adapters and enables Copilot ACP" {
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     const status =
         \\[
-        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"external_enforcement_pending"},
-        \\  {"id":"codex-acp","protocol":"acp-v1","readiness":"login_required","containment":"external_enforcement_pending"},
-        \\  {"id":"claude-acp","protocol":"acp-v1","readiness":"probe_failed","containment":"external_enforcement_pending"},
-        \\  {"id":"copilot-acp","protocol":"acp-v1","readiness":"available","containment":"external_enforcement_pending"}
+        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"native_seatbelt"},
+        \\  {"id":"codex-acp","protocol":"acp-v1","readiness":"login_required","containment":"native_seatbelt"},
+        \\  {"id":"claude-acp","protocol":"acp-v1","readiness":"probe_failed","containment":"native_seatbelt"},
+        \\  {"id":"copilot-acp","protocol":"acp-v1","readiness":"available","containment":"native_seatbelt"}
         \\]
     ;
     var model = main.initialModelWithProviderStatus(terminal_url, agent_url, "", status);
     try testing.expect(model.agentProviderReady(.codex));
     try testing.expect(!model.agentProviderReady(.codex_acp));
     try testing.expect(model.agentProviderReady(.copilot_acp));
+    try testing.expectEqual(model.available_agent_providers, model.contained_agent_providers);
     try testing.expectEqual(main.AgentProviderReadiness.available, model.agentProviderReadiness(.copilot_acp));
 
     var fx = main.Effects.init(testing.allocator);
@@ -204,12 +205,13 @@ test "malformed Agent provider status fails closed" {
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     const duplicate =
         \\[
-        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"external_enforcement_pending"},
-        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"external_enforcement_pending"}
+        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"native_seatbelt"},
+        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"native_seatbelt"}
         \\]
     ;
     const model = main.initialModelWithProviderStatus("", agent_url, "codex", duplicate);
     try testing.expectEqual(@as(u8, 0), model.available_agent_providers);
+    try testing.expectEqual(@as(u8, 0), model.contained_agent_providers);
     try testing.expect(model.agentProviderUnavailable());
 }
 

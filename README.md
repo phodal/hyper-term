@@ -124,6 +124,7 @@ The important boundary is not Native versus Web. It is **who has authority**:
 | Structured ACP Agent tabs | Active development |
 | Codex and Claude packaged ACP adapters | Implemented baseline |
 | GitHub Copilot ACP discovery | Implemented baseline |
+| macOS Seatbelt plus managed proxy for Codex and ACP control processes | Implemented Tier 1 baseline |
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
 | Multi-file Artifact editor, Diff, deterministic reducer replay, effect receipts, diagnostics, completion, and approved publish | Experimental |
@@ -283,7 +284,8 @@ Useful design documents:
   authority.
 - Version and migrate accepted-source, editor, runtime, and Bug Capsule schemas
   while preserving deterministic replay across Hyper Term upgrades.
-- Strengthen containment for external coding-agent processes.
+- Add isolated Tier 2 worktrees/containers for opaque provider-internal
+  execution; keep the implemented macOS Tier 1 ACP control process read-only.
 - Publish signed and notarized Apple Silicon and Intel builds.
 - Define the supported-platform contract before expanding beyond macOS.
 

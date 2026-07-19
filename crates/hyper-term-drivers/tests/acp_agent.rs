@@ -163,6 +163,7 @@ fn launch_installed_acp_agent_with_mcp(
         provider_id,
         workspace: workspace.path().canonicalize().unwrap(),
         brokered_mcp_server,
+        containment: None,
     })
     .expect("launch inspected ACP adapter");
     (client, workspace)

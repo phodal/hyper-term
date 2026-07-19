@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,11 +18,11 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use hyper_term_drivers::{
-    AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentDriverEvent, AgentEffectAuthorization,
-    AgentEffectKind, AgentSessionCapabilities, AgentSessionConfigValue, CodexAppServerClient,
-    CodexAppServerConfig, CodexContainmentConfig, CodexMcpServerConfig, DenoGenUiCompiler,
+    AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentContainmentConfig, AgentDriverEvent,
+    AgentEffectAuthorization, AgentEffectKind, AgentSessionCapabilities, AgentSessionConfigValue,
+    CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig, DenoGenUiCompiler,
     DenoGenUiConfig, DriverState, ExternalRequestId, GenUiCompileRequest, StructuredAgentClient,
-    StructuredAgentProtocol, sha256_file,
+    StructuredAgentProtocol, sha256_file, stage_codex_auth_file,
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, GenUiArtifactCandidate,
@@ -78,8 +79,21 @@ const MAX_WORKBENCH_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EDITOR_LSP_BODY_BYTES: usize = 1024 * 1024 + 64 * 1024;
 const MAX_ARTIFACT_DRAFT_FILES: usize = 100;
 const MAX_ARTIFACT_DRAFT_SOURCE_BYTES: usize = 1024 * 1024;
+const MAX_ACP_SHEBANG_BYTES: usize = 512;
 const ARTIFACT_BOOTSTRAP_MARKER: &str = "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->";
 const CODEX_NETWORK_ALLOWED_HOSTS: &[&str] = &["api.openai.com", "auth.openai.com", "chatgpt.com"];
+const CLAUDE_NETWORK_ALLOWED_HOSTS: &[&str] = &[
+    "api.anthropic.com",
+    "*.anthropic.com",
+    "claude.ai",
+    "*.claude.ai",
+];
+const COPILOT_NETWORK_ALLOWED_HOSTS: &[&str] = &[
+    "api.github.com",
+    "github.com",
+    "*.githubcopilot.com",
+    "copilot-proxy.githubusercontent.com",
+];
 
 #[derive(Clone)]
 pub struct AgentGatewayConfig {
@@ -2033,6 +2047,209 @@ fn reconcile_workspace_receipt(
         .map_err(|error| error.to_string())
 }
 
+fn acp_network_allowed_hosts(provider_id: &str) -> Option<&'static [&'static str]> {
+    match provider_id {
+        "codex-acp" => Some(CODEX_NETWORK_ALLOWED_HOSTS),
+        "claude-acp" => Some(CLAUDE_NETWORK_ALLOWED_HOSTS),
+        "copilot-acp" => Some(COPILOT_NETWORK_ALLOWED_HOSTS),
+        _ if cfg!(debug_assertions) => Some(CODEX_NETWORK_ALLOWED_HOSTS),
+        _ => None,
+    }
+}
+
+fn acp_provider_read_paths(provider: &AcpAgentProviderConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let search_paths = provider
+        .environment
+        .get("PATH")
+        .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    add_acp_runtime_path(&mut paths, &mut seen, &provider.executable, &search_paths);
+    for argument in &provider.arguments {
+        let path = PathBuf::from(argument);
+        if path.is_absolute() {
+            add_acp_runtime_path(&mut paths, &mut seen, &path, &search_paths);
+        }
+    }
+    for name in ["CODEX_PATH", "CLAUDE_CODE_EXECUTABLE"] {
+        if let Some(value) = provider.environment.get(name) {
+            add_acp_runtime_path(&mut paths, &mut seen, Path::new(value), &search_paths);
+        }
+    }
+    for directory in &search_paths {
+        add_existing_acp_read_path(&mut paths, &mut seen, directory);
+    }
+    let Some(home) = provider.environment.get("HOME").map(PathBuf::from) else {
+        return paths;
+    };
+    let credential_paths: &[&str] = match provider.provider_id.as_str() {
+        "codex-acp" => &[".codex/auth.json", ".codex/config.toml", ".codex/AGENTS.md"],
+        "claude-acp" => &[".claude", ".claude.json", ".config/claude"],
+        "copilot-acp" => &[".config/github-copilot", ".config/gh"],
+        _ => &[],
+    };
+    for relative in credential_paths {
+        add_existing_acp_read_path(&mut paths, &mut seen, &home.join(relative));
+    }
+    paths
+}
+
+fn add_acp_runtime_path(
+    paths: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    path: &Path,
+    search_paths: &[PathBuf],
+) {
+    let Ok(canonical) = path.canonicalize() else {
+        return;
+    };
+    add_unique_acp_read_path(paths, seen, canonical.clone());
+    if let Some(node_modules) = canonical.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .is_some_and(|name| name == "node_modules")
+    }) {
+        add_unique_acp_read_path(paths, seen, node_modules.to_path_buf());
+    }
+    if let Some(parent) = path.parent() {
+        add_existing_acp_read_path(paths, seen, parent);
+    }
+    add_acp_script_interpreter(paths, seen, &canonical, search_paths);
+}
+
+fn add_acp_script_interpreter(
+    paths: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    script: &Path,
+    search_paths: &[PathBuf],
+) {
+    let Ok(mut file) = std::fs::File::open(script) else {
+        return;
+    };
+    let mut buffer = [0_u8; MAX_ACP_SHEBANG_BYTES];
+    let Ok(read) = file.read(&mut buffer) else {
+        return;
+    };
+    let Ok(header) = std::str::from_utf8(&buffer[..read]) else {
+        return;
+    };
+    let Some(shebang) = header
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("#!"))
+    else {
+        return;
+    };
+    let words = shebang.split_ascii_whitespace().collect::<Vec<_>>();
+    let Some(first) = words.first() else {
+        return;
+    };
+    let command = if Path::new(first)
+        .file_name()
+        .is_some_and(|name| name == "env")
+    {
+        words
+            .iter()
+            .skip(1)
+            .copied()
+            .find(|word| !word.starts_with('-'))
+    } else {
+        Some(*first)
+    };
+    let Some(command) = command else {
+        return;
+    };
+    let command = PathBuf::from(command);
+    let interpreter = if command.is_absolute() {
+        command.canonicalize().ok()
+    } else {
+        search_paths
+            .iter()
+            .map(|directory| directory.join(&command))
+            .find_map(|candidate| candidate.canonicalize().ok())
+    };
+    let Some(interpreter) = interpreter else {
+        return;
+    };
+    add_unique_acp_read_path(paths, seen, interpreter.clone());
+    if let Some(install_root) = interpreter.ancestors().find(|ancestor| {
+        ancestor
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "Cellar")
+    }) {
+        add_unique_acp_read_path(paths, seen, install_root.to_path_buf());
+    }
+    let homebrew = Path::new("/opt/homebrew");
+    if interpreter.starts_with(homebrew) {
+        add_existing_acp_read_path(paths, seen, homebrew);
+    }
+}
+
+fn add_existing_acp_read_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: &Path) {
+    if let Ok(canonical) = path.canonicalize() {
+        add_unique_acp_read_path(paths, seen, canonical);
+    }
+}
+
+fn add_unique_acp_read_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if seen.insert(path.clone()) {
+        paths.push(path);
+    }
+}
+
+#[cfg(unix)]
+fn stage_acp_codex_preferences(home: &Path, codex_home: &Path) -> Result<(), std::io::Error> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::symlink;
+
+    if !home.is_absolute() || !codex_home.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "ACP Codex homes must be absolute",
+        ));
+    }
+    let source_root = home.join(".codex");
+    let Ok(canonical_root) = source_root.canonicalize() else {
+        return Ok(());
+    };
+    for relative in ["config.toml", "AGENTS.md"] {
+        let source = source_root.join(relative);
+        let Ok(metadata) = std::fs::symlink_metadata(&source) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ACP Codex preference source is not a regular file or directory",
+            ));
+        }
+        let canonical = source.canonicalize()?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ACP Codex preference source escaped its root",
+            ));
+        }
+        let target = codex_home.join(relative);
+        if std::fs::symlink_metadata(&target).is_ok() {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                "ACP Codex preference target already exists",
+            ));
+        }
+        symlink(canonical, target)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn stage_acp_codex_preferences(_home: &Path, _codex_home: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
 impl AgentGatewayRuntime {
     fn start_agent(
         &self,
@@ -2155,7 +2372,7 @@ impl AgentGatewayRuntime {
                     executable_sha256: mcp.executable_sha256,
                     arguments: mcp.arguments,
                 }),
-                containment: Some(CodexContainmentConfig {
+                containment: Some(AgentContainmentConfig {
                     proxy_url: endpoint.proxy_url.clone(),
                     credentialed_proxy_url: managed_proxy.credentialed_proxy_url().to_owned(),
                     allowed_hosts: endpoint.allowed_hosts.clone(),
@@ -2178,11 +2395,44 @@ impl AgentGatewayRuntime {
             .ok_or(StartError::Unavailable)?;
         let executable_sha256 =
             sha256_file(&provider.executable).map_err(|_| StartError::Driver)?;
+        let allowed_hosts =
+            acp_network_allowed_hosts(&provider.provider_id).ok_or(StartError::Unavailable)?;
+        let managed_proxy =
+            ManagedConnectProxy::start(allowed_hosts.iter().map(|host| (*host).to_owned()))
+                .map_err(|_| StartError::Driver)?;
+        let endpoint = managed_proxy.endpoint();
+        let allowed_unix_sockets = mcp
+            .as_ref()
+            .map(|_| vec![self.config.control_socket.clone()])
+            .unwrap_or_default();
+        let mut read_paths = acp_provider_read_paths(provider);
+        let mut environment = provider.environment.clone();
+        if provider.provider_id == "codex-acp" {
+            let isolated_home = session_root.join("home");
+            let codex_home = session_root.join("codex-home");
+            let scratch = session_root.join("scratch");
+            for directory in [&isolated_home, &codex_home, &scratch] {
+                create_private_runtime_root(directory).map_err(|_| StartError::Driver)?;
+            }
+            stage_codex_auth_file(self.config.codex_auth_file.as_deref(), &codex_home)
+                .map_err(|_| StartError::Driver)?;
+            if let Some(auth_file) = self.config.codex_auth_file.as_deref() {
+                let mut seen = read_paths.iter().cloned().collect::<HashSet<_>>();
+                add_existing_acp_read_path(&mut read_paths, &mut seen, auth_file);
+            }
+            if let Some(home) = provider.environment.get("HOME") {
+                stage_acp_codex_preferences(Path::new(home), &codex_home)
+                    .map_err(|_| StartError::Driver)?;
+            }
+            environment.insert("HOME".into(), isolated_home.into_os_string());
+            environment.insert("CODEX_HOME".into(), codex_home.into_os_string());
+            environment.insert("TMPDIR".into(), scratch.into_os_string());
+        }
         let client = AcpAgentClient::launch(AcpAgentConfig {
             executable: provider.executable.clone(),
             executable_sha256,
             arguments: provider.arguments.clone(),
-            environment: provider.environment.clone(),
+            environment,
             implementation_version: provider.implementation_version.clone(),
             provider_id: provider.provider_id.clone(),
             workspace: self.config.workspace.clone(),
@@ -2191,11 +2441,19 @@ impl AgentGatewayRuntime {
                 executable_sha256: mcp.executable_sha256,
                 arguments: mcp.arguments,
             }),
+            containment: Some(AgentContainmentConfig {
+                proxy_url: endpoint.proxy_url.clone(),
+                credentialed_proxy_url: managed_proxy.credentialed_proxy_url().to_owned(),
+                allowed_hosts: endpoint.allowed_hosts.clone(),
+                allowed_unix_sockets,
+                read_paths,
+                write_paths: vec![session_root.to_path_buf()],
+            }),
         })
         .map_err(|_| StartError::Driver)?;
         Ok(LaunchedAgentProvider {
             client: Arc::new(client),
-            managed_proxy: None,
+            managed_proxy: Some(managed_proxy),
         })
     }
 
@@ -4625,6 +4883,67 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_containment_reads_only_the_adapter_provider_and_auth_roots() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = temporary.path().join("runtime");
+        let adapter_root = runtime.join("acp/node_modules");
+        let adapter = adapter_root.join("@agentclientprotocol/codex-acp/dist/index.js");
+        let provider_root = temporary.path().join("provider/node_modules");
+        let provider = provider_root.join("@openai/codex/bin/codex.js");
+        let executable = runtime.join("deno");
+        let bin = temporary.path().join("bin");
+        let node_root = temporary.path().join("Cellar/node/26.0.0");
+        let node = node_root.join("bin/node");
+        let home = temporary.path().join("home");
+        let codex_root = home.join(".codex");
+        let auth = codex_root.join("auth.json");
+        let unrelated = home.join("Documents/private.txt");
+        for directory in [
+            adapter.parent().unwrap(),
+            provider.parent().unwrap(),
+            &bin,
+            node.parent().unwrap(),
+            &codex_root,
+            unrelated.parent().unwrap(),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for file in [&adapter, &provider, &auth, &unrelated] {
+            std::fs::write(file, "fixture").unwrap();
+        }
+        std::fs::write(&executable, "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(&node, "node fixture").unwrap();
+        symlink(&node, bin.join("node")).unwrap();
+        let provider = AcpAgentProviderConfig {
+            provider_id: "codex-acp".into(),
+            executable,
+            arguments: vec!["run".into(), adapter.into_os_string()],
+            environment: BTreeMap::from([
+                ("HOME".into(), home.clone().into_os_string()),
+                ("PATH".into(), bin.into_os_string()),
+                ("CODEX_PATH".into(), provider.into_os_string()),
+            ]),
+            implementation_version: "fixture-1".into(),
+        };
+
+        let paths = acp_provider_read_paths(&provider);
+        assert!(paths.contains(&adapter_root.canonicalize().unwrap()));
+        assert!(paths.contains(&provider_root.canonicalize().unwrap()));
+        assert!(paths.contains(&node_root.canonicalize().unwrap()));
+        assert!(paths.contains(&auth.canonicalize().unwrap()));
+        assert!(!paths.contains(&codex_root.canonicalize().unwrap()));
+        assert!(!paths.contains(&home.canonicalize().unwrap()));
+        assert!(!paths.contains(&unrelated.canonicalize().unwrap()));
+        assert_eq!(
+            acp_network_allowed_hosts("codex-acp").unwrap(),
+            CODEX_NETWORK_ALLOWED_HOSTS
+        );
     }
 
     #[test]

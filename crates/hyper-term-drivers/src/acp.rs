@@ -19,13 +19,15 @@ use similar::{ChangeTag, TextDiff};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::codex_containment::{apply_managed_proxy_environment, compile_agent_task_sandbox};
 use crate::{
-    AgentAvailableCommand, AgentClientError, AgentDriverEvent, AgentEffectAuthorization,
-    AgentEffectKind, AgentEffectProposal, AgentSessionCapabilities, AgentSessionConfigChoice,
-    AgentSessionConfigKind, AgentSessionConfigOption, AgentSessionConfigValue,
-    DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
-    DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
-    StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
+    AgentAvailableCommand, AgentClientError, AgentContainmentConfig, AgentDriverEvent,
+    AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal, AgentSessionCapabilities,
+    AgentSessionConfigChoice, AgentSessionConfigKind, AgentSessionConfigOption,
+    AgentSessionConfigValue, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent,
+    DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
+    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox,
+    sha256_file,
 };
 
 const ACP_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -129,6 +131,7 @@ pub struct AcpAgentConfig {
     pub provider_id: String,
     pub workspace: PathBuf,
     pub brokered_mcp_server: Option<AcpMcpServerConfig>,
+    pub containment: Option<AgentContainmentConfig>,
 }
 
 pub struct AcpAgentClient {
@@ -181,9 +184,42 @@ impl AcpAgentClient {
             .transpose()?
             .into_iter()
             .collect();
+        let driver_id = Uuid::new_v4();
+        let authority_environment = config.environment.clone();
+        let mut environment = config.environment;
+        let sandbox = match config.containment.as_ref() {
+            Some(containment) => {
+                apply_managed_proxy_environment(
+                    &mut environment,
+                    &containment.credentialed_proxy_url,
+                );
+                let mut read_paths = containment.read_paths.clone();
+                if let Some(mcp) = &config.brokered_mcp_server {
+                    read_paths.push(mcp.executable.clone());
+                }
+                Some(compile_agent_task_sandbox(
+                    driver_id,
+                    &config.executable,
+                    &config.arguments,
+                    &workspace,
+                    &environment,
+                    &authority_environment,
+                    &containment.proxy_url,
+                    &containment.allowed_hosts,
+                    &containment.allowed_unix_sockets,
+                    read_paths,
+                    containment.write_paths.clone(),
+                )?)
+            }
+            None => None,
+        };
+        let permission_profile = sandbox
+            .as_ref()
+            .map(crate::sandbox_permission_profile)
+            .unwrap_or_else(|| "acp-proposal-only-v1".into());
         let process = DriverProcess::spawn(DriverSpec {
             manifest: DriverManifest {
-                driver_id: Uuid::new_v4(),
+                driver_id,
                 kind: DriverKind::AcpAgent,
                 implementation_version: config.implementation_version,
                 protocol_version: "acp-v1".into(),
@@ -196,13 +232,13 @@ impl AcpAgentClient {
                 ],
                 transport: "stdio-jsonrpc-jsonl".into(),
                 executable_sha256: config.executable_sha256,
-                permission_profile: "acp-proposal-only-v1".into(),
+                permission_profile,
             },
             executable: config.executable,
             arguments: config.arguments,
             working_directory: workspace.clone(),
-            environment: config.environment,
-            sandbox: None,
+            environment,
+            sandbox,
             framing: DriverFraming::JsonLines,
             max_frame_bytes: ACP_FRAME_BYTES,
             max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
@@ -1417,6 +1453,7 @@ mod tests {
             provider_id: "fixture-acp".into(),
             workspace: workspace.to_owned(),
             brokered_mcp_server: None,
+            containment: None,
         })
         .unwrap()
     }
@@ -1573,6 +1610,7 @@ mod tests {
                     "/tmp/hyperd.sock".into(),
                 ],
             }),
+            containment: None,
         })
         .unwrap();
 
@@ -1619,6 +1657,7 @@ mod tests {
                 executable_sha256: sha256_file(&mcp).unwrap(),
                 arguments: vec!["--agent-mode".into()],
             }),
+            containment: None,
         })
         .unwrap();
 
@@ -1671,6 +1710,7 @@ mod tests {
                 executable_sha256: sha256_file(&mcp).unwrap(),
                 arguments: vec!["--agent-mode".into()],
             }),
+            containment: None,
         })
         .unwrap();
 
@@ -1734,6 +1774,74 @@ mod tests {
             client.next_event(Duration::from_secs(2)).unwrap(),
             AgentDriverEvent::TurnCompleted { .. }
         ));
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_acp_can_handshake_but_cannot_read_host_or_write_workspace() {
+        use std::net::TcpListener;
+
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let scratch = root.path().join("scratch");
+        let secret = root.path().join("host-secret.txt");
+        let marker = scratch.join("boundary.txt");
+        let forbidden = workspace.join("provider-write.txt");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(&secret, "must stay outside the ACP sandbox").unwrap();
+        let script = format!(
+            "#!/bin/sh\nif /bin/cat {secret} >/dev/null 2>&1; then host=allowed; else host=denied; fi\nif /usr/bin/touch {forbidden} >/dev/null 2>&1; then workspace=allowed; else workspace=denied; fi\nprintf '%s,%s\\n' \"$host\" \"$workspace\" > {marker}\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{}},\"authMethods\":[]}}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"contained-session\"}}}}' ;;\n  esac\ndone\n",
+            secret = secret.display(),
+            forbidden = forbidden.display(),
+            marker = marker.display(),
+        );
+        let executable = root.path().join("contained-acp");
+        std::fs::write(&executable, script).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let credentialed_proxy_url =
+            proxy_url.replacen("http://", "http://hyper-term:contained-test-token@", 1);
+        let environment = BTreeMap::from([
+            ("HOME".into(), scratch.clone().into_os_string()),
+            ("PATH".into(), OsString::from("/usr/bin:/bin")),
+            ("TERM".into(), OsString::from("dumb")),
+            ("TMPDIR".into(), scratch.clone().into_os_string()),
+        ]);
+        let client = AcpAgentClient::launch(AcpAgentConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            arguments: Vec::new(),
+            environment,
+            implementation_version: "contained-fixture-1".into(),
+            provider_id: "contained-fixture-acp".into(),
+            workspace: workspace.canonicalize().unwrap(),
+            brokered_mcp_server: None,
+            containment: Some(AgentContainmentConfig {
+                proxy_url,
+                credentialed_proxy_url,
+                allowed_hosts: vec!["api.example.com".into()],
+                allowed_unix_sockets: Vec::new(),
+                read_paths: Vec::new(),
+                write_paths: vec![scratch.canonicalize().unwrap()],
+            }),
+        })
+        .unwrap();
+
+        client.initialize(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            client.start_session(Duration::from_secs(10)).unwrap(),
+            "contained-session"
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap().trim(),
+            "denied,denied"
+        );
+        assert!(!forbidden.exists());
         assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 }

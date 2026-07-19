@@ -444,7 +444,7 @@ pub const Model = struct {
     login_required_agent_providers: u8 = 0,
     provider_missing_agent_providers: u8 = 0,
     provider_probe_failed_agent_providers: u8 = 0,
-    containment_pending_agent_providers: u8 = 0,
+    contained_agent_providers: u8 = 0,
     terminal_base_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
     terminal_base_url_len: usize = 0,
     terminal_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
@@ -497,7 +497,7 @@ pub const Model = struct {
         "login_required_agent_providers",
         "provider_missing_agent_providers",
         "provider_probe_failed_agent_providers",
-        "containment_pending_agent_providers",
+        "contained_agent_providers",
         "terminal_base_url_storage",
         "terminal_base_url_len",
         "terminal_url_storage",
@@ -2925,14 +2925,14 @@ fn applyAgentProviderStatus(model: *Model, source: []const u8) bool {
     var login_required: u8 = 0;
     var provider_missing: u8 = 0;
     var probe_failed: u8 = 0;
-    var containment_pending: u8 = 0;
+    var contained: u8 = 0;
     for (parsed.value) |status| {
         const provider = parseAgentProvider(status.id) orelse return false;
         const bit = providerBit(provider);
         if (detected & bit != 0 or !std.mem.eql(u8, status.protocol, expectedAgentProtocol(provider))) return false;
         detected |= bit;
-        if (!std.mem.eql(u8, status.containment, "external_enforcement_pending")) return false;
-        containment_pending |= bit;
+        if (!std.mem.eql(u8, status.containment, "native_seatbelt")) return false;
+        contained |= bit;
         if (std.mem.eql(u8, status.readiness, "authenticated")) {
             authenticated |= bit;
         } else if (std.mem.eql(u8, status.readiness, "available")) {
@@ -2951,7 +2951,7 @@ fn applyAgentProviderStatus(model: *Model, source: []const u8) bool {
     model.login_required_agent_providers = login_required;
     model.provider_missing_agent_providers = provider_missing;
     model.provider_probe_failed_agent_providers = probe_failed;
-    model.containment_pending_agent_providers = containment_pending;
+    model.contained_agent_providers = contained;
     return true;
 }
 
@@ -2962,7 +2962,7 @@ fn clearAgentProviderStatus(model: *Model) void {
     model.login_required_agent_providers = 0;
     model.provider_missing_agent_providers = 0;
     model.provider_probe_failed_agent_providers = 0;
-    model.containment_pending_agent_providers = 0;
+    model.contained_agent_providers = 0;
 }
 
 fn parseAgentProvider(id: []const u8) ?AgentProvider {

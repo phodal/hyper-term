@@ -16,6 +16,7 @@ pub use acp::*;
 pub use agent::*;
 pub use codec::*;
 pub use codex::*;
+pub use codex_containment::AgentContainmentConfig;
 pub use deno_genui::*;
 pub use deno_lsp::*;
 pub use mcp::*;

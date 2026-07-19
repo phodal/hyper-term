@@ -13,8 +13,23 @@ use uuid::Uuid;
 
 use crate::DriverError;
 
+/// Rust-selected containment inputs for one structured Agent process tree.
+///
+/// The credentialed proxy URL is deliberately separate from the serializable
+/// policy. It is bound into the exact command digest and injected only into the
+/// launched child environment.
+#[derive(Clone, Debug)]
+pub struct AgentContainmentConfig {
+    pub proxy_url: String,
+    pub credentialed_proxy_url: String,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_unix_sockets: Vec<PathBuf>,
+    pub read_paths: Vec<PathBuf>,
+    pub write_paths: Vec<PathBuf>,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn compile_codex_task_sandbox(
+pub(crate) fn compile_agent_task_sandbox(
     driver_id: Uuid,
     executable: &Path,
     arguments: &[OsString],
@@ -28,10 +43,10 @@ pub(crate) fn compile_codex_task_sandbox(
     write_paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<SandboxLaunchPlan, DriverError> {
     let command = TerminalCommand {
-        program: utf8_path(executable, "Codex executable")?,
+        program: utf8_path(executable, "Agent executable")?,
         args: arguments
             .iter()
-            .map(|argument| utf8_os(argument, "Codex argument"))
+            .map(|argument| utf8_os(argument, "Agent argument"))
             .collect::<Result<Vec<_>, _>>()?,
         cwd: Some(working_directory.to_path_buf()),
         env: utf8_environment(command_environment)?,
@@ -90,13 +105,24 @@ pub(crate) fn compile_codex_task_sandbox(
         .map_err(|error| DriverError::InvalidContainment(error.to_string()))
 }
 
+pub(crate) fn apply_managed_proxy_environment(
+    environment: &mut BTreeMap<String, OsString>,
+    credentialed_proxy_url: &str,
+) {
+    for name in ["HTTP_PROXY", "HTTPS_PROXY", "WS_PROXY", "WSS_PROXY"] {
+        environment.insert(name.into(), credentialed_proxy_url.into());
+    }
+    environment.insert("NO_PROXY".into(), OsString::new());
+    environment.insert("NODE_USE_ENV_PROXY".into(), "1".into());
+}
+
 fn utf8_environment(
     environment: &BTreeMap<String, OsString>,
 ) -> Result<BTreeMap<String, String>, DriverError> {
     environment
         .iter()
         .map(|(name, value)| {
-            utf8_os(value, "Codex environment value").map(|value| (name.clone(), value))
+            utf8_os(value, "Agent environment value").map(|value| (name.clone(), value))
         })
         .collect()
 }
@@ -135,7 +161,7 @@ mod tests {
             BTreeMap::from([("HOME".into(), runtime.clone().into_os_string())]);
         let mut command_environment = authority_environment.clone();
         command_environment.insert("HTTPS_PROXY".into(), credentialed.clone().into());
-        let plan = compile_codex_task_sandbox(
+        let plan = compile_agent_task_sandbox(
             Uuid::new_v4(),
             &executable,
             &[],

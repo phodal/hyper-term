@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::codex_containment::compile_codex_task_sandbox;
+use crate::codex_containment::{
+    AgentContainmentConfig, apply_managed_proxy_environment, compile_agent_task_sandbox,
+};
 use crate::{
     AgentClientError, AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind,
     AgentEffectProposal, AgentSessionCapabilities, AgentSessionConfigValue,
@@ -37,20 +39,6 @@ pub struct CodexMcpServerConfig {
     pub arguments: Vec<OsString>,
 }
 
-/// Rust-selected containment inputs for one Direct Codex process tree.
-///
-/// `credentialed_proxy_url` is intentionally kept out of the serializable
-/// sandbox profile. It is bound into the exact command action digest and only
-/// injected into the child environment.
-pub struct CodexContainmentConfig {
-    pub proxy_url: String,
-    pub credentialed_proxy_url: String,
-    pub allowed_hosts: Vec<String>,
-    pub allowed_unix_sockets: Vec<PathBuf>,
-    pub read_paths: Vec<PathBuf>,
-    pub write_paths: Vec<PathBuf>,
-}
-
 pub struct CodexAppServerConfig {
     pub executable: PathBuf,
     pub executable_sha256: String,
@@ -62,7 +50,7 @@ pub struct CodexAppServerConfig {
     /// On Unix this is staged as a private symlink after ownership and mode checks.
     pub auth_file: Option<PathBuf>,
     pub brokered_mcp_server: Option<CodexMcpServerConfig>,
-    pub containment: Option<CodexContainmentConfig>,
+    pub containment: Option<AgentContainmentConfig>,
 }
 
 pub struct CodexAppServerClient {
@@ -97,7 +85,7 @@ impl CodexAppServerClient {
         let codex_home = config.codex_home.canonicalize()?;
         let scratch = config.scratch_directory.canonicalize()?;
         let auth_read_path = config.auth_file.clone();
-        let staged_auth_file = stage_auth_file(config.auth_file.as_ref(), &codex_home)?;
+        let staged_auth_file = stage_codex_auth_file(config.auth_file.as_deref(), &codex_home)?;
         let mut environment = BTreeMap::from([
             ("CODEX_HOME".into(), codex_home.into_os_string()),
             ("HOME".into(), scratch.clone().into_os_string()),
@@ -125,7 +113,7 @@ impl CodexAppServerClient {
                 if let Some(mcp) = &config.brokered_mcp_server {
                     read_paths.push(mcp.executable.clone());
                 }
-                match compile_codex_task_sandbox(
+                match compile_agent_task_sandbox(
                     driver_id,
                     &config.executable,
                     &arguments,
@@ -470,17 +458,6 @@ impl CodexAppServerClient {
     }
 }
 
-fn apply_managed_proxy_environment(
-    environment: &mut BTreeMap<String, OsString>,
-    credentialed_proxy_url: &str,
-) {
-    for name in ["HTTP_PROXY", "HTTPS_PROXY", "WS_PROXY", "WSS_PROXY"] {
-        environment.insert(name.into(), credentialed_proxy_url.into());
-    }
-    environment.insert("NO_PROXY".into(), OsString::new());
-    environment.insert("NODE_USE_ENV_PROXY".into(), "1".into());
-}
-
 impl Drop for CodexAppServerClient {
     fn drop(&mut self) {
         remove_staged_auth_file(self.staged_auth_file.as_ref());
@@ -558,8 +535,8 @@ impl StructuredAgentClient for CodexAppServerClient {
 }
 
 #[cfg(unix)]
-fn stage_auth_file(
-    source: Option<&PathBuf>,
+pub fn stage_codex_auth_file(
+    source: Option<&std::path::Path>,
     codex_home: &std::path::Path,
 ) -> Result<Option<PathBuf>, CodexAdapterError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -598,8 +575,8 @@ fn stage_auth_file(
 }
 
 #[cfg(not(unix))]
-fn stage_auth_file(
-    source: Option<&PathBuf>,
+pub fn stage_codex_auth_file(
+    source: Option<&std::path::Path>,
     _codex_home: &std::path::Path,
 ) -> Result<Option<PathBuf>, CodexAdapterError> {
     if source.is_some() {
@@ -862,7 +839,7 @@ mod tests {
             scratch_directory: runtime.join("scratch"),
             auth_file: None,
             brokered_mcp_server: None,
-            containment: Some(CodexContainmentConfig {
+            containment: Some(AgentContainmentConfig {
                 proxy_url: proxy_url.clone(),
                 credentialed_proxy_url: proxy_url,
                 allowed_hosts: vec!["api.openai.com".into()],
@@ -968,14 +945,14 @@ mod tests {
         permissions.set_mode(0o644);
         fs::set_permissions(&auth, permissions).unwrap();
         assert!(matches!(
-            stage_auth_file(Some(&auth), &codex_home),
+            stage_codex_auth_file(Some(&auth), &codex_home),
             Err(CodexAdapterError::InvalidConfig(_))
         ));
 
         let mut permissions = fs::metadata(&auth).unwrap().permissions();
         permissions.set_mode(0o600);
         fs::set_permissions(&auth, permissions).unwrap();
-        let staged = stage_auth_file(Some(&auth), &codex_home)
+        let staged = stage_codex_auth_file(Some(&auth), &codex_home)
             .unwrap()
             .expect("staged auth");
         assert!(

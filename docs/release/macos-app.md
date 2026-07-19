@@ -28,9 +28,12 @@ ZIP. Modifying the bundle after the signing step invalidates its signature.
 The bundled Deno executable is re-signed with the reviewed V8/JIT entitlements
 in `runtime/deno.entitlements.plist`. Rust gives the GenUI compiler no shell,
 network, FFI, or workspace authority. The ACP adapters use the same pinned Deno
-binary and an offline local dependency tree, but still launch the user's
-authenticated Codex or Claude executable; binding those provider processes to
-the Tier 2 containment policy remains the release gate in ADR 0014.
+binary and an offline local dependency tree, then launch the user's
+authenticated Codex or Claude executable inside the implemented macOS Tier 1
+Seatbelt and managed-proxy boundary. The provider control process receives a
+read-only workspace and a private writable session home. Opaque
+provider-internal execution and hermetic acceptance still require Tier 2 under
+ADR 0014.
 
 The application does not bundle Node or the large provider CLI binaries. It
 only offers a bundled ACP provider when the matching `codex` or `claude`

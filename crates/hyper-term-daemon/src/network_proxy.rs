@@ -162,7 +162,7 @@ impl ProxyPolicy {
         if self.allow_private_targets {
             return true;
         }
-        is_public_address(address)
+        is_public_address(address) || is_transparent_proxy_fake_ip(address)
     }
 
     fn allows_port(&self, port: u16) -> bool {
@@ -437,6 +437,23 @@ fn is_public_address(address: IpAddr) -> bool {
     }
 }
 
+/// Transparent proxy clients such as Clash commonly synthesize RFC 2544
+/// benchmark addresses for public DNS names and intercept the resulting TCP
+/// connection locally. The CONNECT target is still constrained by the
+/// authenticated hostname allowlist and port policy before this address is
+/// considered; no IP literal can enter the allowlist parser.
+fn is_transparent_proxy_fake_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [first, second, _, _] = address.octets();
+            first == 198 && (second == 18 || second == 19)
+        }
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .is_some_and(|address| is_transparent_proxy_fake_ip(IpAddr::V4(address))),
+    }
+}
+
 fn is_public_ipv4(address: Ipv4Addr) -> bool {
     let [first, second, third, _] = address.octets();
     !(first == 0
@@ -547,6 +564,17 @@ mod tests {
                 "{address}"
             );
         }
+    }
+
+    #[test]
+    fn only_rfc_2544_addresses_are_accepted_as_transparent_proxy_fake_ips() {
+        let policy = ProxyPolicy::new(["chatgpt.com".to_owned()]).expect("policy");
+        assert!(policy.allows_address("198.18.0.1".parse().unwrap()));
+        assert!(policy.allows_address("198.19.255.254".parse().unwrap()));
+        assert!(policy.allows_address("1.1.1.1".parse().unwrap()));
+        assert!(!policy.allows_address("10.0.0.1".parse().unwrap()));
+        assert!(!policy.allows_address("192.168.0.1".parse().unwrap()));
+        assert!(!policy.allows_address("203.0.113.1".parse().unwrap()));
     }
 
     #[tokio::test]

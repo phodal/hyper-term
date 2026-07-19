@@ -523,6 +523,40 @@ The existing Codex adapter does not make an app-server approval authoritative.
 It is a proposal adapter. Support for external enforcement must be confirmed in
 the negotiated app-server/runtime surface before implementation.
 
+### Implemented macOS control-process boundary
+
+The macOS baseline now applies the same Rust-compiled Tier 1 Seatbelt and
+managed-network policy to direct Codex and every configured ACP adapter:
+
+- the provider executable, adapter runtime, interpreter, dynamic libraries,
+  PATH toolchains, and provider-specific preference/authentication roots are
+  explicit read roots;
+- the live workspace is read-only to the provider process tree; only a private
+  per-session home, tool home, and scratch root are writable;
+- `HOME`, `CODEX_HOME`, and `TMPDIR` are session-private for Codex ACP. Its
+  authentication file and read-only preferences are staged without copying
+  credentials into logs or persisted policy;
+- optional MCP access is limited to the broker control socket and the
+  digest-pinned MCP executable;
+- outbound sockets are denied except for an authenticated loopback CONNECT
+  proxy with a provider-specific hostname allowlist and port 443;
+- RFC 2544 `198.18.0.0/15` results are accepted only after the CONNECT hostname
+  and port pass policy, for macOS transparent proxies that implement Fake-IP
+  DNS. IP literals, RFC 1918, loopback, link-local, documentation, and other
+  reserved targets remain denied.
+
+The negative conformance test completes a real ACP initialize/session handshake
+while proving that the same process cannot read an unrelated host secret or
+write the workspace. A local installed `codex-acp` smoke test also completes
+through the Seatbelt and managed proxy boundary.
+
+This is a Tier 1 control-process boundary, not the deferred Tier 2 environment.
+Homebrew adapters may read the Homebrew installation root because their Node
+interpreter and dylibs cross Cellar and `opt` paths. Opaque provider-internal
+execution, hermetic dependencies, resource isolation, and review-only
+acceptance still require Tier 2; protocol tool requests continue through the
+Rust broker instead of inheriting workspace write authority.
+
 ## Audit and observability
 
 Every execution records a `SandboxReceipt` containing at least:
