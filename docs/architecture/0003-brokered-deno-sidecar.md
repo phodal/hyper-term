@@ -164,6 +164,11 @@ cache and scratch roots. Closing the Agent removes the complete session runtime
 root. A real integration test starts the configured MCP server through an ACP
 `mcpServers` entry, obtains the Diff/GenUI/LSP catalog, authorizes an LSP query
 through the Rust operation ledger, and returns the result to the ACP turn.
+If the selected directory exceeds or violates the snapshot contract, the
+partial snapshot is removed and the session starts with the narrower
+Diff/GenUI catalog instead of failing or exposing the live directory. Deno LSP
+returns only after the user selects a bounded workspace that can be captured
+safely.
 
 The supervisor now treats a request deadline as a lifecycle boundary. If an
 effect times out, it sends `SIGTERM` and then `SIGKILL` to the complete process

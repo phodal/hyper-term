@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hyper_term_drivers::{
-    AcpAgentClient, AcpAgentConfig, AgentDriverEvent, AgentEffectAuthorization, DriverState,
+    AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentDriverEvent, AgentEffectAuthorization,
+    DriverState, sha256_file,
 };
 use hyper_term_protocol::{OperationId, PermissionDecision};
 use tempfile::TempDir;
@@ -16,6 +17,53 @@ fn installed_acp_agent_completes_a_real_initialize_handshake() {
     client
         .initialize(Duration::from_secs(20))
         .unwrap_or_else(|error| panic_with_stderr(&client, "initialize", error));
+    assert_eq!(client.state().unwrap(), DriverState::Ready);
+    assert_eq!(client.close().unwrap(), DriverState::Closed);
+}
+
+#[test]
+#[ignore = "requires HYPER_TERM_ACP_PATH, HYPER_TERM_ACP_SHA256, and an installed ACP adapter"]
+fn installed_acp_agent_creates_a_real_session_without_prompt() {
+    let (client, _workspace) = launch_installed_acp_agent_with_mcp(None);
+    client
+        .initialize(Duration::from_secs(20))
+        .unwrap_or_else(|error| panic_with_stderr(&client, "initialize", error));
+    let session_id = client
+        .start_session(Duration::from_secs(20))
+        .unwrap_or_else(|error| panic_with_stderr(&client, "session/new", error));
+
+    assert!(!session_id.is_empty());
+    assert_eq!(client.state().unwrap(), DriverState::Ready);
+    assert_eq!(client.close().unwrap(), DriverState::Closed);
+}
+
+#[test]
+#[ignore = "requires an installed ACP adapter plus HYPER_TERM_MCP_PATH and HYPER_TERM_MCP_ARGS_JSON"]
+fn installed_acp_agent_creates_a_real_session_with_brokered_mcp_without_prompt() {
+    let mcp_executable = required_path("HYPER_TERM_MCP_PATH")
+        .canonicalize()
+        .expect("HYPER_TERM_MCP_PATH must resolve to the inspected connector");
+    let arguments = serde_json::from_str::<Vec<String>>(
+        &std::env::var("HYPER_TERM_MCP_ARGS_JSON").expect("HYPER_TERM_MCP_ARGS_JSON"),
+    )
+    .expect("HYPER_TERM_MCP_ARGS_JSON must be a JSON string array")
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    let mcp = AcpMcpServerConfig {
+        executable_sha256: sha256_file(&mcp_executable).expect("digest MCP connector"),
+        executable: mcp_executable,
+        arguments,
+    };
+    let (client, _workspace) = launch_installed_acp_agent_with_mcp(Some(mcp));
+    client
+        .initialize(Duration::from_secs(20))
+        .unwrap_or_else(|error| panic_with_stderr(&client, "initialize", error));
+    let session_id = client
+        .start_session(Duration::from_secs(20))
+        .unwrap_or_else(|error| panic_with_stderr(&client, "session/new", error));
+
+    assert!(!session_id.is_empty());
     assert_eq!(client.state().unwrap(), DriverState::Ready);
     assert_eq!(client.close().unwrap(), DriverState::Closed);
 }
@@ -88,6 +136,12 @@ fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
 }
 
 fn launch_installed_acp_agent() -> (AcpAgentClient, TempDir) {
+    launch_installed_acp_agent_with_mcp(None)
+}
+
+fn launch_installed_acp_agent_with_mcp(
+    brokered_mcp_server: Option<AcpMcpServerConfig>,
+) -> (AcpAgentClient, TempDir) {
     let executable = required_path("HYPER_TERM_ACP_PATH");
     let executable = executable
         .canonicalize()
@@ -106,7 +160,7 @@ fn launch_installed_acp_agent() -> (AcpAgentClient, TempDir) {
         implementation_version: "installed-e2e".into(),
         provider_id,
         workspace: workspace.path().canonicalize().unwrap(),
-        brokered_mcp_server: None,
+        brokered_mcp_server,
     })
     .expect("launch inspected ACP adapter");
     (client, workspace)

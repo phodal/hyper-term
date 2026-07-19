@@ -111,7 +111,9 @@ UI bridge.
 
 Agent providers require a compatible CLI already installed and authenticated on
 the local machine. Hyper Term packages the adapter runtime, not the provider
-CLI or account credentials.
+CLI or account credentials. Agent sessions started from an oversized directory
+such as the user's home still retain Diff and GenUI MCP tools, but Deno LSP is
+omitted until a bounded workspace can be snapshotted safely.
 
 ## Quick start
 

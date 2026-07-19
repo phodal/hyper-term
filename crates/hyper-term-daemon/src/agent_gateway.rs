@@ -2944,13 +2944,6 @@ impl AgentGatewayRuntime {
                 Err(_) => return Some(Err(StartError::Driver)),
             };
             let deno_root = session_root.join("deno-tools");
-            let snapshot = match create_workspace_snapshot(
-                &self.config.workspace,
-                &deno_root.join("workspace-snapshot"),
-            ) {
-                Ok(snapshot) => snapshot,
-                Err(_) => return Some(Err(StartError::Driver)),
-            };
             arguments.extend([
                 "--deno".into(),
                 runtime.deno_executable.clone().into_os_string(),
@@ -2958,12 +2951,21 @@ impl AgentGatewayRuntime {
                 deno_sha256.into(),
                 "--deno-version".into(),
                 runtime.runtime_version.clone().into(),
-                "--workspace-snapshot".into(),
-                snapshot.root.into_os_string(),
                 "--deno-cache".into(),
                 deno_root.join("cache").into_os_string(),
                 "--deno-scratch".into(),
                 deno_root.join("scratch").into_os_string(),
+            ]);
+            if let Ok(snapshot) = create_workspace_snapshot(
+                &self.config.workspace,
+                &deno_root.join("workspace-snapshot"),
+            ) {
+                arguments.extend([
+                    "--workspace-snapshot".into(),
+                    snapshot.root.into_os_string(),
+                ]);
+            }
+            arguments.extend([
                 "--genui-script".into(),
                 runtime.compiler_script.clone().into_os_string(),
                 "--genui-script-sha256".into(),
@@ -5859,6 +5861,28 @@ mod tests {
         assert!(!snapshot.join("node_modules").exists());
         assert!(arguments.iter().any(|argument| argument.len() == 64));
         assert!(config.arguments.len() <= 32);
+
+        std::fs::write(
+            workspace.join("oversized.ts"),
+            vec![b'x'; 2 * 1024 * 1024 + 1],
+        )
+        .expect("oversized source fixture");
+        let degraded = runtime
+            .mcp_launch(TaskId::new(), &state_directory.join("agents/session-8"))
+            .expect("MCP configured")
+            .expect("GenUI-only MCP config");
+        let degraded_arguments = degraded
+            .arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(degraded_arguments.contains(&std::borrow::Cow::Borrowed("--genui-script")));
+        assert!(!degraded_arguments.contains(&std::borrow::Cow::Borrowed("--workspace-snapshot")));
+        assert!(
+            !state_directory
+                .join("agents/session-8/deno-tools/workspace-snapshot")
+                .exists()
+        );
     }
 
     async fn request(

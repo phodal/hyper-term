@@ -181,6 +181,12 @@ set is enabled per release.
   private workspace snapshot. A real-Deno integration test proves an ACP Agent
   can discover all three tools, propose and authorize `hyper_term.lsp.query`,
   and receive the real LSP result through the Agent turn.
+- A directory that cannot be captured within the private snapshot limits no
+  longer prevents the ACP session itself from starting. Rust omits only the
+  Deno LSP capability for that session, deletes the partial snapshot, and keeps
+  the stricter Diff and GenUI MCP catalog. This is important for the normal
+  Terminal default of starting in the user's home directory: Home is not
+  silently treated as one giant Agent workspace.
 - Distribution still needs the containment decision in ADR 0014, a
   terminal-auth UI, and the full fuzz and protocol-upgrade matrix. The internal
   MCP adapter remains a bounded stdio subset; adopting the complete Rust MCP SDK
