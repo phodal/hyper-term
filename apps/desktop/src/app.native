@@ -2,8 +2,8 @@
      Agent-authored content enters later as versioned Block data, never markup. -->
 <template name="agent-thread">
   <column min-width="400" grow="1" background="surface" label="Agent conversation">
-    <row gap="8" padding="9" cross="center">
-      <icon name="circle-dot" width="14" height="14" foreground="accent" />
+    <row gap="6" padding="7" cross="center">
+      <icon name="circle-dot" width="12" height="12" foreground="accent" />
       <text grow="1"><span weight="medium">Agent</span></text>
       <badge variant="secondary">{activeAgentProviderLabel}</badge>
       <badge variant="secondary">{agentConnectionLabel}</badge>
@@ -12,8 +12,13 @@
       </if>
     </row>
     <separator />
-    <scroll grow="1" value="{agentScrollOffset}" on-scroll="agent_scrolled" label="Agent blocks">
-      <column gap="14" padding="14">
+    <!-- The Zig root replaces this labelled slot with a variable-height,
+         tail-anchored virtual list. The unreachable branch keeps the Native
+         model contract checking the builder-owned block vocabulary. -->
+    <column grow="1" label="Agent blocks">
+      <if test="false">
+        <scroll grow="1" label="Agent block contract">
+          <column gap="3" padding="10">
         <if test="{hasAgentBlocks}">
           <for each="agentBlocks" key="id" as="block">
             <if test="{block.isMessage}">
@@ -31,12 +36,8 @@
                 </row>
               </if>
               <else>
-                <column gap="6" padding="4">
-                  <row gap="7" cross="center">
-                    <icon name="circle-dot" width="12" height="12" foreground="accent" />
-                    <text foreground="text_muted">{block.roleLabel}</text>
-                  </row>
-                  <column padding="4">
+                <column gap="4" padding="2">
+                  <column padding="2">
                     <markdown source="{block.content}" />
                   </column>
                   <if test="{block.truncated}">
@@ -47,8 +48,8 @@
             </if>
             <else>
               <if test="{block.isActivity}">
-                <accordion text="{block.activityTitle}" selected="{block.expanded}" on-toggle="toggle_agent_block:{block.id}">
-                  <column gap="7" padding="8">
+                <accordion size="sm" text="{block.activityTitle}" selected="{block.expanded}" on-toggle="toggle_agent_block:{block.id}">
+                  <column gap="5" padding="7">
                     <text foreground="text_muted">{block.activityMeta}</text>
                     <if test="{block.hasActivityDetails}">
                       <markdown source="{block.content}" />
@@ -122,19 +123,23 @@
         <else>
           <spacer height="4" />
         </else>
-      </column>
-    </scroll>
+          </column>
+        </scroll>
+      </if>
+    </column>
     <separator />
-    <column padding="9">
-      <input-group label="Agent prompt composer" height="82">
-        <textarea text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerDisabled}" label="Agent prompt" />
+    <column padding="8">
+      <input-group label="Agent prompt composer" height="{agentComposerHeight}">
+        <textarea size="sm" text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerDisabled}" label="Agent prompt" />
         <input-group-actions>
           <spacer grow="1" />
           <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentComposerDisabled}" label="Send prompt"></button>
         </input-group-actions>
       </input-group>
     </column>
-    <status-bar>{agentStatus}</status-bar>
+    <if test="{hasAgentStatusNotice}">
+      <status-bar>{agentStatus}</status-bar>
+    </if>
   </column>
 </template>
 

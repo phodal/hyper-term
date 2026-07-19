@@ -51,6 +51,12 @@ fn containsText(widget: canvas.Widget, value: []const u8) bool {
     return false;
 }
 
+fn widgetCount(widget: canvas.Widget) usize {
+    var count: usize = 1;
+    for (widget.children) |child| count += widgetCount(child);
+    return count;
+}
+
 test "default session is an ordinary terminal" {
     var model = main.initialModel();
     try testing.expectEqualStrings("hidden_inset", @tagName(main.shell_scene.windows[0].titlebar));
@@ -62,6 +68,25 @@ test "default session is an ordinary terminal" {
     const tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) != null);
     try testing.expect(!containsText(tree.root, "Native Block surface"));
+}
+
+test "Native typography uses the registered broad-coverage face when available" {
+    try testing.expectEqualStrings(
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        main.preferredUiFontPath(null),
+    );
+    try testing.expectEqualStrings(
+        "/tmp/HyperTerm-CJK.ttf",
+        main.preferredUiFontPath("/tmp/HyperTerm-CJK.ttf"),
+    );
+
+    var model = main.initialModel();
+    try testing.expectEqual(canvas.default_sans_font_id, main.hyperTermTokens(&model).typography.font_id);
+    model.ui_font_registered = true;
+    try testing.expectEqual(canvas.min_registered_font_id, main.hyperTermTokens(&model).typography.font_id);
+
+    model.high_contrast = true;
+    try testing.expectEqual(canvas.min_registered_font_id, main.hyperTermTokens(&model).typography.font_id);
 }
 
 test "session bar exposes direct Terminal and Agent creation" {
@@ -213,6 +238,7 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
     } }, &fx);
     try testing.expectEqual(main.AgentConnection.ready, model.activeSession().agent_connection);
     try testing.expectEqualStrings("Agent ready", model.agentStatus());
+    try testing.expect(!model.hasAgentStatusNotice());
     try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
     try testing.expectEqual(std.http.Method.GET, fx.pendingFetchAt(1).?.method);
     try testing.expectEqualStrings(
@@ -239,6 +265,7 @@ test "Agent start failures keep the tab inert and explain the gateway result" {
     try testing.expectEqual(main.AgentConnection.failed, model.activeSession().agent_connection);
     try testing.expectEqual(main.AgentTurnStatus.failed, model.agent_turn_status);
     try testing.expect(model.agentComposerDisabled());
+    try testing.expect(model.hasAgentStatusNotice());
     try testing.expectEqualStrings(
         "Agent session limit reached · close a tab and retry",
         model.agentStatus(),
@@ -256,6 +283,9 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     main.update(&model, .choose_agent, &fx);
     model.session_slots[1].agent_connection = .ready;
     model.agent_turn_status = .ready;
+    try testing.expectEqual(@as(f32, 68), model.agentComposerHeight());
+    model.agent_composer_buffer.set("One\nTwo\nThree");
+    try testing.expect(model.agentComposerHeight() > 68);
     model.agent_composer_buffer.set("Explain the PTY boundary");
     main.update(&model, .send_agent_prompt, &fx);
 
@@ -528,7 +558,8 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expectEqualStrings("completed · 1 file · +1 −1", model.agentBlocks()[1].activityMeta());
     try testing.expect(!model.agentBlocks()[1].expanded);
     try testing.expectEqualStrings("Run shell command", model.agentBlocks()[2].activityTitle());
-    try testing.expect(model.agentBlocks()[3].expanded);
+    try testing.expect(!model.agentBlocks()[3].expanded);
+    try testing.expectEqualStrings("Plan · 1 / 2 complete", model.agentBlocks()[3].activityTitle());
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -539,9 +570,15 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
     try testing.expect(containsText(tree.root, "Edit src/lib.rs"));
     try testing.expect(containsText(tree.root, "Run shell command"));
-    try testing.expect(containsText(tree.root, "1 / 2 complete"));
-    try testing.expect(containsText(tree.root, "Verify the edit"));
+    try testing.expect(containsText(tree.root, "Plan · 1 / 2 complete"));
     try testing.expect(!findByText(tree.root, .accordion, "Edit src/lib.rs").?.state.selected);
+    try testing.expect(!findByText(tree.root, .accordion, "Plan · 1 / 2 complete").?.state.selected);
+
+    main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[3].id }, &fx);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByText(tree.root, .accordion, "Plan · 1 / 2 complete").?.state.selected);
 
     main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[1].id }, &fx);
     arena_state.deinit();
@@ -553,7 +590,35 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(containsText(tree.root, "terminal-7"));
 }
 
-test "Agent stream preserves the native scroll position across snapshots" {
+test "ACP reasoning is one collapsed disclosure instead of transcript prose" {
+    var model = main.initialModel();
+    model.session_slots[0].mode = .agent;
+    model.session_slots[0].title = "Agent";
+    model.agent_turn_status = .completed;
+    model.agent_block_count = 1;
+    model.agent_blocks[0].id = 41;
+    model.agent_blocks[0].kind = .message;
+    model.agent_blocks[0].role = .thought;
+    const thought = "Searching repository\n\nPlanning concise response\n\nConsolidating result";
+    @memcpy(model.agent_blocks[0].content_storage[0..thought.len], thought);
+    model.agent_blocks[0].content_len = thought.len;
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(!findByText(tree.root, .accordion, "Processed").?.state.selected);
+
+    main.update(&model, .{ .toggle_agent_block = 41 }, &fx);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByText(tree.root, .accordion, "Processed").?.state.selected);
+}
+
+test "Agent stream uses a tail-anchored variable timeline with stable block identity" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     const snapshot =
@@ -574,14 +639,13 @@ test "Agent stream preserves the native scroll position across snapshots" {
         .status = 200,
         .body = snapshot,
     } }, &fx);
-    try testing.expectEqual(@as(f32, 0), model.agentScrollOffset());
-
-    main.update(&model, .{ .agent_scrolled = .{
-        .offset = 100,
-        .viewport_extent = 200,
-        .content_extent = 800,
-    } }, &fx);
-    try testing.expectEqual(@as(f32, 100), model.agentScrollOffset());
+    const first_id = model.agentBlocks()[0].id;
+    const options = main.agentTimelineOptions(&model);
+    try testing.expectEqual(@as(usize, 1), options.item_count);
+    try testing.expectEqual(@as(u64, 0), options.index_base);
+    try testing.expect(options.extent_estimate != null);
+    try testing.expect(options.anchor == .trailing);
+    try testing.expect(options.extent_estimate.?(options.extent_context, 0) > 0);
 
     model.agent_snapshot_in_flight_session_id = 2;
     main.update(&model, .{ .agent_snapshot_received = .{
@@ -589,7 +653,35 @@ test "Agent stream preserves the native scroll position across snapshots" {
         .status = 200,
         .body = snapshot,
     } }, &fx);
-    try testing.expectEqual(@as(f32, 100), model.agentScrollOffset());
+    try testing.expectEqual(first_id, model.agentBlocks()[0].id);
+}
+
+test "Agent timeline mounts only a tail window at the full retained block bound" {
+    var model = main.initialModel();
+    model.session_slots[0].mode = .agent;
+    model.session_slots[0].title = "Agent";
+    model.agent_block_count = main.max_agent_blocks;
+    model.agent_block_index_base = 4_096;
+    for (model.agent_blocks[0..model.agent_block_count], 0..) |*block, index| {
+        block.id = @intCast(index + 1);
+        block.kind = .message;
+        block.role = .agent;
+        const text = std.fmt.bufPrint(&block.content_storage, "Message {d}", .{index}) catch unreachable;
+        block.content_len = text.len;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    const timeline = findByLabel(tree.root, "Agent blocks").?;
+
+    try testing.expectEqual(canvas.WidgetKind.scroll_view, timeline.kind);
+    try testing.expect(timeline.layout.virtualized);
+    try testing.expectEqual(main.max_agent_blocks, timeline.layout.virtual_item_count);
+    try testing.expect(timeline.layout.virtual_first_index > 0);
+    try testing.expect(timeline.children.len < main.max_agent_blocks / 2);
+    try testing.expect(containsText(timeline, "Message 127"));
+    try testing.expect(widgetCount(tree.root) < 220);
 }
 
 test "read-only MCP approvals expose an exact Allow once action" {

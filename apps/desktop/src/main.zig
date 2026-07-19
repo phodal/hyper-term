@@ -30,7 +30,7 @@ const max_gateway_token_bytes: usize = 128;
 const max_agent_provider_status_bytes: usize = 4 * 1024;
 const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
 const agent_effect_url_capacity: usize = agent_url_capacity + 64;
-const max_agent_blocks: usize = 16;
+pub const max_agent_blocks: usize = 128;
 const max_agent_block_bytes: usize = 8 * 1024;
 const max_agent_operation_id_bytes: usize = 36;
 const max_agent_operation_kind_bytes: usize = 96;
@@ -38,6 +38,9 @@ const max_agent_activity_title_bytes: usize = 512;
 const max_agent_activity_meta_bytes: usize = 512;
 const max_agent_error_bytes: usize = 512;
 const max_agent_prompt_bytes: usize = 16 * 1024;
+const ui_font_id: canvas.FontId = canvas.min_registered_font_id;
+const max_ui_font_bytes: usize = 24 * 1024 * 1024;
+const default_macos_ui_font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf";
 const terminal_close_effect_key_base: u64 = 0x4854_4300;
 pub const agent_start_effect_key_base: u64 = 0x4854_4100;
 const agent_close_effect_key_base: u64 = 0x4854_4200;
@@ -232,6 +235,10 @@ pub const AgentBlockView = struct {
         return block.kind == .message and block.role == .user;
     }
 
+    pub fn isThoughtMessage(block: *const AgentBlockView) bool {
+        return block.kind == .message and block.role == .thought;
+    }
+
     pub fn isOperation(block: *const AgentBlockView) bool {
         return block.kind == .operation;
     }
@@ -370,11 +377,12 @@ pub const Model = struct {
     genui_source_revision: u64 = 0,
     agent_editor_open_session_id: u8 = 0,
     agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
+    ui_font_registered: bool = false,
     agent_blocks: [max_agent_blocks]AgentBlockView = [_]AgentBlockView{.{}} ** max_agent_blocks,
     agent_block_count: usize = 0,
+    agent_block_index_base: u64 = 0,
     agent_history_clipped: bool = false,
     agent_projection_session_id: u8 = 0,
-    agent_scroll_offset: f32 = 0,
     agent_turn_status: AgentTurnStatus = .idle,
     agent_error_storage: [max_agent_error_bytes]u8 = [_]u8{0} ** max_agent_error_bytes,
     agent_error_len: usize = 0,
@@ -410,10 +418,11 @@ pub const Model = struct {
         "genui_source_revision",
         "agent_editor_open_session_id",
         "agent_composer_buffer",
+        "ui_font_registered",
         "agent_blocks",
         "agent_block_count",
+        "agent_block_index_base",
         "agent_projection_session_id",
-        "agent_scroll_offset",
         "agent_turn_status",
         "agent_error_storage",
         "agent_error_len",
@@ -583,6 +592,23 @@ pub const Model = struct {
         };
     }
 
+    pub fn hasAgentStatusNotice(model: *const Model) bool {
+        const session = model.activeSession();
+        if (session.mode != .agent) return false;
+        return !model.agentProviderReady(session.agent_provider) or
+            session.agent_connection == .failed or
+            model.agent_turn_status == .failed;
+    }
+
+    pub fn agentComposerHeight(model: *const Model) f32 {
+        const text = model.agent_composer_buffer.text();
+        var visual_lines: usize = 1;
+        for (text) |byte| visual_lines += @intFromBool(byte == '\n');
+        visual_lines += text.len / 96;
+        const extra_lines = @min(visual_lines - 1, 4);
+        return 68 + @as(f32, @floatFromInt(extra_lines)) * 19;
+    }
+
     pub fn agentComposerText(model: *const Model) []const u8 {
         return model.agent_composer_buffer.text();
     }
@@ -596,10 +622,6 @@ pub const Model = struct {
 
     pub fn agentBlocks(model: *const Model) []const AgentBlockView {
         return model.agent_blocks[0..model.agent_block_count];
-    }
-
-    pub fn agentScrollOffset(model: *const Model) f32 {
-        return model.agent_scroll_offset;
     }
 
     pub fn hasAgentBlocks(model: *const Model) bool {
@@ -663,7 +685,6 @@ pub const Msg = union(enum) {
     send_agent_prompt,
     agent_turn_started: native_sdk.EffectResponse,
     agent_snapshot_received: native_sdk.EffectResponse,
-    agent_scrolled: canvas.ScrollState,
     toggle_agent_block: u64,
     reject_agent_effect: []const u8,
     allow_agent_effect: []const u8,
@@ -717,10 +738,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
-        .agent_scrolled => |scroll| model.agent_scroll_offset = scroll.offset,
         .toggle_agent_block => |block_id| {
             for (model.agent_blocks[0..model.agent_block_count]) |*block| {
-                if (block.id == block_id and block.isActivity()) {
+                if (block.id == block_id and (block.isActivity() or block.isThoughtMessage())) {
                     block.expanded = !block.expanded;
                     break;
                 }
@@ -1169,6 +1189,7 @@ fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
         if (renderableAgentBlock(block)) block_total += 1;
     }
     var skip = block_total -| max_agent_blocks;
+    model.agent_block_index_base = @intCast(skip);
     model.agent_history_clipped = skip > 0;
     for (blocks, 0..) |block, block_index| {
         if (!renderableAgentBlock(block)) continue;
@@ -1323,7 +1344,7 @@ fn projectAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
     view.kind = .tool_call;
     copyActivityTitle(view, displayAgentToolTitle(call.kind, call.title));
     view.tool_status = parseAgentToolStatus(call.status);
-    view.expanded = view.tool_status == .in_progress or view.tool_status == .failed;
+    view.expanded = view.tool_status == .failed;
     var added_lines: u64 = 0;
     var removed_lines: u64 = 0;
     var diff_count: usize = 0;
@@ -1396,19 +1417,19 @@ fn displayAgentToolTitle(kind: []const u8, title: []const u8) []const u8 {
 
 fn projectAgentPlan(view: *AgentBlockView, entries: []const AgentPlanEntryWire) void {
     view.kind = .plan;
-    copyActivityTitle(view, "Plan");
     var completed: usize = 0;
-    var running = false;
     for (entries) |entry| {
         const marker: []const u8 = if (std.mem.eql(u8, entry.status, "completed")) "x" else " ";
         completed += @intFromBool(std.mem.eql(u8, entry.status, "completed"));
-        running = running or std.mem.eql(u8, entry.status, "in_progress");
         appendActivityFmt(view, "- [{s}] {s} _{s}_\n", .{ marker, entry.content, entry.priority });
     }
     var meta: [max_agent_activity_meta_bytes]u8 = undefined;
     const rendered = std.fmt.bufPrint(&meta, "{d} / {d} complete", .{ completed, entries.len }) catch "Plan";
     copyActivityMeta(view, rendered);
-    view.expanded = running;
+    var title: [max_agent_activity_title_bytes]u8 = undefined;
+    const title_rendered = std.fmt.bufPrint(&title, "Plan · {s}", .{rendered}) catch "Plan";
+    copyActivityTitle(view, title_rendered);
+    view.expanded = false;
 }
 
 fn parseAgentToolStatus(value: []const u8) AgentToolStatus {
@@ -1583,9 +1604,9 @@ fn effectSessionId(key: u64, base: u64) ?u8 {
 fn resetAgentProjection(model: *Model, session_id: u8) void {
     for (&model.agent_blocks) |*block| block.* = .{};
     model.agent_block_count = 0;
+    model.agent_block_index_base = 0;
     model.agent_history_clipped = false;
     model.agent_projection_session_id = session_id;
-    model.agent_scroll_offset = 0;
     model.agent_turn_status = .idle;
     model.agent_error_len = 0;
     model.agent_permission_in_flight_session_id = 0;
@@ -1705,6 +1726,7 @@ pub fn hyperTermTokens(model: *const Model) canvas.DesignTokens {
         tokens.metrics.tabs_gap = 4;
         tokens.controls.button_group_style = .segmented;
         tokens.metrics.button_group_gap = 0;
+        if (model.ui_font_registered) tokens.typography.font_id = ui_font_id;
         return tokens;
     }
 
@@ -1771,19 +1793,226 @@ pub fn hyperTermTokens(model: *const Model) canvas.DesignTokens {
     tokens.metrics.tabs_gap = 4;
     tokens.controls.button_group_style = .segmented;
     tokens.metrics.button_group_gap = 0;
+    if (model.ui_font_registered) tokens.typography.font_id = ui_font_id;
     return tokens;
+}
+
+/// The Native canvas renderer does not provide per-glyph fallback on every
+/// render path. Hyper Term therefore registers one broad-coverage UI face at
+/// boot. Packaging may override the path with a bundled OFL font; the macOS
+/// development fallback is a system-owned font and is never copied into the
+/// repository or read by a WebView.
+pub fn preferredUiFontPath(configured: ?[]const u8) []const u8 {
+    if (configured) |path| {
+        if (path.len > 0) return path;
+    }
+    return default_macos_ui_font_path;
 }
 
 pub const HyperTermUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
 pub const CompiledHyperTermView = canvas.CompiledMarkupView(Model, Msg, app_markup);
+const AgentMarkdown = native_sdk.markdown.Markdown(Msg);
+
+const agent_timeline_id = "agent-blocks";
+const agent_timeline_estimated_width: usize = 84;
+const agent_timeline_line_height: f32 = 19;
+const agent_timeline_viewport_fallback: f32 = 480;
+
+fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 {
+    const pointer = context orelse return 36;
+    const model: *const Model = @ptrCast(@alignCast(pointer));
+    if (logical_index < model.agent_block_index_base) return 36;
+    const physical_u64 = logical_index - model.agent_block_index_base;
+    if (physical_u64 >= model.agent_block_count) return 36;
+    const block = &model.agent_blocks[@intCast(physical_u64)];
+    const lines = @max(@as(usize, 1), (block.content_len + agent_timeline_estimated_width - 1) / agent_timeline_estimated_width);
+    const text_extent = @as(f32, @floatFromInt(@min(lines, 96))) * agent_timeline_line_height;
+    return switch (block.kind) {
+        .message => if (block.role == .user) 28 + text_extent else 14 + text_extent,
+        .tool_call, .plan => if (block.expanded) 48 + text_extent else 34,
+        .operation => 78 + @min(text_extent, agent_timeline_line_height * 3),
+        .approval => 210 + @min(text_extent, agent_timeline_line_height * 8),
+    };
+}
+
+pub fn agentTimelineOptions(model: *const Model) HyperTermUi.VirtualListOptions {
+    return .{
+        .id = agent_timeline_id,
+        .item_count = model.agent_block_count,
+        .index_base = model.agent_block_index_base,
+        .item_extent = 36,
+        .extent_estimate = agentBlockExtentEstimate,
+        .extent_context = model,
+        .gap = 3,
+        .overscan = 4,
+        .grow = 1,
+        .viewport_fallback = agent_timeline_viewport_fallback,
+        .anchor = .trailing,
+        .semantics = .{ .label = "Agent blocks" },
+    };
+}
+
+fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
+    const options = agentTimelineOptions(model);
+    const window = ui.virtualWindow(options);
+    const rows = ui.arena.alloc(HyperTermUi.Node, window.itemCount()) catch {
+        ui.failed = true;
+        return ui.column(.{ .grow = 1 }, .{});
+    };
+    for (rows, 0..) |*row, offset| {
+        const physical = window.start_index + offset;
+        var node = agentBlockNode(ui, model, &model.agent_blocks[physical]);
+        node.key = .{ .int = model.agent_blocks[physical].id };
+        row.* = node;
+    }
+    const timeline = ui.virtualList(options, window, .{rows});
+    if (!model.agent_history_clipped) return timeline;
+    return ui.column(.{ .grow = 1 }, .{
+        ui.text(.{ .padding = 6, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Older activity is compacted · showing the latest {d} blocks", .{max_agent_blocks})),
+        timeline,
+    });
+}
+
+fn agentBlockNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBlockView) HyperTermUi.Node {
+    return switch (block.kind) {
+        .message => agentMessageNode(ui, model, block),
+        .tool_call, .plan => agentActivityNode(ui, block),
+        .operation => agentOperationNode(ui, block),
+        .approval => agentApprovalNode(ui, model, block),
+    };
+}
+
+fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBlockView) HyperTermUi.Node {
+    const clipped = if (block.truncated)
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, if (block.isUserMessage()) "Block clipped to 8 KiB in this view." else "Response clipped to 8 KiB in this view.")
+    else
+        ui.el(.stack, .{}, .{});
+    if (block.isUserMessage()) {
+        return ui.row(.{ .padding = 2 }, .{
+            ui.spacer(1),
+            ui.el(.bubble, .{}, .{
+                ui.column(.{ .gap = 3, .padding = 7 }, .{
+                    ui.text(.{ .wrap = true }, block.content()),
+                    clipped,
+                }),
+            }),
+        });
+    }
+    if (block.isThoughtMessage()) {
+        const label = switch (model.agent_turn_status) {
+            .running, .waiting_approval => "Reasoning",
+            else => "Processed",
+        };
+        return ui.el(.accordion, .{
+            .text = label,
+            .size = .sm,
+            .selected = block.expanded,
+            .on_toggle = Msg{ .toggle_agent_block = block.id },
+        }, .{
+            ui.column(.{ .gap = 4, .padding = 7 }, .{
+                AgentMarkdown.view(ui, block.content(), .{}),
+                clipped,
+            }),
+        });
+    }
+    return ui.column(.{ .gap = 4, .padding = 2 }, .{
+        ui.column(.{ .padding = 2 }, .{AgentMarkdown.view(ui, block.content(), .{})}),
+        clipped,
+    });
+}
+
+fn agentActivityNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
+    return ui.el(.accordion, .{
+        .text = block.activityTitle(),
+        .size = .sm,
+        .selected = block.expanded,
+        .on_toggle = Msg{ .toggle_agent_block = block.id },
+    }, .{
+        ui.column(.{ .gap = 5, .padding = 7 }, .{
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.activityMeta()),
+            if (block.hasActivityDetails()) AgentMarkdown.view(ui, block.content(), .{}) else ui.el(.stack, .{}, .{}),
+            if (block.truncated)
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Tool details clipped to 8 KiB in this view.")
+            else
+                ui.el(.stack, .{}, .{}),
+        }),
+    });
+}
+
+fn agentOperationNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
+    return ui.el(.card, .{}, .{
+        ui.column(.{ .gap = 7, .padding = 9 }, .{
+            ui.row(.{ .gap = 7, .cross = .center }, .{
+                ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .info } }, "wrench"),
+                ui.text(.{ .grow = 1, .wrap = true }, block.content()),
+                ui.el(.badge, .{ .text = block.stateLabel(), .variant = .secondary }, .{}),
+            }),
+            ui.text(.{ .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
+        }),
+    });
+}
+
+fn agentApprovalNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBlockView) HyperTermUi.Node {
+    const decision = if (!block.isApprovalPending())
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Decision: {s}", .{block.decisionLabel()}))
+    else if (block.canAllowOnce())
+        ui.el(.alert, .{ .text = "Brokered MCP tool" }, .{
+            ui.column(.{ .gap = 7, .padding = 9 }, .{
+                ui.text(.{ .wrap = true }, "This read-only tool runs through the Rust permission broker and records a receipt."),
+                ui.column(.{ .gap = 7 }, .{
+                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .allow_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Allow once"),
+                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
+                    ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel request"),
+                }),
+            }),
+        })
+    else
+        ui.el(.alert, .{ .text = "Proposal-only safety gate" }, .{
+            ui.column(.{ .gap = 7, .padding = 9 }, .{
+                ui.text(.{ .wrap = true }, "Allow is unavailable until the Rust sandbox can enforce this exact effect."),
+                ui.column(.{ .gap = 7 }, .{
+                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
+                    ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel request"),
+                }),
+            }),
+        });
+    return ui.el(.card, .{ .style_tokens = .{ .border_color = .warning } }, .{
+        ui.column(.{ .gap = 9, .padding = 10 }, .{
+            ui.row(.{ .gap = 7, .cross = .center }, .{
+                ui.icon(.{ .width = 14, .height = 14, .style_tokens = .{ .foreground = .warning } }, "alert"),
+                ui.text(.{ .grow = 1 }, block.approvalTitle()),
+            }),
+            ui.text(.{ .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
+            ui.text(.{ .wrap = true }, block.content()),
+            decision,
+        }),
+    });
+}
+
+fn replaceNodeByLabel(ui: *HyperTermUi, source: HyperTermUi.Node, label: []const u8, replacement: HyperTermUi.Node) HyperTermUi.Node {
+    if (std.mem.eql(u8, source.widget.semantics.label, label)) return replacement;
+    if (source.nodes.len == 0) return source;
+    var result = source;
+    const children = ui.arena.alloc(HyperTermUi.Node, source.nodes.len) catch {
+        ui.failed = true;
+        return source;
+    };
+    for (source.nodes, children) |child, *output| {
+        output.* = replaceNodeByLabel(ui, child, label, replacement);
+    }
+    result.nodes = children;
+    return result;
+}
 
 /// Stable Zig composition seam for the product shell. Today the complete
 /// shell is one compiled Native markup document; builder-owned surfaces such
 /// as the windowed Agent transcript can replace individual branches here
 /// without moving the rest of the design system out of `.native` fragments.
 pub fn rootView(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
-    return CompiledHyperTermView.build(ui, model);
+    const shell = CompiledHyperTermView.build(ui, model);
+    if (model.isTerminal()) return shell;
+    return replaceNodeByLabel(ui, shell, "Agent blocks", agentTimeline(ui, model));
 }
 
 pub fn initialModel() Model {
@@ -2082,6 +2311,23 @@ pub fn main(init: std.process.Init) !void {
     const agent_url = init.environ_map.get("HYPER_TERM_AGENT_URL") orelse "";
     const agent_providers = init.environ_map.get("HYPER_TERM_AGENT_PROVIDERS") orelse "";
     const agent_provider_status = init.environ_map.get("HYPER_TERM_AGENT_PROVIDER_STATUS") orelse "";
+    const ui_font_path = preferredUiFontPath(init.environ_map.get("HYPER_TERM_UI_FONT_PATH"));
+    const ui_font_bytes = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        ui_font_path,
+        std.heap.page_allocator,
+        .limited(max_ui_font_bytes),
+    ) catch null;
+    defer if (ui_font_bytes) |bytes| std.heap.page_allocator.free(bytes);
+    var font_registration: [1]HyperTermApp.FontRegistration = undefined;
+    const app_fonts: []const HyperTermApp.FontRegistration = if (ui_font_bytes) |bytes| blk: {
+        font_registration[0] = .{
+            .id = ui_font_id,
+            .name = std.fs.path.basename(ui_font_path),
+            .ttf = bytes,
+        };
+        break :blk &font_registration;
+    } else &.{};
     var allowed_origins = [_][]const u8{
         "zero://app",
         "zero://inline",
@@ -2099,6 +2345,7 @@ pub fn main(init: std.process.Init) !void {
         .canvas_label = canvas_label,
         .update_fx = update,
         .tokens_fn = hyperTermTokens,
+        .fonts = app_fonts,
         .on_command = command,
         .on_key = onKey,
         .on_appearance = onAppearance,
@@ -2117,6 +2364,7 @@ pub fn main(init: std.process.Init) !void {
         agent_providers,
         agent_provider_status,
     );
+    app_state.model.ui_font_registered = app_fonts.len > 0;
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "hyper-term",
