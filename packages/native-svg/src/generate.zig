@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
 
     var model = app.initialModel();
     var ui = app.HyperTermUi.init(init.arena.allocator());
-    const tree = try ui.finalize(app.CompiledHyperTermView.build(&ui, &model));
+    const tree = try ui.finalize(app.rootView(&ui, &model));
     const tokens = app.hyperTermTokens(&model);
 
     var layout_nodes: [max_widgets]canvas.WidgetLayoutNode = undefined;

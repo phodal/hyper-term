@@ -1778,6 +1778,14 @@ pub const HyperTermUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
 pub const CompiledHyperTermView = canvas.CompiledMarkupView(Model, Msg, app_markup);
 
+/// Stable Zig composition seam for the product shell. Today the complete
+/// shell is one compiled Native markup document; builder-owned surfaces such
+/// as the windowed Agent transcript can replace individual branches here
+/// without moving the rest of the design system out of `.native` fragments.
+pub fn rootView(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
+    return CompiledHyperTermView.build(ui, model);
+}
+
 pub fn initialModel() Model {
     return .{};
 }
@@ -2095,7 +2103,7 @@ pub fn main(init: std.process.Init) !void {
         .on_key = onKey,
         .on_appearance = onAppearance,
         .on_chrome = onChrome,
-        .view = CompiledHyperTermView.build,
+        .view = rootView,
         .web_panes = desktopPanes,
         .markup = if (dev_markup_reload)
             .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io }

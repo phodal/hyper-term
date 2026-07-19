@@ -10,7 +10,7 @@ const Markup = canvas.MarkupView(main.Model, main.Msg);
 
 fn buildTree(arena: std.mem.Allocator, model: *const main.Model) !main.HyperTermUi.Tree {
     var ui = main.HyperTermUi.init(arena);
-    return ui.finalize(main.CompiledHyperTermView.build(&ui, model));
+    return ui.finalize(main.rootView(&ui, model));
 }
 
 fn interpretTree(arena: std.mem.Allocator, model: *const main.Model) !main.HyperTermUi.Tree {
