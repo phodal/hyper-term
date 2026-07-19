@@ -95,7 +95,7 @@ test "session bar exposes direct Terminal and Agent creation" {
     try testing.expectEqual(@as(usize, 3), model.openSessions().len);
 
     tree = try buildTree(arena, &model);
-    try testing.expect(containsText(tree.root, "Ask an Agent"));
+    try testing.expect(!containsText(tree.root, "Ask an Agent"));
     try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
     try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) == null);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
@@ -172,7 +172,7 @@ test "Agent provider status disables unready adapters and enables Copilot ACP" {
     try testing.expectEqual(main.AgentProvider.copilot_acp, model.activeSession().agent_provider);
     try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
     try testing.expect(std.mem.endsWith(u8, fx.pendingFetchAt(0).?.url, "provider=copilot-acp"));
-    try testing.expectEqualStrings("Agent connecting · external containment pending", model.agentStatus());
+    try testing.expectEqualStrings("Agent connecting", model.agentStatus());
 }
 
 test "malformed Agent provider status fails closed" {
@@ -212,7 +212,7 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
         .body = "{\"session_id\":2,\"provider\":\"codex\",\"protocol\":\"codex-app-server-v2\",\"status\":\"ready\"}",
     } }, &fx);
     try testing.expectEqual(main.AgentConnection.ready, model.activeSession().agent_connection);
-    try testing.expectEqualStrings("Agent ready · external containment pending", model.agentStatus());
+    try testing.expectEqualStrings("Agent ready", model.agentStatus());
     try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
     try testing.expectEqual(std.http.Method.GET, fx.pendingFetchAt(1).?.method);
     try testing.expectEqualStrings(
@@ -494,6 +494,102 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     } }, &fx);
     try testing.expect(!model.agentPermissionBusy());
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+}
+
+test "ACP activity renders compact plans diffs terminals and hides low-signal tips" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"completed","error":null,"document":{"blocks":[
+        \\  {"block_id":"00000000-0000-4000-8000-000000000031","kind":"message","payload":{"type":"message","role":"agent","text":"Warning: Skill descriptions were shortened to fit the budget.\n\nHi! What are we working on today?"}},
+        \\  {"block_id":"00000000-0000-4000-8000-000000000030","kind":"message","payload":{"type":"message","role":"agent","text":"Model metadata for gpt-5.6-sol is unavailable"}},
+        \\  {"block_id":"00000000-0000-4000-8000-000000000032","kind":"agent_tool_call","payload":{"type":"agent_tool_call","turn_id":"turn-1","call":{"tool_call_id":"edit-1","title":"Edit src/lib.rs","kind":"edit","status":"completed","locations":[{"path":"/workspace/src/lib.rs","line":7}],"content":[{"type":"diff","path":"/workspace/src/lib.rs","patch":"--- a/src/lib.rs\n+++ b/src/lib.rs\n-old\n+new\n","added_lines":1,"removed_lines":1},{"type":"terminal","terminal_id":"terminal-7"}],"raw_input":null,"raw_output":"{\"ok\":true}"}}},
+        \\  {"block_id":"00000000-0000-4000-8000-000000000034","kind":"agent_tool_call","payload":{"type":"agent_tool_call","turn_id":"turn-1","call":{"tool_call_id":"exec-1","title":"sed -n '1,240p' Cargo.toml && rg -n '^name' --glob Cargo.toml .","kind":"execute","status":"completed","locations":[],"content":[{"type":"terminal","terminal_id":"terminal-9"}],"raw_input":"{\"command\":\"sed Cargo.toml\"}","raw_output":null}}},
+        \\  {"block_id":"00000000-0000-4000-8000-000000000033","kind":"agent_plan","payload":{"type":"agent_plan","turn_id":"turn-1","entries":[{"content":"Inspect the workspace","priority":"high","status":"completed"},{"content":"Verify the edit","priority":"medium","status":"in_progress"}]}}
+        \\]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqual(@as(usize, 4), model.agentBlocks().len);
+    try testing.expectEqualStrings("Hi! What are we working on today?", model.agentBlocks()[0].content());
+    try testing.expect(model.agentBlocks()[1].isActivity());
+    try testing.expectEqualStrings("Edit src/lib.rs", model.agentBlocks()[1].activityTitle());
+    try testing.expectEqualStrings("completed · 1 file · +1 −1", model.agentBlocks()[1].activityMeta());
+    try testing.expect(!model.agentBlocks()[1].expanded);
+    try testing.expectEqualStrings("Run shell command", model.agentBlocks()[2].activityTitle());
+    try testing.expect(model.agentBlocks()[3].expanded);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tree = try buildTree(arena, &model);
+    try testing.expect(!containsText(tree.root, "Skill descriptions were shortened"));
+    try testing.expect(!containsText(tree.root, "Model metadata for"));
+    try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
+    try testing.expect(containsText(tree.root, "Edit src/lib.rs"));
+    try testing.expect(containsText(tree.root, "Run shell command"));
+    try testing.expect(containsText(tree.root, "1 / 2 complete"));
+    try testing.expect(containsText(tree.root, "Verify the edit"));
+    try testing.expect(!findByText(tree.root, .accordion, "Edit src/lib.rs").?.state.selected);
+
+    main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[1].id }, &fx);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByText(tree.root, .accordion, "Edit src/lib.rs").?.state.selected);
+    try testing.expect(containsText(tree.root, "/workspace/src/lib.rs"));
+    try testing.expect(containsText(tree.root, "+new"));
+    try testing.expect(containsText(tree.root, "terminal-7"));
+}
+
+test "Agent stream preserves the native scroll position across snapshots" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    const snapshot =
+        \\{"status":"running","error":null,"document":{"blocks":[
+        \\  {"block_id":"00000000-0000-4000-8000-000000000041","kind":"message","payload":{"type":"message","role":"agent","text":"Streaming response"}}
+        \\]}}
+    ;
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body = snapshot,
+    } }, &fx);
+    try testing.expectEqual(@as(f32, 0), model.agentScrollOffset());
+
+    main.update(&model, .{ .agent_scrolled = .{
+        .offset = 100,
+        .viewport_extent = 200,
+        .content_extent = 800,
+    } }, &fx);
+    try testing.expectEqual(@as(f32, 100), model.agentScrollOffset());
+
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body = snapshot,
+    } }, &fx);
+    try testing.expectEqual(@as(f32, 100), model.agentScrollOffset());
 }
 
 test "read-only MCP approvals expose an exact Allow once action" {

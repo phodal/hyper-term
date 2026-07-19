@@ -34,6 +34,8 @@ const max_agent_blocks: usize = 16;
 const max_agent_block_bytes: usize = 8 * 1024;
 const max_agent_operation_id_bytes: usize = 36;
 const max_agent_operation_kind_bytes: usize = 96;
+const max_agent_activity_title_bytes: usize = 512;
+const max_agent_activity_meta_bytes: usize = 512;
 const max_agent_error_bytes: usize = 512;
 const max_agent_prompt_bytes: usize = 16 * 1024;
 const terminal_close_effect_key_base: u64 = 0x4854_4300;
@@ -161,7 +163,9 @@ pub const AgentTurnStatus = enum {
 
 pub const AgentMessageRole = enum { user, agent, system, thought };
 
-pub const AgentBlockKind = enum { message, operation, approval };
+pub const AgentBlockKind = enum { message, operation, approval, tool_call, plan };
+
+pub const AgentToolStatus = enum { pending, in_progress, completed, failed };
 
 pub const AgentRisk = enum {
     read_only,
@@ -196,6 +200,12 @@ pub const AgentBlockView = struct {
     operation_id_len: usize = 0,
     operation_kind_storage: [max_agent_operation_kind_bytes]u8 = [_]u8{0} ** max_agent_operation_kind_bytes,
     operation_kind_len: usize = 0,
+    title_storage: [max_agent_activity_title_bytes]u8 = [_]u8{0} ** max_agent_activity_title_bytes,
+    title_len: usize = 0,
+    meta_storage: [max_agent_activity_meta_bytes]u8 = [_]u8{0} ** max_agent_activity_meta_bytes,
+    meta_len: usize = 0,
+    expanded: bool = false,
+    tool_status: AgentToolStatus = .pending,
     operation_revision: u64 = 0,
     risk: AgentRisk = .unknown,
     state: AgentOperationState = .proposed,
@@ -228,6 +238,22 @@ pub const AgentBlockView = struct {
 
     pub fn isApproval(block: *const AgentBlockView) bool {
         return block.kind == .approval;
+    }
+
+    pub fn isActivity(block: *const AgentBlockView) bool {
+        return block.kind == .tool_call or block.kind == .plan;
+    }
+
+    pub fn activityTitle(block: *const AgentBlockView) []const u8 {
+        return block.title_storage[0..block.title_len];
+    }
+
+    pub fn activityMeta(block: *const AgentBlockView) []const u8 {
+        return block.meta_storage[0..block.meta_len];
+    }
+
+    pub fn hasActivityDetails(block: *const AgentBlockView) bool {
+        return block.content_len > 0;
     }
 
     pub fn isApprovalPending(block: *const AgentBlockView) bool {
@@ -348,6 +374,7 @@ pub const Model = struct {
     agent_block_count: usize = 0,
     agent_history_clipped: bool = false,
     agent_projection_session_id: u8 = 0,
+    agent_scroll_offset: f32 = 0,
     agent_turn_status: AgentTurnStatus = .idle,
     agent_error_storage: [max_agent_error_bytes]u8 = [_]u8{0} ** max_agent_error_bytes,
     agent_error_len: usize = 0,
@@ -386,6 +413,7 @@ pub const Model = struct {
         "agent_blocks",
         "agent_block_count",
         "agent_projection_session_id",
+        "agent_scroll_offset",
         "agent_turn_status",
         "agent_error_storage",
         "agent_error_len",
@@ -540,17 +568,17 @@ pub const Model = struct {
         }
         if (model.activeSession().agent_connection == .ready) {
             return switch (model.agent_turn_status) {
-                .running => "Agent responding · external containment pending",
-                .waiting_approval => "Effect proposed · Rust permission flow active",
+                .running => "Agent working",
+                .waiting_approval => "Needs approval",
                 .failed => if (model.agent_error_len > 0) model.agentError() else "Agent turn failed",
-                .completed => "Turn complete · external containment pending",
-                else => "Agent ready · external containment pending",
+                .completed => "Turn complete",
+                else => "Agent ready",
             };
         }
         return switch (model.activeSession().agent_connection) {
             .unavailable => "Agent unavailable · no command executed",
-            .connecting => "Agent connecting · external containment pending",
-            .ready => "Agent ready · external containment pending",
+            .connecting => "Agent connecting",
+            .ready => "Agent ready",
             .failed => if (model.agent_error_len > 0) model.agentError() else "Agent start failed · no command executed",
         };
     }
@@ -568,6 +596,10 @@ pub const Model = struct {
 
     pub fn agentBlocks(model: *const Model) []const AgentBlockView {
         return model.agent_blocks[0..model.agent_block_count];
+    }
+
+    pub fn agentScrollOffset(model: *const Model) f32 {
+        return model.agent_scroll_offset;
     }
 
     pub fn hasAgentBlocks(model: *const Model) bool {
@@ -631,6 +663,8 @@ pub const Msg = union(enum) {
     send_agent_prompt,
     agent_turn_started: native_sdk.EffectResponse,
     agent_snapshot_received: native_sdk.EffectResponse,
+    agent_scrolled: canvas.ScrollState,
+    toggle_agent_block: u64,
     reject_agent_effect: []const u8,
     allow_agent_effect: []const u8,
     cancel_agent_effect: []const u8,
@@ -683,6 +717,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
+        .agent_scrolled => |scroll| model.agent_scroll_offset = scroll.offset,
+        .toggle_agent_block => |block_id| {
+            for (model.agent_blocks[0..model.agent_block_count]) |*block| {
+                if (block.id == block_id and block.isActivity()) {
+                    block.expanded = !block.expanded;
+                    break;
+                }
+            }
+        },
         .reject_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "reject_once", fx),
         .allow_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "allow_once", fx),
         .cancel_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "cancelled", fx),
@@ -1005,6 +1048,44 @@ const AgentSnapshotWire = struct {
     },
 };
 
+const AgentToolContentWire = struct {
+    type: []const u8,
+    text: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    patch: ?[]const u8 = null,
+    added_lines: ?u32 = null,
+    removed_lines: ?u32 = null,
+    terminal_id: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+    uri: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    byte_count: ?u64 = null,
+    encoded_bytes: ?u64 = null,
+};
+
+const AgentToolLocationWire = struct {
+    path: []const u8,
+    line: ?u32 = null,
+};
+
+const AgentToolCallWire = struct {
+    tool_call_id: []const u8,
+    title: []const u8,
+    kind: []const u8,
+    status: []const u8,
+    content: []const AgentToolContentWire,
+    locations: []const AgentToolLocationWire,
+    raw_input: ?[]const u8 = null,
+    raw_output: ?[]const u8 = null,
+};
+
+const AgentPlanEntryWire = struct {
+    content: []const u8,
+    priority: []const u8,
+    status: []const u8,
+};
+
 const AgentBlockWire = struct {
     block_id: ?[]const u8 = null,
     block_revision: u64 = 0,
@@ -1032,6 +1113,8 @@ const AgentBlockWire = struct {
                 version: []const u8,
             },
         } = null,
+        call: ?AgentToolCallWire = null,
+        entries: ?[]const AgentPlanEntryWire = null,
     },
 };
 
@@ -1067,6 +1150,12 @@ fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse
 }
 
 fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
+    var previous_ids = [_]u64{0} ** max_agent_blocks;
+    var previous_expanded = [_]bool{false} ** max_agent_blocks;
+    for (model.agent_blocks[0..model.agent_block_count], 0..) |block, index| {
+        previous_ids[index] = block.id;
+        previous_expanded[index] = block.expanded;
+    }
     for (&model.agent_blocks) |*block| block.* = .{};
     model.agent_block_count = 0;
     clearGenUiArtifact(model);
@@ -1093,11 +1182,21 @@ fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
         if (std.mem.eql(u8, block.kind, "message")) {
             view.kind = .message;
             view.role = parseAgentMessageRole(block.payload.role.?);
-            copyAgentBlockContent(view, block.payload.text.?);
+            copyAgentBlockContent(view, visibleAgentMessageText(block.payload.text.?));
         } else if (std.mem.eql(u8, block.kind, "operation")) {
             projectOperationBlock(view, block);
-        } else {
+        } else if (std.mem.eql(u8, block.kind, "approval")) {
             projectApprovalBlock(view, block, blocks);
+        } else if (std.mem.eql(u8, block.kind, "agent_tool_call")) {
+            projectAgentToolCall(view, block.payload.call.?);
+        } else {
+            projectAgentPlan(view, block.payload.entries.?);
+        }
+        for (previous_ids, 0..) |previous_id, previous_index| {
+            if (previous_id == view.id) {
+                view.expanded = previous_expanded[previous_index];
+                break;
+            }
         }
         model.agent_block_count += 1;
     }
@@ -1147,7 +1246,17 @@ fn isSha256(value: []const u8) bool {
 fn renderableAgentBlock(block: AgentBlockWire) bool {
     if (std.mem.eql(u8, block.kind, "message")) {
         return std.mem.eql(u8, block.payload.type, "message") and
-            block.payload.role != null and block.payload.text != null;
+            block.payload.role != null and block.payload.text != null and
+            (!std.mem.eql(u8, block.payload.role.?, "agent") or
+                visibleAgentMessageText(block.payload.text.?).len > 0);
+    }
+    if (std.mem.eql(u8, block.kind, "agent_tool_call")) {
+        return std.mem.eql(u8, block.payload.type, "agent_tool_call") and
+            block.payload.call != null and block.payload.call.?.title.len > 0;
+    }
+    if (std.mem.eql(u8, block.kind, "agent_plan")) {
+        return std.mem.eql(u8, block.payload.type, "agent_plan") and
+            block.payload.entries != null and block.payload.entries.?.len > 0;
     }
     const trusted = block.trust_class != null and
         std.mem.eql(u8, block.trust_class.?, "trusted_chrome");
@@ -1163,6 +1272,159 @@ fn renderableAgentBlock(block: AgentBlockWire) bool {
             block.payload.prompt != null and block.payload.operation_revision != null;
     }
     return false;
+}
+
+fn visibleAgentMessageText(text: []const u8) []const u8 {
+    const low_signal_prefixes = [_][]const u8{
+        "Warning: Skill descriptions were shortened to fit",
+        "Model metadata for ",
+    };
+    var low_signal = false;
+    for (low_signal_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, text, prefix)) {
+            low_signal = true;
+            break;
+        }
+    }
+    if (!low_signal) return text;
+    const separator = std.mem.indexOf(u8, text, "\n\n") orelse return "";
+    return std.mem.trimStart(u8, text[separator + 2 ..], "\r\n ");
+}
+
+fn copyActivityTitle(view: *AgentBlockView, value: []const u8) void {
+    const length = utf8BoundedLength(value, view.title_storage.len);
+    @memcpy(view.title_storage[0..length], value[0..length]);
+    view.title_len = length;
+}
+
+fn copyActivityMeta(view: *AgentBlockView, value: []const u8) void {
+    const length = utf8BoundedLength(value, view.meta_storage.len);
+    @memcpy(view.meta_storage[0..length], value[0..length]);
+    view.meta_len = length;
+}
+
+fn appendActivitySlice(view: *AgentBlockView, value: []const u8) void {
+    const available = view.content_storage.len - view.content_len;
+    const length = utf8BoundedLength(value, available);
+    @memcpy(view.content_storage[view.content_len..][0..length], value[0..length]);
+    view.content_len += length;
+    view.truncated = view.truncated or length < value.len;
+}
+
+fn appendActivityFmt(view: *AgentBlockView, comptime format: []const u8, args: anytype) void {
+    const rendered = std.fmt.bufPrint(view.content_storage[view.content_len..], format, args) catch {
+        view.truncated = true;
+        return;
+    };
+    view.content_len += rendered.len;
+}
+
+fn projectAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
+    view.kind = .tool_call;
+    copyActivityTitle(view, displayAgentToolTitle(call.kind, call.title));
+    view.tool_status = parseAgentToolStatus(call.status);
+    view.expanded = view.tool_status == .in_progress or view.tool_status == .failed;
+    var added_lines: u64 = 0;
+    var removed_lines: u64 = 0;
+    var diff_count: usize = 0;
+    var terminal_count: usize = 0;
+    for (call.locations) |location| {
+        if (location.line) |line| {
+            appendActivityFmt(view, "- `{s}:{d}`\n", .{ location.path, line });
+        } else {
+            appendActivityFmt(view, "- `{s}`\n", .{location.path});
+        }
+    }
+    if (call.locations.len > 0) appendActivitySlice(view, "\n");
+    for (call.content) |content| {
+        if (std.mem.eql(u8, content.type, "text") and content.text != null) {
+            appendActivitySlice(view, content.text.?);
+            appendActivitySlice(view, "\n\n");
+        } else if (std.mem.eql(u8, content.type, "diff") and
+            content.path != null and content.patch != null)
+        {
+            diff_count += 1;
+            added_lines += content.added_lines orelse 0;
+            removed_lines += content.removed_lines orelse 0;
+            appendActivityFmt(view, "**{s}**\n\n```diff\n", .{content.path.?});
+            appendActivitySlice(view, content.patch.?);
+            appendActivitySlice(view, "\n```\n\n");
+        } else if (std.mem.eql(u8, content.type, "terminal") and content.terminal_id != null) {
+            terminal_count += 1;
+            appendActivityFmt(view, "**Terminal** `{s}`\n\n", .{content.terminal_id.?});
+        } else if (std.mem.eql(u8, content.type, "media")) {
+            appendActivityFmt(
+                view,
+                "**{s}** · {s} · {d} encoded bytes\n\n",
+                .{ content.kind orelse "media", content.mime_type orelse "application/octet-stream", content.encoded_bytes orelse 0 },
+            );
+        } else if (std.mem.eql(u8, content.type, "resource")) {
+            appendActivityFmt(view, "**{s}** · `{s}`\n\n", .{ content.name orelse "Resource", content.uri orelse "" });
+            if (content.text) |text| {
+                appendActivitySlice(view, text);
+                appendActivitySlice(view, "\n\n");
+            }
+        }
+    }
+    if (call.raw_input) |raw| {
+        appendActivitySlice(view, "**Input**\n\n```json\n");
+        appendActivitySlice(view, raw);
+        appendActivitySlice(view, "\n```\n\n");
+    }
+    if (call.raw_output) |raw| {
+        appendActivitySlice(view, "**Output**\n\n```json\n");
+        appendActivitySlice(view, raw);
+        appendActivitySlice(view, "\n```\n");
+    }
+    var meta: [max_agent_activity_meta_bytes]u8 = undefined;
+    const status = agentToolStatusLabel(view.tool_status);
+    const rendered = if (diff_count > 0)
+        std.fmt.bufPrint(&meta, "{s} · {d} file{s} · +{d} −{d}", .{ status, diff_count, if (diff_count == 1) "" else "s", added_lines, removed_lines }) catch status
+    else if (terminal_count > 0)
+        std.fmt.bufPrint(&meta, "{s} · {d} terminal{s}", .{ status, terminal_count, if (terminal_count == 1) "" else "s" }) catch status
+    else
+        std.fmt.bufPrint(&meta, "{s} · {s}", .{ status, call.kind }) catch status;
+    copyActivityMeta(view, rendered);
+}
+
+fn displayAgentToolTitle(kind: []const u8, title: []const u8) []const u8 {
+    if (std.mem.eql(u8, title, "mcp__hyper_term__startup")) return "Start Hyper Term tools";
+    if (std.mem.eql(u8, kind, "execute") and
+        (title.len > 80 or std.mem.indexOfAny(u8, title, "|;&\n") != null)) return "Run shell command";
+    return title;
+}
+
+fn projectAgentPlan(view: *AgentBlockView, entries: []const AgentPlanEntryWire) void {
+    view.kind = .plan;
+    copyActivityTitle(view, "Plan");
+    var completed: usize = 0;
+    var running = false;
+    for (entries) |entry| {
+        const marker: []const u8 = if (std.mem.eql(u8, entry.status, "completed")) "x" else " ";
+        completed += @intFromBool(std.mem.eql(u8, entry.status, "completed"));
+        running = running or std.mem.eql(u8, entry.status, "in_progress");
+        appendActivityFmt(view, "- [{s}] {s} _{s}_\n", .{ marker, entry.content, entry.priority });
+    }
+    var meta: [max_agent_activity_meta_bytes]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&meta, "{d} / {d} complete", .{ completed, entries.len }) catch "Plan";
+    copyActivityMeta(view, rendered);
+    view.expanded = running;
+}
+
+fn parseAgentToolStatus(value: []const u8) AgentToolStatus {
+    if (std.mem.eql(u8, value, "in_progress")) return .in_progress;
+    if (std.mem.eql(u8, value, "completed")) return .completed;
+    if (std.mem.eql(u8, value, "failed")) return .failed;
+    return .pending;
+}
+
+fn agentToolStatusLabel(status: AgentToolStatus) []const u8 {
+    return switch (status) {
+        .pending => "pending",
+        .in_progress => "running",
+        .completed => "completed",
+        .failed => "failed",
+    };
 }
 
 fn projectOperationBlock(view: *AgentBlockView, block: AgentBlockWire) void {
@@ -1323,6 +1585,7 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_block_count = 0;
     model.agent_history_clipped = false;
     model.agent_projection_session_id = session_id;
+    model.agent_scroll_offset = 0;
     model.agent_turn_status = .idle;
     model.agent_error_len = 0;
     model.agent_permission_in_flight_session_id = 0;
