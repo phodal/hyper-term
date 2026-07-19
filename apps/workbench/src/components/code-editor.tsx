@@ -7,6 +7,7 @@ import {
 } from "@codemirror/autocomplete";
 import { javascript } from "@codemirror/lang-javascript";
 import {
+  EditorSelection,
   EditorState,
   type Extension,
   StateEffect,
@@ -38,6 +39,8 @@ interface CodeEditorProps {
   revealRequest?: number;
   languageService?: EditorLanguageService;
   onLanguageStatus?(status: "idle" | "checking" | "ready" | "failed"): void;
+  selection?: { anchor: number; head: number };
+  onSelectionChange?(selection: { anchor: number; head: number }): void;
 }
 
 const setRuntimeErrorLine = StateEffect.define<number | null>();
@@ -89,6 +92,8 @@ export function CodeEditor(
     revealRequest = 0,
     languageService,
     onLanguageStatus,
+    selection,
+    onSelectionChange,
   }: CodeEditorProps,
 ) {
   const parent = useRef<HTMLDivElement>(null);
@@ -97,6 +102,8 @@ export function CodeEditor(
   onChangeRef.current = onChange;
   const onLanguageStatusRef = useRef(onLanguageStatus);
   onLanguageStatusRef.current = onLanguageStatus;
+  const onSelectionChangeRef = useRef(onSelectionChange);
+  onSelectionChangeRef.current = onSelectionChange;
 
   useEffect(() => {
     if (!parent.current) return;
@@ -141,6 +148,10 @@ export function CodeEditor(
       parent: parent.current,
       state: EditorState.create({
         doc: value,
+        selection: selection && selection.anchor <= value.length &&
+            selection.head <= value.length
+          ? EditorSelection.single(selection.anchor, selection.head)
+          : undefined,
         extensions: [
           basicSetup,
           javascript({ jsx: true, typescript: true }),
@@ -150,6 +161,13 @@ export function CodeEditor(
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               onChangeRef.current(update.state.doc.toString());
+            }
+            if (update.docChanged || update.selectionSet) {
+              const main = update.state.selection.main;
+              onSelectionChangeRef.current?.({
+                anchor: main.anchor,
+                head: main.head,
+              });
             }
           }),
           ...languageExtensions,
@@ -170,6 +188,21 @@ export function CodeEditor(
       changes: { from: 0, to: current.state.doc.length, insert: value },
     });
   }, [value]);
+
+  useEffect(() => {
+    const current = view.current;
+    if (
+      !current || !selection || selection.anchor > current.state.doc.length ||
+      selection.head > current.state.doc.length
+    ) return;
+    const main = current.state.selection.main;
+    if (main.anchor === selection.anchor && main.head === selection.head) {
+      return;
+    }
+    current.dispatch({
+      selection: EditorSelection.single(selection.anchor, selection.head),
+    });
+  }, [selection?.anchor, selection?.head]);
 
   useEffect(() => {
     const current = view.current;

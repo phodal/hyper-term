@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ArtifactDraftStatus } from "../artifact-draft-publisher.ts";
 import type {
+  ArtifactEditorSelection,
+  ArtifactEditorView,
+} from "../artifact-editor-checkpoint.ts";
+import type {
   ArtifactHistoryEntry,
   ArtifactHistorySource,
 } from "../artifact-history-client.ts";
@@ -62,7 +66,7 @@ export default function AgentStatus() {
 }
 `;
 
-type StudioView = "code" | "diff" | "trace";
+type StudioView = ArtifactEditorView;
 
 const sampleBaselineFiles = { "/App.tsx": sampleOriginalSource };
 const sampleDraftFiles = { "/App.tsx": sampleInitialSource };
@@ -80,12 +84,22 @@ export interface GenUiStudioProps {
   initialFiles?: Record<string, string>;
   baselineFiles?: Record<string, string>;
   initialActivePath?: string;
+  initialView?: StudioView;
+  initialSelections?: Record<string, ArtifactEditorSelection>;
   initialRevision?: number;
   heading?: string;
   languageServiceForPath?: (path: string) => EditorLanguageService;
   onActivePathChange?: (path: string) => void;
   onPublishDraft?: (files: Record<string, string>) => void;
   onDraftStateChange?: (changed: boolean) => void;
+  onCheckpointStateChange?: (state: {
+    files: Record<string, string>;
+    activePath: string;
+    view: StudioView;
+    selections: Record<string, ArtifactEditorSelection>;
+  }) => void;
+  checkpointStatus?: "restored" | "idle" | "saving" | "saved" | "failed";
+  checkpointError?: string;
   publishStatus?: ArtifactDraftStatus | "idle";
   publishError?: string;
   historyEntries?: ArtifactHistoryEntry[];
@@ -103,12 +117,17 @@ export function GenUiStudio({
   initialFiles = sampleDraftFiles,
   baselineFiles = sampleBaselineFiles,
   initialActivePath = entrypoint,
+  initialView = "code",
+  initialSelections = {},
   initialRevision = 0,
   heading,
   languageServiceForPath,
   onActivePathChange,
   onPublishDraft,
   onDraftStateChange,
+  onCheckpointStateChange,
+  checkpointStatus = "idle",
+  checkpointError,
   publishStatus = "idle",
   publishError,
   historyEntries = [],
@@ -122,7 +141,10 @@ export function GenUiStudio({
   const [activePath, setActivePath] = useState(
     initialActivePath in initialFiles ? initialActivePath : entrypoint,
   );
-  const [view, setView] = useState<StudioView>("code");
+  const [view, setView] = useState<StudioView>(initialView);
+  const [selections, setSelections] = useState<
+    Record<string, ArtifactEditorSelection>
+  >(() => ({ ...initialSelections }));
   const [status, setStatus] = useState("Compiler starting");
   const [error, setError] = useState<string>();
   const [accepted, setAccepted] = useState<AcceptedArtifact>();
@@ -333,6 +355,9 @@ export function GenUiStudio({
         );
       }
       setFiles({ ...historical.files });
+      setSelections((current) =>
+        normalizeSelections(current, historical.files)
+      );
       if (!(activePath in historical.files)) {
         setActivePath(historical.entrypoint);
       }
@@ -366,11 +391,26 @@ export function GenUiStudio({
     setLanguageStatus(languageService ? "idle" : "failed");
   }, [activePath, languageService, onActivePathChange]);
 
+  useEffect(() => {
+    onCheckpointStateChange?.({
+      files: { ...files },
+      activePath,
+      view,
+      selections: { ...selections },
+    });
+  }, [activePath, files, onCheckpointStateChange, selections, view]);
+
   const updateSource = (nextSource: string) => {
     setFiles((current) =>
       current[activePath] === nextSource
         ? current
         : { ...current, [activePath]: nextSource }
+    );
+    setSelections((current) =>
+      normalizeSelections(current, {
+        ...filesRef.current,
+        [activePath]: nextSource,
+      })
     );
   };
 
@@ -382,6 +422,14 @@ export function GenUiStudio({
           <h2>{heading ?? activePath}</h2>
         </div>
         <div className="studio-actions">
+          <span
+            className={`checkpoint-status ${checkpointStatus}`}
+            title={checkpointError ??
+              "Unpublished editor state is versioned by the Rust checkpoint journal"}
+            role={checkpointStatus === "failed" ? "alert" : "status"}
+          >
+            Draft sync · {checkpointStatusLabel(checkpointStatus)}
+          </span>
           <span className={`compiler-status ${error ? "has-error" : ""}`}>
             <span /> {status}
           </span>
@@ -447,6 +495,14 @@ export function GenUiStudio({
             revealRequest={revealRequest}
             languageService={languageService}
             onLanguageStatus={setLanguageStatus}
+            selection={selections[activePath]}
+            onSelectionChange={(selection) =>
+              setSelections((current) =>
+                current[activePath]?.anchor === selection.anchor &&
+                  current[activePath]?.head === selection.head
+                  ? current
+                  : { ...current, [activePath]: selection }
+              )}
           />
         )}
         {view === "diff" && (
@@ -546,6 +602,40 @@ function publishDraftLabel(
   if (status === "accepted" && !changed) return `Published r${revision}`;
   if (status === "failed" || status === "rejected") return "Retry publish";
   return "Publish draft";
+}
+
+function checkpointStatusLabel(
+  status: "restored" | "idle" | "saving" | "saved" | "failed",
+): string {
+  switch (status) {
+    case "restored":
+      return "restored";
+    case "saving":
+      return "saving";
+    case "saved":
+      return "saved";
+    case "failed":
+      return "attention";
+    case "idle":
+      return "ready";
+  }
+}
+
+function normalizeSelections(
+  selections: Record<string, ArtifactEditorSelection>,
+  files: Record<string, string>,
+): Record<string, ArtifactEditorSelection> {
+  return Object.fromEntries(
+    Object.entries(selections)
+      .filter(([path]) => path in files)
+      .map(([path, selection]) => {
+        const maximum = files[path].length;
+        return [path, {
+          anchor: Math.min(selection.anchor, maximum),
+          head: Math.min(selection.head, maximum),
+        }];
+      }),
+  );
 }
 
 interface TraceTimelineProps {

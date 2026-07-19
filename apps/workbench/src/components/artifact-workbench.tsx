@@ -8,6 +8,11 @@ import {
   type ArtifactHistoryEntry,
   type ArtifactHistorySource,
 } from "../artifact-history-client.ts";
+import {
+  type ArtifactEditorCheckpoint,
+  ArtifactEditorCheckpointClient,
+  type ArtifactEditorCheckpointInput,
+} from "../artifact-editor-checkpoint.ts";
 import { resolveHost } from "../host.ts";
 import { ArtifactLanguageService } from "../editor-language-service.ts";
 import {
@@ -32,7 +37,11 @@ interface ArtifactSourceResponse {
 type LoadState =
   | { kind: "loading" }
   | { kind: "failed"; message: string }
-  | { kind: "ready"; source: ArtifactSourceResponse };
+  | {
+    kind: "ready";
+    source: ArtifactSourceResponse;
+    checkpoint: ArtifactEditorCheckpoint;
+  };
 
 type HistoryState =
   | { kind: "loading" }
@@ -60,8 +69,14 @@ export function ArtifactWorkbench() {
     ArtifactDraftStatus | "idle"
   >("idle");
   const [publishError, setPublishError] = useState<string>();
-  const [activeSourcePath, setActiveSourcePath] = useState<string>();
   const [hasLocalDraft, setHasLocalDraft] = useState(false);
+  const [checkpointStatus, setCheckpointStatus] = useState<
+    "restored" | "idle" | "saving" | "saved" | "failed"
+  >("idle");
+  const [checkpointError, setCheckpointError] = useState<string>();
+  const [pendingCheckpoint, setPendingCheckpoint] = useState<
+    ArtifactEditorCheckpointInput
+  >();
   const [applyPreview, setApplyPreview] = useState<WorkspaceApplyPreview>();
   const [applyReview, setApplyReview] = useState<WorkspaceApplyUpdate>();
   const [applyError, setApplyError] = useState<string>();
@@ -72,12 +87,11 @@ export function ArtifactWorkbench() {
   const [applyStarting, setApplyStarting] = useState(false);
   const publishController = useRef<AbortController | undefined>(undefined);
   const applyController = useRef<AbortController | undefined>(undefined);
-  const selectedSourcePath = state.kind === "ready" && activeSourcePath &&
-      activeSourcePath in state.source.files
-    ? activeSourcePath
-    : state.kind === "ready"
-    ? state.source.entrypoint
-    : "";
+  const checkpointRevision = useRef(0);
+  const checkpointGeneration = useRef(0);
+  const lastCheckpointFingerprint = useRef("");
+  const checkpointQueue = useRef<Promise<void>>(Promise.resolve());
+  const checkpointControllers = useRef(new Set<AbortController>());
   const languageServiceForPath = useCallback((documentPath: string) => {
     if (!context || state.kind !== "ready") {
       throw new Error("Artifact language service context is unavailable.");
@@ -100,9 +114,20 @@ export function ArtifactWorkbench() {
       return;
     }
     const controller = new AbortController();
-    fetchArtifactSource(context, context.artifactId, controller.signal)
-      .then((source) => {
-        setState({ kind: "ready", source });
+    fetchArtifactWorkspace(context, context.artifactId, controller.signal)
+      .then(({ source, checkpoint }) => {
+        checkpointGeneration.current += 1;
+        checkpointRevision.current = checkpoint.revision;
+        lastCheckpointFingerprint.current = checkpointFingerprint({
+          files: checkpoint.files,
+          activePath: checkpoint.active_path,
+          view: checkpoint.view,
+          selections: checkpoint.selections,
+        });
+        setCheckpointStatus(checkpoint.revision > 0 ? "restored" : "idle");
+        setCheckpointError(undefined);
+        setHasLocalDraft(!sameFiles(checkpoint.files, source.files));
+        setState({ kind: "ready", source, checkpoint });
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
@@ -139,7 +164,60 @@ export function ArtifactWorkbench() {
   useEffect(() => () => {
     publishController.current?.abort();
     applyController.current?.abort();
+    for (const controller of checkpointControllers.current) {
+      controller.abort();
+    }
+    checkpointControllers.current.clear();
   }, []);
+
+  useEffect(() => {
+    if (!context || state.kind !== "ready" || !pendingCheckpoint) return;
+    const fingerprint = checkpointFingerprint(pendingCheckpoint);
+    if (fingerprint === lastCheckpointFingerprint.current) return;
+    const generation = checkpointGeneration.current;
+    const timer = globalThis.setTimeout(() => {
+      const input = cloneCheckpointInput(pendingCheckpoint);
+      checkpointQueue.current = checkpointQueue.current.catch(() => {}).then(
+        async () => {
+          if (generation !== checkpointGeneration.current) return;
+          const nextFingerprint = checkpointFingerprint(input);
+          if (nextFingerprint === lastCheckpointFingerprint.current) return;
+          const controller = new AbortController();
+          checkpointControllers.current.add(controller);
+          setCheckpointStatus("saving");
+          setCheckpointError(undefined);
+          try {
+            const saved = await new ArtifactEditorCheckpointClient({
+              artifactId: state.source.artifact_id,
+              sourceRevision: state.source.source_revision,
+              entrypoint: state.source.entrypoint,
+              files: state.source.files,
+              sessionId: context.sessionId,
+              token: context.token,
+            }).save(checkpointRevision.current, input, controller.signal);
+            if (generation !== checkpointGeneration.current) return;
+            checkpointRevision.current = saved.revision;
+            lastCheckpointFingerprint.current = checkpointFingerprint({
+              files: saved.files,
+              activePath: saved.active_path,
+              view: saved.view,
+              selections: saved.selections,
+            });
+            setCheckpointStatus("saved");
+          } catch (error) {
+            if (controller.signal.aborted) return;
+            setCheckpointStatus("failed");
+            setCheckpointError(
+              error instanceof Error ? error.message : String(error),
+            );
+          } finally {
+            checkpointControllers.current.delete(controller);
+          }
+        },
+      );
+    }, 420);
+    return () => clearTimeout(timer);
+  }, [context, pendingCheckpoint, state]);
 
   const publishDraft = useCallback((files: Record<string, string>) => {
     if (!context || state.kind !== "ready") return;
@@ -160,10 +238,25 @@ export function ArtifactWorkbench() {
       (update) => setPublishStatus(update.status),
       controller.signal,
     ).then((artifact) =>
-      fetchArtifactSource(context, artifact.artifact_id, controller.signal)
-    ).then((nextSource) => {
+      fetchArtifactWorkspace(context, artifact.artifact_id, controller.signal)
+    ).then(({ source: nextSource, checkpoint }) => {
       if (controller.signal.aborted) return;
-      setState({ kind: "ready", source: nextSource });
+      checkpointGeneration.current += 1;
+      for (const checkpointController of checkpointControllers.current) {
+        checkpointController.abort();
+      }
+      checkpointControllers.current.clear();
+      checkpointRevision.current = checkpoint.revision;
+      lastCheckpointFingerprint.current = checkpointFingerprint({
+        files: checkpoint.files,
+        activePath: checkpoint.active_path,
+        view: checkpoint.view,
+        selections: checkpoint.selections,
+      });
+      setPendingCheckpoint(undefined);
+      setCheckpointStatus("idle");
+      setCheckpointError(undefined);
+      setState({ kind: "ready", source: nextSource, checkpoint });
       setPublishStatus("accepted");
       setHasLocalDraft(false);
       setApplyPreview(undefined);
@@ -291,14 +384,18 @@ export function ArtifactWorkbench() {
               key={`${state.source.artifact_id}:${state.source.source_revision}`}
               host={host}
               entrypoint={state.source.entrypoint}
-              initialFiles={state.source.files}
+              initialFiles={state.checkpoint.files}
               baselineFiles={state.source.files}
-              initialActivePath={selectedSourcePath}
+              initialActivePath={state.checkpoint.active_path}
+              initialView={state.checkpoint.view}
+              initialSelections={state.checkpoint.selections}
               initialRevision={state.source.source_revision}
               languageServiceForPath={languageServiceForPath}
-              onActivePathChange={setActiveSourcePath}
               onPublishDraft={publishDraft}
               onDraftStateChange={setHasLocalDraft}
+              onCheckpointStateChange={setPendingCheckpoint}
+              checkpointStatus={checkpointStatus}
+              checkpointError={checkpointError}
               publishStatus={publishStatus}
               publishError={publishError}
               historyEntries={historyState.kind === "ready" &&
@@ -456,6 +553,70 @@ async function fetchArtifactSource(
     throw new Error("Rust source snapshot did not match the active artifact.");
   }
   return source;
+}
+
+async function fetchArtifactWorkspace(
+  context: ArtifactContext,
+  artifactId: string,
+  signal: AbortSignal,
+): Promise<{
+  source: ArtifactSourceResponse;
+  checkpoint: ArtifactEditorCheckpoint;
+}> {
+  const source = await fetchArtifactSource(context, artifactId, signal);
+  const checkpoint = await new ArtifactEditorCheckpointClient({
+    artifactId: source.artifact_id,
+    sourceRevision: source.source_revision,
+    entrypoint: source.entrypoint,
+    files: source.files,
+    sessionId: context.sessionId,
+    token: context.token,
+  }).load(signal);
+  return { source, checkpoint };
+}
+
+function checkpointFingerprint(input: ArtifactEditorCheckpointInput): string {
+  return JSON.stringify({
+    files: Object.fromEntries(
+      Object.keys(input.files).sort().map((path) => [path, input.files[path]]),
+    ),
+    activePath: input.activePath,
+    view: input.view,
+    selections: Object.fromEntries(
+      Object.keys(input.selections).sort().map((path) => [
+        path,
+        input.selections[path],
+      ]),
+    ),
+  });
+}
+
+function cloneCheckpointInput(
+  input: ArtifactEditorCheckpointInput,
+): ArtifactEditorCheckpointInput {
+  return {
+    files: { ...input.files },
+    activePath: input.activePath,
+    view: input.view,
+    selections: Object.fromEntries(
+      Object.entries(input.selections).map(([path, selection]) => [
+        path,
+        { ...selection },
+      ]),
+    ),
+  };
+}
+
+function sameFiles(
+  left: Record<string, string>,
+  right: Record<string, string>,
+): boolean {
+  const leftPaths = Object.keys(left).sort();
+  const rightPaths = Object.keys(right).sort();
+  return leftPaths.length === rightPaths.length &&
+    leftPaths.every((path, index) =>
+      path === rightPaths[index] && left[path] === right[path]
+    );
 }
 
 function readArtifactContext(): ArtifactContext | undefined {

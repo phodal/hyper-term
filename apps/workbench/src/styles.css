@@ -1400,6 +1400,24 @@ textarea:focus-visible {
   background: var(--red);
   box-shadow: 0 0 7px #ff8d83;
 }
+.checkpoint-status {
+  max-width: 126px;
+  overflow: hidden;
+  color: #697461;
+  font: 8px ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.checkpoint-status.restored,
+.checkpoint-status.saved {
+  color: #9ab37a;
+}
+.checkpoint-status.saving {
+  color: var(--amber);
+}
+.checkpoint-status.failed {
+  color: var(--red);
+}
 .publish-draft {
   height: 27px;
   padding: 0 9px;
@@ -1720,6 +1738,9 @@ textarea:focus-visible {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  [data-surface="artifact"] .checkpoint-status {
+    max-width: 116px;
   }
   [data-surface="artifact"] .studio-tabs button {
     padding: 0 6px;
