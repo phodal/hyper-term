@@ -38,6 +38,11 @@ const max_agent_activity_title_bytes: usize = 512;
 const max_agent_activity_meta_bytes: usize = 512;
 const max_agent_error_bytes: usize = 512;
 const max_agent_prompt_bytes: usize = 16 * 1024;
+const max_agent_config_options: usize = 4;
+const max_agent_config_choices: usize = 24;
+const max_agent_commands: usize = 24;
+const max_agent_capability_id_bytes: usize = 128;
+const max_agent_capability_label_bytes: usize = 192;
 const ui_font_id: canvas.FontId = canvas.min_registered_font_id;
 const max_ui_font_bytes: usize = 24 * 1024 * 1024;
 const default_macos_ui_font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf";
@@ -48,6 +53,7 @@ pub const agent_turn_effect_key_base: u64 = 0x4854_4400;
 pub const agent_snapshot_effect_key_base: u64 = 0x4854_4500;
 pub const agent_poll_timer_key_base: u64 = 0x4854_4600;
 pub const agent_permission_effect_key_base: u64 = 0x4854_4700;
+pub const agent_config_effect_key_base: u64 = 0x4854_4800;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -324,6 +330,63 @@ pub const AgentBlockView = struct {
     }
 };
 
+pub const AgentConfigChoiceView = struct {
+    action_id: u16 = 0,
+    value_storage: [max_agent_capability_id_bytes]u8 = [_]u8{0} ** max_agent_capability_id_bytes,
+    value_len: usize = 0,
+    name_storage: [max_agent_capability_label_bytes]u8 = [_]u8{0} ** max_agent_capability_label_bytes,
+    name_len: usize = 0,
+    selected: bool = false,
+
+    pub fn value(choice: *const AgentConfigChoiceView) []const u8 {
+        return choice.value_storage[0..choice.value_len];
+    }
+
+    pub fn name(choice: *const AgentConfigChoiceView) []const u8 {
+        return choice.name_storage[0..choice.name_len];
+    }
+};
+
+pub const AgentConfigOptionView = struct {
+    index: u8 = 0,
+    id_storage: [max_agent_capability_id_bytes]u8 = [_]u8{0} ** max_agent_capability_id_bytes,
+    id_len: usize = 0,
+    name_storage: [max_agent_capability_label_bytes]u8 = [_]u8{0} ** max_agent_capability_label_bytes,
+    name_len: usize = 0,
+    current_storage: [max_agent_capability_label_bytes]u8 = [_]u8{0} ** max_agent_capability_label_bytes,
+    current_len: usize = 0,
+    picker_open: bool = false,
+    is_boolean: bool = false,
+    choices: [max_agent_config_choices]AgentConfigChoiceView = [_]AgentConfigChoiceView{.{}} ** max_agent_config_choices,
+    choice_count: usize = 0,
+
+    pub fn id(option: *const AgentConfigOptionView) []const u8 {
+        return option.id_storage[0..option.id_len];
+    }
+
+    pub fn name(option: *const AgentConfigOptionView) []const u8 {
+        return option.name_storage[0..option.name_len];
+    }
+
+    pub fn currentLabel(option: *const AgentConfigOptionView) []const u8 {
+        return option.current_storage[0..option.current_len];
+    }
+
+    pub fn visibleChoices(option: *const AgentConfigOptionView) []const AgentConfigChoiceView {
+        return option.choices[0..option.choice_count];
+    }
+};
+
+pub const AgentCommandView = struct {
+    index: u8 = 0,
+    name_storage: [max_agent_capability_id_bytes]u8 = [_]u8{0} ** max_agent_capability_id_bytes,
+    name_len: usize = 0,
+
+    pub fn name(entry: *const AgentCommandView) []const u8 {
+        return entry.name_storage[0..entry.name_len];
+    }
+};
+
 pub const Session = struct {
     id: u8 = 0,
     mode: SessionMode = .terminal,
@@ -388,6 +451,12 @@ pub const Model = struct {
     agent_error_len: usize = 0,
     agent_snapshot_in_flight_session_id: u8 = 0,
     agent_permission_in_flight_session_id: u8 = 0,
+    agent_config_options: [max_agent_config_options]AgentConfigOptionView = [_]AgentConfigOptionView{.{}} ** max_agent_config_options,
+    agent_config_option_count: usize = 0,
+    agent_commands: [max_agent_commands]AgentCommandView = [_]AgentCommandView{.{}} ** max_agent_commands,
+    agent_command_count: usize = 0,
+    agent_config_in_flight_session_id: u8 = 0,
+    agent_command_picker_open: bool = false,
 
     /// Read by update, token, and derived-binding code rather than bound
     /// directly by the declarative view.
@@ -428,6 +497,10 @@ pub const Model = struct {
         "agent_error_len",
         "agent_snapshot_in_flight_session_id",
         "agent_permission_in_flight_session_id",
+        "agent_config_options",
+        "agent_config_option_count",
+        "agent_commands",
+        "agent_config_in_flight_session_id",
         "terminalReady",
         "terminalUrl",
         "genUiWorkbenchUrl",
@@ -632,6 +705,25 @@ pub const Model = struct {
         return model.agent_permission_in_flight_session_id != 0;
     }
 
+    pub fn agentConfigOptions(model: *const Model) []const AgentConfigOptionView {
+        return model.agent_config_options[0..model.agent_config_option_count];
+    }
+
+    pub fn agentCommands(model: *const Model) []const AgentCommandView {
+        return model.agent_commands[0..model.agent_command_count];
+    }
+
+    pub fn openAgentConfigChoices(model: *const Model) []const AgentConfigChoiceView {
+        for (model.agent_config_options[0..model.agent_config_option_count]) |*option| {
+            if (option.picker_open) return option.choices[0..option.choice_count];
+        }
+        return &.{};
+    }
+
+    pub fn agentCapabilityBusy(model: *const Model) bool {
+        return model.agent_config_in_flight_session_id != 0 or model.agentComposerDisabled();
+    }
+
     pub fn agentError(model: *const Model) []const u8 {
         return model.agent_error_storage[0..model.agent_error_len];
     }
@@ -685,6 +777,13 @@ pub const Msg = union(enum) {
     send_agent_prompt,
     agent_turn_started: native_sdk.EffectResponse,
     agent_snapshot_received: native_sdk.EffectResponse,
+    toggle_agent_config_picker: u8,
+    dismiss_agent_config_picker,
+    toggle_agent_command_picker,
+    dismiss_agent_command_picker,
+    choose_agent_config: u16,
+    agent_config_updated: native_sdk.EffectResponse,
+    insert_agent_command: u8,
     toggle_agent_block: u64,
     reject_agent_effect: []const u8,
     allow_agent_effect: []const u8,
@@ -702,7 +801,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_permission_decided", "agent_poll", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_config_updated", "agent_permission_decided", "agent_poll", "system_appearance", "chrome_changed" };
 };
 
 const dev_markup_reload = builtin.mode == .Debug;
@@ -738,6 +837,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
+        .toggle_agent_config_picker => |index| toggleAgentConfigPicker(model, index),
+        .dismiss_agent_config_picker => closeAgentConfigPickers(model),
+        .toggle_agent_command_picker => model.agent_command_picker_open = !model.agent_command_picker_open,
+        .dismiss_agent_command_picker => model.agent_command_picker_open = false,
+        .choose_agent_config => |action_id| requestAgentConfig(model, action_id, fx),
+        .agent_config_updated => |response| applyAgentConfigResponse(model, response, fx),
+        .insert_agent_command => |index| insertAgentCommand(model, index),
         .toggle_agent_block => |block_id| {
             for (model.agent_blocks[0..model.agent_block_count]) |*block| {
                 if (block.id == block_id and (block.isActivity() or block.isThoughtMessage())) {
@@ -825,8 +931,12 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         requestAgentClose(model, session_id, fx);
         fx.cancelTimer(agent_poll_timer_key_base + session_id);
         fx.cancel(agent_permission_effect_key_base + session_id);
+        fx.cancel(agent_config_effect_key_base + session_id);
         if (model.agent_permission_in_flight_session_id == session_id) {
             model.agent_permission_in_flight_session_id = 0;
+        }
+        if (model.agent_config_in_flight_session_id == session_id) {
+            model.agent_config_in_flight_session_id = 0;
         }
     }
 
@@ -924,6 +1034,19 @@ fn writeAgentPermissionUrl(model: *const Model, session_id: u8, storage: []u8) ?
     return std.fmt.bufPrint(
         storage,
         "{s}/agent/session/permission?token={s}&session_id={d}",
+        .{ origin, token, session_id },
+    ) catch null;
+}
+
+fn writeAgentConfigUrl(model: *const Model, session_id: u8, storage: []u8) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(
+        storage,
+        "{s}/agent/session/config?token={s}&session_id={d}",
         .{ origin, token, session_id },
     ) catch null;
 }
@@ -1040,6 +1163,122 @@ fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectRespon
     requestAgentSnapshot(model, session_id, fx);
 }
 
+fn toggleAgentConfigPicker(model: *Model, index: u8) void {
+    model.agent_command_picker_open = false;
+    for (model.agent_config_options[0..model.agent_config_option_count]) |*option| {
+        option.picker_open = option.index == index and !option.picker_open;
+    }
+}
+
+fn closeAgentConfigPickers(model: *Model) void {
+    for (model.agent_config_options[0..model.agent_config_option_count]) |*option| {
+        option.picker_open = false;
+    }
+}
+
+fn requestAgentConfig(model: *Model, action_id: u16, fx: *Effects) void {
+    if (model.agent_config_in_flight_session_id != 0 or model.agentComposerDisabled()) return;
+    var selected_option: ?*const AgentConfigOptionView = null;
+    var selected_choice: ?*const AgentConfigChoiceView = null;
+    for (model.agent_config_options[0..model.agent_config_option_count]) |*option| {
+        for (option.choices[0..option.choice_count]) |*choice| {
+            if (choice.action_id == action_id) {
+                selected_option = option;
+                selected_choice = choice;
+                break;
+            }
+        }
+        if (selected_choice != null) break;
+    }
+    const option = selected_option orelse return;
+    const choice = selected_choice orelse return;
+    if (choice.selected) {
+        closeAgentConfigPickers(model);
+        return;
+    }
+    const session_id = model.active_session_id;
+    var url_storage: [agent_effect_url_capacity + 16]u8 = undefined;
+    const request_url = writeAgentConfigUrl(model, session_id, url_storage[0..]) orelse return;
+    if (option.is_boolean) {
+        const request = .{
+            .config_id = option.id(),
+            .value = .{
+                .type = "boolean",
+                .value = std.mem.eql(u8, choice.value(), "true"),
+            },
+        };
+        const body = std.json.Stringify.valueAlloc(std.heap.page_allocator, request, .{}) catch return;
+        defer std.heap.page_allocator.free(body);
+        fetchAgentConfig(model, session_id, request_url, body, fx);
+    } else {
+        const request = .{
+            .config_id = option.id(),
+            .value = .{ .type = "id", .value = choice.value() },
+        };
+        const body = std.json.Stringify.valueAlloc(std.heap.page_allocator, request, .{}) catch return;
+        defer std.heap.page_allocator.free(body);
+        fetchAgentConfig(model, session_id, request_url, body, fx);
+    }
+}
+
+fn fetchAgentConfig(
+    model: *Model,
+    session_id: u8,
+    request_url: []const u8,
+    body: []const u8,
+    fx: *Effects,
+) void {
+    fx.fetch(.{
+        .key = agent_config_effect_key_base + session_id,
+        .method = .POST,
+        .url = request_url,
+        .body = body,
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_config_updated),
+    });
+    model.agent_config_in_flight_session_id = session_id;
+    closeAgentConfigPickers(model);
+}
+
+fn applyAgentConfigResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    _ = fx;
+    const session_id = effectSessionId(response.key, agent_config_effect_key_base) orelse return;
+    if (model.agent_config_in_flight_session_id == session_id) {
+        model.agent_config_in_flight_session_id = 0;
+    }
+    if (session_id != model.active_session_id) return;
+    if (response.outcome != .ok or response.status != 200 or response.truncated) {
+        setAgentError(model, "Agent configuration could not be updated");
+        return;
+    }
+    const parsed = std.json.parseFromSlice(
+        AgentCapabilitiesResponseWire,
+        std.heap.page_allocator,
+        response.body,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        setAgentError(model, "Agent configuration response was invalid");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value.session_id != session_id) return;
+    projectAgentCapabilities(model, parsed.value.capabilities);
+    model.agent_error_len = 0;
+}
+
+fn insertAgentCommand(model: *Model, index: u8) void {
+    if (index >= model.agent_command_count) return;
+    model.agent_command_picker_open = false;
+    const entry = &model.agent_commands[index];
+    var storage: [max_agent_prompt_bytes]u8 = undefined;
+    const current = model.agent_composer_buffer.text();
+    const next = if (current.len == 0)
+        std.fmt.bufPrint(&storage, "/{s} ", .{entry.name()}) catch return
+    else
+        std.fmt.bufPrint(&storage, "{s}\n/{s} ", .{ current, entry.name() }) catch return;
+    model.agent_composer_buffer = canvas.TextBuffer(max_agent_prompt_bytes).init(next);
+}
+
 fn requestActiveAgentSnapshot(model: *Model, fx: *Effects) void {
     const session = model.activeSession();
     if (session.mode == .agent and session.agent_connection == .ready) {
@@ -1063,9 +1302,36 @@ fn requestAgentSnapshot(model: *Model, session_id: u8, fx: *Effects) void {
 const AgentSnapshotWire = struct {
     status: []const u8,
     @"error": ?[]const u8 = null,
+    capabilities: AgentCapabilitiesWire = .{},
     document: struct {
         blocks: []const AgentBlockWire,
     },
+};
+
+const AgentConfigChoiceWire = struct {
+    value: []const u8,
+    name: []const u8,
+};
+
+const AgentConfigOptionWire = struct {
+    id: []const u8,
+    name: []const u8,
+    kind: std.json.Value,
+    choices: []const AgentConfigChoiceWire = &.{},
+};
+
+const AgentCommandWire = struct {
+    name: []const u8,
+};
+
+const AgentCapabilitiesWire = struct {
+    config_options: []const AgentConfigOptionWire = &.{},
+    available_commands: []const AgentCommandWire = &.{},
+};
+
+const AgentCapabilitiesResponseWire = struct {
+    session_id: u8,
+    capabilities: AgentCapabilitiesWire,
 };
 
 const AgentToolContentWire = struct {
@@ -1163,10 +1429,101 @@ fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse
         return;
     };
     defer parsed.deinit();
+    projectAgentCapabilities(model, parsed.value.capabilities);
     projectAgentBlocks(model, parsed.value.document.blocks);
     model.agent_turn_status = parseAgentTurnStatus(parsed.value.status);
     if (parsed.value.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
     if (model.agent_turn_status == .running) scheduleAgentPoll(session_id, fx);
+}
+
+fn projectAgentCapabilities(model: *Model, capabilities: AgentCapabilitiesWire) void {
+    for (&model.agent_config_options) |*option| option.* = .{};
+    for (&model.agent_commands) |*entry| entry.* = .{};
+    model.agent_config_option_count = 0;
+    model.agent_command_count = 0;
+    var next_action_id: u16 = 1;
+    for (capabilities.config_options) |wire| {
+        if (model.agent_config_option_count == max_agent_config_options) break;
+        if (wire.id.len == 0 or wire.id.len > max_agent_capability_id_bytes or
+            wire.name.len == 0 or wire.name.len > max_agent_capability_label_bytes) continue;
+        const kind = switch (wire.kind) {
+            .object => |object| object,
+            else => continue,
+        };
+        const type_value = kind.get("type") orelse continue;
+        const type_name = switch (type_value) {
+            .string => |value| value,
+            else => continue,
+        };
+        const option = &model.agent_config_options[model.agent_config_option_count];
+        option.index = @intCast(model.agent_config_option_count);
+        copyCapabilityText(&option.id_storage, &option.id_len, wire.id);
+        copyCapabilityText(&option.name_storage, &option.name_len, wire.name);
+        if (std.mem.eql(u8, type_name, "select")) {
+            const current_value = kind.get("current_value") orelse continue;
+            const current = switch (current_value) {
+                .string => |value| value,
+                else => continue,
+            };
+            for (wire.choices) |choice| {
+                if (option.choice_count == max_agent_config_choices) break;
+                if (choice.value.len == 0 or choice.value.len > max_agent_capability_id_bytes or
+                    choice.name.len == 0 or choice.name.len > max_agent_capability_label_bytes) continue;
+                const projected = &option.choices[option.choice_count];
+                projected.action_id = next_action_id;
+                next_action_id +%= 1;
+                copyCapabilityText(&projected.value_storage, &projected.value_len, choice.value);
+                copyCapabilityText(&projected.name_storage, &projected.name_len, choice.name);
+                projected.selected = std.mem.eql(u8, choice.value, current);
+                if (projected.selected) {
+                    copyCapabilityText(&option.current_storage, &option.current_len, choice.name);
+                }
+                option.choice_count += 1;
+            }
+            if (option.choice_count == 0) continue;
+            if (option.current_len == 0) {
+                copyCapabilityText(&option.current_storage, &option.current_len, current);
+            }
+        } else if (std.mem.eql(u8, type_name, "boolean")) {
+            const current_value = kind.get("current_value") orelse continue;
+            const current = switch (current_value) {
+                .bool => |value| value,
+                else => continue,
+            };
+            option.is_boolean = true;
+            const values = [_]struct { value: []const u8, name: []const u8, selected: bool }{
+                .{ .value = "true", .name = "On", .selected = current },
+                .{ .value = "false", .name = "Off", .selected = !current },
+            };
+            for (values) |value| {
+                const projected = &option.choices[option.choice_count];
+                projected.action_id = next_action_id;
+                next_action_id +%= 1;
+                copyCapabilityText(&projected.value_storage, &projected.value_len, value.value);
+                copyCapabilityText(&projected.name_storage, &projected.name_len, value.name);
+                projected.selected = value.selected;
+                if (value.selected) {
+                    copyCapabilityText(&option.current_storage, &option.current_len, value.name);
+                }
+                option.choice_count += 1;
+            }
+        } else continue;
+        model.agent_config_option_count += 1;
+    }
+    for (capabilities.available_commands) |wire| {
+        if (model.agent_command_count == max_agent_commands) break;
+        if (wire.name.len == 0 or wire.name.len > max_agent_capability_id_bytes) continue;
+        const entry = &model.agent_commands[model.agent_command_count];
+        entry.index = @intCast(model.agent_command_count);
+        copyCapabilityText(&entry.name_storage, &entry.name_len, wire.name);
+        model.agent_command_count += 1;
+    }
+}
+
+fn copyCapabilityText(destination: []u8, length: *usize, value: []const u8) void {
+    const bounded_length = utf8BoundedLength(value, destination.len);
+    @memcpy(destination[0..bounded_length], value[0..bounded_length]);
+    length.* = bounded_length;
 }
 
 fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
@@ -1610,6 +1967,12 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_turn_status = .idle;
     model.agent_error_len = 0;
     model.agent_permission_in_flight_session_id = 0;
+    for (&model.agent_config_options) |*option| option.* = .{};
+    for (&model.agent_commands) |*entry| entry.* = .{};
+    model.agent_config_option_count = 0;
+    model.agent_command_count = 0;
+    model.agent_config_in_flight_session_id = 0;
+    model.agent_command_picker_open = false;
     clearGenUiArtifact(model);
 }
 

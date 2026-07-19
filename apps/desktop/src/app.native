@@ -132,6 +132,30 @@
       <input-group label="Agent prompt composer" height="{agentComposerHeight}">
         <textarea size="sm" text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerDisabled}" label="Agent prompt" />
         <input-group-actions>
+          <if test="{agent_command_count > 0}">
+            <stack>
+              <button size="sm" variant="ghost" icon="plus" on-press="toggle_agent_command_picker" disabled="{agentCapabilityBusy}" label="Agent commands"></button>
+              <if test="{agent_command_picker_open}">
+                <dropdown-menu anchor="above" anchor-alignment="start" on-dismiss="dismiss_agent_command_picker" label="Agent commands">
+                  <for each="agentCommands" key="index" as="command">
+                    <menu-item on-press="insert_agent_command:{command.index}">/{command.name}</menu-item>
+                  </for>
+                </dropdown-menu>
+              </if>
+            </stack>
+          </if>
+          <for each="agentConfigOptions" key="id" as="option">
+            <stack>
+              <select size="sm" on-press="toggle_agent_config_picker:{option.index}" disabled="{agentCapabilityBusy}" label="{option.name}">{option.currentLabel}</select>
+              <if test="{option.picker_open}">
+                <dropdown-menu anchor="above" anchor-alignment="start" on-dismiss="dismiss_agent_config_picker" label="{option.name}">
+                  <for each="openAgentConfigChoices" key="action_id" as="choice">
+                    <menu-item selected="{choice.selected}" on-press="choose_agent_config:{choice.action_id}">{choice.name}</menu-item>
+                  </for>
+                </dropdown-menu>
+              </if>
+            </stack>
+          </for>
           <spacer grow="1" />
           <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentComposerDisabled}" label="Send prompt"></button>
         </input-group-actions>

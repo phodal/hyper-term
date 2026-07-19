@@ -301,6 +301,71 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
 }
 
+test "ACP composer renders provider capabilities and routes configuration through Rust" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithProviders(terminal_url, agent_url, "codex-acp");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_codex_acp_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_turn_status = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"ready","error":null,"capabilities":{"config_options":[{"id":"model","name":"Model","description":null,"category":"model","kind":{"type":"select","current_value":"fast"},"choices":[{"value":"fast","name":"Fast","description":null,"group":null},{"value":"deep","name":"Deep","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]},"document":{"blocks":[]}}
+        ,
+    } }, &fx);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tree = try buildTree(arena, &model);
+    try testing.expect(findAnyByText(tree.root, "Fast") != null);
+    const command_trigger = findByLabel(tree.root, "Agent commands").?;
+    main.update(&model, tree.msgForPointer(command_trigger.id, .up).?, &fx);
+    tree = try buildTree(arena, &model);
+    try testing.expect(findAnyByText(tree.root, "/skills") != null);
+
+    main.update(&model, .dismiss_agent_command_picker, &fx);
+    tree = try buildTree(arena, &model);
+
+    const selector = findByLabel(tree.root, "Model").?;
+    main.update(&model, tree.msgForPointer(selector.id, .up).?, &fx);
+    tree = try buildTree(arena, &model);
+    const deep = findAnyByText(tree.root, "Deep").?;
+    main.update(&model, tree.msgForPointer(deep.id, .up).?, &fx);
+    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
+    const request = fx.pendingFetchAt(1).?;
+    try testing.expectEqual(std.http.Method.POST, request.method);
+    try testing.expect(std.mem.endsWith(u8, request.url, "/agent/session/config?token=abcdef0123456789abcdef0123456789&session_id=2"));
+    try testing.expectEqualStrings(
+        "{\"config_id\":\"model\",\"value\":{\"type\":\"id\",\"value\":\"deep\"}}",
+        request.body,
+    );
+
+    main.update(&model, .{ .agent_config_updated = .{
+        .key = main.agent_config_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"capabilities":{"config_options":[{"id":"model","name":"Model","description":null,"category":"model","kind":{"type":"select","current_value":"deep"},"choices":[{"value":"fast","name":"Fast","description":null,"group":null},{"value":"deep","name":"Deep","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]}}
+        ,
+    } }, &fx);
+    try testing.expectEqualStrings("Deep", model.agentConfigOptions()[0].currentLabel());
+
+    tree = try buildTree(arena, &model);
+    const updated_command_trigger = findByLabel(tree.root, "Agent commands").?;
+    main.update(&model, tree.msgForPointer(updated_command_trigger.id, .up).?, &fx);
+    tree = try buildTree(arena, &model);
+    const skills = findAnyByText(tree.root, "/skills").?;
+    main.update(&model, tree.msgForPointer(skills.id, .up).?, &fx);
+    try testing.expectEqualStrings("/skills ", model.agentComposerText());
+}
+
 test "direct Codex artifacts never expose the ACP editor panel" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
