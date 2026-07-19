@@ -139,10 +139,40 @@ creates a new revision and passes the normal approval and pinned-Deno path. A
 480-pixel browser flow proves two-file history restore, current-versus-history
 Diff, live preview reload, enabled publish, and zero page overflow.
 
-This is accepted-Artifact Time Travel, not completion of the whole ADR. Durable
-editor transactions and selections, reducer/action trace checkpoints, effect
-receipt substitution, replay projection digests, and redacted offline bug
-capsules remain open.
+## Runtime checkpoint evidence (2026-07-20)
+
+The next slice adds an explicit generated-runtime boundary rather than
+instrumenting React internals. `@hyper/runtime` exposes bounded `traceAction`
+and `traceCheckpoint` calls. The network-closed iframe assigns a new stream ID
+to every accepted local render and sends semantic events to its trusted parent.
+The parent validates the exact iframe, channel token, local preview identity,
+event schema, and byte bounds. It forwards events only while the editor source
+is byte-for-byte equal to the Rust-accepted source; events from unpublished
+drafts remain visible only in the ephemeral compiler trace.
+
+The authenticated Rust gateway then fences the request to the current task,
+Artifact ID, and source revision. It redacts sensitive keys, enforces depth,
+node, string, event, batch, and journal limits, assigns the canonical event
+sequence and SHA-256 payload digest, and appends mode-0600 JSONL evidence. Exact
+client retries are idempotent. Gaps, conflicting retries, stale revisions,
+symlinks, oversized events, digest tampering, and torn tails are rejected. The
+Workbench batches events briefly and renders the durable projection in Time
+Travel without exposing a replay action.
+
+Validation is deliberately split at the authority boundary. Rust store and
+gateway tests prove authentication, current-revision fencing, redaction,
+ordering, restart recovery, and tamper rejection. Browser verification proves
+the isolated preview emits action/checkpoint events, unpublished-draft events
+stay labelled as non-durable, the Time Travel sections render without console
+or page errors, and both 1440-pixel and 480-pixel layouts avoid page-level
+horizontal overflow.
+
+This is accepted-source runtime evidence, not completion of the whole ADR.
+Deterministic reducer reconstruction, effect-receipt substitution, replay
+projection digests, and redacted offline bug capsules remain open. Durable
+editor transactions and selections are implemented as a separate private
+checkpoint journal, but are not yet merged with this runtime stream into one
+canonical replay projection.
 
 ## Validation gates
 

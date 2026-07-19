@@ -10,6 +10,11 @@ import type {
 } from "../artifact-history-client.ts";
 import type { HyperTermHost } from "../host.ts";
 import type { AcceptedArtifact } from "../protocol.ts";
+import {
+  isRuntimeTraceMessage,
+  type RuntimeTraceEvent,
+  type RuntimeTraceInput,
+} from "../runtime-trace-client.ts";
 import type { EditorLanguageService } from "../editor-language-service.ts";
 import { GenUiCompiler } from "../genui/compiler-client.ts";
 import {
@@ -32,6 +37,7 @@ export default function AgentStatus() {
 `;
 
 const sampleInitialSource = `import React from "react";
+import { traceAction, traceCheckpoint } from "@hyper/runtime";
 
 export default function AgentStatus() {
   const [expanded, setExpanded] = React.useState(false);
@@ -46,7 +52,12 @@ export default function AgentStatus() {
         <small style={{ color: "#9ba88a" }}>ACP · CODEX</small>
         <h2 style={{ margin: "10px 0 4px" }}>Verification complete</h2>
         <p style={{ color: "#aeb6a1" }}>19 tests passed · 0 effects replayed</p>
-        <button onClick={() => setExpanded(!expanded)} style={{
+        <button onClick={() => {
+          const next = !expanded;
+          traceAction("evidence.toggle", { expanded: next });
+          setExpanded(next);
+          traceCheckpoint("agent-status", { expanded: next });
+        }} style={{
           marginTop: 12,
           border: 0,
           borderRadius: 9,
@@ -109,6 +120,10 @@ export interface GenUiStudioProps {
     entry: ArtifactHistoryEntry,
     signal: AbortSignal,
   ) => Promise<ArtifactHistorySource>;
+  runtimeTraceEvents?: RuntimeTraceEvent[];
+  runtimeTraceStatus?: "loading" | "ready" | "saving" | "failed";
+  runtimeTraceError?: string;
+  onRuntimeTrace?: (event: RuntimeTraceInput) => void;
 }
 
 export function GenUiStudio({
@@ -134,6 +149,10 @@ export function GenUiStudio({
   historyStatus = "ready",
   historyError,
   onLoadHistorySource,
+  runtimeTraceEvents = [],
+  runtimeTraceStatus = "ready",
+  runtimeTraceError,
+  onRuntimeTrace,
 }: GenUiStudioProps) {
   const [files, setFiles] = useState<Record<string, string>>(() => ({
     ...initialFiles,
@@ -197,6 +216,7 @@ export function GenUiStudio({
         source_revision?: number;
         generated_line?: number;
         generated_column?: number;
+        event?: unknown;
       };
       if (message.channel_token !== previewChannel) return;
       if (message.type === "hyper_term_preview_boot") {
@@ -241,11 +261,33 @@ export function GenUiStudio({
             state: "failed" as const,
           }, ...entries].slice(0, 8)
         );
+      } else if (message.type === "hyper_term_preview_trace") {
+        if (
+          !accepted || message.artifact_id !== accepted.artifact_id ||
+          message.source_revision !== accepted.source_revision ||
+          !isRuntimeTraceMessage(message.event)
+        ) return;
+        const runtimeEvent = message.event;
+        const isAcceptedSource = sameFiles(filesRef.current, baselineFiles);
+        const durableRuntimeTrace = isAcceptedSource && Boolean(onRuntimeTrace);
+        setTrace((entries) =>
+          [{
+            revision: accepted.source_revision,
+            label: `${runtimeEvent.kind} · ${runtimeEvent.name}`,
+            detail: durableRuntimeTrace
+              ? "forwarded to Rust evidence journal"
+              : isAcceptedSource
+              ? "demo broker only · not durable evidence"
+              : "local draft only · not durable evidence",
+            state: "accepted" as const,
+          }, ...entries].slice(0, 8)
+        );
+        if (durableRuntimeTrace) onRuntimeTrace?.(runtimeEvent);
       }
     }
     globalThis.addEventListener("message", receivePreviewEvent);
     return () => globalThis.removeEventListener("message", receivePreviewEvent);
-  }, [accepted, previewChannel]);
+  }, [accepted, baselineFiles, onRuntimeTrace, previewChannel]);
 
   useEffect(() => {
     if (!accepted || previewBoot === 0) return;
@@ -525,6 +567,9 @@ export function GenUiStudio({
             onLoadHistory={onLoadHistorySource
               ? (entry) => void loadHistoryAsDraft(entry)
               : undefined}
+            runtimeTraceEvents={runtimeTraceEvents}
+            runtimeTraceStatus={runtimeTraceStatus}
+            runtimeTraceError={runtimeTraceError}
           />
         )}
       </div>
@@ -647,6 +692,9 @@ interface TraceTimelineProps {
   publishBusy: boolean;
   draftChanged: boolean;
   onLoadHistory?: (entry: ArtifactHistoryEntry) => void;
+  runtimeTraceEvents: RuntimeTraceEvent[];
+  runtimeTraceStatus: "loading" | "ready" | "saving" | "failed";
+  runtimeTraceError?: string;
 }
 
 function TraceTimeline({
@@ -658,12 +706,52 @@ function TraceTimeline({
   publishBusy,
   draftChanged,
   onLoadHistory,
+  runtimeTraceEvents,
+  runtimeTraceStatus,
+  runtimeTraceError,
 }: TraceTimelineProps) {
   return (
     <div className="trace-timeline">
       <div className="trace-note">
-        Rust journal revisions are replay-only. Loading one creates a local
-        draft and never repeats Shell, MCP, ACP, or Computer Use effects.
+        Rust journals accepted source and redacted runtime checkpoints. Loading
+        source creates a local draft; Time Travel never repeats Shell, MCP, ACP,
+        or Computer Use effects.
+      </div>
+      <div className="trace-section-heading">
+        <strong>Runtime checkpoints</strong>
+        <span>{runtimeTraceStatus}</span>
+      </div>
+      {runtimeTraceError && (
+        <p className="trace-history-error" role="alert">
+          {runtimeTraceError}
+        </p>
+      )}
+      {runtimeTraceEvents.length === 0 && runtimeTraceStatus === "ready" && (
+        <p className="dim">
+          No accepted-source actions or checkpoints recorded yet.
+        </p>
+      )}
+      {[...runtimeTraceEvents].reverse().map((event) => (
+        <div
+          className="trace-entry runtime"
+          data-state="accepted"
+          key={event.event_sequence}
+        >
+          <span className="trace-node" />
+          <div>
+            <strong>{event.kind} · {event.name}</strong>
+            <p>
+              event #{event.event_sequence} · {formatHistoryTime(
+                event.recorded_at_ms,
+              )} · {event.payload_digest.slice(0, 10)}
+              {event.redacted ? " · redacted" : ""}
+            </p>
+          </div>
+        </div>
+      ))}
+      <div className="trace-section-heading">
+        <strong>Accepted source</strong>
+        <span>{historyStatus}</span>
       </div>
       {historyStatus === "loading" && (
         <p className="dim">Loading durable Artifact history…</p>
@@ -723,6 +811,18 @@ function TraceTimeline({
       ))}
     </div>
   );
+}
+
+function sameFiles(
+  left: Record<string, string>,
+  right: Record<string, string>,
+): boolean {
+  const leftPaths = Object.keys(left).sort();
+  const rightPaths = Object.keys(right).sort();
+  return leftPaths.length === rightPaths.length &&
+    leftPaths.every((path, index) =>
+      path === rightPaths[index] && left[path] === right[path]
+    );
 }
 
 function formatHistoryTime(recordedAtMs: number): string {

@@ -1633,11 +1633,28 @@ textarea:focus-visible {
   font-size: 9px;
   line-height: 1.5;
 }
+.trace-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 13px 0 4px;
+  color: #929c89;
+  font: 700 8px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.trace-section-heading span {
+  color: #626b5d;
+  font-weight: 500;
+}
 .trace-entry {
   display: grid;
   grid-template-columns: 12px 1fr;
   gap: 8px;
   padding: 7px 0;
+}
+.trace-entry.runtime {
+  border-bottom: 1px solid #20251d;
 }
 .trace-entry.durable {
   grid-template-columns: 12px minmax(0, 1fr) auto;

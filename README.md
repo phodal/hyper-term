@@ -117,7 +117,7 @@ The important boundary is not Native versus Web. It is **who has authority**:
 | GitHub Copilot ACP discovery | Implemented baseline |
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
-| Multi-file Artifact editor, Diff, durable accepted-revision Time Travel, diagnostics, completion, and approved publish | Experimental |
+| Multi-file Artifact editor, Diff, durable accepted-source/runtime evidence, diagnostics, completion, and approved publish | Experimental |
 | Brokered exact multi-file Artifact-to-workspace apply with hunk selection and crash recovery | Experimental |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |
@@ -258,8 +258,9 @@ Useful design documents:
 - Extend the crash-recoverable transactional hunk apply to isolated Tier 2
   worktrees and bounded binary patches, without giving the renderer write
   authority.
-- Extend accepted-Artifact Time Travel into journaled editor transactions,
-  reducer/runtime trace checkpoints, and redacted offline bug capsules.
+- Merge accepted-source history, editor checkpoints, and redacted runtime
+  action/checkpoint evidence into deterministic replay projections and offline
+  bug capsules.
 - Strengthen containment for external coding-agent processes.
 - Publish signed and notarized Apple Silicon and Intel builds.
 - Define the supported-platform contract before expanding beyond macOS.

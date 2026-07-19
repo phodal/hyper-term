@@ -16,6 +16,11 @@ import {
 import { resolveHost } from "../host.ts";
 import { ArtifactLanguageService } from "../editor-language-service.ts";
 import {
+  RuntimeTraceClient,
+  type RuntimeTraceEvent,
+  type RuntimeTraceInput,
+} from "../runtime-trace-client.ts";
+import {
   type WorkspaceApplyMapping,
   type WorkspaceApplyPreview,
   WorkspaceApplyPublisher,
@@ -85,6 +90,13 @@ export function ArtifactWorkbench() {
   >("none");
   const [previewStarting, setPreviewStarting] = useState(false);
   const [applyStarting, setApplyStarting] = useState(false);
+  const [runtimeTraceEvents, setRuntimeTraceEvents] = useState<
+    RuntimeTraceEvent[]
+  >([]);
+  const [runtimeTraceStatus, setRuntimeTraceStatus] = useState<
+    "loading" | "ready" | "saving" | "failed"
+  >("loading");
+  const [runtimeTraceError, setRuntimeTraceError] = useState<string>();
   const publishController = useRef<AbortController | undefined>(undefined);
   const applyController = useRef<AbortController | undefined>(undefined);
   const checkpointRevision = useRef(0);
@@ -92,6 +104,20 @@ export function ArtifactWorkbench() {
   const lastCheckpointFingerprint = useRef("");
   const checkpointQueue = useRef<Promise<void>>(Promise.resolve());
   const checkpointControllers = useRef(new Set<AbortController>());
+  const runtimeTraceQueue = useRef<RuntimeTraceInput[]>([]);
+  const runtimeTraceTimer = useRef<number | undefined>(undefined);
+  const runtimeTraceAppendQueue = useRef<Promise<void>>(Promise.resolve());
+  const runtimeTraceGeneration = useRef(0);
+  const runtimeTraceFailed = useRef(false);
+  const runtimeTraceClient = useMemo(() => {
+    if (!context || state.kind !== "ready") return undefined;
+    return new RuntimeTraceClient({
+      artifactId: state.source.artifact_id,
+      sourceRevision: state.source.source_revision,
+      sessionId: context.sessionId,
+      token: context.token,
+    });
+  }, [context, state]);
   const languageServiceForPath = useCallback((documentPath: string) => {
     if (!context || state.kind !== "ready") {
       throw new Error("Artifact language service context is unavailable.");
@@ -160,6 +186,98 @@ export function ArtifactWorkbench() {
     });
     return () => controller.abort();
   }, [context, state]);
+
+  useEffect(() => {
+    if (!runtimeTraceClient) return;
+    const generation = ++runtimeTraceGeneration.current;
+    const controller = new AbortController();
+    runtimeTraceQueue.current = [];
+    runtimeTraceFailed.current = false;
+    runtimeTraceAppendQueue.current = Promise.resolve();
+    if (runtimeTraceTimer.current !== undefined) {
+      clearTimeout(runtimeTraceTimer.current);
+      runtimeTraceTimer.current = undefined;
+    }
+    setRuntimeTraceStatus("loading");
+    setRuntimeTraceError(undefined);
+    runtimeTraceClient.list(controller.signal).then((projection) => {
+      if (
+        controller.signal.aborted ||
+        generation !== runtimeTraceGeneration.current
+      ) return;
+      setRuntimeTraceEvents(projection.events);
+      setRuntimeTraceStatus("ready");
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      runtimeTraceFailed.current = true;
+      setRuntimeTraceStatus("failed");
+      setRuntimeTraceError(
+        error instanceof Error ? error.message : String(error),
+      );
+    });
+    return () => {
+      controller.abort();
+      runtimeTraceGeneration.current += 1;
+      runtimeTraceQueue.current = [];
+      if (runtimeTraceTimer.current !== undefined) {
+        clearTimeout(runtimeTraceTimer.current);
+        runtimeTraceTimer.current = undefined;
+      }
+    };
+  }, [runtimeTraceClient]);
+
+  const flushRuntimeTrace = useCallback(() => {
+    if (runtimeTraceTimer.current !== undefined) {
+      clearTimeout(runtimeTraceTimer.current);
+      runtimeTraceTimer.current = undefined;
+    }
+    if (!runtimeTraceClient || runtimeTraceFailed.current) return;
+    const batch = runtimeTraceQueue.current.splice(0, 16);
+    if (batch.length === 0) return;
+    const generation = runtimeTraceGeneration.current;
+    runtimeTraceAppendQueue.current = runtimeTraceAppendQueue.current
+      .catch(() => {})
+      .then(async () => {
+        if (
+          generation !== runtimeTraceGeneration.current ||
+          runtimeTraceFailed.current
+        ) return;
+        setRuntimeTraceStatus("saving");
+        setRuntimeTraceError(undefined);
+        try {
+          const projection = await appendRuntimeTraceWithRetry(
+            runtimeTraceClient,
+            batch,
+          );
+          if (generation !== runtimeTraceGeneration.current) return;
+          setRuntimeTraceEvents(projection.events);
+          setRuntimeTraceStatus("ready");
+        } catch (error) {
+          if (generation !== runtimeTraceGeneration.current) return;
+          runtimeTraceFailed.current = true;
+          runtimeTraceQueue.current = [];
+          setRuntimeTraceStatus("failed");
+          setRuntimeTraceError(
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      });
+  }, [runtimeTraceClient]);
+
+  const recordRuntimeTrace = useCallback((event: RuntimeTraceInput) => {
+    if (!runtimeTraceClient || runtimeTraceFailed.current) return;
+    runtimeTraceQueue.current.push(event);
+    if (runtimeTraceQueue.current.length >= 16) {
+      flushRuntimeTrace();
+      return;
+    }
+    if (runtimeTraceTimer.current === undefined) {
+      runtimeTraceTimer.current = globalThis.setTimeout(
+        flushRuntimeTrace,
+        48,
+      );
+    }
+  }, [flushRuntimeTrace, runtimeTraceClient]);
 
   useEffect(() => () => {
     publishController.current?.abort();
@@ -410,6 +528,10 @@ export function ArtifactWorkbench() {
                 ? historyState.message
                 : undefined}
               onLoadHistorySource={loadHistorySource}
+              runtimeTraceEvents={runtimeTraceEvents}
+              runtimeTraceStatus={runtimeTraceStatus}
+              runtimeTraceError={runtimeTraceError}
+              onRuntimeTrace={recordRuntimeTrace}
             />
           </div>
           {workspacePanel === "mapping" && (
@@ -504,6 +626,19 @@ function workspaceApplyLabel(
       return "Inspect target";
     case "idle":
       return `Map ${Math.min(fileCount, 32)} file(s)`;
+  }
+}
+
+async function appendRuntimeTraceWithRetry(
+  client: RuntimeTraceClient,
+  events: RuntimeTraceInput[],
+): Promise<{ events: RuntimeTraceEvent[] }> {
+  try {
+    return await client.append(events);
+  } catch {
+    // The Rust store makes an exact retry idempotent, including the case where
+    // the first response was lost after the append reached durable storage.
+    return await client.append(events);
   }
 }
 

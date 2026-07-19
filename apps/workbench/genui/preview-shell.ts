@@ -27,18 +27,29 @@ interface RenderArtifactMessage {
   };
 }
 
+type RuntimeTraceKind = "action" | "checkpoint" | "console" | "error";
+
 declare global {
   var __HYPER_REACT__: typeof React;
   var __HYPER_JSX_RUNTIME__: typeof JsxRuntime;
   var __HYPER_JSX_DEV_RUNTIME__: typeof JsxDevRuntime;
   var __HYPER_MOUNT__: (component: React.ComponentType) => void;
+  var __HYPER_TRACE__: (
+    kind: RuntimeTraceKind,
+    name: string,
+    payload?: unknown,
+  ) => void;
   var __HYPER_BOOTSTRAP_ARTIFACT__:
     | RenderArtifactMessage["artifact"]
     | undefined;
 }
 
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
+const MAX_RUNTIME_TRACE_BYTES = 32 * 1024;
+const MAX_RUNTIME_TRACE_NAME_BYTES = 128;
 const channelToken = location.hash.slice(1);
+let runtimeTraceStreamId = crypto.randomUUID();
+let runtimeTraceSequence = 0;
 const rootElement = requiredElement("root");
 const runtimeErrorElement = requiredElement("runtime-error");
 let root: Root | undefined;
@@ -62,6 +73,42 @@ globalThis.__HYPER_JSX_DEV_RUNTIME__ = JsxDevRuntime;
 globalThis.__HYPER_MOUNT__ = (component) => {
   root ??= createRoot(rootElement);
   root.render(React.createElement(component));
+};
+globalThis.__HYPER_TRACE__ = (kind, name, payload = null) => {
+  if (
+    !activeArtifact || !validRuntimeTraceKind(kind) || !validTraceName(name)
+  ) {
+    return;
+  }
+  let cloned: unknown;
+  try {
+    const encoded = JSON.stringify(payload);
+    if (
+      encoded === undefined ||
+      new TextEncoder().encode(encoded).byteLength > MAX_RUNTIME_TRACE_BYTES
+    ) return;
+    cloned = JSON.parse(encoded);
+  } catch {
+    return;
+  }
+  const event = {
+    schema_version: 1 as const,
+    stream_id: runtimeTraceStreamId,
+    client_sequence: runtimeTraceSequence + 1,
+    kind,
+    name,
+    payload: cloned,
+  };
+  if (
+    new TextEncoder().encode(JSON.stringify(event)).byteLength >
+      MAX_RUNTIME_TRACE_BYTES
+  ) return;
+  runtimeTraceSequence = event.client_sequence;
+  report("hyper_term_preview_trace", {
+    artifact_id: activeArtifact.artifact_id,
+    source_revision: activeArtifact.source_revision,
+    event,
+  });
 };
 
 globalThis.addEventListener("message", (event: MessageEvent<unknown>) => {
@@ -95,6 +142,11 @@ if (globalThis.__HYPER_BOOTSTRAP_ARTIFACT__) {
 async function render(message: RenderArtifactMessage): Promise<void> {
   const { artifact } = message;
   clearRuntimeError();
+  // Each accepted render is a distinct semantic stream. This prevents a
+  // discarded local draft from creating sequence gaps when the editor returns
+  // to the Rust-accepted source revision.
+  runtimeTraceStreamId = crypto.randomUUID();
+  runtimeTraceSequence = 0;
   activeArtifact = {
     artifact_id: artifact.artifact_id,
     source_revision: artifact.source_revision,
@@ -212,6 +264,18 @@ function isRenderMessage(value: unknown): value is RenderArtifactMessage {
     typeof message.artifact.bundle === "string" &&
     typeof message.artifact.css === "string" &&
     typeof message.artifact.source_map === "string";
+}
+
+function validRuntimeTraceKind(value: string): value is RuntimeTraceKind {
+  return value === "action" || value === "checkpoint" || value === "console" ||
+    value === "error";
+}
+
+function validTraceName(value: string): boolean {
+  return value.length > 0 &&
+    new TextEncoder().encode(value).byteLength <=
+      MAX_RUNTIME_TRACE_NAME_BYTES &&
+    !value.includes("\0") && !value.includes("\n") && !value.includes("\r");
 }
 
 function report(type: string, detail: Record<string, unknown> = {}): void {
