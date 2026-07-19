@@ -1,5 +1,6 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import {
@@ -23,6 +24,7 @@ import {
   type TerminalShortcut,
   terminalShortcut,
 } from "./terminal-preferences.ts";
+import { installGpuRenderer } from "./terminal-renderer.ts";
 import "./styles.css";
 
 const attachmentStorageKey = terminalAttachmentStorageKey(
@@ -93,6 +95,11 @@ const search = new SearchAddon();
 terminal.loadAddon(fit);
 terminal.loadAddon(search);
 terminal.open(terminalElement);
+installGpuRenderer(
+  terminal,
+  new WebglAddon(),
+  (backend) => terminalElement.dataset.renderer = backend,
+);
 fitTerminal();
 terminal.focus();
 
