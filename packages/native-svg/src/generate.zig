@@ -1,7 +1,6 @@
 const std = @import("std");
 const canvas = @import("canvas");
 const app = @import("hyper_term_app");
-const native_svg = @import("native_svg");
 
 const max_widgets = 2048;
 const max_commands = 8192;
@@ -31,13 +30,14 @@ pub fn main(init: std.process.Init) !void {
 
     var output = try std.Io.Writer.Allocating.initCapacity(init.gpa, 128 * 1024);
     defer output.deinit();
-    try native_svg.writeSvg(
+    try canvas.writeSvg(
         init.gpa,
         &output.writer,
-        builder.displayList(),
         .{
-            .width = app.window_width,
-            .height = app.window_height,
+            .display_list = builder.displayList(),
+            .size = .{ .width = app.window_width, .height = app.window_height },
+        },
+        .{
             .background = tokens.colors.background,
             .title = "Hyper Term",
             .description = "Generated from apps/desktop/src/app.native through the Native SDK widget layout and display list.",

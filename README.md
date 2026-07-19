@@ -191,9 +191,10 @@ deno task check:readme-svg
 deno task test:native-svg
 ```
 
-The renderer imports the desktop application's actual `main.zig` and
-`app.native`, then converts the Native SDK display list to standalone SVG. The
-preview therefore follows UI layout and token changes without a second mockup.
+The adapter imports the desktop application's actual `main.zig` and
+`app.native`, then hands the resulting scene to Native SDK's reusable SVG
+exporter. The preview therefore follows UI layout and token changes without a
+second mockup, while the converter remains usable by other Native SDK apps.
 
 This repository intentionally uses Deno's frozen lockfile and built-in bundler;
 there is no Vite or pnpm build.
@@ -204,7 +205,7 @@ there is no Vite or pnpm build.
 apps/desktop/               Native SDK macOS application
 apps/terminal/              Terminal WebView renderer
 apps/workbench/             Agent blocks, editor, and isolated artifact preview
-packages/native-svg/        Native SDK display-list to SVG renderer
+packages/native-svg/        Hyper Term adapter for Native SDK SVG export
 crates/hyper-term-core/     Renderer-independent state and PTY authority
 crates/hyper-term-daemon/   Daemon, desktop supervisor, and local gateways
 crates/hyper-term-drivers/  ACP, MCP, Deno LSP, and GenUI supervision

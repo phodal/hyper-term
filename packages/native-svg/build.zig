@@ -7,17 +7,6 @@ pub fn build(b: *std.Build) void {
 
     const sdk = nativeSdkModules(b, native_dep, target, optimize);
 
-    const svg_mod = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    svg_mod.addImport("canvas", sdk.canvas);
-
-    const tests = b.addTest(.{ .root_module = svg_mod });
-    const test_step = b.step("test", "Run native display-list to SVG tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
-
     const options = b.addOptions();
     options.addOption([]const u8, "platform", "null");
     options.addOption([]const u8, "trace", "off");
@@ -53,8 +42,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     generator_mod.addImport("canvas", sdk.canvas);
-    generator_mod.addImport("native_svg", svg_mod);
     generator_mod.addImport("hyper_term_app", app_mod);
+
+    const tests = b.addTest(.{ .root_module = generator_mod });
+    const test_step = b.step("test", "Compile the Hyper Term Native SVG adapter");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 
     const generator = b.addExecutable(.{
         .name = "render-hyper-term-readme",
