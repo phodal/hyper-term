@@ -15,6 +15,13 @@ CodeMirror diagnostics and completion come from a Rust-supervised Deno LSP
 process against the current artifact's private snapshot. Draft updates travel as
 bounded LSP document changes, not filesystem writes.
 
+Each structured Agent session also receives Hyper Term as a digest-pinned stdio
+MCP server. Its Diff and GenUI tools operate only on bounded request data. The
+Deno LSP tool sees a private per-session text snapshot created by Rust, not the
+live workspace; dependency/build directories, binary files, and symlinks are
+excluded. Calls remain visible approval operations in the Agent tab, and the
+snapshot and runtime roots are removed when that Agent session closes.
+
 The native chrome, design tokens, mode selection, responsive layout, and Agent
 Block composition remain native. The terminal cell renderer is currently a child
 system WebView anchored into that layout. It connects directly to the

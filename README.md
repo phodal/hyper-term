@@ -39,6 +39,9 @@ task model without giving the UI direct command or filesystem authority.
 - **Generated UI artifacts.** Agents can propose React/TypeScript interfaces
   that are compiled by a pinned Deno runtime, content-addressed by Rust, and
   shown in a network-closed preview.
+- **Brokered Agent tools.** ACP and Codex sessions receive a digest-pinned MCP
+  server with bounded Diff, GenUI compile, and Deno LSP tools. Every call is an
+  operation proposal; Rust and the user authorize it before execution.
 - **Artifact Workbench.** Current artifacts can open in a CodeMirror editor with
   Diff, Time Travel, source-mapped diagnostics, completion, and an isolated
   local preview. Drafts do not write to the workspace.
@@ -80,6 +83,7 @@ UI bridge.
 | Structured ACP Agent tabs | Active development |
 | Codex and Claude packaged ACP adapters | Implemented baseline |
 | GitHub Copilot ACP discovery | Implemented baseline |
+| ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
 | Artifact editor, Diff, Time Travel, diagnostics, and completion | Experimental |
 | Brokered workspace edits | Not implemented |

@@ -154,6 +154,17 @@ items before returning advisory data to CodeMirror. Closing the Agent session
 shuts down the Deno process and removes that private snapshot. The WebView never
 receives a workspace path or filesystem capability.
 
+The ACP/Codex MCP tool plane now enables the same Deno LSP for workspace
+queries without mounting the live workspace into the sidecar. At Agent-session
+creation, Rust copies only bounded text/source files into a private snapshot,
+skips symlinks and dependency/build trees, rejects file/count/byte/depth limit
+violations, and passes that exact root to `hyper-term-mcp`. The LSP sidecar has
+read-only sandbox access to the snapshot plus write access only to its private
+cache and scratch roots. Closing the Agent removes the complete session runtime
+root. A real integration test starts the configured MCP server through an ACP
+`mcpServers` entry, obtains the Diff/GenUI/LSP catalog, authorizes an LSP query
+through the Rust operation ledger, and returns the result to the ACP turn.
+
 The supervisor now treats a request deadline as a lifecycle boundary. If an
 effect times out, it sends `SIGTERM` and then `SIGKILL` to the complete process
 group, retains `UnknownExecution`, and therefore forbids automatic replay. A

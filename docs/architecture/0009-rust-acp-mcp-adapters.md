@@ -166,6 +166,13 @@ set is enabled per release.
   bounded per-file digest inventory, and runs the offline entrypoints with the
   already bundled Deno runtime. Real prompt gates pass through this exact pruned
   artifact for both providers.
+- ACP v1 `session/new` and direct Codex sessions now receive the same
+  digest-pinned `hyper-term-mcp` stdio server. Its enabled catalog is derived
+  from the exact runtime configuration: Diff is always bounded and read-only;
+  GenUI uses the signed Deno/esbuild assets; Deno LSP uses a Rust-created
+  private workspace snapshot. A real-Deno integration test proves an ACP Agent
+  can discover all three tools, propose and authorize `hyper_term.lsp.query`,
+  and receive the real LSP result through the Agent turn.
 - Distribution still needs the containment decision in ADR 0014, a
   terminal-auth UI, and the full fuzz and protocol-upgrade matrix. The internal
   MCP adapter remains a bounded stdio subset; adopting the complete Rust MCP SDK
