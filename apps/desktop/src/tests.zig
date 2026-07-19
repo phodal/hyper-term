@@ -329,7 +329,7 @@ test "ACP composer renders provider capabilities and routes configuration throug
     const command_trigger = findByLabel(tree.root, "Agent commands").?;
     main.update(&model, tree.msgForPointer(command_trigger.id, .up).?, &fx);
     tree = try buildTree(arena, &model);
-    try testing.expect(findAnyByText(tree.root, "/skills") != null);
+    try testing.expect(findAnyByText(tree.root, "Skills · Configure skills") != null);
 
     main.update(&model, .dismiss_agent_command_picker, &fx);
     tree = try buildTree(arena, &model);
@@ -361,7 +361,7 @@ test "ACP composer renders provider capabilities and routes configuration throug
     const updated_command_trigger = findByLabel(tree.root, "Agent commands").?;
     main.update(&model, tree.msgForPointer(updated_command_trigger.id, .up).?, &fx);
     tree = try buildTree(arena, &model);
-    const skills = findAnyByText(tree.root, "/skills").?;
+    const skills = findAnyByText(tree.root, "Skills · Configure skills").?;
     main.update(&model, tree.msgForPointer(skills.id, .up).?, &fx);
     try testing.expectEqualStrings("/skills ", model.agentComposerText());
 }
@@ -616,16 +616,15 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
         ,
     } }, &fx);
 
-    try testing.expectEqual(@as(usize, 3), model.agentBlocks().len);
+    try testing.expectEqual(@as(usize, 2), model.agentBlocks().len);
     try testing.expectEqualStrings("Hi! What are we working on today?", model.agentBlocks()[0].content());
     try testing.expect(model.agentBlocks()[1].isActivity());
-    try testing.expectEqualStrings("Edit src/lib.rs", model.agentBlocks()[1].activityTitle());
-    try testing.expectEqualStrings("completed · 1 file · +1 −1", model.agentBlocks()[1].activityMeta());
+    try testing.expectEqualStrings("Used 2 tools", model.agentBlocks()[1].activityTitle());
+    try testing.expectEqualStrings("completed · 2 tools · 1 file · +1 −1", model.agentBlocks()[1].activityMeta());
     try testing.expect(!model.agentBlocks()[1].expanded);
-    try testing.expectEqualStrings("Run shell command", model.agentBlocks()[2].activityTitle());
     const plan = model.agentPlan().?;
     try testing.expect(!plan.expanded);
-    try testing.expectEqualStrings("Plan · 1 / 2 complete", plan.activityTitle());
+    try testing.expectEqualStrings("Goal · Verify the edit · 1 / 2", plan.activityTitle());
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -634,23 +633,24 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(!containsText(tree.root, "Skill descriptions were shortened"));
     try testing.expect(!containsText(tree.root, "Model metadata for"));
     try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
-    try testing.expect(containsText(tree.root, "Edit src/lib.rs"));
-    try testing.expect(containsText(tree.root, "Run shell command"));
-    try testing.expect(containsText(tree.root, "Plan · 1 / 2 complete"));
-    try testing.expect(!findByText(tree.root, .accordion, "Edit src/lib.rs").?.state.selected);
-    try testing.expect(!findByText(tree.root, .accordion, "Plan · 1 / 2 complete").?.state.selected);
+    try testing.expect(containsText(tree.root, "Used 2 tools"));
+    try testing.expect(containsText(tree.root, "Goal · Verify the edit · 1 / 2"));
+    try testing.expect(!findByText(tree.root, .accordion, "Used 2 tools").?.state.selected);
+    try testing.expect(!findByText(tree.root, .accordion, "Goal · Verify the edit · 1 / 2").?.state.selected);
 
     main.update(&model, .{ .toggle_agent_block = plan.id }, &fx);
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(findByText(tree.root, .accordion, "Plan · 1 / 2 complete").?.state.selected);
+    try testing.expect(findByText(tree.root, .accordion, "Goal · Verify the edit · 1 / 2").?.state.selected);
 
     main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[1].id }, &fx);
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(findByText(tree.root, .accordion, "Edit src/lib.rs").?.state.selected);
+    try testing.expect(findByText(tree.root, .accordion, "Used 2 tools").?.state.selected);
+    try testing.expect(containsText(tree.root, "Edit src/lib.rs"));
+    try testing.expect(containsText(tree.root, "Run shell command"));
     try testing.expect(containsText(tree.root, "/workspace/src/lib.rs"));
     try testing.expect(containsText(tree.root, "+new"));
     try testing.expect(containsText(tree.root, "terminal-7"));

@@ -62,16 +62,12 @@
               </if>
               <else>
                 <if test="{block.isOperation}">
-                  <card>
-                    <column gap="7" padding="9">
-                      <row gap="7" cross="center">
-                        <icon name="wrench" width="13" height="13" foreground="info" />
-                        <text grow="1"><span weight="medium">{block.content}</span></text>
-                        <badge variant="secondary">{block.stateLabel}</badge>
-                      </row>
-                      <text wrap="true" foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
-                    </column>
-                  </card>
+                  <row gap="7" padding="5" cross="center">
+                    <icon name="wrench" width="13" height="13" foreground="info" />
+                    <text grow="1"><span weight="medium">{block.content}</span></text>
+                    <text foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
+                    <badge variant="secondary">{block.stateLabel}</badge>
+                  </row>
                 </if>
                 <else>
                   <card border-color="warning">
@@ -138,7 +134,7 @@
               <if test="{agent_command_picker_open}">
                 <dropdown-menu anchor="above" anchor-alignment="start" on-dismiss="dismiss_agent_command_picker" label="Agent commands">
                   <for each="agentCommands" key="index" as="command">
-                    <menu-item on-press="insert_agent_command:{command.index}">/{command.name}</menu-item>
+                    <menu-item on-press="insert_agent_command:{command.index}">{command.menuLabel}</menu-item>
                   </for>
                 </dropdown-menu>
               </if>

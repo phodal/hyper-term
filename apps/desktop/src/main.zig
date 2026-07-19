@@ -215,6 +215,15 @@ pub const AgentBlockView = struct {
     meta_len: usize = 0,
     expanded: bool = false,
     tool_status: AgentToolStatus = .pending,
+    activity_count: u16 = 0,
+    execute_count: u16 = 0,
+    read_count: u16 = 0,
+    edit_count: u16 = 0,
+    other_tool_count: u16 = 0,
+    diff_count: u16 = 0,
+    terminal_count: u16 = 0,
+    added_lines: u64 = 0,
+    removed_lines: u64 = 0,
     operation_revision: u64 = 0,
     risk: AgentRisk = .unknown,
     state: AgentOperationState = .proposed,
@@ -381,9 +390,15 @@ pub const AgentCommandView = struct {
     index: u8 = 0,
     name_storage: [max_agent_capability_id_bytes]u8 = [_]u8{0} ** max_agent_capability_id_bytes,
     name_len: usize = 0,
+    label_storage: [max_agent_capability_label_bytes]u8 = [_]u8{0} ** max_agent_capability_label_bytes,
+    label_len: usize = 0,
 
     pub fn name(entry: *const AgentCommandView) []const u8 {
         return entry.name_storage[0..entry.name_len];
+    }
+
+    pub fn menuLabel(entry: *const AgentCommandView) []const u8 {
+        return entry.label_storage[0..entry.label_len];
     }
 };
 
@@ -1333,6 +1348,7 @@ const AgentConfigOptionWire = struct {
 
 const AgentCommandWire = struct {
     name: []const u8,
+    description: ?[]const u8 = null,
 };
 
 const AgentCapabilitiesWire = struct {
@@ -1527,6 +1543,16 @@ fn projectAgentCapabilities(model: *Model, capabilities: AgentCapabilitiesWire) 
         const entry = &model.agent_commands[model.agent_command_count];
         entry.index = @intCast(model.agent_command_count);
         copyCapabilityText(&entry.name_storage, &entry.name_len, wire.name);
+        if (std.mem.eql(u8, wire.name, "skills")) {
+            copyCapabilityText(&entry.label_storage, &entry.label_len, "Skills");
+        } else {
+            copyCapabilityText(&entry.label_storage, &entry.label_len, "/");
+            appendCapabilityText(&entry.label_storage, &entry.label_len, wire.name);
+        }
+        if (wire.description) |description| {
+            appendCapabilityText(&entry.label_storage, &entry.label_len, " · ");
+            appendCapabilityText(&entry.label_storage, &entry.label_len, description);
+        }
         model.agent_command_count += 1;
     }
 }
@@ -1535,6 +1561,36 @@ fn copyCapabilityText(destination: []u8, length: *usize, value: []const u8) void
     const bounded_length = utf8BoundedLength(value, destination.len);
     @memcpy(destination[0..bounded_length], value[0..bounded_length]);
     length.* = bounded_length;
+}
+
+fn appendCapabilityText(destination: []u8, length: *usize, value: []const u8) void {
+    if (length.* >= destination.len) return;
+    const bounded_length = utf8BoundedLength(value, destination.len - length.*);
+    @memcpy(destination[length.*..][0..bounded_length], value[0..bounded_length]);
+    length.* += bounded_length;
+}
+
+const AgentProjectionGroup = enum { none, tool_calls, reasoning, single };
+
+fn agentProjectionGroup(block: AgentBlockWire) AgentProjectionGroup {
+    if (!renderableAgentBlock(block) or std.mem.eql(u8, block.kind, "agent_plan")) return .none;
+    if (std.mem.eql(u8, block.kind, "agent_tool_call")) return .tool_calls;
+    if (std.mem.eql(u8, block.kind, "message") and
+        parseAgentMessageRole(block.payload.role.?) == .thought) return .reasoning;
+    return .single;
+}
+
+fn projectedAgentBlockCount(blocks: []const AgentBlockWire) usize {
+    var count: usize = 0;
+    var previous: AgentProjectionGroup = .none;
+    for (blocks) |block| {
+        const group = agentProjectionGroup(block);
+        if (group == .none) continue;
+        const continues = group != .single and group == previous;
+        count += @intFromBool(!continues);
+        previous = if (group == .single) .none else group;
+    }
+    return count;
 }
 
 fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
@@ -1564,41 +1620,54 @@ fn projectAgentBlocks(model: *Model, blocks: []const AgentBlockWire) void {
             model.agent_plan_visible = true;
         }
     }
-    var block_total: usize = 0;
-    for (blocks) |block| {
-        if (renderableAgentBlock(block) and !std.mem.eql(u8, block.kind, "agent_plan")) block_total += 1;
-    }
+    const block_total = projectedAgentBlockCount(blocks);
     var skip = block_total -| max_agent_blocks;
     model.agent_block_index_base = @intCast(skip);
     model.agent_history_clipped = skip > 0;
+    var previous_group: AgentProjectionGroup = .none;
+    var retained_group = false;
     for (blocks, 0..) |block, block_index| {
-        if (!renderableAgentBlock(block)) continue;
-        if (std.mem.eql(u8, block.kind, "agent_plan")) continue;
-        if (skip > 0) {
-            skip -= 1;
-            continue;
+        const group = agentProjectionGroup(block);
+        if (group == .none) continue;
+        const continues = group != .single and group == previous_group;
+        if (!continues) {
+            retained_group = skip == 0;
+            if (skip > 0) skip -= 1;
         }
-        if (model.agent_block_count == max_agent_blocks) break;
-        const view = &model.agent_blocks[model.agent_block_count];
-        view.id = stableAgentBlockId(block.block_id, block_index);
+        previous_group = if (group == .single) .none else group;
+        if (!retained_group) continue;
+        if (!continues and model.agent_block_count == max_agent_blocks) break;
+        const view = if (continues)
+            &model.agent_blocks[model.agent_block_count - 1]
+        else
+            &model.agent_blocks[model.agent_block_count];
+        if (!continues) view.id = stableAgentBlockId(block.block_id, block_index);
         if (std.mem.eql(u8, block.kind, "message")) {
-            view.kind = .message;
-            view.role = parseAgentMessageRole(block.payload.role.?);
-            copyAgentBlockContent(view, visibleAgentMessageText(block.payload.text.?));
+            const role = parseAgentMessageRole(block.payload.role.?);
+            if (continues and role == .thought) {
+                appendActivitySlice(view, "\n\n");
+                appendActivitySlice(view, visibleAgentMessageText(block.payload.text.?));
+            } else {
+                view.kind = .message;
+                view.role = role;
+                copyAgentBlockContent(view, visibleAgentMessageText(block.payload.text.?));
+            }
         } else if (std.mem.eql(u8, block.kind, "operation")) {
             projectOperationBlock(view, block);
         } else if (std.mem.eql(u8, block.kind, "approval")) {
             projectApprovalBlock(view, block, blocks);
         } else if (std.mem.eql(u8, block.kind, "agent_tool_call")) {
-            projectAgentToolCall(view, block.payload.call.?);
+            appendAgentToolCall(view, block.payload.call.?);
         }
+        if (!continues) model.agent_block_count += 1;
+    }
+    for (model.agent_blocks[0..model.agent_block_count]) |*view| {
         for (previous_ids, 0..) |previous_id, previous_index| {
             if (previous_id == view.id) {
                 view.expanded = previous_expanded[previous_index];
                 break;
             }
         }
-        model.agent_block_count += 1;
     }
     model.agent_projection_session_id = model.active_session_id;
 }
@@ -1697,6 +1766,14 @@ fn copyActivityTitle(view: *AgentBlockView, value: []const u8) void {
     view.title_len = length;
 }
 
+fn appendActivityTitle(view: *AgentBlockView, value: []const u8) void {
+    if (view.title_len >= view.title_storage.len) return;
+    const available = view.title_storage.len - view.title_len;
+    const length = utf8BoundedLength(value, available);
+    @memcpy(view.title_storage[view.title_len..][0..length], value[0..length]);
+    view.title_len += length;
+}
+
 fn copyActivityMeta(view: *AgentBlockView, value: []const u8) void {
     const length = utf8BoundedLength(value, view.meta_storage.len);
     @memcpy(view.meta_storage[0..length], value[0..length]);
@@ -1719,15 +1796,33 @@ fn appendActivityFmt(view: *AgentBlockView, comptime format: []const u8, args: a
     view.content_len += rendered.len;
 }
 
-fn projectAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
-    view.kind = .tool_call;
-    copyActivityTitle(view, displayAgentToolTitle(call.kind, call.title));
-    view.tool_status = parseAgentToolStatus(call.status);
-    view.expanded = view.tool_status == .failed;
-    var added_lines: u64 = 0;
-    var removed_lines: u64 = 0;
-    var diff_count: usize = 0;
-    var terminal_count: usize = 0;
+fn appendAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
+    const call_status = parseAgentToolStatus(call.status);
+    if (view.activity_count == 0) {
+        view.kind = .tool_call;
+        view.tool_status = call_status;
+    } else {
+        view.tool_status = mergedAgentToolStatus(view.tool_status, call_status);
+        appendActivitySlice(view, "\n---\n\n");
+    }
+    view.activity_count +|= 1;
+    if (std.mem.eql(u8, call.kind, "execute")) {
+        view.execute_count +|= 1;
+    } else if (std.mem.eql(u8, call.kind, "edit")) {
+        view.edit_count +|= 1;
+    } else if (std.mem.eql(u8, call.kind, "read") or
+        std.mem.eql(u8, call.kind, "search") or
+        std.mem.eql(u8, call.kind, "fetch"))
+    {
+        view.read_count +|= 1;
+    } else {
+        view.other_tool_count +|= 1;
+    }
+    appendActivityFmt(
+        view,
+        "**{s}** · _{s}_\n\n",
+        .{ displayAgentToolTitle(call.kind, call.title), agentToolStatusLabel(call_status) },
+    );
     for (call.locations) |location| {
         if (location.line) |line| {
             appendActivityFmt(view, "- `{s}:{d}`\n", .{ location.path, line });
@@ -1743,14 +1838,14 @@ fn projectAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
         } else if (std.mem.eql(u8, content.type, "diff") and
             content.path != null and content.patch != null)
         {
-            diff_count += 1;
-            added_lines += content.added_lines orelse 0;
-            removed_lines += content.removed_lines orelse 0;
+            view.diff_count +|= 1;
+            view.added_lines +|= content.added_lines orelse 0;
+            view.removed_lines +|= content.removed_lines orelse 0;
             appendActivityFmt(view, "**{s}**\n\n```diff\n", .{content.path.?});
             appendActivitySlice(view, content.patch.?);
             appendActivitySlice(view, "\n```\n\n");
         } else if (std.mem.eql(u8, content.type, "terminal") and content.terminal_id != null) {
-            terminal_count += 1;
+            view.terminal_count +|= 1;
             appendActivityFmt(view, "**Terminal** `{s}`\n\n", .{content.terminal_id.?});
         } else if (std.mem.eql(u8, content.type, "media")) {
             appendActivityFmt(
@@ -1776,14 +1871,48 @@ fn projectAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
         appendActivitySlice(view, raw);
         appendActivitySlice(view, "\n```\n");
     }
+    updateAgentToolSummary(view, call);
+    if (view.tool_status == .failed) view.expanded = true;
+}
+
+fn mergedAgentToolStatus(left: AgentToolStatus, right: AgentToolStatus) AgentToolStatus {
+    if (left == .failed or right == .failed) return .failed;
+    if (left == .in_progress or right == .in_progress) return .in_progress;
+    if (left == .pending or right == .pending) return .pending;
+    return .completed;
+}
+
+fn updateAgentToolSummary(view: *AgentBlockView, last_call: AgentToolCallWire) void {
+    var title: [max_agent_activity_title_bytes]u8 = undefined;
+    const rendered_title = if (view.activity_count == 1)
+        displayAgentToolTitle(last_call.kind, last_call.title)
+    else if (view.other_tool_count == 0 and view.edit_count == 0 and view.execute_count > 0)
+        if (view.read_count > 0)
+            std.fmt.bufPrint(&title, "Read files and ran {d} command{s}", .{ view.execute_count, if (view.execute_count == 1) "" else "s" }) catch "Used tools"
+        else
+            std.fmt.bufPrint(&title, "Ran {d} commands", .{view.execute_count}) catch "Used tools"
+    else if (view.other_tool_count == 0 and view.execute_count == 0 and view.read_count == 0 and view.edit_count > 0)
+        std.fmt.bufPrint(&title, "Made {d} edits", .{view.edit_count}) catch "Used tools"
+    else if (view.other_tool_count == 0 and view.execute_count == 0 and view.edit_count == 0 and view.read_count > 0)
+        std.fmt.bufPrint(&title, "Read files with {d} tools", .{view.read_count}) catch "Used tools"
+    else
+        std.fmt.bufPrint(&title, "Used {d} tools", .{view.activity_count}) catch "Used tools";
+    copyActivityTitle(view, rendered_title);
+
     var meta: [max_agent_activity_meta_bytes]u8 = undefined;
     const status = agentToolStatusLabel(view.tool_status);
-    const rendered = if (diff_count > 0)
-        std.fmt.bufPrint(&meta, "{s} · {d} file{s} · +{d} −{d}", .{ status, diff_count, if (diff_count == 1) "" else "s", added_lines, removed_lines }) catch status
-    else if (terminal_count > 0)
-        std.fmt.bufPrint(&meta, "{s} · {d} terminal{s}", .{ status, terminal_count, if (terminal_count == 1) "" else "s" }) catch status
+    const rendered = if (view.activity_count == 1 and view.diff_count > 0)
+        std.fmt.bufPrint(&meta, "{s} · {d} file{s} · +{d} −{d}", .{ status, view.diff_count, if (view.diff_count == 1) "" else "s", view.added_lines, view.removed_lines }) catch status
+    else if (view.activity_count == 1 and view.terminal_count > 0)
+        std.fmt.bufPrint(&meta, "{s} · {d} terminal{s}", .{ status, view.terminal_count, if (view.terminal_count == 1) "" else "s" }) catch status
+    else if (view.activity_count == 1)
+        std.fmt.bufPrint(&meta, "{s} · {s}", .{ status, last_call.kind }) catch status
+    else if (view.diff_count > 0)
+        std.fmt.bufPrint(&meta, "{s} · {d} tool{s} · {d} file{s} · +{d} −{d}", .{ status, view.activity_count, if (view.activity_count == 1) "" else "s", view.diff_count, if (view.diff_count == 1) "" else "s", view.added_lines, view.removed_lines }) catch status
+    else if (view.terminal_count > 0)
+        std.fmt.bufPrint(&meta, "{s} · {d} tool{s} · {d} terminal{s}", .{ status, view.activity_count, if (view.activity_count == 1) "" else "s", view.terminal_count, if (view.terminal_count == 1) "" else "s" }) catch status
     else
-        std.fmt.bufPrint(&meta, "{s} · {s}", .{ status, call.kind }) catch status;
+        std.fmt.bufPrint(&meta, "{s} · {d} tool{s}", .{ status, view.activity_count, if (view.activity_count == 1) "" else "s" }) catch status;
     copyActivityMeta(view, rendered);
 }
 
@@ -1797,17 +1926,33 @@ fn displayAgentToolTitle(kind: []const u8, title: []const u8) []const u8 {
 fn projectAgentPlan(view: *AgentBlockView, entries: []const AgentPlanEntryWire) void {
     view.kind = .plan;
     var completed: usize = 0;
+    var current_step: ?[]const u8 = null;
     for (entries) |entry| {
         const marker: []const u8 = if (std.mem.eql(u8, entry.status, "completed")) "x" else " ";
         completed += @intFromBool(std.mem.eql(u8, entry.status, "completed"));
+        if (current_step == null and !std.mem.eql(u8, entry.status, "completed")) {
+            current_step = entry.content;
+        }
         appendActivityFmt(view, "- [{s}] {s} _{s}_\n", .{ marker, entry.content, entry.priority });
     }
     var meta: [max_agent_activity_meta_bytes]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&meta, "{d} / {d} complete", .{ completed, entries.len }) catch "Plan";
+    const rendered = std.fmt.bufPrint(&meta, "{d} / {d} steps complete", .{ completed, entries.len }) catch "Goal";
     copyActivityMeta(view, rendered);
-    var title: [max_agent_activity_title_bytes]u8 = undefined;
-    const title_rendered = std.fmt.bufPrint(&title, "Plan · {s}", .{rendered}) catch "Plan";
-    copyActivityTitle(view, title_rendered);
+    if (completed == entries.len) {
+        var title: [max_agent_activity_title_bytes]u8 = undefined;
+        const title_rendered = std.fmt.bufPrint(&title, "Goal complete · {d} / {d}", .{ completed, entries.len }) catch "Goal complete";
+        copyActivityTitle(view, title_rendered);
+    } else {
+        copyActivityTitle(view, "Goal · ");
+        var suffix_storage: [64]u8 = undefined;
+        const suffix = std.fmt.bufPrint(&suffix_storage, " · {d} / {d}", .{ completed, entries.len }) catch "";
+        const available = view.title_storage.len - view.title_len;
+        const step_capacity = available -| suffix.len;
+        const step = current_step orelse entries[0].content;
+        const step_length = utf8BoundedLength(step, step_capacity);
+        appendActivityTitle(view, step[0..step_length]);
+        appendActivityTitle(view, suffix);
+    }
     view.expanded = false;
 }
 
@@ -2218,7 +2363,7 @@ fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 
     return switch (block.kind) {
         .message => if (block.role == .user) 28 + text_extent else 14 + text_extent,
         .tool_call, .plan => if (block.expanded) 48 + text_extent else 34,
-        .operation => 78 + @min(text_extent, agent_timeline_line_height * 3),
+        .operation => 36 + @min(text_extent, agent_timeline_line_height),
         .approval => 210 + @min(text_extent, agent_timeline_line_height * 8),
     };
 }
@@ -2335,15 +2480,11 @@ fn agentActivityNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi
 }
 
 fn agentOperationNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
-    return ui.el(.card, .{}, .{
-        ui.column(.{ .gap = 7, .padding = 9 }, .{
-            ui.row(.{ .gap = 7, .cross = .center }, .{
-                ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .info } }, "wrench"),
-                ui.text(.{ .grow = 1, .wrap = true }, block.content()),
-                ui.el(.badge, .{ .text = block.stateLabel(), .variant = .secondary }, .{}),
-            }),
-            ui.text(.{ .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
-        }),
+    return ui.row(.{ .gap = 7, .padding = 5, .cross = .center }, .{
+        ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .info } }, "wrench"),
+        ui.text(.{ .grow = 1, .wrap = true }, block.content()),
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
+        ui.el(.badge, .{ .text = block.stateLabel(), .variant = .secondary }, .{}),
     });
 }
 
