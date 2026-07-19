@@ -14,9 +14,12 @@ executors and projections of one durable human–AI task model.
 > prompt gates, a brokered MCP gateway, and a terminal-first React Workbench
 > built directly by pinned Deno. The packaged Native SDK application now carries
 > a digest-checked Deno GenUI compiler and frozen official Codex/Claude ACP
-> adapters without bundling Node. Broker-accepted artifacts are persisted
-> by Rust, projected as isolated Blocks, and served to a bounded Native WebView
-> pane without replacing the last-known-good revision on failure. Every newly
+> adapters without bundling Node. Broker-accepted artifacts are persisted by
+> Rust and projected as isolated Blocks without replacing the last-known-good
+> revision on failure. Agent tabs remain a single conversation surface by
+> default; only an ACP session with a current editable artifact mounts the
+> authenticated Deno-built Workbench as a right-hand Native WebView pane. Every
+> newly
 > accepted artifact retains its exact bounded virtual TS/JS source tree in the
 > private Rust store and exposes it only through the authenticated,
 > task-current Agent source endpoint, establishing the authority path for the
@@ -289,6 +292,15 @@ exact compiler input snapshot and expose it as bounded JSON at
 `/agent/artifact/:id/source`; the token, session, task, and current-artifact
 checks are identical to the preview boundary. Older artifacts remain readable
 for preview but honestly report source as unavailable.
+
+The Native host does not reserve a permanent right sidebar. Ordinary Terminal
+tabs and Agent conversations use the full window. A right-hand editor appears
+only while a Codex ACP, Claude ACP, or Copilot ACP session owns a current
+artifact. Its HTML/JS/WASM assets are served by the authenticated loopback Agent
+gateway, and its source fetch is still fenced by token, session, task, and
+current artifact. CodeMirror edits, Diff, Time Travel, and the local preview are
+draft-only today; applying a workspace transaction remains unavailable until
+the Rust permission-broker path is implemented.
 
 The Rust `hyper-term-drivers` crate launches the same pinned Deno executable
 with a cleared environment, dedicated cache and scratch roots, bounded framing,

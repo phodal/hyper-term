@@ -137,6 +137,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Upload verified artifact Workbench
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: artifact-workbench
+          path: dist/workbench
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload verified GenUI runtime assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -216,6 +224,12 @@ jobs:
           name: terminal-renderer
           path: dist/terminal
 
+      - name: Download verified artifact Workbench
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: artifact-workbench
+          path: dist/workbench
+
       - name: Download verified GenUI runtime assets
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -260,6 +274,7 @@ jobs:
             "target/$RUST_TARGET/release/hyper-term-desktop" \
             "target/$RUST_TARGET/release/hyper-term-mcp" \
             dist/terminal \
+            dist/workbench \
             "$(command -v deno)" \
             dist/runtime
           "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term" --help \
@@ -267,6 +282,8 @@ jobs:
           "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term-mcp" --help \
             | grep -F "Hyper Term brokered MCP connector"
           test -x "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/deno"
+          test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/workbench/index.html"
+          test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/workbench/esbuild.wasm"
           test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/genui-compiler.js"
           test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/genui/preview.html"
           test -f "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/esbuild.wasm"

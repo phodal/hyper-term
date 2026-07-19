@@ -9,7 +9,7 @@ import {
 import { CodeDiff } from "./code-diff.tsx";
 import { CodeEditor } from "./code-editor.tsx";
 
-const originalSource = `import React from "react";
+const sampleOriginalSource = `import React from "react";
 
 export default function AgentStatus() {
   return (
@@ -20,7 +20,7 @@ export default function AgentStatus() {
 }
 `;
 
-const initialSource = `import React from "react";
+const sampleInitialSource = `import React from "react";
 
 export default function AgentStatus() {
   const [expanded, setExpanded] = React.useState(false);
@@ -64,7 +64,21 @@ interface TraceEntry {
   state: "working" | "accepted" | "failed";
 }
 
-export function GenUiStudio({ host }: { host: HyperTermHost }) {
+export interface GenUiStudioProps {
+  host: HyperTermHost;
+  initialSource?: string;
+  baselineSource?: string;
+  initialRevision?: number;
+  heading?: string;
+}
+
+export function GenUiStudio({
+  host,
+  initialSource = sampleInitialSource,
+  baselineSource = sampleOriginalSource,
+  initialRevision = 0,
+  heading = "Live artifact",
+}: GenUiStudioProps) {
   const [source, setSource] = useState(initialSource);
   const [view, setView] = useState<StudioView>("code");
   const [status, setStatus] = useState("Compiler starting");
@@ -80,7 +94,7 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
   const compiler = useRef<GenUiCompiler | null>(null);
   const previewFrame = useRef<HTMLIFrameElement | null>(null);
   const previewChannel = useRef(crypto.randomUUID()).current;
-  const revision = useRef(0);
+  const revision = useRef(initialRevision);
   const previewUrl = new URL("./genui/preview.html", document.baseURI);
   previewUrl.hash = previewChannel;
 
@@ -222,7 +236,7 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
       <header className="studio-header">
         <div>
           <span className="eyebrow">Agentic UI Studio</span>
-          <h2>Live artifact</h2>
+          <h2>{heading}</h2>
         </div>
         <span className={`compiler-status ${error ? "has-error" : ""}`}>
           <span /> {status}
@@ -257,7 +271,7 @@ export function GenUiStudio({ host }: { host: HyperTermHost }) {
         )}
         {view === "diff" && (
           <CodeDiff
-            original={originalSource}
+            original={baselineSource}
             modified={source}
             onChange={setSource}
           />

@@ -6,6 +6,12 @@ Terminal. `New` creates another ordinary Terminal tab, while the adjacent
 own close control and context-menu action; Command-W closes the active tab
 through the same Rust-owned session lifecycle.
 
+Agent tabs are single-pane by default, matching the disclosure behavior of a
+modern coding-agent client rather than reserving a permanent sidebar. A right
+editor pane is mounted only when an ACP-backed Agent has a current editable
+artifact. That pane is the packaged Deno-built Workbench; CodeMirror, Diff, Time
+Travel, and its isolated local preview have no workspace-write authority.
+
 The native chrome, design tokens, mode selection, responsive layout, and Agent
 Block composition remain native. The terminal cell renderer is currently a child
 system WebView anchored into that layout. It connects directly to the
@@ -17,10 +23,12 @@ then let the Rust desktop supervisor own daemon and renderer lifetime:
 
 ```sh
 deno task build:terminal
+deno task build:workbench
 (cd apps/desktop && native build --release=fast)
 cargo run -p hyper-term-daemon --bin hyper-term-desktop -- \
   --ui "$PWD/apps/desktop/zig-out/bin/hyper-term" \
-  --terminal-assets "$PWD/dist/terminal"
+  --terminal-assets "$PWD/dist/terminal" \
+  --workbench-assets "$PWD/dist/workbench"
 ```
 
 The supervisor creates a per-launch gateway token, starts new login shells in
@@ -39,7 +47,8 @@ open "dist/macos/Hyper Term.app"
 The package keeps `hyper-term` as the Rust-owned bundle entry point and installs
 the Native SDK executable as `hyper-term-ui`. Terminal assets are copied into
 `Contents/Resources/terminal`; no development server or global Node runtime is
-required at launch.
+required at launch. The trusted editor assets are packaged separately under
+`Contents/Resources/workbench` and served only by the Rust Agent gateway.
 
 ## Commands
 

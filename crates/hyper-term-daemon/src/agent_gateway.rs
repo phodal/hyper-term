@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,7 +40,10 @@ const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_AGENT_MESSAGE_BYTES: usize = 256 * 1024;
 const AGENT_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
 const PREVIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const WORKBENCH_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; frame-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const WORKBENCH_PREVIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 const MAX_PREVIEW_SHELL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_WORKBENCH_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const ARTIFACT_BOOTSTRAP_MARKER: &str = "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->";
 
 #[derive(Clone)]
@@ -55,6 +58,7 @@ pub struct AgentGatewayConfig {
     pub acp_providers: Vec<AcpAgentProviderConfig>,
     pub mcp_executable: Option<PathBuf>,
     pub genui_runtime: Option<AgentGenUiRuntimeConfig>,
+    pub workbench_assets: Option<PathBuf>,
     pub control_socket: PathBuf,
 }
 
@@ -122,6 +126,8 @@ pub enum AgentGatewayError {
     InvalidStateDirectory(PathBuf),
     #[error("agent gateway GenUI runtime is invalid: {0}")]
     InvalidGenUiRuntime(String),
+    #[error("agent gateway Workbench assets are invalid: {0}")]
+    InvalidWorkbenchAssets(PathBuf),
     #[error("agent gateway ACP provider is invalid: {0}")]
     InvalidAcpProvider(String),
     #[error("agent gateway I/O failed: {0}")]
@@ -135,6 +141,7 @@ struct AgentGatewayRuntime {
     config: Arc<AgentGatewayConfig>,
     sessions: Arc<Mutex<HashMap<u16, Arc<AgentSession>>>>,
     preview_shell: Option<Arc<str>>,
+    workbench_assets: Option<Arc<PathBuf>>,
 }
 
 struct AgentSession {
@@ -287,6 +294,19 @@ pub async fn spawn_agent_gateway(
         .map(|runtime| read_preview_shell(&runtime.preview_shell))
         .transpose()?
         .map(Arc::<str>::from);
+    let workbench_assets = config
+        .workbench_assets
+        .take()
+        .map(|assets| {
+            let canonical = assets
+                .canonicalize()
+                .map_err(|_| AgentGatewayError::InvalidWorkbenchAssets(assets.clone()))?;
+            if !canonical.is_dir() || !canonical.join("index.html").is_file() {
+                return Err(AgentGatewayError::InvalidWorkbenchAssets(canonical));
+            }
+            Ok(Arc::new(canonical))
+        })
+        .transpose()?;
 
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
@@ -294,6 +314,7 @@ pub async fn spawn_agent_gateway(
         config: Arc::new(config),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         preview_shell,
+        workbench_assets,
     };
     let router = Router::new()
         .route(
@@ -313,6 +334,9 @@ pub async fn spawn_agent_gateway(
             get(artifact_source_map),
         )
         .route("/agent/artifact/{artifact_id}/source", get(artifact_source))
+        .route("/agent/workbench", get(workbench_index))
+        .route("/agent/workbench/", get(workbench_index))
+        .route("/agent/workbench/{*path}", get(workbench_asset))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_PROMPT_BYTES))
         .with_state(runtime.clone());
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -329,6 +353,73 @@ pub async fn spawn_agent_gateway(
         task: Some(task),
         runtime,
     })
+}
+
+async fn workbench_index(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    if runtime.session(session_id).is_err() {
+        return status_response(StatusCode::NOT_FOUND, "Agent session does not exist");
+    }
+    serve_workbench_asset(&runtime, Path::new("index.html")).await
+}
+
+async fn workbench_asset(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(path): RoutePath<String>,
+) -> Response {
+    if path.contains('%') {
+        return status_response(StatusCode::BAD_REQUEST, "Workbench asset path is invalid");
+    }
+    let relative = Path::new(&path);
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return status_response(StatusCode::BAD_REQUEST, "Workbench asset path is invalid");
+    }
+    serve_workbench_asset(&runtime, relative).await
+}
+
+async fn serve_workbench_asset(runtime: &AgentGatewayRuntime, relative: &Path) -> Response {
+    let Some(root) = runtime.workbench_assets.as_ref() else {
+        return status_response(StatusCode::NOT_FOUND, "Workbench is unavailable");
+    };
+    let candidate = root.join(relative);
+    let Ok(candidate) = candidate.canonicalize() else {
+        return status_response(StatusCode::NOT_FOUND, "Workbench asset was not found");
+    };
+    let Ok(metadata) = std::fs::metadata(&candidate) else {
+        return status_response(StatusCode::NOT_FOUND, "Workbench asset was not found");
+    };
+    if !candidate.starts_with(root.as_ref())
+        || !metadata.is_file()
+        || metadata.len() > MAX_WORKBENCH_ASSET_BYTES
+    {
+        return status_response(StatusCode::NOT_FOUND, "Workbench asset was not found");
+    }
+    let Ok(bytes) = tokio::fs::read(&candidate).await else {
+        return status_response(StatusCode::NOT_FOUND, "Workbench asset was not found");
+    };
+    let content_type = match candidate.extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json" | "map") => "application/json; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
+    };
+    let csp = if relative == Path::new("genui/preview.html") {
+        WORKBENCH_PREVIEW_CSP
+    } else {
+        WORKBENCH_CSP
+    };
+    secure_response_with_csp(StatusCode::OK, content_type, Body::from(bytes), csp)
 }
 
 async fn start_session(
@@ -1505,6 +1596,7 @@ mod tests {
             acp_providers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
+            workbench_assets: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -1593,6 +1685,7 @@ mod tests {
             }],
             mcp_executable: None,
             genui_runtime: None,
+            workbench_assets: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -1683,6 +1776,23 @@ mod tests {
             ),
         )
         .unwrap();
+        let workbench_assets = temporary.path().join("workbench");
+        std::fs::create_dir_all(workbench_assets.join("genui")).unwrap();
+        std::fs::write(
+            workbench_assets.join("index.html"),
+            "<html><body>trusted-workbench<script src=\"index.js\"></script></body></html>",
+        )
+        .unwrap();
+        std::fs::write(
+            workbench_assets.join("index.js"),
+            "globalThis.workbench=true;",
+        )
+        .unwrap();
+        std::fs::write(
+            workbench_assets.join("genui/preview.html"),
+            "<html><script>globalThis.preview=true;</script></html>",
+        )
+        .unwrap();
 
         let token = "0123456789abcdef0123456789abcdef".to_owned();
         let gateway = spawn_agent_gateway(AgentGatewayConfig {
@@ -1703,6 +1813,7 @@ mod tests {
                 preview_shell,
                 compiler_version: "0.28.1".into(),
             }),
+            workbench_assets: Some(workbench_assets),
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -1712,6 +1823,52 @@ mod tests {
         assert_eq!(status, StatusCode::OK.as_u16());
         let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let task_id: TaskId = serde_json::from_value(response["task_id"].clone()).unwrap();
+        let workbench_path =
+            format!("/agent/workbench/?token={token}&session_id=6&surface=artifact");
+        let (status, headers, body) =
+            request_path_raw(gateway.address(), &workbench_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+        assert!(headers.contains("content-type: text/html"));
+        assert!(headers.contains("connect-src 'self'"));
+        assert!(headers.contains("'wasm-unsafe-eval'"));
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("trusted-workbench")
+        );
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                "/agent/workbench?token=wrong&session_id=6",
+                "GET",
+                b"",
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        let (status, headers, body) =
+            request_path_raw(gateway.address(), "/agent/workbench/index.js", "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert!(
+            String::from_utf8(headers)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("content-type: text/javascript")
+        );
+        assert_eq!(body, b"globalThis.workbench=true;");
+        let (status, headers, _) = request_path_raw(
+            gateway.address(),
+            "/agent/workbench/genui/preview.html",
+            "GET",
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+        assert!(headers.contains("frame-ancestors 'self'"));
+        assert!(headers.contains("connect-src 'none'"));
         let proposed = daemon
             .propose_operation(
                 task_id,
@@ -1867,6 +2024,7 @@ mod tests {
             acp_providers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
+            workbench_assets: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -2012,6 +2170,7 @@ mod tests {
             acp_providers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
+            workbench_assets: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -2128,10 +2287,12 @@ mod tests {
                     preview_shell: preview,
                     compiler_version: "0.28.1".into(),
                 }),
+                workbench_assets: None,
                 control_socket: temporary.path().join("hyperd.sock"),
             }),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             preview_shell: None,
+            workbench_assets: None,
         };
         let session_root = state_directory.join("agents/session-7");
         let config = runtime

@@ -54,6 +54,7 @@ fn run() -> Result<i32, String> {
             "Hyper Term desktop host\n\nUsage: hyper-term-desktop [OPTIONS]\n\n\
              Options:\n  --ui PATH                 Native renderer executable\n  \
              --terminal-assets PATH    Built terminal renderer directory\n  \
+             --workbench-assets PATH   Built trusted artifact Workbench directory\n+  \
              --state-dir PATH          Durable Hyper Term state\n  \
              --shell-cwd PATH          Initial directory for new shells\n  \
              --codex PATH              Codex executable for Agent sessions\n  \
@@ -150,6 +151,7 @@ fn run() -> Result<i32, String> {
                     preview_shell: runtime.preview_shell.clone(),
                     compiler_version: "0.28.1".into(),
                 }),
+            workbench_assets: resolved.workbench_assets.clone(),
             control_socket,
         })
         .await
@@ -212,6 +214,7 @@ async fn wait_for_renderer(renderer: &mut std::process::Child) -> Result<ExitSta
 struct Options {
     ui: Option<PathBuf>,
     terminal_assets: Option<PathBuf>,
+    workbench_assets: Option<PathBuf>,
     state_directory: Option<PathBuf>,
     shell_cwd: Option<PathBuf>,
     codex: Option<PathBuf>,
@@ -237,6 +240,10 @@ impl Options {
                 Some("--terminal-assets") => {
                     options.terminal_assets =
                         Some(required_path(&mut arguments, "--terminal-assets")?);
+                }
+                Some("--workbench-assets") => {
+                    options.workbench_assets =
+                        Some(required_path(&mut arguments, "--workbench-assets")?);
                 }
                 Some("--state-dir") => {
                     options.state_directory = Some(required_path(&mut arguments, "--state-dir")?);
@@ -287,6 +294,13 @@ impl Options {
             .and_then(Path::parent)
             .ok_or_else(|| "desktop executable is not inside a macOS bundle layout".to_owned())?;
         let runtime_resources = contents.join("Resources/runtime");
+        let explicit_workbench = self.workbench_assets.is_some();
+        let workbench_candidate = self
+            .workbench_assets
+            .unwrap_or_else(|| contents.join("Resources/workbench"));
+        let workbench_assets = (explicit_workbench
+            || workbench_candidate.join("index.html").is_file())
+        .then_some(workbench_candidate);
         let explicit_runtime = self.deno_runtime.is_some()
             || self.genui_script.is_some()
             || self.genui_wasm.is_some()
@@ -361,6 +375,7 @@ impl Options {
             terminal_assets: self
                 .terminal_assets
                 .unwrap_or_else(|| contents.join("Resources/terminal")),
+            workbench_assets,
             state_directory: self
                 .state_directory
                 .unwrap_or_else(|| default_state_directory(home)),
@@ -387,6 +402,7 @@ impl Options {
 struct ResolvedOptions {
     ui: PathBuf,
     terminal_assets: PathBuf,
+    workbench_assets: Option<PathBuf>,
     state_directory: PathBuf,
     shell_cwd: PathBuf,
     codex: Option<PathBuf>,
@@ -479,6 +495,14 @@ impl ResolvedOptions {
             return Err(format!(
                 "terminal assets are missing index.html: {}",
                 self.terminal_assets.display()
+            ));
+        }
+        if let Some(workbench) = &self.workbench_assets
+            && (!workbench.is_absolute() || !workbench.join("index.html").is_file())
+        {
+            return Err(format!(
+                "Workbench assets are missing index.html: {}",
+                workbench.display()
             ));
         }
         if !self.shell_cwd.is_absolute() || !self.shell_cwd.is_dir() {
@@ -1120,6 +1144,7 @@ mod tests {
             options.terminal_assets,
             Path::new("/Applications/Hyper Term.app/Contents/Resources/terminal")
         );
+        assert_eq!(options.workbench_assets, None);
         assert_eq!(options.shell_cwd, Path::new("/Users/example"));
     }
 
@@ -1130,6 +1155,8 @@ mod tests {
             "/tmp/hyper-term-ui".into(),
             "--terminal-assets".into(),
             "/tmp/terminal".into(),
+            "--workbench-assets".into(),
+            "/tmp/workbench".into(),
             "--state-dir".into(),
             "/tmp/state".into(),
             "--shell-cwd".into(),
@@ -1160,6 +1187,10 @@ mod tests {
         assert_eq!(
             options.terminal_assets,
             Some(PathBuf::from("/tmp/terminal"))
+        );
+        assert_eq!(
+            options.workbench_assets,
+            Some(PathBuf::from("/tmp/workbench"))
         );
         assert_eq!(options.state_directory, Some(PathBuf::from("/tmp/state")));
         assert_eq!(options.shell_cwd, Some(PathBuf::from("/tmp")));
@@ -1229,6 +1260,7 @@ mod tests {
         let resolved = ResolvedOptions {
             ui: "/tmp/ui".into(),
             terminal_assets: "/tmp/terminal".into(),
+            workbench_assets: None,
             state_directory: "/tmp/state".into(),
             shell_cwd: "/tmp".into(),
             codex: Some(codex.clone()),

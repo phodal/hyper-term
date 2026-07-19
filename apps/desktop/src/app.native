@@ -1,5 +1,151 @@
 <!-- Hyper Term product shell. This native view is trusted application code.
      Agent-authored content enters later as versioned Block data, never markup. -->
+<template name="agent-thread">
+  <column min-width="400" grow="1" background="surface" label="Agent conversation">
+    <row gap="8" padding="10" cross="center">
+      <icon name="circle-dot" width="14" height="14" foreground="accent" />
+      <text grow="1"><span weight="medium">Agent</span></text>
+      <badge variant="secondary">{activeAgentProviderLabel}</badge>
+      <badge variant="secondary">{agentConnectionLabel}</badge>
+    </row>
+    <separator />
+    <scroll grow="1" label="Agent blocks">
+      <column gap="12" padding="12">
+        <if test="{hasAgentBlocks}">
+          <for each="agentBlocks" key="id" as="block">
+            <if test="{block.isMessage}">
+              <if test="{block.isUserMessage}">
+                <row>
+                  <spacer grow="1" />
+                  <bubble>
+                    <column gap="5" padding="10">
+                      <text foreground="text_muted">{block.roleLabel}</text>
+                      <text wrap="true">{block.content}</text>
+                      <if test="{block.truncated}">
+                        <text foreground="warning">Block clipped to 8 KiB in this view.</text>
+                      </if>
+                    </column>
+                  </bubble>
+                </row>
+              </if>
+              <else>
+                <card>
+                  <column gap="7" padding="11">
+                    <row gap="7" cross="center">
+                      <icon name="circle-dot" width="13" height="13" foreground="accent" />
+                      <text foreground="text_muted">{block.roleLabel}</text>
+                    </row>
+                    <markdown source="{block.content}" />
+                    <if test="{block.truncated}">
+                      <text foreground="warning">Block clipped to 8 KiB in this view.</text>
+                    </if>
+                  </column>
+                </card>
+              </else>
+            </if>
+            <else>
+              <if test="{block.isOperation}">
+                <card>
+                  <column gap="8" padding="11">
+                    <row gap="7" cross="center">
+                      <icon name="wrench" width="14" height="14" foreground="info" />
+                      <text grow="1"><span weight="medium">Operation</span></text>
+                    </row>
+                    <text wrap="true" foreground="text_muted">{block.operationKindLabel} · {block.stateLabel} · {block.riskLabel}</text>
+                    <text wrap="true">{block.content}</text>
+                    <text foreground="text_muted"><span mono="true">{block.operationId}</span></text>
+                  </column>
+                </card>
+              </if>
+              <else>
+                <card border-color="warning">
+                  <column gap="9" padding="11">
+                    <row gap="7" cross="center">
+                      <icon name="alert" width="14" height="14" foreground="warning" />
+                      <text grow="1"><span weight="medium">{block.approvalTitle}</span></text>
+                    </row>
+                    <text wrap="true" foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
+                    <text wrap="true">{block.content}</text>
+                    <text foreground="text_muted"><span mono="true">{block.operationId}</span></text>
+                    <text foreground="text_muted">revision {block.operation_revision}</text>
+                    <if test="{block.isApprovalPending}">
+                      <if test="{block.canAllowOnce}">
+                        <alert text="Brokered MCP tool">
+                          <column gap="7" padding="9">
+                            <text wrap="true">This read-only tool runs through the Rust permission broker and records a receipt.</text>
+                            <column gap="7">
+                              <button size="sm" variant="primary" on-press="allow_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Allow once</button>
+                              <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
+                              <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel request</button>
+                            </column>
+                          </column>
+                        </alert>
+                      </if>
+                      <else>
+                        <alert text="Proposal-only safety gate">
+                          <column gap="7" padding="9">
+                            <text wrap="true">Allow is unavailable until the Rust sandbox can enforce this exact effect.</text>
+                            <column gap="7">
+                              <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
+                              <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel request</button>
+                            </column>
+                          </column>
+                        </alert>
+                      </else>
+                    </if>
+                    <else>
+                      <text foreground="text_muted">Decision: {block.decisionLabel}</text>
+                    </else>
+                  </column>
+                </card>
+              </else>
+            </else>
+          </for>
+          <if test="{agent_history_clipped}">
+            <text foreground="text_muted">Showing the latest 16 Agent blocks.</text>
+          </if>
+        </if>
+        <else>
+          <card>
+            <column gap="8" padding="12">
+              <row gap="8" cross="center">
+                <icon name="info" width="14" height="14" foreground="info" />
+                <text><span weight="medium">Ask an Agent</span></text>
+              </row>
+              <text wrap="true" foreground="text_muted">This Agent tab keeps prompts, streaming responses, plans, and future approvals in the Rust-owned BlockDocument.</text>
+            </column>
+          </card>
+        </else>
+      </column>
+    </scroll>
+    <separator />
+    <column padding="10">
+      <input-group label="Agent prompt composer" height="112">
+        <textarea text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerDisabled}" label="Agent prompt" />
+        <input-group-actions>
+          <text foreground="text_muted">Command Enter to send</text>
+          <spacer grow="1" />
+          <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentComposerDisabled}" label="Send prompt"></button>
+        </input-group-actions>
+      </input-group>
+    </column>
+    <status-bar>{agentStatus}</status-bar>
+  </column>
+</template>
+
+<template name="agent-editor">
+  <column min-width="360" grow="1" background="background" label="ACP artifact editor">
+    <row gap="8" padding="9" cross="center" background="surface_subtle">
+      <icon name="edit" width="13" height="13" foreground="accent" />
+      <text grow="1"><span weight="medium">Edit</span></text>
+      <text foreground="text_muted"><span mono="true">{genUiArtifactLabel}</span></text>
+      <badge variant="secondary">draft</badge>
+    </row>
+    <separator />
+    <column grow="1" background="background" label="Agent artifact editor viewport"></column>
+  </column>
+</template>
+
 <column background="background">
   <row gap="8" padding="8" height="{titlebar_height}" cross="center" background="surface" window-drag="true" label="Session bar">
     <spacer width="{chrome_leading}" />
@@ -66,170 +212,14 @@
     </column>
   </if>
   <else>
-    <split value="{agent_split}" on-resize="agent_split_resized" resize-duration="120" resize-easing="standard" grow="1">
-      <column min-width="400" background="background" label="Agent terminal">
-        <row gap="8" padding="8" cross="center" background="surface_subtle">
-          <badge variant="secondary">zsh</badge>
-          <text grow="1" foreground="text_muted">Terminal</text>
-          <badge variant="secondary">{terminalConnectionLabel}</badge>
-        </row>
-        <column grow="1" background="background" label="Terminal viewport">
-          <if test="{terminalDisconnected}">
-            <column gap="5" padding="16">
-              <text><span mono="true" foreground="accent">phodal@mac</span> <span mono="true" foreground="text_muted">~/ai/hyper-term</span> <span mono="true">% codex</span></text>
-              <text foreground="text_muted"><span mono="true">Waiting for the brokered Rust PTY stream…</span></text>
-              <text><span mono="true" foreground="accent">_</span></text>
-            </column>
-          </if>
-        </column>
-        <status-bar>terminal plane · ordered · reconnectable</status-bar>
-      </column>
-
-      <column min-width="300" background="surface" label="Agent workspace">
-        <row gap="8" padding="10" cross="center">
-          <icon name="circle-dot" width="14" height="14" foreground="accent" />
-          <text grow="1"><span weight="medium">Agent</span></text>
-          <badge variant="secondary">{activeAgentProviderLabel}</badge>
-          <badge variant="secondary">{agentConnectionLabel}</badge>
-        </row>
-        <separator />
-        <if test="{hasGenUiArtifact}">
-          <column height="236" background="background" label="Agentic UI preview">
-            <row gap="8" padding="8" cross="center" background="surface_subtle">
-              <icon name="eye" width="13" height="13" foreground="accent" />
-              <text grow="1"><span weight="medium">Agentic UI</span></text>
-              <badge variant="secondary">{genUiStatus}</badge>
-            </row>
-            <column grow="1" background="background" label="Agentic UI preview viewport"></column>
-            <row padding="6" gap="6" cross="center">
-              <text foreground="text_muted">Artifact</text>
-              <text grow="1" foreground="text_muted"><span mono="true">{genUiArtifactLabel}</span></text>
-            </row>
-          </column>
-          <separator />
-        </if>
-        <scroll grow="1" label="Agent blocks">
-          <column gap="12" padding="12">
-            <if test="{hasAgentBlocks}">
-              <for each="agentBlocks" key="id" as="block">
-                <if test="{block.isMessage}">
-                  <if test="{block.isUserMessage}">
-                    <row>
-                      <spacer grow="1" />
-                      <bubble>
-                        <column gap="5" padding="10">
-                          <text foreground="text_muted">{block.roleLabel}</text>
-                          <text wrap="true">{block.content}</text>
-                          <if test="{block.truncated}">
-                            <text foreground="warning">Block clipped to 8 KiB in this view.</text>
-                          </if>
-                        </column>
-                      </bubble>
-                    </row>
-                  </if>
-                  <else>
-                    <card>
-                      <column gap="7" padding="11">
-                        <row gap="7" cross="center">
-                          <icon name="circle-dot" width="13" height="13" foreground="accent" />
-                          <text foreground="text_muted">{block.roleLabel}</text>
-                        </row>
-                        <markdown source="{block.content}" />
-                        <if test="{block.truncated}">
-                          <text foreground="warning">Block clipped to 8 KiB in this view.</text>
-                        </if>
-                      </column>
-                    </card>
-                  </else>
-                </if>
-                <else>
-                  <if test="{block.isOperation}">
-                    <card>
-                      <column gap="8" padding="11">
-                        <row gap="7" cross="center">
-                          <icon name="wrench" width="14" height="14" foreground="info" />
-                          <text grow="1"><span weight="medium">Operation</span></text>
-                        </row>
-                        <text wrap="true" foreground="text_muted">{block.operationKindLabel} · {block.stateLabel} · {block.riskLabel}</text>
-                        <text wrap="true">{block.content}</text>
-                        <text foreground="text_muted"><span mono="true">{block.operationId}</span></text>
-                      </column>
-                    </card>
-                  </if>
-                  <else>
-                    <card border-color="warning">
-                      <column gap="9" padding="11">
-                        <row gap="7" cross="center">
-                          <icon name="alert" width="14" height="14" foreground="warning" />
-                          <text grow="1"><span weight="medium">{block.approvalTitle}</span></text>
-                        </row>
-                        <text wrap="true" foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
-                        <text wrap="true">{block.content}</text>
-                        <text foreground="text_muted"><span mono="true">{block.operationId}</span></text>
-                        <text foreground="text_muted">revision {block.operation_revision}</text>
-                        <if test="{block.isApprovalPending}">
-                          <if test="{block.canAllowOnce}">
-                            <alert text="Brokered MCP tool">
-                              <column gap="7" padding="9">
-                                <text wrap="true">This read-only tool runs through the Rust permission broker and records a receipt.</text>
-                                <column gap="7">
-                                  <button size="sm" variant="primary" on-press="allow_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Allow once</button>
-                                  <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
-                                  <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel request</button>
-                                </column>
-                              </column>
-                            </alert>
-                          </if>
-                          <else>
-                            <alert text="Proposal-only safety gate">
-                              <column gap="7" padding="9">
-                                <text wrap="true">Allow is unavailable until the Rust sandbox can enforce this exact effect.</text>
-                                <column gap="7">
-                                  <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
-                                  <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel request</button>
-                                </column>
-                              </column>
-                            </alert>
-                          </else>
-                        </if>
-                        <else>
-                          <text foreground="text_muted">Decision: {block.decisionLabel}</text>
-                        </else>
-                      </column>
-                    </card>
-                  </else>
-                </else>
-              </for>
-              <if test="{agent_history_clipped}">
-                <text foreground="text_muted">Showing the latest 16 Agent blocks.</text>
-              </if>
-            </if>
-            <else>
-              <card>
-                <column gap="8" padding="12">
-                  <row gap="8" cross="center">
-                    <icon name="info" width="14" height="14" foreground="info" />
-                    <text><span weight="medium">Ask an Agent</span></text>
-                  </row>
-                  <text wrap="true" foreground="text_muted">This Agent tab keeps prompts, streaming responses, plans, and future approvals in the Rust-owned BlockDocument.</text>
-                </column>
-              </card>
-            </else>
-          </column>
-        </scroll>
-        <separator />
-        <column padding="10">
-          <input-group label="Agent prompt composer" height="112">
-            <textarea text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerDisabled}" label="Agent prompt" />
-            <input-group-actions>
-              <text foreground="text_muted">Command Enter to send</text>
-              <spacer grow="1" />
-              <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentComposerDisabled}" label="Send prompt"></button>
-            </input-group-actions>
-          </input-group>
-        </column>
-        <status-bar>{agentStatus}</status-bar>
-      </column>
-    </split>
+    <if test="{hasAgentEditor}">
+      <split value="{agent_split}" on-resize="agent_split_resized" resize-duration="120" resize-easing="standard" grow="1">
+        <use template="agent-thread" />
+        <use template="agent-editor" />
+      </split>
+    </if>
+    <else>
+      <use template="agent-thread" />
+    </else>
   </else>
 </column>

@@ -124,8 +124,12 @@ The Rust acceptance path now retains the exact bounded virtual source snapshot
 for every new GenUI artifact and exposes only the current task artifact through
 an authenticated, no-store Agent endpoint. That closes the missing source
 recovery seam needed to open Agent-generated code in the trusted editor without
-letting the WebView read the workspace. Native embedding, multi-file selection,
-transaction journaling, Deno LSP editor requests, and brokered apply remain open.
+letting the WebView read the workspace. The Native host now keeps Agent tabs
+single-pane by default and mounts the packaged Workbench on the right only when
+an ACP session has a current artifact. The Workbench loads that exact source,
+then offers draft CodeMirror, Diff, Time Travel, and isolated local preview
+surfaces. Multi-file selection, transaction journaling, Deno LSP editor
+requests, and brokered apply remain open.
 
 ## Validation gates
 

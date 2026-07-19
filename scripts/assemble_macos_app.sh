@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 6 ]]; then
-  echo "usage: $0 <Hyper Term.app> <desktop-supervisor> <mcp-connector> <terminal-assets> <deno-runtime> <genui-runtime-assets>" >&2
+if [[ $# -ne 7 ]]; then
+  echo "usage: $0 <Hyper Term.app> <desktop-supervisor> <mcp-connector> <terminal-assets> <workbench-assets> <deno-runtime> <genui-runtime-assets>" >&2
   exit 2
 fi
 
@@ -10,8 +10,9 @@ app_bundle=$1
 desktop_supervisor=$2
 mcp_connector=$3
 terminal_assets=$4
-deno_runtime=$5
-genui_runtime_assets=$6
+workbench_assets=$5
+deno_runtime=$6
+genui_runtime_assets=$7
 macos_directory="$app_bundle/Contents/MacOS"
 resources_directory="$app_bundle/Contents/Resources"
 native_renderer="$macos_directory/hyper-term"
@@ -19,6 +20,7 @@ packaged_renderer="$macos_directory/hyper-term-ui"
 packaged_supervisor="$macos_directory/hyper-term"
 packaged_mcp_connector="$macos_directory/hyper-term-mcp"
 packaged_terminal="$resources_directory/terminal"
+packaged_workbench="$resources_directory/workbench"
 packaged_runtime="$resources_directory/runtime"
 
 if [[ ! -d "$app_bundle" ]]; then
@@ -45,6 +47,12 @@ if [[ ! -f "$terminal_assets/build-manifest.json" ]]; then
   echo "terminal renderer is missing build-manifest.json: $terminal_assets" >&2
   exit 1
 fi
+if [[ ! -f "$workbench_assets/index.html" \
+  || ! -f "$workbench_assets/build-manifest.json" \
+  || ! -f "$workbench_assets/esbuild.wasm" ]]; then
+  echo "trusted Workbench assets are incomplete: $workbench_assets" >&2
+  exit 1
+fi
 if [[ ! -x "$deno_runtime" ]]; then
   echo "pinned Deno runtime is missing: $deno_runtime" >&2
   exit 1
@@ -62,6 +70,8 @@ install -m 0755 "$mcp_connector" "$packaged_mcp_connector"
 mkdir -p "$resources_directory"
 rm -rf "$packaged_terminal"
 cp -R "$terminal_assets" "$packaged_terminal"
+rm -rf "$packaged_workbench"
+cp -R "$workbench_assets" "$packaged_workbench"
 rm -rf "$packaged_runtime"
 mkdir -p "$packaged_runtime"
 cp -R "$genui_runtime_assets/." "$packaged_runtime/"
@@ -81,6 +91,12 @@ if [[ ! -x "$packaged_runtime/deno" \
   || ! -f "$packaged_runtime/acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js" \
   || ! -f "$packaged_runtime/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js" ]]; then
   echo "assembled app is missing the brokered GenUI/ACP runtime" >&2
+  exit 1
+fi
+if [[ ! -f "$packaged_workbench/index.html" \
+  || ! -f "$packaged_workbench/esbuild.wasm" \
+  || ! -f "$packaged_workbench/genui/preview.html" ]]; then
+  echo "assembled app is missing the trusted artifact Workbench" >&2
   exit 1
 fi
 

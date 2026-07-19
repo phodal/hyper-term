@@ -96,7 +96,9 @@ test "session bar exposes direct Terminal and Agent creation" {
 
     tree = try buildTree(arena, &model);
     try testing.expect(containsText(tree.root, "Ask an Agent"));
-    try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) != null);
+    try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
+    try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) == null);
+    try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
 }
 
 test "Agent provider picker creates a provider-bound ACP tab" {
@@ -245,7 +247,7 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
 }
 
-test "accepted artifact blocks drive an isolated Agent preview pane" {
+test "Agent tabs stay single-pane until an ACP artifact enters editing" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     var model = main.initialModelWithServices(terminal_url, agent_url);
@@ -261,31 +263,71 @@ test "accepted artifact blocks drive an isolated Agent preview pane" {
         .status = 200,
         .body =
         \\{"status":"completed","error":null,"document":{"blocks":[
+        \\  {"block_id":"00000000-0000-4000-8000-000000000030","kind":"artifact","trust_class":"isolated_artifact","payload":{"type":"artifact","artifact":{"artifact_id":"44444444-4444-4444-8444-444444444444","source_revision":6,"entrypoint":"/App.tsx","content_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","compiler":{"name":"esbuild-wasm","version":"0.28.1"}}}}
+        \\]}}
+        ,
+    } }, &fx);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
+    try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
+    try testing.expect(model.hasGenUiArtifact());
+    try testing.expect(!model.hasAgentEditor());
+
+    var panes: [2]main.HyperTermApp.WebViewPane = undefined;
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings("zero://inline", panes[0].url);
+}
+
+test "accepted ACP artifact opens the authenticated Workbench panel" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithProviders(
+        terminal_url,
+        agent_url,
+        "codex,codex-acp",
+    );
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_codex_acp_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"completed","error":null,"document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000031","kind":"artifact","trust_class":"isolated_artifact","payload":{"type":"artifact","artifact":{"artifact_id":"55555555-5555-4555-8555-555555555555","source_revision":7,"entrypoint":"/App.tsx","content_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","compiler":{"name":"esbuild-wasm","version":"0.28.1"}}}}
         \\]}}
         ,
     } }, &fx);
 
     try testing.expect(model.hasGenUiArtifact());
+    try testing.expect(model.hasAgentEditor());
     try testing.expectEqualStrings("55555555", model.genUiArtifactLabel());
     try testing.expectEqualStrings(
-        "http://127.0.0.1:55321/agent/artifact/55555555-5555-4555-8555-555555555555/preview?token=abcdef0123456789abcdef0123456789&session_id=2#55555555-5555-4555-8555-555555555555",
-        model.genUiPreviewUrl(),
+        "http://127.0.0.1:55321/agent/workbench/?surface=artifact&artifact_id=55555555-5555-4555-8555-555555555555&session_id=2&token=abcdef0123456789abcdef0123456789",
+        model.genUiWorkbenchUrl(),
     );
     try testing.expectEqual(@as(usize, 0), model.agentBlocks().len);
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
-    try testing.expectEqualStrings(main.genui_view_label, panes[1].label);
-    try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
-    try testing.expectEqualStrings(model.genUiPreviewUrl(), panes[1].url);
-    try testing.expectEqual(@as(u64, 7), panes[1].reload_token);
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings(main.genui_view_label, panes[0].label);
+    try testing.expectEqualStrings(main.genui_view_anchor, panes[0].anchor.?);
+    try testing.expectEqualStrings(model.genUiWorkbenchUrl(), panes[0].url);
+    try testing.expectEqual(@as(u64, 7), panes[0].reload_token);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) != null);
-    try testing.expect(containsText(tree.root, "accepted · isolated"));
+    try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
+    try testing.expect(containsText(tree.root, "Edit"));
+    try testing.expect(containsText(tree.root, "draft"));
     try testing.expect(containsText(tree.root, "55555555"));
     const tokens = main.hyperTermTokens(&model);
     const sweep = canvas.LayoutAuditSweepOptions{

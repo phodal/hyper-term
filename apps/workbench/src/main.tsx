@@ -5,6 +5,8 @@ import "./styles.css";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("workbench root is missing");
+document.documentElement.dataset.surface =
+  new URLSearchParams(globalThis.location.search).get("surface") ?? "demo";
 
 createRoot(root).render(
   <StrictMode>

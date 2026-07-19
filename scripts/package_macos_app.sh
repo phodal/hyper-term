@@ -43,6 +43,7 @@ cd "$hyper_repo_root"
 "$hyper_deno" task check
 "$hyper_deno" task test
 "$hyper_deno" task build:terminal
+"$hyper_deno" task build:workbench
 "$hyper_deno" task build:runtime
 cargo build \
   --locked \
@@ -69,6 +70,7 @@ native package \
   "$hyper_repo_root/target/release/hyper-term-desktop" \
   "$hyper_repo_root/target/release/hyper-term-mcp" \
   "$hyper_repo_root/dist/terminal" \
+  "$hyper_repo_root/dist/workbench" \
   "$hyper_deno" \
   "$hyper_repo_root/dist/runtime"
 
@@ -100,6 +102,11 @@ if [[ ! -x "$hyper_staging_app/Contents/MacOS/hyper-term-mcp" ]]; then
 fi
 if [[ ! -f "$hyper_staging_app/Contents/Resources/terminal/index.html" ]]; then
   echo "packaged terminal renderer is unavailable" >&2
+  exit 1
+fi
+if [[ ! -f "$hyper_staging_app/Contents/Resources/workbench/index.html" \
+  || ! -f "$hyper_staging_app/Contents/Resources/workbench/esbuild.wasm" ]]; then
+  echo "packaged trusted artifact Workbench is unavailable" >&2
   exit 1
 fi
 if [[ ! -x "$hyper_staging_app/Contents/Resources/runtime/deno" \

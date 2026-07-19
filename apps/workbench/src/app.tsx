@@ -1,11 +1,22 @@
 import { useMemo, useState } from "react";
 import { BlockWorkbench } from "./components/block-workbench.tsx";
+import { ArtifactWorkbench } from "./components/artifact-workbench.tsx";
 import { GenUiStudio } from "./components/genui-studio.tsx";
 import { resolveHost } from "./host.ts";
 import type { UiIntent } from "./protocol.ts";
 import { sampleDocument } from "./sample-document.ts";
 
 export function App() {
+  if (
+    new URLSearchParams(globalThis.location.search).get("surface") ===
+      "artifact"
+  ) {
+    return <ArtifactWorkbench />;
+  }
+  return <DemoWorkbench />;
+}
+
+function DemoWorkbench() {
   const host = useMemo(resolveHost, []);
   const [notice, setNotice] = useState<string>();
 

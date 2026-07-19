@@ -20,7 +20,7 @@ pub const canvas_label = "hyper-term-canvas";
 pub const terminal_view_label = "hyper-term-terminal-view";
 pub const terminal_view_anchor = "Terminal viewport";
 pub const genui_view_label = "hyper-term-genui-view";
-pub const genui_view_anchor = "Agentic UI preview viewport";
+pub const genui_view_anchor = "Agent artifact editor viewport";
 pub const terminal_gateway_origin = "http://127.0.0.1:47437";
 pub const max_sessions: usize = 8;
 const terminal_url_capacity: usize = 256;
@@ -337,8 +337,8 @@ pub const Model = struct {
     terminal_url_len: usize = 0,
     agent_base_url_storage: [agent_url_capacity]u8 = [_]u8{0} ** agent_url_capacity,
     agent_base_url_len: usize = 0,
-    genui_preview_url_storage: [genui_url_capacity]u8 = [_]u8{0} ** genui_url_capacity,
-    genui_preview_url_len: usize = 0,
+    genui_workbench_url_storage: [genui_url_capacity]u8 = [_]u8{0} ** genui_url_capacity,
+    genui_workbench_url_len: usize = 0,
     genui_artifact_id_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
     genui_artifact_id_len: usize = 0,
     genui_source_revision: u64 = 0,
@@ -375,8 +375,8 @@ pub const Model = struct {
         "terminal_url_len",
         "agent_base_url_storage",
         "agent_base_url_len",
-        "genui_preview_url_storage",
-        "genui_preview_url_len",
+        "genui_workbench_url_storage",
+        "genui_workbench_url_len",
         "genui_artifact_id_storage",
         "genui_artifact_id_len",
         "genui_source_revision",
@@ -391,7 +391,8 @@ pub const Model = struct {
         "agent_permission_in_flight_session_id",
         "terminalReady",
         "terminalUrl",
-        "genUiPreviewUrl",
+        "genUiWorkbenchUrl",
+        "hasGenUiArtifact",
         "agentError",
     };
 
@@ -416,10 +417,6 @@ pub const Model = struct {
 
     pub fn terminalDisconnected(model: *const Model) bool {
         return !model.terminalReady();
-    }
-
-    pub fn terminalConnectionLabel(model: *const Model) []const u8 {
-        return if (model.terminalReady()) "connected" else "offline";
     }
 
     pub fn terminalStatus(model: *const Model) []const u8 {
@@ -583,19 +580,23 @@ pub const Model = struct {
     }
 
     pub fn hasGenUiArtifact(model: *const Model) bool {
-        return model.activeSession().mode == .agent and model.genui_preview_url_len > 0;
+        return model.activeSession().mode == .agent and model.genui_workbench_url_len > 0;
+    }
+
+    pub fn hasAgentEditor(model: *const Model) bool {
+        if (!model.hasGenUiArtifact()) return false;
+        return switch (model.activeSession().agent_provider) {
+            .codex => false,
+            .codex_acp, .claude_acp, .copilot_acp => true,
+        };
     }
 
     pub fn genUiArtifactLabel(model: *const Model) []const u8 {
         return model.genui_artifact_id_storage[0..@min(model.genui_artifact_id_len, 8)];
     }
 
-    pub fn genUiPreviewUrl(model: *const Model) []const u8 {
-        return model.genui_preview_url_storage[0..model.genui_preview_url_len];
-    }
-
-    pub fn genUiStatus(model: *const Model) []const u8 {
-        return if (model.hasGenUiArtifact()) "accepted · isolated" else "no artifact";
+    pub fn genUiWorkbenchUrl(model: *const Model) []const u8 {
+        return model.genui_workbench_url_storage[0..model.genui_workbench_url_len];
     }
 };
 
@@ -1082,11 +1083,11 @@ fn projectGenUiArtifact(model: *Model, block: AgentBlockWire) void {
     );
     model.genui_artifact_id_len = artifact.artifact_id.len;
     model.genui_source_revision = artifact.source_revision;
-    refreshGenUiPreviewUrl(model);
+    refreshGenUiWorkbenchUrl(model);
 }
 
 fn clearGenUiArtifact(model: *Model) void {
-    model.genui_preview_url_len = 0;
+    model.genui_workbench_url_len = 0;
     model.genui_artifact_id_len = 0;
     model.genui_source_revision = 0;
 }
@@ -1668,7 +1669,7 @@ fn refreshTerminalUrl(model: *Model) void {
 }
 
 pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize {
-    if (!model.terminalReady() or out.len == 0) return 0;
+    if (!model.isTerminal() or !model.terminalReady() or out.len == 0) return 0;
     out[0] = .{
         .label = terminal_view_label,
         .anchor = terminal_view_anchor,
@@ -1680,10 +1681,10 @@ pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize
 pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize {
     var count = terminalPanes(model, out);
     if (count == out.len) return count;
-    out[count] = if (model.hasGenUiArtifact()) .{
+    out[count] = if (model.hasAgentEditor()) .{
         .label = genui_view_label,
         .anchor = genui_view_anchor,
-        .url = model.genUiPreviewUrl(),
+        .url = model.genUiWorkbenchUrl(),
         .reload_token = model.genui_source_revision,
     } else .{
         .label = genui_view_label,
@@ -1694,29 +1695,29 @@ pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize 
     return count;
 }
 
-fn refreshGenUiPreviewUrl(model: *Model) void {
+fn refreshGenUiWorkbenchUrl(model: *Model) void {
     if (model.agent_base_url_len == 0 or model.genui_artifact_id_len == 0) {
-        model.genui_preview_url_len = 0;
+        model.genui_workbench_url_len = 0;
         return;
     }
     const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
     const marker = "/?token=";
     const marker_index = std.mem.indexOf(u8, base_url, marker) orelse {
-        model.genui_preview_url_len = 0;
+        model.genui_workbench_url_len = 0;
         return;
     };
     const origin = base_url[0..marker_index];
     const token = base_url[marker_index + marker.len ..];
     const artifact_id = model.genui_artifact_id_storage[0..model.genui_artifact_id_len];
     const url = std.fmt.bufPrint(
-        model.genui_preview_url_storage[0..],
-        "{s}/agent/artifact/{s}/preview?token={s}&session_id={d}#{s}",
-        .{ origin, artifact_id, token, model.active_session_id, artifact_id },
+        model.genui_workbench_url_storage[0..],
+        "{s}/agent/workbench/?surface=artifact&artifact_id={s}&session_id={d}&token={s}",
+        .{ origin, artifact_id, model.active_session_id, token },
     ) catch {
-        model.genui_preview_url_len = 0;
+        model.genui_workbench_url_len = 0;
         return;
     };
-    model.genui_preview_url_len = url.len;
+    model.genui_workbench_url_len = url.len;
 }
 
 pub fn trustedTerminalUrl(url: []const u8) bool {

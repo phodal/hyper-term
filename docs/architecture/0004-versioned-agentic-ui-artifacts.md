@@ -135,8 +135,9 @@ injected into the preview capsule, retained outside artifact globals, and used
 to render source-mapped runtime failures inside the isolated WebView itself. A
 browser run of the same compiled capsule rendered an interactive React artifact,
 mapped an intentional failure back to `/App.tsx`, and recovered after editing,
-while a Native automation run proved Terminal/Agent tab switching and the
-bounded pane layout.
+while Native layout tests prove Terminal/Agent tab switching, a full-width
+default Agent conversation, and conditional mounting of the bounded editor
+pane only for ACP sessions with a current artifact.
 
 New acceptance now also requires the exact bounded virtual source tree passed
 to the supervised compiler. Rust attaches that snapshot after the Deno child
