@@ -11,12 +11,14 @@ import {
 import { resolveHost } from "../host.ts";
 import { ArtifactLanguageService } from "../editor-language-service.ts";
 import {
+  type WorkspaceApplyMapping,
   WorkspaceApplyPublisher,
   type WorkspaceApplyStatus,
   type WorkspaceApplyUpdate,
 } from "../workspace-apply-publisher.ts";
 import { GenUiStudio } from "./genui-studio.tsx";
 import { WorkspaceReview } from "./workspace-review.tsx";
+import { WorkspaceApplyComposer } from "./workspace-apply-composer.tsx";
 
 interface ArtifactSourceResponse {
   artifact_id: string;
@@ -56,12 +58,14 @@ export function ArtifactWorkbench() {
     ArtifactDraftStatus | "idle"
   >("idle");
   const [publishError, setPublishError] = useState<string>();
-  const [workspaceTarget, setWorkspaceTarget] = useState("");
   const [activeSourcePath, setActiveSourcePath] = useState<string>();
   const [hasLocalDraft, setHasLocalDraft] = useState(false);
   const [applyReview, setApplyReview] = useState<WorkspaceApplyUpdate>();
   const [applyError, setApplyError] = useState<string>();
-  const [reviewVisible, setReviewVisible] = useState(false);
+  const [workspacePanel, setWorkspacePanel] = useState<
+    "none" | "mapping" | "review"
+  >("none");
+  const [applyStarting, setApplyStarting] = useState(false);
   const publishController = useRef<AbortController | undefined>(undefined);
   const applyController = useRef<AbortController | undefined>(undefined);
   const openedReviewOperation = useRef<string | undefined>(undefined);
@@ -134,10 +138,6 @@ export function ArtifactWorkbench() {
     applyController.current?.abort();
   }, []);
 
-  useEffect(() => {
-    setWorkspaceTarget("");
-  }, [selectedSourcePath]);
-
   const publishDraft = useCallback((files: Record<string, string>) => {
     if (!context || state.kind !== "ready") return;
     publishController.current?.abort();
@@ -186,48 +186,41 @@ export function ArtifactWorkbench() {
     }).source(entry, signal);
   }, [context, state]);
 
-  const applyWorkspace = useCallback(() => {
-    if (!context || state.kind !== "ready" || !selectedSourcePath) return;
-    const targetPath = workspaceTarget.trim();
-    if (!targetPath || hasLocalDraft) return;
+  const applyWorkspace = useCallback((mappings: WorkspaceApplyMapping[]) => {
+    if (!context || state.kind !== "ready" || hasLocalDraft) return;
     applyController.current?.abort();
     const controller = new AbortController();
     applyController.current = controller;
+    setApplyStarting(true);
     setApplyError(undefined);
     setApplyReview(undefined);
-    setReviewVisible(false);
     const publisher = new WorkspaceApplyPublisher({
       artifactId: state.source.artifact_id,
       sourceRevision: state.source.source_revision,
-      sourcePath: selectedSourcePath,
       sessionId: context.sessionId,
       token: context.token,
     });
     publisher.apply(
-      targetPath,
+      mappings,
       (update) => {
+        setApplyStarting(false);
         setApplyReview(update);
         if (openedReviewOperation.current !== update.operation_id) {
           openedReviewOperation.current = update.operation_id;
-          setReviewVisible(true);
+          setWorkspacePanel("review");
         }
       },
       controller.signal,
     ).catch((error: unknown) => {
       if (controller.signal.aborted) return;
+      setApplyStarting(false);
       setApplyError(error instanceof Error ? error.message : String(error));
     });
-  }, [
-    context,
-    hasLocalDraft,
-    selectedSourcePath,
-    state,
-    workspaceTarget,
-  ]);
+  }, [context, hasLocalDraft, state]);
 
   const applyStatus: WorkspaceApplyStatus | "idle" = applyReview?.status ??
     "idle";
-  const applyBusy = applyStatus === "waiting_approval" ||
+  const applyBusy = applyStarting || applyStatus === "waiting_approval" ||
     applyStatus === "applying";
 
   return (
@@ -258,8 +251,8 @@ export function ArtifactWorkbench() {
         <div className="artifact-workbench-stage">
           <div
             className="artifact-editor-layer"
-            data-obscured={reviewVisible || undefined}
-            aria-hidden={reviewVisible || undefined}
+            data-obscured={workspacePanel !== "none" || undefined}
+            aria-hidden={workspacePanel !== "none" || undefined}
           >
             <GenUiStudio
               key={`${state.source.artifact_id}:${state.source.source_revision}`}
@@ -289,12 +282,21 @@ export function ArtifactWorkbench() {
               onLoadHistorySource={loadHistorySource}
             />
           </div>
-          {reviewVisible && applyReview && (
+          {workspacePanel === "mapping" && (
+            <WorkspaceApplyComposer
+              sourcePaths={Object.keys(state.source.files)}
+              busy={applyStarting}
+              error={applyError}
+              onCancel={() => setWorkspacePanel("none")}
+              onReview={applyWorkspace}
+            />
+          )}
+          {workspacePanel === "review" && applyReview && (
             <WorkspaceReview
               review={applyReview}
               status={applyReview.status}
               error={applyError}
-              onBack={() => setReviewVisible(false)}
+              onBack={() => setWorkspacePanel("none")}
             />
           )}
         </div>
@@ -309,47 +311,36 @@ export function ArtifactWorkbench() {
               Object.keys(state.source.files).length
             } bounded virtual file(s)`}
         </span>
-        {state.kind === "ready" && (
-          <form
-            className="workspace-apply-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              applyWorkspace();
-            }}
-          >
-            <input
-              aria-label="Workspace target path"
-              autoComplete="off"
-              disabled={applyBusy}
-              maxLength={4096}
-              placeholder={selectedSourcePath
-                ? `target for ${selectedSourcePath}`
-                : "workspace-relative target"}
-              spellCheck={false}
-              value={workspaceTarget}
-              onChange={(event) => setWorkspaceTarget(event.target.value)}
-            />
-            {applyReview && !reviewVisible && (
+        {state.kind === "ready" && workspacePanel !== "mapping" && (
+          <div className="workspace-apply-form">
+            {applyReview && workspacePanel !== "review" && (
               <button
                 type="button"
-                onClick={() => setReviewVisible(true)}
+                onClick={() => setWorkspacePanel("review")}
               >
-                Show diff
+                Show {applyReview.changes.length} diff(s)
               </button>
             )}
             <button
-              type="submit"
+              type="button"
               data-state={applyStatus}
-              disabled={!workspaceTarget.trim() || hasLocalDraft || applyBusy}
+              disabled={hasLocalDraft || applyBusy}
               title={hasLocalDraft
                 ? "Publish the local Artifact draft before applying it to the workspace"
-                : "Ask Rust to capture the exact workspace base and create a WorkspaceWrite Approval Block"}
+                : "Map Artifact files to explicit workspace targets before creating one WorkspaceWrite Approval Block"}
+              onClick={() => {
+                setApplyError(undefined);
+                setWorkspacePanel("mapping");
+              }}
             >
-              {workspaceApplyLabel(applyStatus)}
+              {workspaceApplyLabel(
+                applyStarting ? "applying" : applyStatus,
+                Object.keys(state.source.files).length,
+              )}
             </button>
-          </form>
+          </div>
         )}
-        {applyError && !reviewVisible && (
+        {applyError && workspacePanel === "none" && (
           <strong className="workspace-apply-error" role="alert">
             {applyError}
           </strong>
@@ -361,6 +352,7 @@ export function ArtifactWorkbench() {
 
 function workspaceApplyLabel(
   status: WorkspaceApplyStatus | "idle",
+  fileCount: number,
 ): string {
   switch (status) {
     case "waiting_approval":
@@ -376,7 +368,7 @@ function workspaceApplyLabel(
     case "unknown_execution":
       return "Inspect target";
     case "idle":
-      return "Review apply";
+      return `Map ${Math.min(fileCount, 32)} file(s)`;
   }
 }
 
