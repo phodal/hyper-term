@@ -93,7 +93,7 @@ UI bridge.
 | GitHub Copilot ACP discovery | Implemented baseline |
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
-| Artifact editor, Diff, Time Travel, diagnostics, completion, and approved publish | Experimental |
+| Multi-file Artifact editor, Diff, Time Travel, diagnostics, completion, and approved publish | Experimental |
 | Brokered exact single-file Artifact apply | Experimental |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |

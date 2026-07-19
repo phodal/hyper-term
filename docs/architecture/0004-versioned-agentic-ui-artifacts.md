@@ -148,10 +148,20 @@ snapshot for the trusted editor; wrong tokens and stale artifact IDs fail
 closed. Pre-source artifacts remain previewable during migration but cannot
 claim editable-source availability.
 
+The trusted Workbench now keeps that complete fixed-path source tree as one
+draft. A horizontally responsive file strip selects each source without
+discarding edits in other files; dirty state is tracked per path, Deno LSP is
+rebound to the selected document, and every live `esbuild-wasm` compile receives
+the complete snapshot plus the Rust-selected entrypoint. Artifact publish sends
+the complete file set and rejects local attempts to add or drop paths. Runtime
+source-map failures select the owning file when it is present. Workspace apply
+also binds to the explicitly selected Artifact source path rather than assuming
+`/App.tsx`.
+
 This closes the first accepted-artifact, last-known-good delivery, initial
-runtime-error mapping, and source-recovery slices. It does not yet close the
-complete hostile-artifact matrix, Native trusted-workbench integration,
-multi-file editor navigation, action/trace protocol, resource budgets, or
+runtime-error mapping, source-recovery, and fixed-file-tree editor navigation
+slices. It does not yet close the complete hostile-artifact matrix, durable
+action/trace protocol, resource budgets, multi-file workspace acceptance, or
 accessibility gates below.
 
 ## Validation gates

@@ -165,10 +165,21 @@ identity, no-replace creation, and symlink escape rejection. Browser passes at
 480 pixels cover review, returning to the editor during polling, and zero
 horizontal page overflow.
 
+The editor no longer collapses an Artifact to its entrypoint. One Studio owns
+the complete Rust-returned virtual file map, keeps per-file CodeMirror drafts
+alive across tab switches and workspace-review overlays, marks changed paths,
+and binds Deno LSP to the selected document. The 260 ms live build snapshots all
+files and the declared entrypoint, so editing an imported module immediately
+updates the isolated preview. Publishing sends the complete fixed path set;
+local additions or removals are rejected before the request. A 480-pixel
+browser flow proves a two-file relative import, per-file LSP readiness, draft
+retention across file and review switches, and current-file Workspace Apply
+mapping without page overflow.
+
 A real Deno integration test separately covers Artifact approval, compilation,
 replacement, source recovery, and stale revision rejection. Multi-file/hunk
-selection, durable edit transaction journaling, crash-recoverable multi-file
-commit, and arbitrary binary files remain open.
+workspace acceptance, durable edit transaction journaling, crash-recoverable
+multi-file commit, and arbitrary binary files remain open.
 
 ## Validation gates
 
