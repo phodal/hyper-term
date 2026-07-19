@@ -44,14 +44,11 @@ export class ArtifactDraftPublisher {
   ) {}
 
   async publish(
-    source: string,
+    files: Record<string, string>,
     onUpdate: (update: ArtifactDraftUpdate) => void,
     signal: AbortSignal,
   ): Promise<PublishedArtifact> {
-    const files = {
-      ...this.context.files,
-      [this.context.entrypoint]: source,
-    };
+    validateDraftFiles(this.context.files, files);
     let update = await this.#request("POST", undefined, files, signal);
     onUpdate(update);
     while (
@@ -124,6 +121,31 @@ export class ArtifactDraftPublisher {
       );
     }
     return payload;
+  }
+}
+
+function validateDraftFiles(
+  baseline: Record<string, string>,
+  draft: Record<string, string>,
+): void {
+  const baselinePaths = Object.keys(baseline).sort();
+  const draftPaths = Object.keys(draft).sort();
+  if (
+    baselinePaths.length !== draftPaths.length ||
+    baselinePaths.some((path, index) => path !== draftPaths[index])
+  ) {
+    throw new Error("Artifact draft file set changed outside Rust authority.");
+  }
+  let bytes = 0;
+  for (const path of draftPaths) {
+    const source = draft[path];
+    if (typeof source !== "string") {
+      throw new Error("Artifact draft contains an invalid source file.");
+    }
+    bytes += new TextEncoder().encode(source).byteLength;
+  }
+  if (bytes > 1024 * 1024) {
+    throw new Error("Artifact draft exceeds the 1 MiB source bound.");
   }
 }
 

@@ -4,6 +4,7 @@ import {
   MAX_SOURCE_BYTES,
   validateCompileRequest,
 } from "./compiler-protocol.ts";
+import { createCompileRequest } from "./compiler-client.ts";
 
 function request(files: Record<string, string>): CompileRequest {
   return {
@@ -50,4 +51,21 @@ Deno.test("compiler rejects malformed request envelopes", () => {
     Error,
     "request id",
   );
+});
+
+Deno.test("compiler client preserves the complete virtual source tree", () => {
+  const files = {
+    "/App.tsx":
+      "import { title } from './title.ts'; export default () => title;",
+    "/title.ts": "export const title = 'multi-file';",
+  };
+  const compiled = createCompileRequest("request-multi", 4, "/App.tsx", files);
+  files["/title.ts"] = "mutated after request";
+
+  if (compiled.files["/title.ts"] !== "export const title = 'multi-file';") {
+    throw new Error("compile request did not snapshot every virtual file");
+  }
+  if (Object.keys(compiled.files).length !== 2) {
+    throw new Error("compile request dropped a virtual file");
+  }
 });

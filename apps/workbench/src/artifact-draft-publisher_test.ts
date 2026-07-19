@@ -53,7 +53,11 @@ Deno.test("artifact publisher waits for approval and returns the Rust artifact",
   );
   const statuses: string[] = [];
   const published = await publisher.publish(
-    "export default function App() { return <main>Live</main>; }",
+    {
+      ...context.files,
+      "/App.tsx": "export default function App() { return <main>Live</main>; }",
+      "/theme.ts": "export const accent = '#95c84f';",
+    },
     (update) => statuses.push(update.status),
     new AbortController().signal,
   );
@@ -70,7 +74,7 @@ Deno.test("artifact publisher waits for approval and returns the Rust artifact",
     entrypoint: "/App.tsx",
     files: {
       "/App.tsx": "export default function App() { return <main>Live</main>; }",
-      "/theme.ts": "export const accent = '#d7ff72';",
+      "/theme.ts": "export const accent = '#95c84f';",
     },
   });
   const statusUrl = new URL(requests[1].url);
@@ -98,11 +102,28 @@ Deno.test("artifact publisher rejects an accepted revision outside its context",
   await assertRejects(
     () =>
       publisher.publish(
-        "export default null;",
+        { ...context.files, "/App.tsx": "export default null;" },
         () => {},
         new AbortController().signal,
       ),
     Error,
     "did not match the editor context",
+  );
+});
+
+Deno.test("artifact publisher cannot add or drop virtual files", async () => {
+  const publisher = new ArtifactDraftPublisher(
+    context,
+    () => Promise.reject(new Error("fetch must not run")),
+  );
+  await assertRejects(
+    () =>
+      publisher.publish(
+        { "/App.tsx": context.files["/App.tsx"] },
+        () => {},
+        new AbortController().signal,
+      ),
+    Error,
+    "file set changed outside Rust authority",
   );
 });

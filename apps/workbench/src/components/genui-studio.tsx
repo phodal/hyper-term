@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ArtifactDraftStatus } from "../artifact-draft-publisher.ts";
 import type { HyperTermHost } from "../host.ts";
 import type { AcceptedArtifact } from "../protocol.ts";
@@ -10,6 +10,7 @@ import {
 } from "../genui/runtime-diagnostic.ts";
 import { CodeDiff } from "./code-diff.tsx";
 import { CodeEditor } from "./code-editor.tsx";
+import { ArtifactFileTabs } from "./artifact-file-tabs.tsx";
 
 const sampleOriginalSource = `import React from "react";
 
@@ -59,6 +60,9 @@ export default function AgentStatus() {
 
 type StudioView = "code" | "diff" | "trace";
 
+const sampleBaselineFiles = { "/App.tsx": sampleOriginalSource };
+const sampleDraftFiles = { "/App.tsx": sampleInitialSource };
+
 interface TraceEntry {
   revision: number;
   label: string;
@@ -68,12 +72,15 @@ interface TraceEntry {
 
 export interface GenUiStudioProps {
   host: HyperTermHost;
-  initialSource?: string;
-  baselineSource?: string;
+  entrypoint?: string;
+  initialFiles?: Record<string, string>;
+  baselineFiles?: Record<string, string>;
+  initialActivePath?: string;
   initialRevision?: number;
   heading?: string;
-  languageService?: EditorLanguageService;
-  onPublishDraft?: (source: string) => void;
+  languageServiceForPath?: (path: string) => EditorLanguageService;
+  onActivePathChange?: (path: string) => void;
+  onPublishDraft?: (files: Record<string, string>) => void;
   onDraftStateChange?: (changed: boolean) => void;
   publishStatus?: ArtifactDraftStatus | "idle";
   publishError?: string;
@@ -81,17 +88,25 @@ export interface GenUiStudioProps {
 
 export function GenUiStudio({
   host,
-  initialSource = sampleInitialSource,
-  baselineSource = sampleOriginalSource,
+  entrypoint = "/App.tsx",
+  initialFiles = sampleDraftFiles,
+  baselineFiles = sampleBaselineFiles,
+  initialActivePath = entrypoint,
   initialRevision = 0,
-  heading = "Live artifact",
-  languageService,
+  heading,
+  languageServiceForPath,
+  onActivePathChange,
   onPublishDraft,
   onDraftStateChange,
   publishStatus = "idle",
   publishError,
 }: GenUiStudioProps) {
-  const [source, setSource] = useState(initialSource);
+  const [files, setFiles] = useState<Record<string, string>>(() => ({
+    ...initialFiles,
+  }));
+  const [activePath, setActivePath] = useState(
+    initialActivePath in initialFiles ? initialActivePath : entrypoint,
+  );
   const [view, setView] = useState<StudioView>("code");
   const [status, setStatus] = useState("Compiler starting");
   const [error, setError] = useState<string>();
@@ -104,14 +119,22 @@ export function GenUiStudio({
   const [previewBoot, setPreviewBoot] = useState(0);
   const [languageStatus, setLanguageStatus] = useState<
     "idle" | "checking" | "ready" | "failed"
-  >(languageService ? "idle" : "failed");
+  >(languageServiceForPath ? "idle" : "failed");
   const [trace, setTrace] = useState<TraceEntry[]>([]);
   const compiler = useRef<GenUiCompiler | null>(null);
+  const filesRef = useRef(files);
+  filesRef.current = files;
   const previewFrame = useRef<HTMLIFrameElement | null>(null);
   const previewChannel = useRef(crypto.randomUUID()).current;
   const revision = useRef(initialRevision);
   const previewUrl = new URL("./genui/preview.html", document.baseURI);
   previewUrl.hash = previewChannel;
+  const source = files[activePath] ?? "";
+  const baselineSource = baselineFiles[activePath] ?? "";
+  const languageService = useMemo(
+    () => languageServiceForPath?.(activePath),
+    [activePath, languageServiceForPath],
+  );
 
   useEffect(() => {
     compiler.current = new GenUiCompiler();
@@ -152,6 +175,12 @@ export function GenUiStudio({
           accepted.source_map,
         );
         setRuntimeDiagnostic(diagnostic);
+        if (
+          diagnostic.original &&
+          diagnostic.original.file in filesRef.current
+        ) {
+          setActivePath(diagnostic.original.file);
+        }
         setPreviewRuntime(
           diagnostic.original
             ? `runtime error · ${diagnostic.original.file}:${diagnostic.original.line}:${diagnostic.original.column}`
@@ -204,12 +233,18 @@ export function GenUiStudio({
         [{
           revision: sourceRevision,
           label: "Compile candidate",
-          detail: "bounded virtual filesystem → esbuild-wasm Worker",
+          detail: `${
+            Object.keys(files).length
+          } bounded file(s) → esbuild-wasm Worker`,
           state: "working" as const,
         }, ...entries].slice(0, 8)
       );
       try {
-        const candidate = await activeCompiler.compile(sourceRevision, source);
+        const candidate = await activeCompiler.compile(
+          sourceRevision,
+          entrypoint,
+          files,
+        );
         const nextAccepted = await host.acceptArtifact(candidate);
         if (sourceRevision !== revision.current) return;
         setAccepted(nextAccepted);
@@ -244,10 +279,13 @@ export function GenUiStudio({
       }
     }, 260);
     return () => clearTimeout(timer);
-  }, [host, source]);
+  }, [entrypoint, files, host]);
 
   const runtimeLocation = runtimeDiagnostic?.original;
-  const draftChanged = source !== baselineSource;
+  const changedPaths = Object.keys(files).filter((path) =>
+    files[path] !== baselineFiles[path]
+  );
+  const draftChanged = changedPaths.length > 0;
   const publishBusy = publishStatus === "waiting_approval" ||
     publishStatus === "compiling";
 
@@ -255,12 +293,25 @@ export function GenUiStudio({
     onDraftStateChange?.(draftChanged);
   }, [draftChanged, onDraftStateChange]);
 
+  useEffect(() => {
+    onActivePathChange?.(activePath);
+    setLanguageStatus(languageService ? "idle" : "failed");
+  }, [activePath, languageService, onActivePathChange]);
+
+  const updateSource = (nextSource: string) => {
+    setFiles((current) =>
+      current[activePath] === nextSource
+        ? current
+        : { ...current, [activePath]: nextSource }
+    );
+  };
+
   return (
     <aside className="studio" aria-label="Agentic UI Studio">
       <header className="studio-header">
         <div>
           <span className="eyebrow">Agentic UI Studio</span>
-          <h2>{heading}</h2>
+          <h2>{heading ?? activePath}</h2>
         </div>
         <div className="studio-actions">
           <span className={`compiler-status ${error ? "has-error" : ""}`}>
@@ -274,7 +325,7 @@ export function GenUiStudio({
               disabled={!draftChanged || publishBusy || Boolean(error)}
               title={publishError ??
                 "Create an Approval Block, then rebuild this draft with Rust-supervised Deno"}
-              onClick={() => onPublishDraft(source)}
+              onClick={() => onPublishDraft({ ...files })}
             >
               {publishDraftLabel(
                 publishStatus,
@@ -285,6 +336,13 @@ export function GenUiStudio({
           )}
         </div>
       </header>
+      <ArtifactFileTabs
+        activePath={activePath}
+        baselineFiles={baselineFiles}
+        entrypoint={entrypoint}
+        files={files}
+        onSelect={setActivePath}
+      />
       <div className="studio-tabs" role="tablist" aria-label="Artifact tools">
         {(["code", "diff", "trace"] as const).map((tab) => (
           <button
@@ -313,8 +371,9 @@ export function GenUiStudio({
         {view === "code" && (
           <CodeEditor
             value={source}
-            onChange={setSource}
-            revealLocation={runtimeLocation?.file === "/App.tsx"
+            onChange={updateSource}
+            readOnly={publishBusy}
+            revealLocation={runtimeLocation?.file === activePath
               ? runtimeLocation
               : undefined}
             revealRequest={revealRequest}
@@ -326,7 +385,8 @@ export function GenUiStudio({
           <CodeDiff
             original={baselineSource}
             modified={source}
-            onChange={setSource}
+            onChange={updateSource}
+            readOnlyModified={publishBusy}
           />
         )}
         {view === "trace" && <TraceTimeline entries={trace} />}

@@ -40,6 +40,7 @@ export function ArtifactWorkbench() {
   >("idle");
   const [publishError, setPublishError] = useState<string>();
   const [workspaceTarget, setWorkspaceTarget] = useState("");
+  const [activeSourcePath, setActiveSourcePath] = useState<string>();
   const [hasLocalDraft, setHasLocalDraft] = useState(false);
   const [applyReview, setApplyReview] = useState<WorkspaceApplyUpdate>();
   const [applyError, setApplyError] = useState<string>();
@@ -47,12 +48,20 @@ export function ArtifactWorkbench() {
   const publishController = useRef<AbortController | undefined>(undefined);
   const applyController = useRef<AbortController | undefined>(undefined);
   const openedReviewOperation = useRef<string | undefined>(undefined);
-  const languageService = useMemo(() => {
-    if (!context || state.kind !== "ready") return undefined;
+  const selectedSourcePath = state.kind === "ready" && activeSourcePath &&
+      activeSourcePath in state.source.files
+    ? activeSourcePath
+    : state.kind === "ready"
+    ? state.source.entrypoint
+    : "";
+  const languageServiceForPath = useCallback((documentPath: string) => {
+    if (!context || state.kind !== "ready") {
+      throw new Error("Artifact language service context is unavailable.");
+    }
     return new ArtifactLanguageService({
       artifactId: state.source.artifact_id,
       sourceRevision: state.source.source_revision,
-      documentPath: state.source.entrypoint,
+      documentPath,
       sessionId: context.sessionId,
       token: context.token,
     });
@@ -86,7 +95,11 @@ export function ArtifactWorkbench() {
     applyController.current?.abort();
   }, []);
 
-  const publishDraft = useCallback((source: string) => {
+  useEffect(() => {
+    setWorkspaceTarget("");
+  }, [selectedSourcePath]);
+
+  const publishDraft = useCallback((files: Record<string, string>) => {
     if (!context || state.kind !== "ready") return;
     publishController.current?.abort();
     const controller = new AbortController();
@@ -101,7 +114,7 @@ export function ArtifactWorkbench() {
       token: context.token,
     });
     publisher.publish(
-      source,
+      files,
       (update) => setPublishStatus(update.status),
       controller.signal,
     ).then((artifact) =>
@@ -119,7 +132,7 @@ export function ArtifactWorkbench() {
   }, [context, state]);
 
   const applyWorkspace = useCallback(() => {
-    if (!context || state.kind !== "ready") return;
+    if (!context || state.kind !== "ready" || !selectedSourcePath) return;
     const targetPath = workspaceTarget.trim();
     if (!targetPath || hasLocalDraft) return;
     applyController.current?.abort();
@@ -131,7 +144,7 @@ export function ArtifactWorkbench() {
     const publisher = new WorkspaceApplyPublisher({
       artifactId: state.source.artifact_id,
       sourceRevision: state.source.source_revision,
-      sourcePath: state.source.entrypoint,
+      sourcePath: selectedSourcePath,
       sessionId: context.sessionId,
       token: context.token,
     });
@@ -149,7 +162,13 @@ export function ArtifactWorkbench() {
       if (controller.signal.aborted) return;
       setApplyError(error instanceof Error ? error.message : String(error));
     });
-  }, [context, hasLocalDraft, state, workspaceTarget]);
+  }, [
+    context,
+    hasLocalDraft,
+    selectedSourcePath,
+    state,
+    workspaceTarget,
+  ]);
 
   const applyStatus: WorkspaceApplyStatus | "idle" = applyReview?.status ??
     "idle";
@@ -181,30 +200,37 @@ export function ArtifactWorkbench() {
         </div>
       )}
       {state.kind === "ready" && (
-        reviewVisible && applyReview
-          ? (
+        <div className="artifact-workbench-stage">
+          <div
+            className="artifact-editor-layer"
+            data-obscured={reviewVisible || undefined}
+            aria-hidden={reviewVisible || undefined}
+          >
+            <GenUiStudio
+              key={`${state.source.artifact_id}:${state.source.source_revision}`}
+              host={host}
+              entrypoint={state.source.entrypoint}
+              initialFiles={state.source.files}
+              baselineFiles={state.source.files}
+              initialActivePath={selectedSourcePath}
+              initialRevision={state.source.source_revision}
+              languageServiceForPath={languageServiceForPath}
+              onActivePathChange={setActiveSourcePath}
+              onPublishDraft={publishDraft}
+              onDraftStateChange={setHasLocalDraft}
+              publishStatus={publishStatus}
+              publishError={publishError}
+            />
+          </div>
+          {reviewVisible && applyReview && (
             <WorkspaceReview
               review={applyReview}
               status={applyReview.status}
               error={applyError}
               onBack={() => setReviewVisible(false)}
             />
-          )
-          : (
-            <GenUiStudio
-              key={`${state.source.artifact_id}:${state.source.source_revision}`}
-              host={host}
-              initialSource={state.source.files[state.source.entrypoint]}
-              baselineSource={state.source.files[state.source.entrypoint]}
-              initialRevision={state.source.source_revision}
-              heading={state.source.entrypoint}
-              languageService={languageService}
-              onPublishDraft={publishDraft}
-              onDraftStateChange={setHasLocalDraft}
-              publishStatus={publishStatus}
-              publishError={publishError}
-            />
-          )
+          )}
+        </div>
       )}
       <footer className="artifact-surface-footer">
         <span className="artifact-source-meta">
@@ -229,7 +255,9 @@ export function ArtifactWorkbench() {
               autoComplete="off"
               disabled={applyBusy}
               maxLength={4096}
-              placeholder="workspace path, e.g. src/App.tsx"
+              placeholder={selectedSourcePath
+                ? `target for ${selectedSourcePath}`
+                : "workspace-relative target"}
               spellCheck={false}
               value={workspaceTarget}
               onChange={(event) => setWorkspaceTarget(event.target.value)}
@@ -302,11 +330,30 @@ async function fetchArtifactSource(
     throw new Error(`Rust source endpoint returned ${response.status}.`);
   }
   const source = await response.json() as ArtifactSourceResponse;
+  const files = source && typeof source.files === "object" &&
+      source.files !== null && !Array.isArray(source.files)
+    ? Object.entries(source.files)
+    : [];
+  const totalSourceBytes = files.reduce(
+    (total, [, value]) =>
+      total +
+      (typeof value === "string"
+        ? new TextEncoder().encode(value).byteLength
+        : 1024 * 1024 + 1),
+    0,
+  );
   if (
     source.artifact_id !== artifactId ||
     !Number.isSafeInteger(source.source_revision) ||
     source.source_revision < 1 ||
     typeof source.entrypoint !== "string" ||
+    files.length === 0 ||
+    files.length > 100 ||
+    files.some(([path, value]) =>
+      !path.startsWith("/") || path.includes("..") || path.includes("\\") ||
+      typeof value !== "string"
+    ) ||
+    totalSourceBytes > 1024 * 1024 ||
     typeof source.files[source.entrypoint] !== "string"
   ) {
     throw new Error("Rust source snapshot did not match the active artifact.");

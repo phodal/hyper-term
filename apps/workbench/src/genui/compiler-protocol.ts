@@ -1,7 +1,7 @@
 import type { ArtifactCandidate, CompileDiagnostic } from "../protocol.ts";
 
 export const MAX_SOURCE_FILES = 100;
-export const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
+export const MAX_SOURCE_BYTES = 1024 * 1024;
 
 export interface CompileRequest {
   type: "compile";

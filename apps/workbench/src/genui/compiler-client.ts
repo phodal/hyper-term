@@ -1,5 +1,9 @@
 import type { ArtifactCandidate } from "../protocol.ts";
-import type { CompileRequest, CompileResponse } from "./compiler-protocol.ts";
+import {
+  type CompileRequest,
+  type CompileResponse,
+  validateCompileRequest,
+} from "./compiler-protocol.ts";
 
 interface PendingCompile {
   revision: number;
@@ -25,16 +29,19 @@ export class GenUiCompiler {
     };
   }
 
-  compile(sourceRevision: number, source: string): Promise<ArtifactCandidate> {
+  compile(
+    sourceRevision: number,
+    entrypoint: string,
+    files: Record<string, string>,
+  ): Promise<ArtifactCandidate> {
     this.#latestRevision = Math.max(this.#latestRevision, sourceRevision);
     const requestId = crypto.randomUUID();
-    const request: CompileRequest = {
-      type: "compile",
-      request_id: requestId,
-      source_revision: sourceRevision,
-      entrypoint: "/App.tsx",
-      files: { "/App.tsx": source },
-    };
+    const request = createCompileRequest(
+      requestId,
+      sourceRevision,
+      entrypoint,
+      files,
+    );
     return new Promise((resolve, reject) => {
       const timeout = globalThis.setTimeout(() => {
         this.#pending.delete(requestId);
@@ -80,4 +87,21 @@ export class GenUiCompiler {
     }
     this.#pending.clear();
   }
+}
+
+export function createCompileRequest(
+  requestId: string,
+  sourceRevision: number,
+  entrypoint: string,
+  files: Record<string, string>,
+): CompileRequest {
+  const request: CompileRequest = {
+    type: "compile",
+    request_id: requestId,
+    source_revision: sourceRevision,
+    entrypoint,
+    files: { ...files },
+  };
+  validateCompileRequest(request);
+  return request;
 }
