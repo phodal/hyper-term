@@ -344,8 +344,8 @@ fn apply_workspace_transaction(
     }
 
     for staged_plan in &staged {
-        if let Some(backup_name) = staged_plan.backup_name.as_ref() {
-            if let Err(error) =
+        if let Some(backup_name) = staged_plan.backup_name.as_ref()
+            && let Err(error) =
                 unlink_at_checked(staged_plan.parent.directory.as_raw_fd(), backup_name).and_then(
                     |()| {
                         staged_plan
@@ -355,11 +355,10 @@ fn apply_workspace_transaction(
                             .map_err(WorkspaceApplyError::from)
                     },
                 )
-            {
-                return Err(WorkspaceApplyError::UnknownExecution(format!(
-                    "targets were installed but transaction cleanup failed: {error}"
-                )));
-            }
+        {
+            return Err(WorkspaceApplyError::UnknownExecution(format!(
+                "targets were installed but transaction cleanup failed: {error}"
+            )));
         }
     }
     Ok(())
