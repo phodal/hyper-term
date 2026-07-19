@@ -342,6 +342,7 @@ pub const Model = struct {
     genui_artifact_id_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
     genui_artifact_id_len: usize = 0,
     genui_source_revision: u64 = 0,
+    agent_editor_open_session_id: u8 = 0,
     agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
     agent_blocks: [max_agent_blocks]AgentBlockView = [_]AgentBlockView{.{}} ** max_agent_blocks,
     agent_block_count: usize = 0,
@@ -380,6 +381,7 @@ pub const Model = struct {
         "genui_artifact_id_storage",
         "genui_artifact_id_len",
         "genui_source_revision",
+        "agent_editor_open_session_id",
         "agent_composer_buffer",
         "agent_blocks",
         "agent_block_count",
@@ -393,6 +395,7 @@ pub const Model = struct {
         "terminalUrl",
         "genUiWorkbenchUrl",
         "hasGenUiArtifact",
+        "hasEditableAgentArtifact",
         "agentError",
     };
 
@@ -583,12 +586,21 @@ pub const Model = struct {
         return model.activeSession().mode == .agent and model.genui_workbench_url_len > 0;
     }
 
-    pub fn hasAgentEditor(model: *const Model) bool {
+    pub fn hasEditableAgentArtifact(model: *const Model) bool {
         if (!model.hasGenUiArtifact()) return false;
         return switch (model.activeSession().agent_provider) {
             .codex => false,
             .codex_acp, .claude_acp, .copilot_acp => true,
         };
+    }
+
+    pub fn canOpenAgentEditor(model: *const Model) bool {
+        return model.hasEditableAgentArtifact() and !model.hasAgentEditor();
+    }
+
+    pub fn hasAgentEditor(model: *const Model) bool {
+        return model.hasEditableAgentArtifact() and
+            model.agent_editor_open_session_id == model.active_session_id;
     }
 
     pub fn genUiArtifactLabel(model: *const Model) []const u8 {
@@ -624,6 +636,8 @@ pub const Msg = union(enum) {
     cancel_agent_effect: []const u8,
     agent_permission_decided: native_sdk.EffectResponse,
     agent_poll: native_sdk.EffectTimer,
+    open_agent_editor,
+    close_agent_editor,
     agent_split_resized: f32,
     system_appearance: struct {
         scheme: canvas.ColorScheme,
@@ -675,6 +689,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .agent_permission_decided => |response| applyAgentPermissionResponse(model, response, fx),
         .agent_poll => |timer| {
             if (timer.outcome == .fired) requestActiveAgentSnapshot(model, fx);
+        },
+        .open_agent_editor => {
+            if (model.hasEditableAgentArtifact()) {
+                model.agent_editor_open_session_id = model.active_session_id;
+            }
+        },
+        .close_agent_editor => {
+            if (model.agent_editor_open_session_id == model.active_session_id) {
+                model.agent_editor_open_session_id = 0;
+            }
         },
         .agent_split_resized => |fraction| model.agent_split = std.math.clamp(fraction, 0.48, 0.76),
         .system_appearance => |appearance| {
@@ -730,6 +754,9 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     const index = closing_index orelse return;
     const session = model.session_slots[index];
     const was_active = model.active_session_id == session_id;
+    if (model.agent_editor_open_session_id == session_id) {
+        model.agent_editor_open_session_id = 0;
+    }
     requestTerminalClose(model, session_id, fx);
     if (session.mode == .agent) {
         requestAgentClose(model, session_id, fx);

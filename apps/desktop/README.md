@@ -9,13 +9,15 @@ Command-F scrollback search and persistent Command-Plus / Command-Minus zoom
 without claiming Ctrl-C or other shell input.
 
 Agent tabs are single-pane by default, matching the disclosure behavior of a
-modern coding-agent client rather than reserving a permanent sidebar. A right
-editor pane is mounted only when an ACP-backed Agent has a current editable
-artifact. That pane is the packaged Deno-built Workbench; CodeMirror, Diff, Time
-Travel, and its isolated local preview have no workspace-write authority.
-CodeMirror diagnostics and completion come from a Rust-supervised Deno LSP
-process against the current artifact's private snapshot. Draft updates travel as
-bounded LSP document changes, not filesystem writes.
+modern coding-agent client rather than reserving a permanent sidebar. When an
+ACP-backed Agent has a current editable artifact, the conversation exposes an
+explicit Edit action; the right editor pane is mounted only after the user
+enters that editing state and can be closed without closing the Agent tab. That
+pane is the packaged Deno-built Workbench; CodeMirror, Diff, Time Travel, and
+its isolated local preview have no workspace-write authority. CodeMirror
+diagnostics and completion come from a Rust-supervised Deno LSP process against
+the current artifact's private snapshot. Draft updates travel as bounded LSP
+document changes, not filesystem writes.
 
 Each structured Agent session also receives Hyper Term as a digest-pinned stdio
 MCP server. Its Diff and GenUI tools operate only on bounded request data. The

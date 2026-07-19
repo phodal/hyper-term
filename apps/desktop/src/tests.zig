@@ -271,7 +271,7 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
 }
 
-test "Agent tabs stay single-pane until an ACP artifact enters editing" {
+test "direct Codex artifacts never expose the ACP editor panel" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     var model = main.initialModelWithServices(terminal_url, agent_url);
@@ -297,7 +297,10 @@ test "Agent tabs stay single-pane until an ACP artifact enters editing" {
     try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
     try testing.expect(model.hasGenUiArtifact());
+    try testing.expect(!model.hasEditableAgentArtifact());
+    try testing.expect(!model.canOpenAgentEditor());
     try testing.expect(!model.hasAgentEditor());
+    try testing.expect(findByLabel(tree.root, "Open ACP artifact editor") == null);
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
     try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
@@ -307,7 +310,7 @@ test "Agent tabs stay single-pane until an ACP artifact enters editing" {
     try testing.expectEqualStrings(main.genui_view_label, panes[1].label);
 }
 
-test "accepted ACP artifact opens the authenticated Workbench panel" {
+test "accepted ACP artifact stays single-pane until the user enters editing" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     var model = main.initialModelWithProviders(
@@ -350,7 +353,9 @@ test "accepted ACP artifact opens the authenticated Workbench panel" {
     } }, &fx);
 
     try testing.expect(model.hasGenUiArtifact());
-    try testing.expect(model.hasAgentEditor());
+    try testing.expect(model.hasEditableAgentArtifact());
+    try testing.expect(model.canOpenAgentEditor());
+    try testing.expect(!model.hasAgentEditor());
     try testing.expectEqualStrings("55555555", model.genUiArtifactLabel());
     try testing.expectEqualStrings(
         "http://127.0.0.1:55321/agent/workbench/?surface=artifact&artifact_id=55555555-5555-4555-8555-555555555555&session_id=2&token=abcdef0123456789abcdef0123456789",
@@ -363,18 +368,40 @@ test "accepted ACP artifact opens the authenticated Workbench panel" {
     try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
     try testing.expectEqualStrings("zero://inline", panes[0].url);
     try testing.expectEqualStrings(main.genui_view_label, panes[1].label);
+    try testing.expectEqualStrings("zero://inline", panes[1].url);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tree = try buildTree(arena, &model);
+    try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
+    try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
+    const open_editor = findByLabel(tree.root, "Open ACP artifact editor").?;
+    main.update(&model, tree.msgForPointer(open_editor.id, .up).?, &fx);
+
+    try testing.expect(!model.canOpenAgentEditor());
+    try testing.expect(model.hasAgentEditor());
+    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
     try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
     try testing.expectEqualStrings(model.genUiWorkbenchUrl(), panes[1].url);
     try testing.expectEqual(@as(u64, 7), panes[1].reload_token);
 
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const tree = try buildTree(arena_state.allocator(), &model);
+    tree = try buildTree(arena, &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) != null);
-    try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
+    try testing.expect(findByLabel(tree.root, "Open ACP artifact editor") == null);
     try testing.expect(containsText(tree.root, "Edit"));
     try testing.expect(containsText(tree.root, "draft"));
     try testing.expect(containsText(tree.root, "55555555"));
+    const close_editor = findByLabel(tree.root, "Close ACP artifact editor").?;
+    main.update(&model, tree.msgForPointer(close_editor.id, .up).?, &fx);
+    try testing.expect(!model.hasAgentEditor());
+    try testing.expect(model.canOpenAgentEditor());
+    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings("zero://inline", panes[1].url);
+
+    tree = try buildTree(arena, &model);
+    try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
+    try testing.expect(findByLabel(tree.root, "Open ACP artifact editor") != null);
     const tokens = main.hyperTermTokens(&model);
     const sweep = canvas.LayoutAuditSweepOptions{
         .tokens = tokens,

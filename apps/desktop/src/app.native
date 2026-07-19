@@ -7,6 +7,9 @@
       <text grow="1"><span weight="medium">Agent</span></text>
       <badge variant="secondary">{activeAgentProviderLabel}</badge>
       <badge variant="secondary">{agentConnectionLabel}</badge>
+      <if test="{canOpenAgentEditor}">
+        <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open ACP artifact editor">Edit</button>
+      </if>
     </row>
     <separator />
     <scroll grow="1" label="Agent blocks">
@@ -140,6 +143,7 @@
       <text grow="1"><span weight="medium">Edit</span></text>
       <text foreground="text_muted"><span mono="true">{genUiArtifactLabel}</span></text>
       <badge variant="secondary">draft</badge>
+      <button size="icon" variant="ghost" icon="x" on-press="close_agent_editor" label="Close ACP artifact editor"></button>
     </row>
     <separator />
     <column grow="1" background="background" label="Agent artifact editor viewport"></column>
