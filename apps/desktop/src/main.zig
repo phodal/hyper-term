@@ -2148,14 +2148,17 @@ fn displayAgentToolTitle(kind: []const u8, title: []const u8) []const u8 {
 fn projectAgentPlan(view: *AgentBlockView, entries: []const AgentPlanEntryWire) void {
     view.kind = .plan;
     var completed: usize = 0;
-    var current_step: ?[]const u8 = null;
+    var active_step: ?[]const u8 = null;
+    var next_step: ?[]const u8 = null;
     for (entries) |entry| {
         const marker: []const u8 = if (std.mem.eql(u8, entry.status, "completed")) "x" else " ";
         completed += @intFromBool(std.mem.eql(u8, entry.status, "completed"));
-        if (current_step == null and !std.mem.eql(u8, entry.status, "completed")) {
-            current_step = entry.content;
-        }
-        appendActivityFmt(view, "- [{s}] {s} _{s}_\n", .{ marker, entry.content, entry.priority });
+        if (active_step == null and std.mem.eql(u8, entry.status, "in_progress")) active_step = entry.content;
+        if (next_step == null and !std.mem.eql(u8, entry.status, "completed")) next_step = entry.content;
+        // ACP priorities help the runtime order work, but they are noisy in the
+        // compact Goal disclosure and are not a user-facing status. Keep the
+        // native projection focused on completion and the current step.
+        appendActivityFmt(view, "- [{s}] {s}\n", .{ marker, entry.content });
     }
     var meta: [max_agent_activity_meta_bytes]u8 = undefined;
     const rendered = std.fmt.bufPrint(&meta, "{d} / {d} steps complete", .{ completed, entries.len }) catch "Goal";
@@ -2170,7 +2173,7 @@ fn projectAgentPlan(view: *AgentBlockView, entries: []const AgentPlanEntryWire) 
         const suffix = std.fmt.bufPrint(&suffix_storage, " · {d} / {d}", .{ completed, entries.len }) catch "";
         const available = view.title_storage.len - view.title_len;
         const step_capacity = available -| suffix.len;
-        const step = current_step orelse entries[0].content;
+        const step = active_step orelse next_step orelse entries[0].content;
         const step_length = utf8BoundedLength(step, step_capacity);
         appendActivityTitle(view, step[0..step_length]);
         appendActivityTitle(view, suffix);
