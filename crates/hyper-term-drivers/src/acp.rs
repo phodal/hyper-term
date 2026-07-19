@@ -809,6 +809,57 @@ mod tests {
     }
 
     #[test]
+    fn acp_session_advertises_the_digest_pinned_brokered_mcp_server() {
+        let (temporary, executable) = fake_agent(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s' \"$line\" > \"$ACP_CAPTURE\"; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-with-mcp\"}}' ;;\n  esac\ndone\n",
+        );
+        let workspace = TempDir::new().unwrap();
+        let capture = temporary.path().join("session-new.json");
+        let mcp = temporary.path().join("hyper-term-mcp");
+        std::fs::write(&mcp, "fixture MCP").unwrap();
+        let mut permissions = std::fs::metadata(&mcp).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&mcp, permissions).unwrap();
+        let client = AcpAgentClient::launch(AcpAgentConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            arguments: vec![],
+            environment: BTreeMap::from([("ACP_CAPTURE".into(), capture.as_os_str().to_owned())]),
+            implementation_version: "fixture-1".into(),
+            provider_id: "fixture-acp".into(),
+            workspace: workspace.path().to_owned(),
+            brokered_mcp_server: Some(AcpMcpServerConfig {
+                executable: mcp.clone(),
+                executable_sha256: sha256_file(&mcp).unwrap(),
+                arguments: vec![
+                    "--agent-mode".into(),
+                    "--socket".into(),
+                    "/tmp/hyperd.sock".into(),
+                ],
+            }),
+        })
+        .unwrap();
+
+        client.initialize(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            client.start_session(Duration::from_secs(2)).unwrap(),
+            "session-with-mcp"
+        );
+        let request: Value = serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        let server = &request["params"]["mcpServers"][0];
+        assert_eq!(server["name"], "hyper_term");
+        assert_eq!(
+            server["command"].as_str(),
+            mcp.canonicalize().unwrap().to_str()
+        );
+        assert_eq!(
+            server["args"],
+            json!(["--agent-mode", "--socket", "/tmp/hyperd.sock"])
+        );
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[test]
     fn acp_permission_becomes_brokered_proposal_and_rejection() {
         let (_temporary, executable) = fake_agent(
             "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-2\"}}' ;;\n    *'\"method\":\"session/prompt\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"permission-7\",\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"session-2\",\"toolCall\":{\"toolCallId\":\"tool-1\",\"kind\":\"execute\",\"title\":\"Run cargo test\"},\"options\":[{\"optionId\":\"allow-once\",\"name\":\"Allow\",\"kind\":\"allow_once\"},{\"optionId\":\"reject-once\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}' ;;\n    *'\"id\":\"permission-7\"'*'\"optionId\":\"reject-once\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",

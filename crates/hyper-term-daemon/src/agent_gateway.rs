@@ -31,6 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::DaemonState;
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
+use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
@@ -153,6 +154,7 @@ struct AgentSession {
     protocol: StructuredAgentProtocol,
     task_id: TaskId,
     thread_id: String,
+    runtime_root: PathBuf,
     progress: Mutex<AgentProgress>,
     pending_effect: Mutex<Option<PendingAgentEffect>>,
 }
@@ -806,28 +808,47 @@ impl AgentGatewayRuntime {
         if sessions.len() >= MAX_AGENT_SESSIONS {
             return Err(StartError::Capacity);
         }
-        let session_root = self
-            .config
-            .state_directory
-            .join("agents")
-            .join(format!("session-{session_id}"));
         let task_id = self
             .config
             .daemon
             .create_task(format!("{provider_id} Agent session {session_id}"))
             .map_err(|_| StartError::Driver)?;
-        let mcp = self.mcp_launch(task_id, &session_root).transpose()?;
-        let client = self.launch_provider(provider_id, &session_root, mcp)?;
+        let session_root = self
+            .config
+            .state_directory
+            .join("agents")
+            .join(format!("session-{session_id}-{task_id}"));
+        create_private_runtime_root(&session_root).map_err(|_| StartError::Driver)?;
+        let mcp = match self.mcp_launch(task_id, &session_root).transpose() {
+            Ok(mcp) => mcp,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&session_root);
+                return Err(error);
+            }
+        };
+        let client = match self.launch_provider(provider_id, &session_root, mcp) {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&session_root);
+                return Err(error);
+            }
+        };
         let protocol = client.protocol();
-        let thread_id = client
-            .initialize_session(INITIALIZE_TIMEOUT)
-            .map_err(|_| StartError::Driver)?;
+        let thread_id = match client.initialize_session(INITIALIZE_TIMEOUT) {
+            Ok(thread_id) => thread_id,
+            Err(_) => {
+                let _ = client.close();
+                let _ = std::fs::remove_dir_all(&session_root);
+                return Err(StartError::Driver);
+            }
+        };
         let session = Arc::new(AgentSession {
             client,
             provider_id: provider_id.to_owned(),
             protocol,
             task_id,
             thread_id,
+            runtime_root: session_root,
             progress: Mutex::new(AgentProgress {
                 status: AgentStatus::Ready,
                 turn_id: None,
@@ -1209,7 +1230,14 @@ impl AgentGatewayRuntime {
                 Ok(digest) => digest,
                 Err(_) => return Some(Err(StartError::Driver)),
             };
-            let deno_root = session_root.join("deno-genui");
+            let deno_root = session_root.join("deno-tools");
+            let snapshot = match create_workspace_snapshot(
+                &self.config.workspace,
+                &deno_root.join("workspace-snapshot"),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return Some(Err(StartError::Driver)),
+            };
             arguments.extend([
                 "--deno".into(),
                 runtime.deno_executable.clone().into_os_string(),
@@ -1217,6 +1245,8 @@ impl AgentGatewayRuntime {
                 deno_sha256.into(),
                 "--deno-version".into(),
                 runtime.runtime_version.clone().into(),
+                "--workspace-snapshot".into(),
+                snapshot.root.into_os_string(),
                 "--deno-cache".into(),
                 deno_root.join("cache").into_os_string(),
                 "--deno-scratch".into(),
@@ -1241,10 +1271,14 @@ impl AgentGatewayRuntime {
     }
 
     fn close_session(&self, session_id: u16) {
-        if let Ok(mut sessions) = self.sessions.lock()
-            && let Some(session) = sessions.remove(&session_id)
-        {
+        let session = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|mut sessions| sessions.remove(&session_id));
+        if let Some(session) = session {
             let _ = session.client.close();
+            let _ = std::fs::remove_dir_all(&session.runtime_root);
         }
         if let Some(editor_lsp) = &self.editor_lsp {
             editor_lsp.close_session(session_id);
@@ -1259,6 +1293,7 @@ impl AgentGatewayRuntime {
         };
         for session in sessions {
             let _ = session.client.close();
+            let _ = std::fs::remove_dir_all(&session.runtime_root);
         }
         if let Some(editor_lsp) = &self.editor_lsp {
             editor_lsp.close_all();
@@ -1791,6 +1826,7 @@ mod tests {
     async fn configured_acp_provider_uses_the_same_agent_session_projection() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
+        let gateway_state = temporary.path().join("gateway-state");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let daemon = DaemonState::open(temporary.path().join("daemon-state")).expect("daemon");
         let fake_acp = temporary.path().join("fixture-acp");
@@ -1807,7 +1843,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             token: token.clone(),
             workspace,
-            state_directory: temporary.path().join("gateway-state"),
+            state_directory: gateway_state.clone(),
             daemon,
             codex_executable: None,
             codex_auth_file: None,
@@ -1877,7 +1913,19 @@ mod tests {
                 .iter()
                 .any(|block| block["payload"]["text"] == "Provider-neutral ACP is live.")
         );
+        assert_eq!(
+            std::fs::read_dir(gateway_state.join("agents"))
+                .unwrap()
+                .count(),
+            1
+        );
         gateway.shutdown().await.unwrap();
+        assert_eq!(
+            std::fs::read_dir(gateway_state.join("agents"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2573,11 +2621,22 @@ mod tests {
     }
 
     #[test]
-    fn brokered_mcp_receives_pinned_genui_runtime_arguments() {
+    fn brokered_mcp_receives_pinned_deno_tools_and_a_private_workspace_snapshot() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
         let state_directory = temporary.path().join("gateway-state");
-        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(workspace.join("src")).expect("workspace");
+        std::fs::create_dir_all(workspace.join("node_modules/ignored")).expect("dependencies");
+        std::fs::write(
+            workspace.join("src/main.ts"),
+            "export const answer: number = 42;\n",
+        )
+        .expect("source");
+        std::fs::write(
+            workspace.join("node_modules/ignored/index.ts"),
+            "export const ignored = true;\n",
+        )
+        .expect("generated dependency");
         std::fs::create_dir_all(&state_directory).expect("state directory");
         let mcp = temporary.path().join("hyper-term-mcp");
         let deno = temporary.path().join("deno");
@@ -2633,6 +2692,16 @@ mod tests {
         assert!(arguments.contains(&std::borrow::Cow::Borrowed("--genui-script")));
         assert!(arguments.contains(&std::borrow::Cow::Borrowed("--genui-wasm")));
         assert!(arguments.contains(&std::borrow::Cow::Borrowed("--deno-sha256")));
+        let snapshot = arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--workspace-snapshot")
+            .map(|pair| PathBuf::from(pair[1].as_ref()))
+            .expect("workspace snapshot argument");
+        assert_eq!(
+            std::fs::read_to_string(snapshot.join("src/main.ts")).unwrap(),
+            "export const answer: number = 42;\n"
+        );
+        assert!(!snapshot.join("node_modules").exists());
         assert!(arguments.iter().any(|argument| argument.len() == 64));
         assert!(config.arguments.len() <= 32);
     }
