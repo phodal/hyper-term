@@ -1,431 +1,220 @@
-# Hyper Term
+<div align="center">
+  <img src="apps/desktop/assets/icon.png" width="112" alt="Hyper Term icon" />
 
-Hyper Term is a design-stage project for a local-first, agentic terminal. It is
-not a terminal with a chat sidebar. It treats Shell, structured agents,
-Computer Use, MCP tools, editors, browsers, and generated interfaces as
-executors and projections of one durable human–AI task model.
+  <h1>Hyper Term</h1>
 
-> **Repository status:** the M1 kernel baseline is implemented; M2 control-loop
-> integration and the M3 Agentic UI risk spike are active. The disposable
-> Vite/Tauri prototype has been removed. The
-> repository now contains a renderer-independent Rust protocol, journal,
-> operation reducer, Block projector, reconnectable PTY daemon,
-> provider-neutral structured Agent sessions, real Codex ACP and Claude ACP
-> prompt gates, a brokered MCP gateway, and a terminal-first React Workbench
-> built directly by pinned Deno. The packaged Native SDK application now carries
-> a digest-checked Deno GenUI compiler and frozen official Codex/Claude ACP
-> adapters without bundling Node. Broker-accepted artifacts are persisted by
-> Rust and projected as isolated Blocks without replacing the last-known-good
-> revision on failure. Agent tabs remain a single conversation surface by
-> default; only an ACP session with a current editable artifact mounts the
-> authenticated Deno-built Workbench as a right-hand Native WebView pane. Every
-> newly
-> accepted artifact retains its exact bounded virtual TS/JS source tree in the
-> private Rust store and exposes it only through the authenticated,
-> task-current Agent source endpoint, establishing the authority path for the
-> real CodeMirror editor and diff surface. Deno LSP and
-> GenUI now run in digest-bound macOS Seatbelt task profiles, and timed-out
-> effects terminate their complete process group without being replayed. Driver
-> queues and secondary Agent/LSP inboxes have byte budgets, and uncertain MCP
-> outcomes remain visible until evidence reconciles them.
-> Performance, memory-pressure recovery, hostile-artifact, and cross-platform
-> containment gates remain open.
-> Proposed ADRs remain subject to the validation and replacement gates recorded
-> in each decision.
+  <p><strong>A local-first terminal for humans and coding agents.</strong></p>
+  <p>A normal terminal by default. A structured Agent workspace when you ask for one.</p>
 
-## Product thesis
+  <p>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0 license" /></a>
+    <img src="https://img.shields.io/badge/platform-macOS-black.svg" alt="macOS" />
+    <img src="https://img.shields.io/badge/status-alpha-orange.svg" alt="Alpha status" />
+  </p>
+</div>
 
-The product model changes from:
+Hyper Term is an open-source, macOS-first terminal that keeps the familiar PTY
+experience and adds an explicit workspace for structured coding agents. Shells,
+agent sessions, approvals, diffs, and generated interfaces share one durable
+task model without giving the UI direct command or filesystem authority.
 
-```text
-tab -> pane -> process -> scrollback
+> [!IMPORTANT]
+> Hyper Term is in active development. The terminal core and macOS application
+> are runnable, but the project is not ready for production use or general
+> distribution yet.
+
+## Features
+
+- **A real terminal first.** New tabs open the user's login shell with job
+  control, resize, `Ctrl-C`, UTF-8, CJK/IME input, truecolor, ordered output,
+  and reconnectable scrollback.
+- **Explicit Agent mode.** Agent sessions live in their own tabs; opening a
+  normal terminal never starts a model or changes shell behavior.
+- **Structured coding-agent sessions.** ACP adapters turn messages, plans, tool
+  calls, approvals, and results into typed blocks instead of scraping ANSI
+  output.
+- **Codex, Claude, and Copilot adapters.** Hyper Term discovers locally
+  installed provider CLIs and connects through provider-specific, supervised
+  adapters. Provider binaries and credentials are never bundled.
+- **Generated UI artifacts.** Agents can propose React/TypeScript interfaces
+  that are compiled by a pinned Deno runtime, content-addressed by Rust, and
+  shown in a network-closed preview.
+- **Artifact Workbench.** Current artifacts can open in a CodeMirror editor with
+  Diff, Time Travel, source-mapped diagnostics, completion, and an isolated
+  local preview. Drafts do not write to the workspace.
+- **Local-first authority.** Rust owns PTYs, process lifetime, permissions,
+  durable state, and accepted artifacts. WebViews render trusted projections
+  and cannot spawn commands or choose arbitrary files.
+- **Native macOS shell.** The desktop application uses a Native SDK window with
+  a fast ordinary Terminal surface and contextual Agent/editor panes.
+
+## How it works
+
+```mermaid
+flowchart LR
+    UI["Native macOS shell"] -->|typed intents| CORE["Rust control kernel"]
+    TERM["Terminal surface"] <-->|authenticated PTY stream| CORE
+    ACP["Codex / Claude / Copilot"] <-->|ACP and structured events| CORE
+
+    CORE --> PTY["PTYs and process lifecycle"]
+    CORE --> STATE["Journal, blocks, and artifacts"]
+    CORE --> BROKER["Permission broker"]
+    CORE --> DENO["Supervised Deno sidecar"]
+
+    DENO --> LSP["Artifact LSP"]
+    DENO --> GENUI["GenUI compiler"]
+    GENUI --> PREVIEW["Isolated preview"]
 ```
 
-to:
+The central rule is simple: **presentation proposes; Rust authorizes and
+executes**. `hyper-term-core` is renderer-independent, terminal output is
+always treated as untrusted data, and bulk PTY traffic does not cross a generic
+UI bridge.
 
-```text
-Intent -> Task -> Operation -> Effect -> Evidence
-```
+## Project status
 
-Four product primitives make that useful:
+| Area | Status |
+| --- | --- |
+| Rust PTY kernel, journal, reconnect, and input lease | Implemented baseline |
+| Native macOS Terminal tabs | Active development |
+| Structured ACP Agent tabs | Active development |
+| Codex and Claude packaged ACP adapters | Implemented baseline |
+| GitHub Copilot ACP discovery | Implemented baseline |
+| Generated artifact storage and isolated preview | Implemented baseline |
+| Artifact editor, Diff, Time Travel, diagnostics, and completion | Experimental |
+| Brokered workspace edits | Not implemented |
+| Signed and notarized public releases | Not available yet |
+| Linux and Windows desktop applications | Not available yet |
 
-- **Mission Composer:** turns text, voice, files, terminal blocks, screenshots,
-  constraints, and acceptance criteria into an editable task contract.
-- **Operation Ledger:** records actor, intent, authority, input, effect,
-  verification, uncertainty, and recovery state instead of retaining only Bash
-  command strings.
-- **Attention OS:** models waiting, approval, conflict, failure, takeover,
-  review-ready, and completion as durable state rather than notification text.
-- **Block Workbench:** projects messages, tools, terminals, diffs, plans,
-  approvals, Computer Use evidence, and generated artifacts through native,
-  terminal-specific, or WebView renderers without giving those renderers
-  machine authority.
+Agent providers require a compatible CLI already installed and authenticated on
+the local machine. Hyper Term packages the adapter runtime, not the provider
+CLI or account credentials.
 
-## Non-negotiable boundaries
+## Quick start
 
-- Rust owns PTYs, process groups, task and operation state, the journal,
-  checkpoints, permissions, accepted artifacts, secrets, and agent/tool drivers.
-- `hyper-term-core` stays independent from Tauri, Native SDK, React, and any
-  other renderer host.
-- The WebView owns presentation and interaction only. It receives no generic
-  process, filesystem, environment, credential, or socket capability.
-- A model or generated UI may propose an action; only the Rust permission broker
-  may authorize and dispatch it.
-- Terminal output, remote content, ACP metadata, and model text are untrusted
-  data. None becomes an application command or renderer registration.
-- PTY, model, and Block streams are ordered, bounded, reconnectable channels;
-  bulk terminal or artifact data does not travel through a JSON UI bridge.
-- Deno is a supervised tooling sidecar and ahead-of-time workbench builder, not
-  the control kernel. Interactive Agentic UI compilation uses a persistent,
-  bounded `esbuild-wasm` worker; approved cold-path compilation uses the same
-  virtual-file and artifact contract in a digest-pinned Deno child.
-- ACP and MCP are versioned input adapters. The renderer consumes the internal
-  `BlockDocument`, never protocol DTOs directly.
+### Prerequisites
 
-## Target shape
+- macOS
+- Rust `1.95` (pinned by `rust-toolchain.toml`)
+- Deno `2.9.3`
+- Zig `0.16.0`
+- Native SDK CLI `0.5.3`
 
-```text
-Text / Voice / Context
-          |
-          v
-Mission Composer -----> Task / Run / Operation journal
-                              |
-                     Rust hyperd control kernel
-                    /          |            \
-              PTY / SSH      ACP / MCP    Computer Use
-                    \          |            /
-                     Effect + receipt + evidence
-                              |
-                         BlockProjector
-                              |
-                  versioned BlockDocument + patches
-                   /             |              \
-             Native blocks   Terminal surface   WebView islands
-```
-
-Native UI, Tauri/React, a daemon client, and tests must be able to consume the
-same Block snapshots and patches and emit the same typed `UiIntent`. A WebView
-block is a logical child of the document but may be a separately pooled OS
-surface aligned to a native layout slot.
-
-## First vertical slice
-
-The first implementation is intentionally one complete workflow, not a set of
-disconnected framework demos:
-
-```text
-editable task brief
-  -> structured ACP agent session
-  -> exact Shell operation proposal
-  -> policy and human approval
-  -> Rust-owned PTY execution
-  -> diff and test evidence
-  -> read-only Computer Use verification
-  -> ReviewReady bundle
-  -> semantic replay with no repeated side effects
-```
-
-The compatibility path must simultaneously run an opaque Codex, Claude Code, or
-other TUI through a normal PTY. The structured path must not scrape ANSI to
-recover plans, tools, approvals, or completion state.
-
-## Roadmap
-
-The roadmap is gate-driven rather than date-driven. A milestone advances only
-when its failure, reconnect, security, and evidence gates pass.
-
-| Milestone | Outcome | Exit gates |
-| --- | --- | --- |
-| **M0 — Architecture baseline** | Review the fourteen ADRs, freeze the first `EventEnvelope`, Task/Run/Operation, `BlockDocument`, `UiIntent`, terminal-stream, and artifact schemas. | Proposed ADRs are accepted, revised, or explicitly deferred; golden protocol fixtures and benchmark workloads are specified before implementation. |
-| **M1 — Durable Rust kernel (baseline implemented)** | Build renderer-independent `hyper-term-core` and an out-of-process `hyperd` with PTY supervision, append-only journal, checkpoints, permission broker, input lease, bounded transcript, and reconnectable ordered streams. | A direct user terminal resolves the configured login shell without renderer-supplied executables; zsh login/interactive mode, UTF-8, truecolor, foreground-job `Ctrl-C`, resize/output ordering, reconnect, cancellation, and recovery have tests and release probes. |
-| **M2 — Agent control loop and Block workbench (current)** | Add raw PTY agent compatibility, a provider-neutral ACP v1 path validated with real Codex and Claude adapters, an MCP host behind the broker, `BlockProjector`, attention reducer, and renderer-independent Workbench assets built by Deno. | One task reaches `ReviewReady` through proposal, approval, execution, verification, and review; all ACP v1 variants have golden fixtures; renderer failure loses no canonical state. |
-| **M3 — Agentic UI and local debugging (accepted-artifact slice implemented)** | Add the brokered Deno tool runtime, persistent `esbuild-wasm` compilation, versioned UI IR/React artifacts, trusted editor adapters, isolated previews, source maps, and semantic Time Travel. | A broken generated UI keeps its last-known-good artifact, maps errors to its source revision, and replays without Shell, network, MCP, or Computer Use effects. |
-| **M4 — Computer Use, voice, and attention** | Implement observe–act–verify drivers, explicit capability and focus leases, before/after evidence, voice briefs, push-to-talk steering, local pause/takeover controls, and semantic notifications. | Stale observations and lease conflicts are rejected; every action has actor, target, capability, receipt, and result; voice never directly approves a consequential effect. |
-| **M5 — Native desktop product shell** | Use Native SDK as the default macOS host for the ordinary terminal surface and common blocks, with bounded Web/WASM islands for generated UI and previews. | Startup, key-to-present, burst throughput, 100k-block virtualization, CJK/IME/accessibility, responsive layout, crash recovery, focus, and a shared Native/Web design-token contract pass on the packaged app. |
-| **M6 — Distribution and ecosystem** | Add signed/updatable desktop packages, SSH/remote sessions, provider adapters, extension manifests, policy profiles, import/export, diagnostics, and a stable compatibility contract. | Reproducible builds, migration/rollback, supply-chain verification, least-privilege defaults, recovery drills, and supported-platform matrices are release-ready. |
-
-Native SDK is the default desktop host target. Renderer work must still preserve
-the durable task model, permission boundary, structured agent loop, and ordinary
-PTY path instead of moving machine authority into UI code.
-
-## Traditional Terminal contract
-
-Hyper Term must first be a fast, ordinary terminal. Creating a default terminal
-is an explicit human action, so it opens the authority-selected user login shell
-without creating an AI operation. The client may choose only an absolute working
-directory and terminal size; it cannot supply a program, arguments, or
-environment. Rust resolves and validates the shell, owns the controlling PTY,
-sets `TERM=xterm-256color` and truecolor metadata, orders output before exit,
-handles input leases and resize generations, and keeps replay available after a
-client reconnects.
-
-Agent, Block, transcript, and evidence consumers subscribe outside the PTY hot
-path. They may fall behind or request a snapshot; they may not delay keyboard
-input, shell echo, or native presentation. The first machine-readable release
-baseline is recorded in
-[Terminal core release baseline](docs/benchmarks/terminal-core-baseline-2026-07-18.md).
-
-## Architecture decisions
-
-### Runtime and authority
-
-- [ADR 0001 — Hybrid renderer spike and native terminal target](docs/architecture/0001-hybrid-renderer-spike.md)
-- [ADR 0002 — Rust, Deno, and UI authority boundaries](docs/architecture/0002-runtime-authority-boundaries.md)
-- [ADR 0003 — Brokered Deno sidecar](docs/architecture/0003-brokered-deno-sidecar.md)
-- [ADR 0008 — License-scoped Warp reuse](docs/architecture/0008-license-scoped-warp-reuse.md)
-- [ADR 0009 — Rust ACP and MCP adapters](docs/architecture/0009-rust-acp-mcp-adapters.md)
-- [ADR 0014 — Rust-owned Coding Agent sandbox](docs/architecture/0014-rust-owned-coding-agent-sandbox.md)
-
-### Agentic UI and history
-
-- [ADR 0004 — Versioned Agentic UI artifacts](docs/architecture/0004-versioned-agentic-ui-artifacts.md)
-- [ADR 0005 — Incremental React compilation with esbuild-wasm](docs/architecture/0005-incremental-react-compilation.md)
-- [ADR 0006 — Semantic Time Travel](docs/architecture/0006-semantic-time-travel-debug.md)
-- [ADR 0007 — React workbench and transactional editors](docs/architecture/0007-react-workbench-and-editors.md)
-- [ADR 0010 — Deno-first static workbench without Vite](docs/architecture/0010-deno-first-static-workbench-build.md)
-
-### Rendering
-
-- [ADR 0011 — Versioned Block Render document](docs/architecture/0011-versioned-block-render-document.md)
-- [ADR 0012 — Tauri baseline and Native SDK renderer spike](docs/architecture/0012-native-sdk-renderer-spike.md)
-- [ADR 0013 — Native SDK default product shell](docs/architecture/0013-native-sdk-default-product-shell.md)
-
-ADR 0001 is accepted for its historical spike, and ADR 0013 is accepted as the
-default product-shell decision. The remaining ADRs are proposed until their
-open validation and replacement gates close.
-
-## Research baseline
-
-- [AI Terminal user needs and product thesis](docs/research/ai-terminal-user-needs-2026-07.md)
-- [AI CLI and Computer Use probe](docs/research/ai-cli-computer-use-probe-2026-07.md)
-- [IntelliJ IDEA New Terminal audit](docs/research/idea-new-terminal-audit-2026-07.md)
-- [AI-era terminal landscape](docs/research/terminal-landscape-2026-07.md)
-
-These documents are dated evidence, not permanent product truth. Recheck
-versions, protocol schemas, platform support, licenses, and performance claims
-before using them for an implementation decision.
-
-## Repository map
-
-```text
-README.md              product boundary and roadmap
-AGENTS.md              contributor and safety rules
-Cargo.toml             Rust workspace definition
-crates/hyper-term-protocol/  versioned events, blocks, and wire frames
-crates/hyper-term-core/      journal, reducers, projections, and PTY ownership
-crates/hyper-term-daemon/    permissioned, reconnectable control-kernel host
-crates/hyper-term-drivers/   bounded agent, Deno LSP, and GenUI supervision
-apps/workbench/         terminal-first React Block workbench and isolated GenUI
-runtime/                pinned supervised-runtime manifests
-scripts/                Deno build and supply-chain verification tools
-docs/architecture/     numbered architecture decisions
-docs/research/         dated product and implementation evidence
-```
-
-Implementation lands in milestone-sized, independently tested slices. Every
-protocol or lifecycle change must include tests, and every milestone must
-preserve the Rust authority and renderer-independence boundaries.
-
-## Develop the Rust kernel
-
-The current M1 slice requires the pinned Rust toolchain only:
+Clone the repository and verify the pinned toolchain:
 
 ```bash
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+git clone https://github.com/phodal/hyper-term.git
+cd hyper-term
+deno task verify:runtime
+```
+
+Build the terminal, Workbench, and native renderer:
+
+```bash
+deno task build:terminal
+deno task build:workbench
+(cd apps/desktop && npx -y @native-sdk/cli@0.5.3 build --release=fast)
+```
+
+Run the integrated development application:
+
+```bash
+cargo run -p hyper-term-daemon --bin hyper-term-desktop -- \
+  --ui "$PWD/apps/desktop/zig-out/bin/hyper-term" \
+  --terminal-assets "$PWD/dist/terminal" \
+  --workbench-assets "$PWD/dist/workbench"
+```
+
+This starts an ordinary terminal without requiring an Agent provider. To use an
+Agent tab, install and authenticate a supported provider CLI first, then pass an
+explicit provider path when needed; see `hyper-term-desktop --help` for the
+available flags.
+
+### Build the macOS application
+
+With `native` available on `PATH`, create an ad-hoc signed local application:
+
+```bash
+./scripts/package_macos_app.sh
+open "dist/macos/Hyper Term.app"
+```
+
+The package contains the Rust supervisor, Native SDK renderer, terminal and
+Workbench assets, and the pinned Deno/ACP runtime. It does not require a global
+Node.js runtime after packaging.
+
+### Run the kernel only
+
+The renderer-independent daemon can also run on its own:
+
+```bash
 cargo run -p hyper-term-daemon --bin hyperd -- \
   --state-dir .hyper-term \
   --socket .hyper-term/hyperd.sock
 ```
 
-`hyperd` exposes a versioned Unix-socket protocol. Control messages are bounded
-JSON frames; PTY input, output, and snapshots use separate bounded binary
-frames. A client must complete `Hello`, receive exact-operation authorization,
-and acquire the terminal input lease before it can write to a PTY.
+## Development
 
-## Develop the Deno Workbench
+Run the Rust gates:
 
-The Workbench is a static browser artifact. It has no Vite dev server, Node.js
-runtime, or renderer-side machine authority. Deno resolves the frozen lockfile
-and bundles React, CodeMirror, the compiler Worker, and the isolated preview
-shell. Generated UI source is compiled by a persistent `esbuild-wasm` Worker
-against an explicit, size-bounded virtual filesystem.
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
-Use Deno `2.9.3`, pinned in `runtime/deno-manifest.json`:
+Run the Workbench gates:
 
 ```bash
 deno task verify:runtime
 deno task check
 deno task test
 deno task build:workbench
-deno task build:runtime
-python3 -m http.server 4173 --bind 127.0.0.1 --directory dist/workbench
 ```
 
-The preview iframe keeps an opaque sandbox origin. Its trusted runtime capsule
-is inlined at build time, accepts only channel-bound accepted artifacts, checks
-their SHA-256 digest again, and denies network access. A failed compile updates
-diagnostics and Time Travel history without replacing the last-known-good
-artifact.
+This repository intentionally uses Deno's frozen lockfile and built-in bundler;
+there is no Vite or pnpm build.
 
-The real Agent path adds a second acceptance boundary after compilation:
+## Repository layout
 
 ```text
-approved MCP GenUI operation
-  -> supervised Deno ArtifactCandidate
-  -> Rust schema, digest, revision, and operation-state validation
-  -> private atomic artifact store + ArtifactAccepted journal metadata
-  -> one task-scoped isolated Artifact Block
-  -> authenticated no-store preview URL
-  -> bridge-free Native SDK WebView pane
+apps/desktop/               Native SDK macOS application
+apps/terminal/              Terminal WebView renderer
+apps/workbench/             Agent blocks, editor, and isolated artifact preview
+crates/hyper-term-core/     Renderer-independent state and PTY authority
+crates/hyper-term-daemon/   Daemon, desktop supervisor, and local gateways
+crates/hyper-term-drivers/  ACP, MCP, Deno LSP, and GenUI supervision
+crates/hyper-term-protocol/ Versioned domain and wire contracts
+crates/hyper-term-sandbox/  Fail-closed OS sandbox backends
+runtime/                    Pinned Deno and ACP runtime manifests
+scripts/                    Build, verification, and packaging tools
+docs/                       Architecture decisions, research, and release notes
 ```
 
-Bundle, CSS, and source-map bytes stay in the private content store rather than
-the journal or Block control plane. The Agent gateway serves only the current
-artifact for the authenticated session's task; a stale artifact ID returns 404.
-The preview response uses a network-closed CSP. Rust injects the current bounded
-source map into the authenticated preview capsule, which maps runtime failures
-to their virtual source and renders a local diagnostic overlay without opening
-a Native SDK bridge. The same map remains available through a separate
-authenticated endpoint for the trusted editor. New artifacts also retain the
-exact compiler input snapshot and expose it as bounded JSON at
-`/agent/artifact/:id/source`; the token, session, task, and current-artifact
-checks are identical to the preview boundary. Older artifacts remain readable
-for preview but honestly report source as unavailable.
+Useful design documents:
 
-The Native host does not reserve a permanent right sidebar. Ordinary Terminal
-tabs and Agent conversations use the full window. A right-hand editor appears
-only while a Codex ACP, Claude ACP, or Copilot ACP session owns a current
-artifact. Its HTML/JS/WASM assets are served by the authenticated loopback Agent
-gateway, and its source fetch is still fenced by token, session, task, and
-current artifact. CodeMirror edits, Diff, Time Travel, and the local preview are
-draft-only today. Diagnostics and completion come from a persistent,
-Rust-supervised Deno LSP process over an ACP-only artifact endpoint; the process
-sees a private accepted-source snapshot plus in-memory draft updates, never a
-WebView-selected workspace path. Applying a workspace transaction remains
-unavailable until the Rust permission-broker path is implemented.
+- [Product and interaction design](DESIGN.md)
+- [Runtime authority boundaries](docs/architecture/0002-runtime-authority-boundaries.md)
+- [Deno-first Workbench build](docs/architecture/0010-deno-first-static-workbench-build.md)
+- [Native SDK product shell](docs/architecture/0013-native-sdk-default-product-shell.md)
+- [macOS release process](docs/release/macos-app.md)
 
-The Rust `hyper-term-drivers` crate launches the same pinned Deno executable
-with a cleared environment, dedicated cache and scratch roots, bounded framing,
-an 8 MiB pending-output budget, bounded secondary inboxes and stderr capture,
-deadline-triggered process-group shutdown, and an exact command-bound macOS
-Seatbelt profile. The LSP driver receives a read-only,
-authority-created snapshot. The GenUI driver receives only its digest-pinned
-compiler script and WASM asset. Neither profile has network or child-process
-authority; writes are limited to private cache and scratch roots. Rust waits for
-a versioned ready handshake and re-computes the artifact digest. A terminal
-driver is discarded without retrying its call; only a later, separately
-authorized MCP operation may launch a fresh sidecar from the retained immutable
-configuration. Ignored integration tests exercise real child processes,
-OS-level denials, and the complete MCP approval/receipt path:
+## Roadmap
 
-```bash
-export HYPER_TERM_DENO_PATH=/absolute/path/to/deno
-export HYPER_TERM_DENO_SHA256=<manifest-executable-sha256>
-cargo test -p hyper-term-drivers --test deno_lsp -- --ignored
-cargo test -p hyper-term-drivers --test deno_genui -- --ignored
-cargo test -p hyper-term-daemon --test mcp_flow \
-  approved_lsp_tool_queries_the_pinned_deno_snapshot \
-  -- --ignored
-cargo test -p hyper-term-daemon --test mcp_flow \
-  approved_genui_tool_compiles_through_the_brokered_deno_runtime \
-  -- --ignored
-```
+- Harden terminal performance, accessibility, reconnect, and recovery gates.
+- Complete brokered workspace transactions without giving the renderer write
+  authority.
+- Strengthen containment for external coding-agent processes.
+- Publish signed and notarized Apple Silicon and Intel builds.
+- Define the supported-platform contract before expanding beyond macOS.
 
-## Release the macOS application
+## Contributing
 
-Pushing a version tag such as `v0.1.0`, or manually dispatching the
-`Release Hyper Term` workflow for an existing tag, validates the Rust, Deno, and
-Native SDK layers and builds complete Apple Silicon and Intel applications. The
-release archives contain the Rust desktop supervisor, Native SDK renderer, and
-terminal WebView assets in one `.app` bundle. They also contain the per-platform
-pinned Deno executable and content-addressed GenUI compiler assets; Deno is lazy
-and does not start for ordinary terminal tabs. Stable releases are Developer ID
-signed and notarized; unsigned RC pipeline tests are labelled explicitly.
-
-The stable part of the tag must match the Cargo workspace and
-`apps/desktop/app.zon` versions. Configure the protected `Release` GitHub
-environment with the Apple signing and App Store Connect API secrets before
-creating a tag. See
-[the macOS release guide](docs/release/macos-app.md) for the bundle layout and
-required secrets.
-
-## Structured agent adapters
-
-ACP, Codex app-server, Claude stream-json, and opaque PTY agents are separate
-transports behind one internal `AgentDriverEvent` boundary. They are not treated
-as interchangeable wire protocols. `StructuredAgentClient` owns the common
-session lifecycle while provider-specific clients translate their wire values
-into bounded canonical events and inert effect proposals. Provider DTOs never
-become Block renderer authority. The current Codex adapter launches an exact
-binary digest with a cleared environment, negotiates app-server v2 over bounded
-JSONL, and turns command/file approval requests into inert
-`AgentEffectProposal` values. Only a matching, revisioned Rust operation
-authorization can produce the external approval response; persistent policy
-choices are not forwarded as one-turn wire approvals. The Native Agent surface
-renders trusted Operation and Approval Blocks and can safely reject or cancel a
-pending Codex proposal. Known read-only MCP operations may be allowed once; the
-GenUI tool then compiles through the supervised Deno driver, asks Rust to accept
-and persist the candidate, and projects the accepted artifact on the same Agent
-task. A compiler result alone is never renderer authority.
-
-Explicit Rust-owned Shell Operations now compile a canonical profile, mint a
-revision-bound one-use lease, and launch through enforced macOS Seatbelt before
-they enter a PTY. Ordinary user terminals remain unsandboxed user authority.
-Codex app-server approval payloads are still provider-owned opaque effects:
-returning `accept` would let the already-running Codex process execute the
-effect outside this new launch port. The Codex Allow button therefore remains
-disabled until external-enforcement negotiation or Tier 2 containment binds the
-provider process itself. UI approval alone is not containment.
-
-The real installed-binary handshake is available as an ignored integration
-test. It uses an isolated `CODEX_HOME`, so it does not read the user's normal
-Codex profile or perform a model turn:
-
-```bash
-HYPER_TERM_CODEX_PATH=/absolute/path/to/codex \
-HYPER_TERM_CODEX_SHA256=<inspected-executable-sha256> \
-cargo test -p hyper-term-drivers --test codex_app_server -- --ignored
-```
-
-The provider-neutral ACP gate performs a harmless model turn and rejects any
-unexpected effect proposal. Point it at an inspected official adapter artifact:
-
-```bash
-# Official Codex ACP
-HYPER_TERM_ACP_PATH=/absolute/path/to/codex-acp \
-HYPER_TERM_ACP_SHA256=<inspected-adapter-sha256> \
-HYPER_TERM_ACP_PROVIDER_ID=codex \
-HYPER_TERM_CODEX_PATH=/absolute/path/to/codex \
-cargo test -p hyper-term-drivers --test acp_agent -- --ignored
-
-# Official Claude Agent ACP
-HYPER_TERM_ACP_PATH=/absolute/path/to/claude-agent-acp \
-HYPER_TERM_ACP_SHA256=<inspected-adapter-sha256> \
-HYPER_TERM_ACP_PROVIDER_ID=claude \
-HYPER_TERM_CLAUDE_PATH=/absolute/path/to/claude \
-cargo test -p hyper-term-drivers --test acp_agent -- --ignored
-```
-
-Packaged applications prefer the current `@agentclientprotocol/codex-acp`
-adapter (the successor recommended by the Zed adapter repository) and Claude
-Agent ACP from the per-file digest-verified, Deno-locked offline runtime. A
-user-selected `--codex-acp PATH` or `HYPER_TERM_CODEX_ACP_PATH` remains the
-compatibility path for the inspected executable distributed by
-`@zed-industries/codex-acp` (the package commonly run as
-`npx @zed-industries/codex-acp`); the renderer never invokes `npx` itself.
-
-The desktop also discovers a local GitHub Copilot CLI and registers it as the
-independent `copilot-acp` provider using `copilot --acp --stdio`. Copilot has no
-read-only login-status command, so authentication is negotiated by its ACP
-session rather than inferred from credential files. Rust publishes a bounded
-provider-status document (`authenticated`, `available`, `login_required`, or
-`probe_failed`) to the Native UI, and only usable providers enter the Agent
-gateway. Every external provider is still labelled `external containment
-pending`; proposal-only controls remain in force until ADR 0014 is satisfied.
+Issues and focused pull requests are welcome. Before changing a protocol or
+process lifecycle, read [AGENTS.md](AGENTS.md), add a regression test, and run
+the Rust and Deno gates above. Please keep `hyper-term-core` independent from
+the desktop renderer and keep machine authority out of WebViews.
 
 ## License
 
-Apache-2.0. Competitor implementations are research input only; do not copy
-GPL/AGPL code into this repository without a separate, explicit licensing
-decision.
+Hyper Term is licensed under the [Apache License 2.0](LICENSE). Third-party
+components and notices are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
