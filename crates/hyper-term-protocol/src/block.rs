@@ -298,6 +298,10 @@ pub struct BlockPatch {
     pub operations: Vec<BlockOperation>,
 }
 
+// Block operations are bounded wire values and are normally serialized or
+// applied immediately. Keeping `Upsert` inline avoids a protocol-only heap
+// allocation; the size difference is intentional and covered by frame bounds.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockOperation {
