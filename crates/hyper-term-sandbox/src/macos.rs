@@ -749,7 +749,7 @@ mod tests {
             "printf connected | /usr/bin/nc -U \"$1\"",
             vec![allowed_socket.to_string_lossy().into_owned()],
         ));
-        let _ = accepted.join().unwrap();
+        accepted.join().unwrap();
         assert!(
             output.status.success(),
             "allowed broker socket failed: {}",
