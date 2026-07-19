@@ -138,17 +138,22 @@ builds retain only the ahead-of-time compiled document and no source watcher.
 The Native Agent transcript now follows the Codex-style disclosure hierarchy
 without copying its application structure. Consecutive reasoning and tool-call
 Blocks project into one collapsed `Processed` activity row; final Agent prose
-remains first-class transcript content. The active `PlanBlock` renders as a
-bounded, centered Goal disclosure directly above the composer instead of a
-full-width panel or permanent side pane.
+remains first-class transcript content. Activity and reasoning disclosures use
+single-line, chrome-free chevron rows; detail content is not mounted until the
+row opens. The active `PlanBlock` renders as a bounded, centered Goal disclosure
+directly above the composer instead of a full-width panel or permanent side
+pane. The Agent header likewise reduces provider and connection state to one
+compact line rather than repeating them as badges.
 
 The composer stays at 68 points for a one-line prompt and grows to 144 points
 for four lines while retaining its bottom action row. ACP-provided Skills and
 commands remain behind the plus menu, and model/config choices remain anchored
-selectors in that row. Native automation exercised both disclosures, opened
-the Skills and model menus, entered a four-line Chinese prompt through the real
-text-input path, and captured a nonblank Metal/reference-renderer screenshot
-without dispatch or widget-budget errors.
+selectors in that row. An active turn disables dispatch and configuration
+changes but leaves the text area editable, so the next prompt can be prepared
+while streaming continues. Native automation exercised both disclosures,
+opened the Skills and model menus, entered a four-line Chinese prompt through
+the real text-input path, and captured a nonblank Metal/reference-renderer
+screenshot without dispatch or widget-budget errors.
 
 ## Rejected alternatives
 

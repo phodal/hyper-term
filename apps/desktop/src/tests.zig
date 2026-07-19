@@ -420,7 +420,7 @@ test "Agent start failures keep the tab inert and explain the gateway result" {
 
     try testing.expectEqual(main.AgentConnection.failed, model.activeSession().agent_connection);
     try testing.expectEqual(main.AgentTurnStatus.failed, model.agent_turn_status);
-    try testing.expect(model.agentComposerDisabled());
+    try testing.expect(model.agentSubmitDisabled());
     try testing.expect(model.hasAgentStatusNotice());
     try testing.expectEqualStrings(
         "Agent session limit reached · close a tab and retry",
@@ -439,9 +439,20 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     main.update(&model, .choose_agent, &fx);
     model.session_slots[1].agent_connection = .ready;
     model.agent_turn_status = .ready;
+    try testing.expect(!model.agentComposerInputDisabled());
+    try testing.expect(!model.agentSubmitDisabled());
     try testing.expectEqual(@as(f32, 68), model.agentComposerHeight());
     model.agent_composer_buffer.set("One\nTwo\nThree");
     try testing.expect(model.agentComposerHeight() > 68);
+    model.agent_turn_status = .running;
+    try testing.expect(!model.agentComposerInputDisabled());
+    try testing.expect(model.agentSubmitDisabled());
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const running_tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(!findByLabel(running_tree.root, "Agent prompt").?.state.disabled);
+    try testing.expect(findByLabel(running_tree.root, "Send prompt").?.state.disabled);
+    model.agent_turn_status = .ready;
     model.agent_composer_buffer.set("Explain the PTY boundary");
     main.update(&model, .send_agent_prompt, &fx);
 
@@ -796,20 +807,20 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
     try testing.expect(containsText(tree.root, "Processed"));
     try testing.expect(containsText(tree.root, "Goal · Verify the edit · 1 / 3"));
-    try testing.expect(!findByText(tree.root, .accordion, "Processed").?.state.selected);
-    try testing.expect(!findByText(tree.root, .accordion, "Goal · Verify the edit · 1 / 3").?.state.selected);
+    try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Processed").?.icon);
+    try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Goal · Verify the edit · 1 / 3").?.icon);
 
     main.update(&model, .{ .toggle_agent_block = plan.id }, &fx);
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(findByText(tree.root, .accordion, "Goal · Verify the edit · 1 / 3").?.state.selected);
+    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Goal · Verify the edit · 1 / 3").?.icon);
 
     main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[1].id }, &fx);
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(findByText(tree.root, .accordion, "Processed").?.state.selected);
+    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Processed").?.icon);
     try testing.expect(containsText(tree.root, "Inspecting the workspace before editing."));
     try testing.expect(containsText(tree.root, "Edit src/lib.rs"));
     try testing.expect(containsText(tree.root, "Run shell command"));
@@ -861,13 +872,13 @@ test "ACP reasoning is one collapsed disclosure instead of transcript prose" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(!findByText(tree.root, .accordion, "Processed").?.state.selected);
+    try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Processed").?.icon);
 
     main.update(&model, .{ .toggle_agent_block = 41 }, &fx);
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(findByText(tree.root, .accordion, "Processed").?.state.selected);
+    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Processed").?.icon);
 }
 
 test "Agent stream uses a tail-anchored variable timeline with stable block identity" {

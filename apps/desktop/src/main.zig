@@ -720,9 +720,13 @@ pub const Model = struct {
         return model.agent_composer_buffer.text();
     }
 
-    pub fn agentComposerDisabled(model: *const Model) bool {
+    pub fn agentComposerInputDisabled(model: *const Model) bool {
         return model.activeSession().agent_connection != .ready or
-            model.agent_base_url_len == 0 or
+            model.agent_base_url_len == 0;
+    }
+
+    pub fn agentSubmitDisabled(model: *const Model) bool {
+        return model.agentComposerInputDisabled() or
             model.agent_turn_status == .running or
             model.agent_turn_status == .waiting_approval;
     }
@@ -759,7 +763,7 @@ pub const Model = struct {
     }
 
     pub fn agentCapabilityBusy(model: *const Model) bool {
-        return model.agent_config_in_flight_session_id != 0 or model.agentComposerDisabled();
+        return model.agent_config_in_flight_session_id != 0 or model.agentSubmitDisabled();
     }
 
     pub fn agentError(model: *const Model) []const u8 {
@@ -1140,7 +1144,7 @@ fn agentStartFailureMessage(response: native_sdk.EffectResponse) []const u8 {
 }
 
 fn requestAgentTurn(model: *Model, fx: *Effects) void {
-    if (model.agentComposerDisabled()) return;
+    if (model.agentSubmitDisabled()) return;
     const prompt = std.mem.trim(u8, model.agent_composer_buffer.text(), " \t\r\n");
     if (prompt.len == 0) return;
     const session_id = model.active_session_id;
@@ -1229,7 +1233,7 @@ fn closeAgentConfigPickers(model: *Model) void {
 }
 
 fn requestAgentConfig(model: *Model, action_id: u16, fx: *Effects) void {
-    if (model.agent_config_in_flight_session_id != 0 or model.agentComposerDisabled()) return;
+    if (model.agent_config_in_flight_session_id != 0 or model.agentSubmitDisabled()) return;
     var selected_option: ?*const AgentConfigOptionView = null;
     var selected_choice: ?*const AgentConfigChoiceView = null;
     for (model.agent_config_options[0..model.agent_config_option_count]) |*option| {
@@ -2599,7 +2603,7 @@ fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 
     const text_extent = @as(f32, @floatFromInt(@min(lines, 96))) * agent_timeline_line_height;
     return switch (block.kind) {
         .message => if (block.role == .user) 28 + text_extent else 14 + text_extent,
-        .tool_call, .plan => if (block.expanded) 48 + text_extent else 34,
+        .tool_call, .plan => if (block.expanded) 42 + text_extent else 30,
         .operation => 36 + @min(text_extent, agent_timeline_line_height),
         .approval => 210 + @min(text_extent, agent_timeline_line_height * 8),
     };
@@ -2685,16 +2689,23 @@ fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBl
             .running, .waiting_approval => "Reasoning",
             else => "Processed",
         };
-        return ui.el(.accordion, .{
-            .text = label,
-            .size = .sm,
-            .selected = block.expanded,
-            .on_toggle = Msg{ .toggle_agent_block = block.id },
-        }, .{
-            ui.column(.{ .gap = 4, .padding = 7 }, .{
-                AgentMarkdown.view(ui, block.content(), .{}),
-                clipped,
+        return ui.column(.{ .grow = 1 }, .{
+            ui.row(.{ .gap = 4, .padding = 2, .cross = .center }, .{
+                ui.button(.{
+                    .grow = 1,
+                    .size = .sm,
+                    .variant = .ghost,
+                    .icon = if (block.expanded) "chevron-down" else "chevron-right",
+                    .on_press = Msg{ .toggle_agent_block = block.id },
+                }, label),
             }),
+            if (block.expanded)
+                ui.column(.{ .gap = 4, .padding = 7 }, .{
+                    AgentMarkdown.view(ui, block.content(), .{}),
+                    clipped,
+                })
+            else
+                ui.el(.stack, .{}, .{}),
         });
     }
     return ui.column(.{ .gap = 4, .padding = 2 }, .{
@@ -2708,21 +2719,30 @@ fn agentActivityNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi
 }
 
 fn agentActivityNodeWithWidth(ui: *HyperTermUi, block: *const AgentBlockView, width: f32) HyperTermUi.Node {
-    return ui.el(.accordion, .{
-        .text = block.activityTitle(),
+    return ui.column(.{
         .width = width,
-        .size = .sm,
-        .selected = block.expanded,
-        .on_toggle = Msg{ .toggle_agent_block = block.id },
+        .grow = if (width == 0) 1 else 0,
     }, .{
-        ui.column(.{ .gap = 5, .padding = 7 }, .{
+        ui.row(.{ .gap = 5, .padding = 2, .cross = .center }, .{
+            ui.button(.{
+                .grow = 1,
+                .size = .sm,
+                .variant = .ghost,
+                .icon = if (block.expanded) "chevron-down" else "chevron-right",
+                .on_press = Msg{ .toggle_agent_block = block.id },
+            }, block.activityTitle()),
             ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.activityMeta()),
+        }),
+        if (block.expanded)
+            ui.column(.{ .gap = 5, .padding = 7 }, .{
             if (block.hasActivityDetails()) AgentMarkdown.view(ui, block.content(), .{}) else ui.el(.stack, .{}, .{}),
             if (block.truncated)
                 ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Tool details clipped to 8 KiB in this view.")
             else
                 ui.el(.stack, .{}, .{}),
-        }),
+            })
+        else
+            ui.el(.stack, .{}, .{}),
     });
 }
 

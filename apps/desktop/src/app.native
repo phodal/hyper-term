@@ -2,11 +2,10 @@
      Agent-authored content enters later as versioned Block data, never markup. -->
 <template name="agent-thread">
   <column min-width="400" grow="1" background="surface" label="Agent conversation">
-    <row gap="6" padding="5" cross="center">
+    <row gap="5" padding="4" cross="center">
       <icon name="circle-dot" width="12" height="12" foreground="accent" />
-      <text grow="1"><span weight="medium">Agent</span></text>
-      <badge variant="secondary">{activeAgentProviderLabel}</badge>
-      <badge variant="secondary">{agentConnectionLabel}</badge>
+      <text><span weight="medium">{activeAgentProviderLabel}</span></text>
+      <text grow="1" foreground="text_muted">{agentConnectionLabel}</text>
       <if test="{canOpenAgentEditor}">
         <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open ACP artifact editor">Edit</button>
       </if>
@@ -126,7 +125,7 @@
     <separator />
     <column padding="6">
       <input-group label="Agent prompt composer" height="{agentComposerHeight}">
-        <textarea size="sm" text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerDisabled}" label="Agent prompt" />
+        <textarea size="sm" text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerInputDisabled}" label="Agent prompt" />
         <input-group-actions>
           <if test="{agent_command_count > 0}">
             <stack>
@@ -153,7 +152,7 @@
             </stack>
           </for>
           <spacer grow="1" />
-          <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentComposerDisabled}" label="Send prompt"></button>
+          <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentSubmitDisabled}" label="Send prompt"></button>
         </input-group-actions>
       </input-group>
     </column>
