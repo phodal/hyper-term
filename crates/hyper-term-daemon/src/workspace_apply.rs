@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -197,6 +197,51 @@ pub(crate) fn apply_workspace_set_plan(
     }
     apply_workspace_transaction(workspace, set)?;
     Ok(set.result_digest.clone())
+}
+
+pub(crate) fn select_workspace_apply_set(
+    reviewed: &WorkspaceApplySetPlan,
+    selections: BTreeMap<String, String>,
+) -> Result<WorkspaceApplySetPlan, WorkspaceApplyError> {
+    if selections.is_empty() || selections.len() > reviewed.plans.len() {
+        return Err(WorkspaceApplyError::NoChanges);
+    }
+    if selections.keys().any(|target| {
+        !reviewed
+            .plans
+            .iter()
+            .any(|plan| &plan.target_path == target)
+    }) {
+        return Err(WorkspaceApplyError::InvalidPath);
+    }
+    let mut total_bytes = 0_usize;
+    let mut plans = Vec::with_capacity(selections.len());
+    for reviewed_plan in &reviewed.plans {
+        let Some(content) = selections.get(&reviewed_plan.target_path) else {
+            continue;
+        };
+        total_bytes = total_bytes
+            .checked_add(content.len())
+            .ok_or(WorkspaceApplyError::TooLarge)?;
+        if content.len() > MAX_WORKSPACE_FILE_BYTES || total_bytes > MAX_WORKSPACE_APPLY_BYTES {
+            return Err(WorkspaceApplyError::TooLarge);
+        }
+        if content == reviewed_plan.base_content() {
+            return Err(WorkspaceApplyError::NoChanges);
+        }
+        let mut plan = reviewed_plan.clone();
+        plan.proposed_digest = sha256_bytes(content.as_bytes());
+        plan.proposed_content = content.clone();
+        plans.push(plan);
+    }
+    if plans.is_empty() {
+        return Err(WorkspaceApplyError::NoChanges);
+    }
+    let result_digest = workspace_set_digest(&plans);
+    Ok(WorkspaceApplySetPlan {
+        plans,
+        result_digest,
+    })
 }
 
 fn apply_single_workspace_plan(
@@ -1022,6 +1067,41 @@ mod tests {
             "after theme\n"
         );
         assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn hunk_selection_reuses_the_reviewed_file_identity_and_rebinds_the_digest() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        fs::write(workspace.join("one.ts"), "one before\n").unwrap();
+        fs::write(workspace.join("two.ts"), "two before\n").unwrap();
+        let reviewed = prepare_workspace_apply_set(
+            &workspace,
+            vec![
+                ("one.ts".into(), "one artifact\n".into()),
+                ("two.ts".into(), "two artifact\n".into()),
+            ],
+        )
+        .unwrap();
+        let selected = select_workspace_apply_set(
+            &reviewed,
+            BTreeMap::from([("two.ts".into(), "two selected hunk\n".into())]),
+        )
+        .unwrap();
+
+        assert_eq!(selected.plans.len(), 1);
+        assert_eq!(selected.plans[0].target_path, "two.ts");
+        assert_eq!(selected.plans[0].base, reviewed.plans[1].base);
+        assert_ne!(selected.result_digest, reviewed.result_digest);
+        apply_workspace_set_plan(&workspace, &selected).unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.ts")).unwrap(),
+            "one before\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.ts")).unwrap(),
+            "two selected hunk\n"
+        );
     }
 
     #[test]

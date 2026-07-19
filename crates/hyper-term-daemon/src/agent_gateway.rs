@@ -37,7 +37,11 @@ use crate::DaemonState;
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
 use crate::workspace_apply::{
     MAX_WORKSPACE_APPLY_FILES, WorkspaceApplyError, WorkspaceApplySetPlan,
-    apply_workspace_set_plan, prepare_workspace_apply_set,
+    apply_workspace_set_plan, prepare_workspace_apply_set, select_workspace_apply_set,
+};
+use crate::workspace_diff::{
+    MAX_WORKSPACE_HUNKS_PER_FILE, WorkspaceDiffHunk, WorkspaceDiffReview, review_workspace_diff,
+    select_workspace_hunks,
 };
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
 
@@ -193,9 +197,20 @@ struct WorkspaceApplyRecord {
     artifact_id: ArtifactId,
     artifact_source_revision: u64,
     source_paths: Vec<String>,
+    artifact_source_digests: Vec<String>,
+    selected_hunk_count: usize,
     waiting_revision: u64,
     plan: WorkspaceApplySetPlan,
     state: WorkspaceApplyState,
+}
+
+struct PreparedWorkspaceReview {
+    artifact_source_revision: u64,
+    source_paths: Vec<String>,
+    artifact_source_digests: Vec<String>,
+    plan: WorkspaceApplySetPlan,
+    diffs: Vec<WorkspaceDiffReview>,
+    review_digest: String,
 }
 
 #[derive(Clone)]
@@ -353,6 +368,8 @@ struct AgentArtifactDraftResponse {
 struct AgentWorkspaceApplyRequest {
     artifact_source_revision: u64,
     #[serde(default)]
+    review_digest: Option<String>,
+    #[serde(default)]
     source_path: Option<String>,
     #[serde(default)]
     target_path: Option<String>,
@@ -364,6 +381,26 @@ struct AgentWorkspaceApplyRequest {
 struct AgentWorkspaceApplyMapping {
     source_path: String,
     target_path: String,
+    #[serde(default)]
+    hunk_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AgentWorkspacePreviewResponse {
+    artifact_source_revision: u64,
+    review_digest: String,
+    changes: Vec<AgentWorkspacePreviewChangeResponse>,
+}
+
+#[derive(Serialize)]
+struct AgentWorkspacePreviewChangeResponse {
+    source_path: String,
+    target_path: String,
+    base_digest: Option<String>,
+    artifact_digest: String,
+    before: String,
+    artifact_after: String,
+    hunks: Vec<WorkspaceDiffHunk>,
 }
 
 #[derive(Deserialize)]
@@ -551,6 +588,10 @@ pub async fn spawn_agent_gateway(
         .route(
             "/agent/artifact/{artifact_id}/draft",
             get(artifact_draft_status).post(propose_artifact_draft),
+        )
+        .route(
+            "/agent/artifact/{artifact_id}/workspace-preview",
+            post(preview_workspace_apply),
         )
         .route(
             "/agent/artifact/{artifact_id}/workspace-apply",
@@ -1062,6 +1103,71 @@ async fn propose_workspace_apply(
                 "Workspace apply could not enter the permission broker",
             )
         }
+    }
+}
+
+async fn preview_workspace_apply(
+    State(runtime): State<AgentGatewayRuntime>,
+    RoutePath(artifact_id): RoutePath<String>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let artifact_id = match parse_artifact_id(&artifact_id) {
+        Some(artifact_id) => artifact_id,
+        None => return status_response(StatusCode::BAD_REQUEST, "Artifact id is invalid"),
+    };
+    let request = match serde_json::from_slice::<AgentWorkspaceApplyRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return status_response(
+                StatusCode::BAD_REQUEST,
+                "Workspace preview request is invalid",
+            );
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.preview_workspace_apply(session_id, artifact_id, request)
+    })
+    .await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::OK, &response),
+        Ok(Err(WorkspaceProposalError::SessionUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Ok(Err(WorkspaceProposalError::AcpRequired)) => status_response(
+            StatusCode::FORBIDDEN,
+            "Workspace preview is available only for ACP Agent artifacts",
+        ),
+        Ok(Err(WorkspaceProposalError::ArtifactUnavailable)) => {
+            status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
+        }
+        Ok(Err(WorkspaceProposalError::StaleRevision)) => status_response(
+            StatusCode::CONFLICT,
+            "Workspace preview no longer matches the current revision",
+        ),
+        Ok(Err(WorkspaceProposalError::NoChanges)) => status_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Workspace targets already match the artifact source",
+        ),
+        Ok(Err(WorkspaceProposalError::InvalidRequest | WorkspaceProposalError::UnsafeTarget)) => {
+            status_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Workspace targets are not bounded regular file paths",
+            )
+        }
+        Ok(Err(
+            WorkspaceProposalError::Busy
+            | WorkspaceProposalError::Daemon
+            | WorkspaceProposalError::Lock,
+        ))
+        | Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Workspace preview could not be prepared",
+        ),
     }
 }
 
@@ -1729,12 +1835,36 @@ impl AgentGatewayRuntime {
         }
     }
 
-    fn propose_workspace_apply(
+    fn preview_workspace_apply(
         &self,
         session_id: u16,
         artifact_id: ArtifactId,
         request: AgentWorkspaceApplyRequest,
-    ) -> Result<AgentWorkspaceApplyResponse, WorkspaceProposalError> {
+    ) -> Result<AgentWorkspacePreviewResponse, WorkspaceProposalError> {
+        if request.review_digest.is_some() {
+            return Err(WorkspaceProposalError::InvalidRequest);
+        }
+        let artifact_source_revision = request.artifact_source_revision;
+        let mappings = normalize_workspace_apply_mappings(request)?;
+        if mappings.iter().any(|mapping| !mapping.hunk_ids.is_empty()) {
+            return Err(WorkspaceProposalError::InvalidRequest);
+        }
+        let review = self.prepare_workspace_review(
+            session_id,
+            artifact_id,
+            artifact_source_revision,
+            &mappings,
+        )?;
+        Ok(workspace_preview_response(&review))
+    }
+
+    fn prepare_workspace_review(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        artifact_source_revision: u64,
+        mappings: &[AgentWorkspaceApplyMapping],
+    ) -> Result<PreparedWorkspaceReview, WorkspaceProposalError> {
         let session = self
             .session(session_id)
             .map_err(|_| WorkspaceProposalError::SessionUnavailable)?;
@@ -1746,11 +1876,9 @@ impl AgentGatewayRuntime {
             .daemon
             .read_active_genui_artifact(session.task_id, artifact_id)
             .map_err(|_| WorkspaceProposalError::ArtifactUnavailable)?;
-        if request.artifact_source_revision != artifact.metadata.source_revision {
+        if artifact_source_revision != artifact.metadata.source_revision {
             return Err(WorkspaceProposalError::StaleRevision);
         }
-        let artifact_source_revision = request.artifact_source_revision;
-        let mappings = normalize_workspace_apply_mappings(request)?;
         let mut target_sources = BTreeMap::new();
         let mut plan_requests = Vec::with_capacity(mappings.len());
         for mapping in mappings {
@@ -1765,7 +1893,7 @@ impl AgentGatewayRuntime {
                 .get(&mapping.source_path)
                 .cloned()
                 .ok_or(WorkspaceProposalError::InvalidRequest)?;
-            plan_requests.push((mapping.target_path, proposed_content));
+            plan_requests.push((mapping.target_path.clone(), proposed_content));
         }
         let plan = prepare_workspace_apply_set(&self.config.workspace, plan_requests)
             .map_err(map_workspace_prepare_error)?;
@@ -1779,9 +1907,132 @@ impl AgentGatewayRuntime {
                     .ok_or(WorkspaceProposalError::InvalidRequest)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let payload =
-            serde_json::to_vec(&(artifact_id, artifact_source_revision, &source_paths, &plan))
-                .map_err(|_| WorkspaceProposalError::InvalidRequest)?;
+        let artifact_source_digests = source_paths
+            .iter()
+            .map(|source_path| {
+                artifact
+                    .source_files
+                    .get(source_path)
+                    .map(|source| sha256_bytes(source.as_bytes()))
+                    .ok_or(WorkspaceProposalError::InvalidRequest)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let diffs = plan
+            .plans
+            .iter()
+            .map(|plan| {
+                review_workspace_diff(
+                    &plan.target_path,
+                    plan.base_content(),
+                    &plan.proposed_content,
+                )
+            })
+            .collect::<Vec<_>>();
+        let review_payload = serde_json::to_vec(&(
+            artifact_id,
+            artifact_source_revision,
+            &source_paths,
+            &artifact_source_digests,
+            &plan,
+            &diffs,
+        ))
+        .map_err(|_| WorkspaceProposalError::InvalidRequest)?;
+        Ok(PreparedWorkspaceReview {
+            artifact_source_revision,
+            source_paths,
+            artifact_source_digests,
+            plan,
+            diffs,
+            review_digest: sha256_bytes(&review_payload),
+        })
+    }
+
+    fn propose_workspace_apply(
+        &self,
+        session_id: u16,
+        artifact_id: ArtifactId,
+        request: AgentWorkspaceApplyRequest,
+    ) -> Result<AgentWorkspaceApplyResponse, WorkspaceProposalError> {
+        let session = self
+            .session(session_id)
+            .map_err(|_| WorkspaceProposalError::SessionUnavailable)?;
+        let artifact_source_revision = request.artifact_source_revision;
+        let expected_review_digest = request.review_digest.clone();
+        let mappings = normalize_workspace_apply_mappings(request)?;
+        let reviewed = self.prepare_workspace_review(
+            session_id,
+            artifact_id,
+            artifact_source_revision,
+            &mappings,
+        )?;
+        let (source_paths, artifact_source_digests, plan, selected_hunk_count) =
+            if let Some(expected_review_digest) = expected_review_digest {
+                if expected_review_digest != reviewed.review_digest {
+                    return Err(WorkspaceProposalError::StaleRevision);
+                }
+                let mut selections = BTreeMap::new();
+                let mut source_paths = Vec::new();
+                let mut artifact_source_digests = Vec::new();
+                let mut selected_hunk_count = 0_usize;
+                for (((source_path, source_digest), reviewed_plan), diff) in reviewed
+                    .source_paths
+                    .iter()
+                    .zip(&reviewed.artifact_source_digests)
+                    .zip(&reviewed.plan.plans)
+                    .zip(&reviewed.diffs)
+                {
+                    let mapping = mappings
+                        .iter()
+                        .find(|mapping| {
+                            mapping.source_path == *source_path
+                                && mapping.target_path == reviewed_plan.target_path
+                        })
+                        .ok_or(WorkspaceProposalError::InvalidRequest)?;
+                    if mapping.hunk_ids.is_empty() {
+                        continue;
+                    }
+                    let selected_content = select_workspace_hunks(
+                        &reviewed_plan.target_path,
+                        reviewed_plan.base_content(),
+                        &reviewed_plan.proposed_content,
+                        &diff.review_digest,
+                        &mapping.hunk_ids,
+                    )
+                    .map_err(|_| WorkspaceProposalError::InvalidRequest)?;
+                    selections.insert(reviewed_plan.target_path.clone(), selected_content);
+                    source_paths.push(source_path.clone());
+                    artifact_source_digests.push(source_digest.clone());
+                    selected_hunk_count += mapping.hunk_ids.len();
+                }
+                let plan = select_workspace_apply_set(&reviewed.plan, selections)
+                    .map_err(map_workspace_prepare_error)?;
+                (
+                    source_paths,
+                    artifact_source_digests,
+                    plan,
+                    selected_hunk_count,
+                )
+            } else {
+                if mappings.iter().any(|mapping| !mapping.hunk_ids.is_empty()) {
+                    return Err(WorkspaceProposalError::InvalidRequest);
+                }
+                let selected_hunk_count = reviewed.diffs.iter().map(|diff| diff.hunks.len()).sum();
+                (
+                    reviewed.source_paths,
+                    reviewed.artifact_source_digests,
+                    reviewed.plan,
+                    selected_hunk_count,
+                )
+            };
+        let payload = serde_json::to_vec(&(
+            artifact_id,
+            artifact_source_revision,
+            &source_paths,
+            &artifact_source_digests,
+            selected_hunk_count,
+            &plan,
+        ))
+        .map_err(|_| WorkspaceProposalError::InvalidRequest)?;
         let payload_digest = sha256_bytes(&payload);
         let mut applies = self
             .workspace_applies
@@ -1814,7 +2065,8 @@ impl AgentGatewayRuntime {
                     payload_digest,
                 },
                 format!(
-                    "Apply {} Artifact source file(s) from r{} to the workspace",
+                    "Apply {} selected hunk(s) across {} Artifact source file(s) from r{} to the workspace",
+                    selected_hunk_count,
                     plan.plans.len(),
                     artifact_source_revision
                 ),
@@ -1828,6 +2080,8 @@ impl AgentGatewayRuntime {
             artifact_id,
             artifact_source_revision,
             source_paths,
+            artifact_source_digests,
+            selected_hunk_count,
             waiting_revision: operation.revision,
             plan,
             state: WorkspaceApplyState::WaitingApproval,
@@ -1902,18 +2156,24 @@ impl AgentGatewayRuntime {
                     "artifact source revision is no longer current".into(),
                 ));
             }
-            if record.source_paths.len() != record.plan.plans.len() {
+            if record.source_paths.len() != record.plan.plans.len()
+                || record.artifact_source_digests.len() != record.plan.plans.len()
+            {
                 return Err(WorkspaceExecutionError::Failed(
                     "workspace apply source mapping is inconsistent".into(),
                 ));
             }
-            for (source_path, plan) in record.source_paths.iter().zip(&record.plan.plans) {
+            for (source_path, artifact_source_digest) in record
+                .source_paths
+                .iter()
+                .zip(&record.artifact_source_digests)
+            {
                 let current_source = current.source_files.get(source_path).ok_or_else(|| {
                     WorkspaceExecutionError::Failed(
                         "artifact source path is no longer current".into(),
                     )
                 })?;
-                if sha256_bytes(current_source.as_bytes()) != plan.proposed_digest {
+                if sha256_bytes(current_source.as_bytes()) != *artifact_source_digest {
                     return Err(WorkspaceExecutionError::Failed(
                         "artifact source digest is no longer current".into(),
                     ));
@@ -1935,8 +2195,9 @@ impl AgentGatewayRuntime {
                     succeeded: true,
                     outcome: Some(OperationOutcome::Succeeded),
                     summary: format!(
-                        "applied {} Artifact source file(s) to the workspace",
-                        record.plan.plans.len()
+                        "applied {} selected hunk(s) across {} Artifact source file(s) to the workspace",
+                        record.selected_hunk_count,
+                        record.plan.plans.len(),
                     ),
                     result_digest: Some(result_digest),
                 };
@@ -2683,6 +2944,7 @@ fn normalize_workspace_apply_mappings(
                 vec![AgentWorkspaceApplyMapping {
                     source_path,
                     target_path,
+                    hunk_ids: Vec::new(),
                 }]
             }
             _ => return Err(WorkspaceProposalError::InvalidRequest),
@@ -2696,16 +2958,31 @@ fn normalize_workspace_apply_mappings(
     if mappings.is_empty() || mappings.len() > MAX_WORKSPACE_APPLY_FILES {
         return Err(WorkspaceProposalError::InvalidRequest);
     }
+    if request
+        .review_digest
+        .as_deref()
+        .is_some_and(|digest| !is_sha256_digest(digest))
+    {
+        return Err(WorkspaceProposalError::InvalidRequest);
+    }
     let mut source_paths = HashSet::new();
     if mappings.iter().any(|mapping| {
+        let unique_hunks = mapping.hunk_ids.iter().collect::<HashSet<_>>();
         mapping.source_path.is_empty()
             || mapping.target_path.is_empty()
             || !source_paths.insert(mapping.source_path.clone())
+            || mapping.hunk_ids.len() > MAX_WORKSPACE_HUNKS_PER_FILE
+            || unique_hunks.len() != mapping.hunk_ids.len()
+            || mapping.hunk_ids.iter().any(|hunk| !is_sha256_digest(hunk))
     }) {
         return Err(WorkspaceProposalError::InvalidRequest);
     }
     mappings.sort_by(|left, right| left.source_path.cmp(&right.source_path));
     Ok(mappings)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn map_workspace_prepare_error(error: WorkspaceApplyError) -> WorkspaceProposalError {
@@ -2719,6 +2996,31 @@ fn map_workspace_prepare_error(error: WorkspaceApplyError) -> WorkspaceProposalE
         | WorkspaceApplyError::StaleBase
         | WorkspaceApplyError::UnknownExecution(_) => WorkspaceProposalError::UnsafeTarget,
         WorkspaceApplyError::Io(_) => WorkspaceProposalError::Daemon,
+    }
+}
+
+fn workspace_preview_response(review: &PreparedWorkspaceReview) -> AgentWorkspacePreviewResponse {
+    let changes = review
+        .source_paths
+        .iter()
+        .zip(&review.plan.plans)
+        .zip(&review.diffs)
+        .map(
+            |((source_path, plan), diff)| AgentWorkspacePreviewChangeResponse {
+                source_path: source_path.clone(),
+                target_path: plan.target_path.clone(),
+                base_digest: plan.base_digest().map(str::to_owned),
+                artifact_digest: diff.artifact_digest.clone(),
+                before: plan.base_content().to_owned(),
+                artifact_after: plan.proposed_content.clone(),
+                hunks: diff.hunks.clone(),
+            },
+        )
+        .collect();
+    AgentWorkspacePreviewResponse {
+        artifact_source_revision: review.artifact_source_revision,
+        review_digest: review.review_digest.clone(),
+        changes,
     }
 }
 
@@ -3610,7 +3912,21 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let workspace_source = "export default function App(){return <main>Workspace</main>;}\n";
+        let workspace_source = concat!(
+            "export default function App() {\n",
+            "  const title = 'Workspace title';\n",
+            "  const keepOne = 1;\n",
+            "  const keepTwo = 2;\n",
+            "  const keepThree = 3;\n",
+            "  const keepFour = 4;\n",
+            "  const keepFive = 5;\n",
+            "  const keepSix = 6;\n",
+            "  const keepSeven = 7;\n",
+            "  const keepEight = 8;\n",
+            "  const footer = 'Workspace footer';\n",
+            "  return <main>{title}{footer}</main>;\n",
+            "}\n",
+        );
         let workspace_theme = "export const accent = 'workspace';\n";
         std::fs::write(workspace.join("App.tsx"), workspace_source).unwrap();
         std::fs::write(workspace.join("theme.ts"), workspace_theme).unwrap();
@@ -3678,7 +3994,21 @@ mod tests {
         let seed = daemon
             .begin_operation(task_id, seed.operation_id, seed.revision)
             .unwrap();
-        let artifact_source = "export default function App(){return <main>AI Artifact</main>;}\n";
+        let artifact_source = concat!(
+            "export default function App() {\n",
+            "  const title = 'AI title';\n",
+            "  const keepOne = 1;\n",
+            "  const keepTwo = 2;\n",
+            "  const keepThree = 3;\n",
+            "  const keepFour = 4;\n",
+            "  const keepFive = 5;\n",
+            "  const keepSix = 6;\n",
+            "  const keepSeven = 7;\n",
+            "  const keepEight = 8;\n",
+            "  const footer = 'AI footer';\n",
+            "  return <main>{title}{footer}</main>;\n",
+            "}\n",
+        );
         let artifact_theme = "export const accent = 'agent';\n";
         let bundle = "globalThis.workspaceApplyFixture=true;";
         let accepted = daemon
@@ -3721,11 +4051,11 @@ mod tests {
             )
             .unwrap();
 
-        let apply_path = format!(
-            "/agent/artifact/{}/workspace-apply?token={token}&session_id=10",
+        let preview_path = format!(
+            "/agent/artifact/{}/workspace-preview?token={token}&session_id=10",
             accepted.artifact_id
         );
-        let apply_request = serde_json::to_vec(&serde_json::json!({
+        let preview_request = serde_json::to_vec(&serde_json::json!({
             "artifact_source_revision": 3,
             "mappings": [
                 {"source_path": "/App.tsx", "target_path": "App.tsx"},
@@ -3734,12 +4064,82 @@ mod tests {
         }))
         .unwrap();
         let (status, body) =
+            request_path(gateway.address(), &preview_path, "POST", &preview_request).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let preview: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preview["artifact_source_revision"], 3);
+        assert_eq!(preview["review_digest"].as_str().map(str::len), Some(64));
+        assert_eq!(preview["changes"].as_array().unwrap().len(), 2);
+        assert_eq!(preview["changes"][0]["source_path"], "/App.tsx");
+        assert_eq!(preview["changes"][0]["before"], workspace_source);
+        assert_eq!(preview["changes"][0]["artifact_after"], artifact_source);
+        assert_eq!(preview["changes"][0]["hunks"].as_array().unwrap().len(), 2);
+        assert_eq!(preview["changes"][1]["source_path"], "/theme.ts");
+        assert_eq!(preview["changes"][1]["hunks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
+            workspace_source
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("theme.ts")).unwrap(),
+            workspace_theme
+        );
+
+        let app_hunk_id = preview["changes"][0]["hunks"][0]["id"].as_str().unwrap();
+        let theme_hunk_id = preview["changes"][1]["hunks"][0]["id"].as_str().unwrap();
+        let invalid_selection = serde_json::to_vec(&serde_json::json!({
+            "artifact_source_revision": 3,
+            "review_digest": preview["review_digest"],
+            "mappings": [
+                {
+                    "source_path": "/App.tsx",
+                    "target_path": "App.tsx",
+                    "hunk_ids": ["0".repeat(64)]
+                },
+                {
+                    "source_path": "/theme.ts",
+                    "target_path": "theme.ts",
+                    "hunk_ids": []
+                }
+            ]
+        }))
+        .unwrap();
+        let apply_path = format!(
+            "/agent/artifact/{}/workspace-apply?token={token}&session_id=10",
+            accepted.artifact_id
+        );
+        assert_eq!(
+            request_path(gateway.address(), &apply_path, "POST", &invalid_selection,)
+                .await
+                .0,
+            StatusCode::UNPROCESSABLE_ENTITY.as_u16()
+        );
+
+        let apply_request = serde_json::to_vec(&serde_json::json!({
+            "artifact_source_revision": 3,
+            "review_digest": preview["review_digest"],
+            "mappings": [
+                {
+                    "source_path": "/App.tsx",
+                    "target_path": "App.tsx",
+                    "hunk_ids": [app_hunk_id]
+                },
+                {
+                    "source_path": "/theme.ts",
+                    "target_path": "theme.ts",
+                    "hunk_ids": [theme_hunk_id]
+                }
+            ]
+        }))
+        .unwrap();
+        let (status, body) =
             request_path(gateway.address(), &apply_path, "POST", &apply_request).await;
         assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
         let proposal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let selected_app_source = workspace_source.replacen("Workspace title", "AI title", 1);
         assert_eq!(proposal["status"], "waiting_approval");
         assert_eq!(proposal["before"], workspace_source);
-        assert_eq!(proposal["after"], artifact_source);
+        assert_eq!(proposal["after"], selected_app_source);
         assert_eq!(proposal["base_digest"].as_str().map(str::len), Some(64));
         assert_eq!(
             proposal["transaction_digest"].as_str().map(str::len),
@@ -3817,7 +4217,7 @@ mod tests {
         assert_eq!(applied["status"], "applied", "{applied:#}");
         assert_eq!(
             std::fs::read_to_string(workspace.join("App.tsx")).unwrap(),
-            artifact_source
+            selected_app_source
         );
         assert_eq!(
             std::fs::read_to_string(workspace.join("theme.ts")).unwrap(),
