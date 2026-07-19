@@ -221,6 +221,30 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
     );
 }
 
+test "Agent start failures keep the tab inert and explain the gateway result" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    main.update(&model, .{ .agent_session_started = .{
+        .key = main.agent_start_effect_key_base + 2,
+        .status = 429,
+        .body = "Agent session limit reached",
+    } }, &fx);
+
+    try testing.expectEqual(main.AgentConnection.failed, model.activeSession().agent_connection);
+    try testing.expectEqual(main.AgentTurnStatus.failed, model.agent_turn_status);
+    try testing.expect(model.agentComposerDisabled());
+    try testing.expectEqualStrings(
+        "Agent session limit reached · close a tab and retry",
+        model.agentStatus(),
+    );
+}
+
 test "Agent composer posts a bounded prompt to the active Codex turn" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";

@@ -735,15 +735,28 @@ async fn start_session(
         tokio::task::spawn_blocking(move || runtime.start_agent(session_id, &provider)).await;
     match result {
         Ok(Ok(response)) => json_response(StatusCode::OK, &response),
-        Ok(Err(StartError::Unavailable)) => status_response(
+        Ok(Err(error)) => agent_start_error_response(error),
+        Err(_) => status_response(
+            StatusCode::BAD_GATEWAY,
+            "Agent provider failed to initialize",
+        ),
+    }
+}
+
+fn agent_start_error_response(error: StartError) -> Response {
+    match error {
+        StartError::Unavailable => status_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Requested Agent provider is unavailable",
         ),
-        Ok(Err(StartError::ProviderMismatch)) => status_response(
+        StartError::ProviderMismatch => status_response(
             StatusCode::CONFLICT,
             "Agent session already uses a different provider",
         ),
-        Ok(Err(_)) | Err(_) => status_response(
+        StartError::Capacity => {
+            status_response(StatusCode::TOO_MANY_REQUESTS, "Agent session limit reached")
+        }
+        StartError::Lock | StartError::Driver => status_response(
             StatusCode::BAD_GATEWAY,
             "Agent provider failed to initialize",
         ),
@@ -5882,6 +5895,14 @@ mod tests {
             !state_directory
                 .join("agents/session-8/deno-tools/workspace-snapshot")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn agent_session_capacity_is_reported_as_rate_limited() {
+        assert_eq!(
+            agent_start_error_response(StartError::Capacity).status(),
+            StatusCode::TOO_MANY_REQUESTS
         );
     }
 

@@ -548,7 +548,7 @@ pub const Model = struct {
             .unavailable => "Agent unavailable · no command executed",
             .connecting => "Agent connecting · external containment pending",
             .ready => "Agent ready · external containment pending",
-            .failed => "Agent start failed · external containment pending",
+            .failed => if (model.agent_error_len > 0) model.agentError() else "Agent start failed · no command executed",
         };
     }
 
@@ -851,8 +851,25 @@ fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse, f
     if (session_id == model.active_session_id) {
         resetAgentProjection(model, session_id);
         model.agent_turn_status = if (ready) .ready else .failed;
-        if (ready) requestAgentSnapshot(model, session_id, fx);
+        if (ready) {
+            requestAgentSnapshot(model, session_id, fx);
+        } else {
+            setAgentError(model, agentStartFailureMessage(response));
+        }
     }
+}
+
+fn agentStartFailureMessage(response: native_sdk.EffectResponse) []const u8 {
+    if (response.outcome != .ok or response.truncated) {
+        return "Agent gateway unavailable · no command executed";
+    }
+    return switch (response.status) {
+        409 => "Agent tab already uses another provider · no command executed",
+        429 => "Agent session limit reached · close a tab and retry",
+        502 => "Agent provider failed to initialize · no command executed",
+        503 => "Agent provider unavailable · no command executed",
+        else => "Agent start failed · no command executed",
+    };
 }
 
 fn requestAgentTurn(model: *Model, fx: *Effects) void {
