@@ -58,6 +58,8 @@ task model without giving the UI direct command or filesystem authority.
 - **Exact hunk apply.** The Workbench maps Artifact files to explicit workspace
   targets, previews Rust-computed hunks without creating an operation, and lets
   the user bind a selected multi-file set to one exact WorkspaceWrite approval.
+  Rust journals the staged transaction outside the workspace and recovers an
+  interrupted commit or rollback before another workspace apply can begin.
 - **Local-first authority.** Rust owns PTYs, process lifetime, permissions,
   durable state, and accepted artifacts. WebViews render trusted projections
   and cannot spawn commands or choose arbitrary files.
@@ -99,7 +101,7 @@ UI bridge.
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
 | Multi-file Artifact editor, Diff, durable accepted-revision Time Travel, diagnostics, completion, and approved publish | Experimental |
-| Brokered exact multi-file Artifact-to-workspace apply with hunk selection | Experimental |
+| Brokered exact multi-file Artifact-to-workspace apply with hunk selection and crash recovery | Experimental |
 | Signed and notarized public releases | Not available yet |
 | Linux and Windows desktop applications | Not available yet |
 
@@ -232,8 +234,9 @@ Useful design documents:
 ## Roadmap
 
 - Harden terminal performance, accessibility, reconnect, and recovery gates.
-- Extend the brokered transactional hunk apply with a crash-recoverable
-  worktree journal, without giving the renderer write authority.
+- Extend the crash-recoverable transactional hunk apply to isolated Tier 2
+  worktrees and bounded binary patches, without giving the renderer write
+  authority.
 - Extend accepted-Artifact Time Travel into journaled editor transactions,
   reducer/runtime trace checkpoints, and redacted offline bug capsules.
 - Strengthen containment for external coding-agent processes.

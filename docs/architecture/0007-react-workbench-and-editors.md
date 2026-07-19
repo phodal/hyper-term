@@ -170,11 +170,25 @@ MiB, changed inodes, changed modes, and changed digests fail closed before
 installation. The Rust executor then stages the selected set in already-open
 parent directories, keeps private backups of existing files, installs each
 target atomically, verifies the results, and rolls back already-installed
-members if a later member fails. Ambiguous rollback or cleanup is reported as
-`UnknownExecution`; this is guarded in-process recovery, not a cross-process
-crash journal. A gateway integration test proves that preview creates no write,
-one exact approval can apply one of two distant App hunks together with a second
-file, and the unselected App hunk remains at its captured base. Unit tests cover
+members if a later member fails. Before staging, Rust atomically fsyncs a
+bounded mode-0600 manifest under the private gateway state directory. The
+manifest advances through `preparing`, `prepared`, `rolling_back`, `committed`,
+or `rolled_back` and records identities and digests, never source content. It
+remains after a terminal filesystem result until the daemon has journaled the
+matching operation receipt; only then is it acknowledged and removed.
+
+On restart, the gateway classifies every target as the exact reviewed base, the
+exact staged proposal, or unknown. A prepared set that is entirely proposed is
+committed; a base/proposed partial set is rolled back; an interrupted rollback
+continues idempotently. Unknown identities are never overwritten and block only
+new Workspace Apply proposals while ordinary Terminal and Agent work remains
+available. The daemon's restart-time `UnknownExecution` operation is resolved
+to `Succeeded` or `Failed` only after that filesystem recovery. Tests inject
+crashes during preparation, partial install, complete install before the commit
+marker, and rollback, plus an external-writer conflict and daemon restart. A
+gateway integration test also proves that preview creates no write, one exact
+approval can apply one of two distant App hunks together with a second file,
+and the unselected App hunk remains at its captured base. Unit tests cover
 stable hunk IDs, byte-exact reconstruction including CRLF and no-final-newline
 cases, invalid selections, successful two-file apply, stale-member preflight,
 later-member rollback, no-replace creation, cleanup, and symlink escape
@@ -204,8 +218,8 @@ flow covers restore, per-file dirty state, Diff, preview reload, and overflow.
 
 A real Deno integration test separately covers Artifact approval, compilation,
 replacement, source recovery, and stale revision rejection. Durable editor-
-transaction/selection journaling, reducer trace checkpoints, cross-process
-crash-recoverable workspace commit, and arbitrary binary files remain open.
+transaction/selection journaling, reducer trace checkpoints, isolated Tier 2
+worktree merges, and arbitrary binary files remain open.
 
 ## Validation gates
 

@@ -451,9 +451,18 @@ rechecks the selected set and current Artifact revision before the in-process
 Rust executor stages every member. Creation uses no-replace semantics;
 replacement retains a private base backup; a later failure rolls back already-
 installed members in reverse order. Uncertain install, rollback, or cleanup
-verification is reported as `UnknownExecution`. This does not yet implement
-isolated Tier 2 worktree merge, binary patches, or a cross-process crash-
-recovery journal.
+verification is reported as `UnknownExecution`.
+
+The same executor now writes a bounded, atomically replaced and fsynced private
+manifest before creating deterministic stage and backup entries. A fully staged
+manifest is the durable boundary before any target install. The terminal
+`committed` or `rolled_back` manifest remains until the daemon operation receipt
+is durable, closing the crash window between filesystem recovery and the
+authority journal. Gateway startup classifies targets by device, inode, mode,
+and digest, completes an exact commit or rollback when possible, and leaves
+ambiguous external changes untouched. Ambiguity blocks later Workspace Apply
+operations but not Terminal sessions or read-only Agent interaction. This does
+not yet implement isolated Tier 2 worktree merge or binary patches.
 
 ## Approval and escalation
 
