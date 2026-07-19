@@ -3,6 +3,9 @@
 .vscode/
 
 target/
+.zig-cache/
+zig-out/
+zig-pkg/
 node_modules/
 dist/
 .tools/

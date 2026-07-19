@@ -37,6 +37,9 @@
   "tasks": {
     "check": "deno fmt --check apps scripts runtime deno.json && deno lint apps scripts runtime && deno check apps/terminal/src/main.ts apps/workbench/src/main.tsx apps/workbench/src/genui/compiler.worker.ts apps/workbench/genui/preview-shell.ts runtime/genui-compiler.ts scripts/*.ts",
     "test": "deno test --allow-read=.",
+    "render:readme": "cd packages/native-svg && zig build render-readme",
+    "check:readme-svg": "cd packages/native-svg && zig build check-readme",
+    "test:native-svg": "cd packages/native-svg && zig build test",
     "clean:workbench": "deno run --allow-write=dist scripts/clean_workbench.ts",
     "clean:terminal": "deno run --allow-write=dist scripts/clean_terminal.ts",
     "clean:runtime": "deno run --allow-write=dist scripts/clean_runtime.ts",
@@ -50,5 +53,12 @@
     "build": "deno task build:terminal && deno task build:workbench && deno task build:runtime",
     "verify:runtime": "deno run --allow-read=runtime scripts/verify_deno_runtime.ts"
   },
-  "exclude": ["dist", ".tools", ".deno-cache", "target"]
+  "exclude": [
+    "dist",
+    ".tools",
+    ".deno-cache",
+    "target",
+    "packages/native-svg/.zig-cache",
+    "packages/native-svg/zig-pkg"
+  ]
 }

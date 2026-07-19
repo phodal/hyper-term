@@ -18,6 +18,12 @@ experience and adds an explicit workspace for structured coding agents. Shells,
 agent sessions, approvals, diffs, and generated interfaces share one durable
 task model without giving the UI direct command or filesystem authority.
 
+<p align="center">
+  <img src="docs/assets/hyper-term-ui.svg" width="100%" alt="Hyper Term native terminal interface" />
+</p>
+
+<p align="center"><sub>Generated from the real Native SDK widget tree, layout, design tokens, and Geist glyph outlines.</sub></p>
+
 > [!IMPORTANT]
 > Hyper Term is in active development. The terminal core and macOS application
 > are runnable, but the project is not ready for production use or general
@@ -175,6 +181,18 @@ deno task test
 deno task build:workbench
 ```
 
+Regenerate and test the README's vector UI preview:
+
+```bash
+deno task render:readme
+deno task check:readme-svg
+deno task test:native-svg
+```
+
+The renderer imports the desktop application's actual `main.zig` and
+`app.native`, then converts the Native SDK display list to standalone SVG. The
+preview therefore follows UI layout and token changes without a second mockup.
+
 This repository intentionally uses Deno's frozen lockfile and built-in bundler;
 there is no Vite or pnpm build.
 
@@ -184,6 +202,7 @@ there is no Vite or pnpm build.
 apps/desktop/               Native SDK macOS application
 apps/terminal/              Terminal WebView renderer
 apps/workbench/             Agent blocks, editor, and isolated artifact preview
+packages/native-svg/        Native SDK display-list to SVG renderer
 crates/hyper-term-core/     Renderer-independent state and PTY authority
 crates/hyper-term-daemon/   Daemon, desktop supervisor, and local gateways
 crates/hyper-term-drivers/  ACP, MCP, Deno LSP, and GenUI supervision
