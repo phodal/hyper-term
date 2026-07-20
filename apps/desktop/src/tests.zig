@@ -537,6 +537,10 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expect(!model.agentComposerInputDisabled());
     try testing.expect(!model.agentSubmitDisabled());
     try testing.expectEqual(@as(f32, 66), model.agentComposerHeight());
+    model.agent_composer_buffer.set("这是一个按视觉宽度计算高度的中文输入框，不应该因为 UTF-8 字节数而提前变高");
+    try testing.expectEqual(@as(f32, 66), model.agentComposerHeight());
+    model.agent_composer_buffer.set("这是一个按视觉宽度计算高度的中文输入框，不应该因为 UTF-8 字节数而提前变高，并且只有真正超过一行的视觉宽度后才需要扩展输入区域");
+    try testing.expectEqual(@as(f32, 84), model.agentComposerHeight());
     model.agent_composer_buffer.set("One\nTwo\nThree");
     try testing.expect(model.agentComposerHeight() > 66);
     model.agent_turn_status = .running;

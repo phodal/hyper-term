@@ -860,9 +860,7 @@ pub const Model = struct {
 
     pub fn agentComposerHeight(model: *const Model) f32 {
         const text = model.agent_composer_buffer.text();
-        var visual_lines: usize = 1;
-        for (text) |byte| visual_lines += @intFromBool(byte == '\n');
-        visual_lines += text.len / 96;
+        const visual_lines = utf8VisualLineCount(text, 96);
         const extra_lines = @min(visual_lines - 1, 4);
         return 66 + @as(f32, @floatFromInt(extra_lines)) * 18;
     }
@@ -2928,6 +2926,34 @@ fn utf8DisplayColumnPrefixLength(value: []const u8, maximum_columns: usize) usiz
     return index;
 }
 
+fn utf8VisualLineCount(value: []const u8, maximum_columns: usize) usize {
+    if (maximum_columns == 0) return 1;
+    var index: usize = 0;
+    var lines: usize = 1;
+    var columns: usize = 0;
+    while (index < value.len) {
+        if (value[index] == '\n') {
+            lines += 1;
+            columns = 0;
+            index += 1;
+            continue;
+        }
+        const sequence_length = std.unicode.utf8ByteSequenceLength(value[index]) catch {
+            index += 1;
+            continue;
+        };
+        if (index + sequence_length > value.len) break;
+        const width: usize = if (sequence_length == 1) 1 else 2;
+        if (columns > 0 and columns + width > maximum_columns) {
+            lines += 1;
+            columns = 0;
+        }
+        columns += width;
+        index += sequence_length;
+    }
+    return lines;
+}
+
 fn parseAgentToolStatus(value: []const u8) AgentToolStatus {
     if (std.mem.eql(u8, value, "in_progress")) return .in_progress;
     if (std.mem.eql(u8, value, "completed")) return .completed;
@@ -3646,18 +3672,22 @@ fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBl
 
 fn agentGoalNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
     return ui.column(.{ .grow = 1, .semantics = .{ .label = "Active Agent goal" } }, .{
-        ui.el(.bubble, .{}, .{
-            ui.row(.{ .gap = 5, .padding = 3, .cross = .center }, .{
-                ui.icon(.{ .width = 12, .height = 12, .style_tokens = .{ .foreground = .accent } }, "circle-dot"),
-                ui.button(.{
-                    .size = .sm,
-                    .variant = .ghost,
-                    .icon = if (block.expanded) "chevron-down" else "chevron-right",
-                    .on_press = Msg{ .toggle_agent_block = block.id },
-                }, block.activityTitle()),
-                ui.spacer(1),
-                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.activityMeta()),
-            }),
+        ui.row(.{
+            .grow = 1,
+            .gap = 5,
+            .padding = 3,
+            .cross = .center,
+            .style_tokens = .{ .background = .surface_subtle, .radius = .lg },
+        }, .{
+            ui.icon(.{ .width = 12, .height = 12, .style_tokens = .{ .foreground = .accent } }, "circle-dot"),
+            ui.button(.{
+                .grow = 1,
+                .size = .sm,
+                .variant = .ghost,
+                .icon = if (block.expanded) "chevron-down" else "chevron-right",
+                .on_press = Msg{ .toggle_agent_block = block.id },
+            }, block.activityTitle()),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.activityMeta()),
         }),
         if (block.expanded)
             ui.column(.{ .gap = 4, .padding = 6 }, .{
