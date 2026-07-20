@@ -626,6 +626,7 @@ test "ACP composer renders provider capabilities and routes configuration throug
         ,
     } }, &fx);
     try testing.expectEqualStrings("Deep", model.agentConfigOptions()[0].currentLabel());
+    try testing.expectEqual(@as(f32, 76), model.agentConfigOptions()[0].compactWidth());
 
     tree = try buildTree(arena, &model);
     const updated_command_trigger = findByLabel(tree.root, "Agent commands").?;

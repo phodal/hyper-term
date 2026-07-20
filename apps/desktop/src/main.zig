@@ -451,6 +451,13 @@ pub const AgentConfigOptionView = struct {
         return option.current_storage[0..option.current_len];
     }
 
+    pub fn compactWidth(option: *const AgentConfigOptionView) f32 {
+        const label = option.currentLabel();
+        const codepoints = std.unicode.utf8CountCodepoints(label) catch label.len;
+        const estimated = 48 + @as(f32, @floatFromInt(codepoints)) * 7;
+        return std.math.clamp(estimated, 76, 128);
+    }
+
     pub fn visibleChoices(option: *const AgentConfigOptionView) []const AgentConfigChoiceView {
         return option.choices[0..option.choice_count];
     }
