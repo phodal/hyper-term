@@ -74,8 +74,11 @@ git -C "$smoke_workspace" commit -qm fixture
 smoke_lima="$smoke_root/limactl"
 smoke_lima_image="$smoke_root/tier2.qcow2"
 smoke_acp="$smoke_root/acp-diff-agent"
+smoke_terminal_acp="$smoke_root/acp-terminal-agent"
 cp "$smoke_acp_fixture" "$smoke_acp"
 chmod 700 "$smoke_acp"
+cp "$smoke_terminal_acp_fixture" "$smoke_terminal_acp"
+chmod 700 "$smoke_terminal_acp"
 cp "$smoke_lima_fixture" "$smoke_lima"
 chmod 700 "$smoke_lima"
 printf 'local pinned smoke image' > "$smoke_lima_image"
@@ -109,7 +112,8 @@ trap 'exit 143' TERM
     --shell-cwd "$smoke_workspace" \
     --codex "$smoke_acp" \
     --codex-acp "$smoke_acp" \
-    --claude-agent-acp "$smoke_terminal_acp_fixture" \
+    --claude-agent-acp "$smoke_terminal_acp" \
+    --claude "$smoke_terminal_acp" \
     --lima "$smoke_lima" \
     --lima-image "$smoke_lima_image" \
     --lima-image-sha256 "$smoke_lima_image_sha256"
