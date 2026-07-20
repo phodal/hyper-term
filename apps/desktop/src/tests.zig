@@ -1045,7 +1045,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
 }
 
-test "ACP activity renders compact plans diffs terminals and hides low-signal tips" {
+test "Agent activity renders compact plans goals diffs terminals and hides low-signal tips" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     var model = main.initialModelWithServices(terminal_url, agent_url);
@@ -1060,7 +1060,7 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"completed","error":null,"document":{"blocks":[
+        \\{"status":"completed","error":null,"goal":{"objective":"Ship the compact Agent UI without losing terminal speed","status":"active","token_budget":50000,"tokens_used":1200,"time_used_seconds":90},"document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000031","kind":"message","payload":{"type":"message","role":"agent","text":"Warning: Skill descriptions were shortened to fit the budget.\n\nHi! What are we working on today?"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000030","kind":"message","payload":{"type":"message","role":"agent","text":"Model metadata for gpt-5.6-sol is unavailable"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000035","kind":"message","payload":{"type":"message","role":"thought","text":"Inspecting the workspace before editing."}},
@@ -1083,12 +1083,19 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(!model.agentBlocks()[1].expanded);
     const plan = model.agentPlan().?;
     try testing.expect(!plan.expanded);
-    try testing.expectEqualStrings("Goal · Verify the edit after reviewing the comple…", plan.activityTitle());
+    try testing.expectEqualStrings("Plan · Verify the edit after reviewing the comple…", plan.activityTitle());
     try testing.expectEqualStrings("1 / 3", plan.activityMeta());
     try testing.expectEqualStrings(
         "- [x] Inspect the workspace\n- [ ] Polish the notes\n- [ ] Verify the edit after reviewing the complete repository architecture\n",
         plan.content(),
     );
+    const goal = model.agentGoal().?;
+    try testing.expectEqualStrings(
+        "Ship the compact Agent UI without losing terminal speed",
+        goal.objective(),
+    );
+    try testing.expectEqualStrings("active · 1m · 1200 / 50000 tokens", goal.meta());
+    try testing.expect(!goal.expanded);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1098,16 +1105,27 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(!containsText(tree.root, "Model metadata for"));
     try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
     try testing.expect(containsText(tree.root, "Processed"));
-    try testing.expect(containsText(tree.root, "Goal · Verify the edit after reviewing the comple…"));
-    try testing.expectEqual(@as(f32, 1), findByLabel(tree.root, "Active Agent goal").?.layout.grow);
+    try testing.expect(containsText(tree.root, "Plan · Verify the edit after reviewing the comple…"));
+    try testing.expectEqual(@as(f32, 1), findByLabel(tree.root, "Agent turn plan").?.layout.grow);
+    try testing.expectEqual(@as(f32, 1), findByLabel(tree.root, "Persistent Agent goal").?.layout.grow);
+    try testing.expect(containsText(tree.root, "Goal · Ship the compact Agent UI without losing t…"));
+    try testing.expect(containsText(tree.root, "active · 1m · 1200 / 50000 tokens"));
     try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Processed").?.icon);
-    try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Goal · Verify the edit after reviewing the comple…").?.icon);
+    try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Plan · Verify the edit after reviewing the comple…").?.icon);
+    try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Goal · Ship the compact Agent UI without losing t…").?.icon);
+
+    main.update(&model, .toggle_agent_goal, &fx);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Goal · Ship the compact Agent UI without losing t…").?.icon);
+    try testing.expect(containsText(tree.root, "Ship the compact Agent UI without losing terminal speed"));
 
     main.update(&model, .{ .toggle_agent_block = plan.id }, &fx);
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Goal · Verify the edit after reviewing the comple…").?.icon);
+    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Plan · Verify the edit after reviewing the comple…").?.icon);
 
     main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[1].id }, &fx);
     arena_state.deinit();

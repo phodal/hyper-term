@@ -264,15 +264,15 @@ PY
     'Approval required' \
     'Shell command · external effect' \
     'Isolated Tier 2 command · no ordinary PTY access' \
-    'name="Active Agent goal"' \
-    'role=button name="Goal · Run the isolated terminal"' \
+    'name="Agent turn plan"' \
+    'role=button name="Plan · Run the isolated terminal"' \
     '0 / 2' \
     'role=button name="Allow once".*enabled=true'
   smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
   native automate widget-click hyper-term-canvas "$smoke_allow_id"
   native automate assert \
     'Tier 2 terminal completed.' \
-    'role=button name="Goal complete"' \
+    'role=button name="Plan complete"' \
     '2 / 2' \
     'role=button name="Allowed once"'
   native automate assert --absent 'Decision: allowed once'
@@ -281,12 +281,12 @@ PY
   native automate assert 'Decision: allowed once'
   native automate widget-click hyper-term-canvas "$smoke_receipt_id"
   native automate assert --absent 'Decision: allowed once'
-  smoke_goal_id=$(smoke_widget_id 'role=button name="Goal complete"')
-  native automate widget-click hyper-term-canvas "$smoke_goal_id"
+  smoke_plan_id=$(smoke_widget_id 'role=button name="Plan complete"')
+  native automate widget-click hyper-term-canvas "$smoke_plan_id"
   native automate assert \
     'Run the isolated terminal' \
     'Review the retained result'
-  native automate widget-click hyper-term-canvas "$smoke_goal_id"
+  native automate widget-click hyper-term-canvas "$smoke_plan_id"
   native automate assert --absent 'Review the retained result'
   native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
   native automate screenshot hyper-term-canvas

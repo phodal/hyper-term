@@ -39,6 +39,8 @@ const max_agent_activity_meta_bytes: usize = 512;
 const max_agent_diff_files: usize = 8;
 const max_agent_diff_path_bytes: usize = 256;
 const max_agent_goal_step_columns: usize = 42;
+const max_agent_goal_objective_bytes: usize = 1024;
+const max_agent_goal_meta_bytes: usize = 128;
 const max_agent_error_bytes: usize = 512;
 const max_agent_prompt_bytes: usize = 16 * 1024;
 const max_agent_config_options: usize = 4;
@@ -195,6 +197,32 @@ pub const AgentMessageRole = enum { user, agent, system, thought };
 pub const AgentBlockKind = enum { message, operation, approval, tool_call, plan };
 
 pub const AgentToolStatus = enum { pending, in_progress, completed, failed };
+
+pub const AgentGoalStatus = enum {
+    active,
+    paused,
+    blocked,
+    usage_limited,
+    budget_limited,
+    complete,
+};
+
+pub const AgentGoalView = struct {
+    objective_storage: [max_agent_goal_objective_bytes]u8 = [_]u8{0} ** max_agent_goal_objective_bytes,
+    objective_len: usize = 0,
+    meta_storage: [max_agent_goal_meta_bytes]u8 = [_]u8{0} ** max_agent_goal_meta_bytes,
+    meta_len: usize = 0,
+    status: AgentGoalStatus = .active,
+    expanded: bool = false,
+
+    pub fn objective(goal: *const AgentGoalView) []const u8 {
+        return goal.objective_storage[0..goal.objective_len];
+    }
+
+    pub fn meta(goal: *const AgentGoalView) []const u8 {
+        return goal.meta_storage[0..goal.meta_len];
+    }
+};
 
 pub const AgentRisk = enum {
     read_only,
@@ -639,6 +667,8 @@ pub const Model = struct {
     agent_history_clipped: bool = false,
     agent_plan: AgentBlockView = .{},
     agent_plan_visible: bool = false,
+    agent_goal: AgentGoalView = .{},
+    agent_goal_visible: bool = false,
     agent_projection_session_id: u8 = 0,
     agent_execution_contexts: [max_agent_execution_contexts]AgentExecutionContextView = [_]AgentExecutionContextView{.{}} ** max_agent_execution_contexts,
     agent_execution_context_count: usize = 0,
@@ -710,6 +740,8 @@ pub const Model = struct {
         "agent_block_index_base",
         "agent_plan",
         "agent_plan_visible",
+        "agent_goal",
+        "agent_goal_visible",
         "agent_projection_session_id",
         "agent_execution_contexts",
         "agent_execution_context_count",
@@ -968,6 +1000,10 @@ pub const Model = struct {
         return if (model.agent_plan_visible) &model.agent_plan else null;
     }
 
+    pub fn agentGoal(model: *const Model) ?*const AgentGoalView {
+        return if (model.agent_goal_visible) &model.agent_goal else null;
+    }
+
     pub fn hasAgentBlocks(model: *const Model) bool {
         return model.agent_block_count > 0;
     }
@@ -1088,6 +1124,7 @@ pub const Msg = union(enum) {
     agent_config_updated: native_sdk.EffectResponse,
     insert_agent_command: u8,
     toggle_agent_block: u64,
+    toggle_agent_goal,
     toggle_agent_execution_context,
     reject_agent_effect: []const u8,
     allow_agent_effect: []const u8,
@@ -1181,6 +1218,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
             }
         },
+        .toggle_agent_goal => model.agent_goal.expanded = !model.agent_goal.expanded,
         .toggle_agent_execution_context => {
             if (model.hasAgentExecutionContext()) {
                 model.agent_execution_context_expanded = !model.agent_execution_context_expanded;
@@ -1899,6 +1937,7 @@ const AgentSnapshotWire = struct {
     status: []const u8,
     @"error": ?[]const u8 = null,
     capabilities: AgentCapabilitiesWire = .{},
+    goal: ?AgentGoalWire = null,
     context: ?AgentExecutionContextEventWire = null,
     document: struct {
         revision: u64 = 0,
@@ -1974,9 +2013,18 @@ const AgentStreamFrameWire = struct {
     @"error": ?[]const u8 = null,
     document_revision: ?u64 = null,
     capabilities: AgentCapabilitiesWire = .{},
+    goal: ?AgentGoalWire = null,
     patch: ?AgentPatchWire = null,
     target_revision: ?u64 = null,
     reason: ?[]const u8 = null,
+};
+
+const AgentGoalWire = struct {
+    objective: []const u8,
+    status: []const u8,
+    token_budget: ?i64 = null,
+    tokens_used: i64 = 0,
+    time_used_seconds: i64 = 0,
 };
 
 const AgentCapabilitiesResponseWire = struct {
@@ -2360,6 +2408,7 @@ fn applyAgentStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects
     const frame = parsed.value;
     if (std.mem.eql(u8, frame.type, "state")) {
         projectAgentCapabilities(model, frame.capabilities);
+        projectAgentGoal(model, frame.goal);
         if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
         if (frame.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
         if (frame.document_revision) |revision| {
@@ -2486,6 +2535,7 @@ fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8) bo
         return false;
     }
     projectAgentCapabilities(model, parsed.value.capabilities);
+    projectAgentGoal(model, parsed.value.goal);
     projectAgentBlocks(model, parsed.value.document.blocks);
     model.agent_document_revision = parsed.value.document.revision;
     model.agent_stream_sequence = parsed.value.document.revision;
@@ -3103,23 +3153,93 @@ fn projectAgentPlan(view: *AgentBlockView, entries: []const AgentPlanEntryWire) 
         if (active_step == null and std.mem.eql(u8, entry.status, "in_progress")) active_step = entry.content;
         if (next_step == null and !std.mem.eql(u8, entry.status, "completed")) next_step = entry.content;
         // ACP priorities help the runtime order work, but they are noisy in the
-        // compact Goal disclosure and are not a user-facing status. Keep the
+        // compact Plan disclosure and are not a user-facing status. Keep the
         // native projection focused on completion and the current step.
         appendActivityFmt(view, "- [{s}] {s}\n", .{ marker, entry.content });
     }
     var meta: [max_agent_activity_meta_bytes]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&meta, "{d} / {d}", .{ completed, entries.len }) catch "Goal";
+    const rendered = std.fmt.bufPrint(&meta, "{d} / {d}", .{ completed, entries.len }) catch "Plan";
     copyActivityMeta(view, rendered);
     if (completed == entries.len) {
-        copyActivityTitle(view, "Goal complete");
+        copyActivityTitle(view, "Plan complete");
     } else {
-        copyActivityTitle(view, "Goal · ");
+        copyActivityTitle(view, "Plan · ");
         const step = active_step orelse next_step orelse entries[0].content;
         const step_length = utf8DisplayColumnPrefixLength(step, max_agent_goal_step_columns);
         appendActivityTitle(view, step[0..step_length]);
         if (step_length < step.len) appendActivityTitle(view, "…");
     }
     view.expanded = false;
+}
+
+fn projectAgentGoal(model: *Model, wire: ?AgentGoalWire) void {
+    const was_expanded = model.agent_goal.expanded;
+    model.agent_goal = .{};
+    model.agent_goal.expanded = was_expanded;
+    model.agent_goal_visible = false;
+    const goal = wire orelse return;
+    const objective = std.mem.trim(u8, goal.objective, " \t\r\n");
+    if (objective.len == 0) return;
+    model.agent_goal.status = parseAgentGoalStatus(goal.status) orelse return;
+    copyCapabilityText(
+        &model.agent_goal.objective_storage,
+        &model.agent_goal.objective_len,
+        objective,
+    );
+    copyCapabilityText(
+        &model.agent_goal.meta_storage,
+        &model.agent_goal.meta_len,
+        agentGoalStatusLabel(model.agent_goal.status),
+    );
+    var buffer: [64]u8 = undefined;
+    if (goal.time_used_seconds > 0) {
+        const elapsed = formatAgentGoalElapsed(&buffer, @intCast(goal.time_used_seconds)) catch "";
+        if (elapsed.len > 0) {
+            appendCapabilityText(&model.agent_goal.meta_storage, &model.agent_goal.meta_len, " · ");
+            appendCapabilityText(&model.agent_goal.meta_storage, &model.agent_goal.meta_len, elapsed);
+        }
+    }
+    if (goal.token_budget) |budget| {
+        if (budget > 0) {
+            const tokens = std.fmt.bufPrint(&buffer, "{d} / {d} tokens", .{ @max(goal.tokens_used, 0), budget }) catch "";
+            if (tokens.len > 0) {
+                appendCapabilityText(&model.agent_goal.meta_storage, &model.agent_goal.meta_len, " · ");
+                appendCapabilityText(&model.agent_goal.meta_storage, &model.agent_goal.meta_len, tokens);
+            }
+        }
+    }
+    model.agent_goal_visible = true;
+}
+
+fn parseAgentGoalStatus(value: []const u8) ?AgentGoalStatus {
+    if (std.mem.eql(u8, value, "active")) return .active;
+    if (std.mem.eql(u8, value, "paused")) return .paused;
+    if (std.mem.eql(u8, value, "blocked")) return .blocked;
+    if (std.mem.eql(u8, value, "usage_limited")) return .usage_limited;
+    if (std.mem.eql(u8, value, "budget_limited")) return .budget_limited;
+    if (std.mem.eql(u8, value, "complete")) return .complete;
+    return null;
+}
+
+fn agentGoalStatusLabel(status: AgentGoalStatus) []const u8 {
+    return switch (status) {
+        .active => "active",
+        .paused => "paused",
+        .blocked => "blocked",
+        .usage_limited => "usage limited",
+        .budget_limited => "budget limited",
+        .complete => "complete",
+    };
+}
+
+fn formatAgentGoalElapsed(buffer: []u8, seconds: u64) ![]u8 {
+    if (seconds < 60) return std.fmt.bufPrint(buffer, "{d}s", .{seconds});
+    const minutes = seconds / 60;
+    if (minutes < 60) return std.fmt.bufPrint(buffer, "{d}m", .{minutes});
+    const hours = minutes / 60;
+    const remaining_minutes = minutes % 60;
+    if (remaining_minutes == 0) return std.fmt.bufPrint(buffer, "{d}h", .{hours});
+    return std.fmt.bufPrint(buffer, "{d}h {d}m", .{ hours, remaining_minutes });
 }
 
 fn utf8DisplayColumnPrefixLength(value: []const u8, maximum_columns: usize) usize {
@@ -3356,6 +3476,8 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_history_clipped = false;
     model.agent_plan = .{};
     model.agent_plan_visible = false;
+    model.agent_goal = .{};
+    model.agent_goal_visible = false;
     model.agent_projection_session_id = session_id;
     clearAgentExecutionContext(model, session_id);
     model.agent_document_revision = 0;
@@ -3685,7 +3807,8 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
             ui.text(.{ .padding = 6, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Older activity is compacted · showing the latest {d} blocks", .{max_agent_blocks})),
             timeline,
         });
-    const content = if (model.agent_tier2_result_count == 0 and !model.agent_plan_visible)
+    const content = if (model.agent_tier2_result_count == 0 and
+        !model.agent_plan_visible and !model.agent_goal_visible)
         transcript
     else blk: {
         break :blk ui.column(.{ .grow = 1 }, .{
@@ -3696,7 +3819,13 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
                 ui.el(.stack, .{}, .{}),
             if (model.agent_plan_visible)
                 ui.row(.{ .gap = 4, .padding = 4, .cross = .center }, .{
-                    agentGoalNode(ui, &model.agent_plan),
+                    agentPlanNode(ui, &model.agent_plan),
+                })
+            else
+                ui.el(.stack, .{}, .{}),
+            if (model.agent_goal_visible)
+                ui.row(.{ .gap = 4, .padding = 4, .cross = .center }, .{
+                    agentGoalNode(ui, &model.agent_goal),
                 })
             else
                 ui.el(.stack, .{}, .{}),
@@ -3886,8 +4015,8 @@ fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBl
     });
 }
 
-fn agentGoalNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
-    return ui.column(.{ .grow = 1, .semantics = .{ .label = "Active Agent goal" } }, .{
+fn agentPlanNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
+    return ui.column(.{ .grow = 1, .semantics = .{ .label = "Agent turn plan" } }, .{
         ui.row(.{
             .grow = 1,
             .gap = 5,
@@ -3909,6 +4038,38 @@ fn agentGoalNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Nod
             ui.column(.{ .gap = 4, .padding = 6 }, .{
                 AgentMarkdown.view(ui, block.content(), .{}),
             })
+        else
+            ui.el(.stack, .{}, .{}),
+    });
+}
+
+fn agentGoalNode(ui: *HyperTermUi, goal: *const AgentGoalView) HyperTermUi.Node {
+    const objective = goal.objective();
+    const title_length = utf8DisplayColumnPrefixLength(objective, max_agent_goal_step_columns);
+    const title = if (title_length < objective.len)
+        ui.fmt("Goal · {s}…", .{objective[0..title_length]})
+    else
+        ui.fmt("Goal · {s}", .{objective});
+    return ui.column(.{ .grow = 1, .semantics = .{ .label = "Persistent Agent goal" } }, .{
+        ui.row(.{
+            .grow = 1,
+            .gap = 5,
+            .padding = 3,
+            .cross = .center,
+            .style_tokens = .{ .background = .surface_subtle, .radius = .lg },
+        }, .{
+            ui.icon(.{ .width = 12, .height = 12, .style_tokens = .{ .foreground = .accent } }, "circle-dot"),
+            ui.button(.{
+                .grow = 1,
+                .size = .sm,
+                .variant = .ghost,
+                .icon = if (goal.expanded) "chevron-down" else "chevron-right",
+                .on_press = .toggle_agent_goal,
+            }, title),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, goal.meta()),
+        }),
+        if (goal.expanded)
+            ui.text(.{ .padding = 6, .wrap = true }, objective)
         else
             ui.el(.stack, .{}, .{}),
     });
