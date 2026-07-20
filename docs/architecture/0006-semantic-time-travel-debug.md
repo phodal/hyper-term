@@ -237,8 +237,24 @@ and reports `effects substituted` without a page or console error.
 This is still an explicit-runtime replay contract, not arbitrary React Fiber or
 browser-state rewind. Durable editor transactions and accepted-source history
 remain separate projections. The offline capsule joins bounded snapshots of
-those projections for inspection; schema migration and cross-version replay
-compatibility remain future work.
+those projections for inspection; each projection retains an independent
+version and digest contract.
+
+## Bug Capsule migration evidence (2026-07-20)
+
+New exports use Bug Capsule schema version 2. In addition to the signed outer
+capsule, they carry an `accepted_source_digest` over the source revision,
+entrypoint, and ordered digest-only file inventory. Rust and the Workbench both
+recompute that identity, so replacing the accepted source inventory and merely
+re-signing the outer JSON fails closed.
+
+Opening a schema version 1 capsule first validates its original outer digest,
+replay projection, inventory, and exclusion contract. Rust then derives the
+accepted-source identity and returns a newly signed version 2 value in memory;
+the user-selected external JSON is not silently rewritten. Unknown future
+schemas, a forged legacy capsule, and version 2 source substitution are rejected.
+The Workbench accepts a verified version 1 response during rolling upgrades but
+expects and independently checks the new identity for version 2.
 
 ## Runtime journal migration evidence (2026-07-20)
 
@@ -256,7 +272,8 @@ after rename only the complete version 2 journal is visible. Tests prove that
 the projection digest is identical before and after migration, exact retries
 remain idempotent, timestamp-only and payload tampering fail closed, and unknown
 future storage schemas are not guessed. Cross-version Bug Capsule migration is
-still separate because its signed export digest covers a different contract.
+implemented separately because its signed export digest covers a different
+contract.
 
 ## Validation gates
 

@@ -241,10 +241,9 @@ unknown future schema both fail closed. Regression tests cover legacy snapshot
 plus journal migration, exact reopen after migration, baseline substitution,
 future schemas, compaction, torn tails, stale revisions, and fixed file sets.
 
-This is the first completed store upgrade in the broader migration roadmap.
-Accepted Artifact source, runtime trace, and Bug Capsule migrations remain
-separate work; they must preserve their own digest and replay contracts rather
-than inheriting the editor format.
+Accepted Artifact source, runtime trace, and Bug Capsule upgrades are now also
+implemented as separate version 2 contracts. Each preserves its own source,
+storage, or replay digest rather than inheriting the editor format.
 
 ## Validation gates
 
