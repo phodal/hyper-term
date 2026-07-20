@@ -223,6 +223,29 @@ binary Artifact editing remain open. Tier 2 result acceptance has its own
 bounded binary transaction path and does not make the WebView editor a binary
 file authority.
 
+## Durable editor migration evidence (2026-07-20)
+
+The Rust-owned Artifact editor store now writes schema version 2. Every snapshot
+and transaction carries a SHA-256 binding over the accepted source revision,
+entrypoint, and complete ordered baseline file map. This prevents a retained
+draft from being resumed against different accepted bytes merely because the
+revision number and virtual paths happen to match.
+
+Opening a version 1 store performs an in-place, bounded migration. Rust validates
+the legacy snapshot and ordered journal against the current accepted Artifact,
+replays each revision, writes one fsynced version 2 snapshot, and then atomically
+replaces the absorbed journal with an empty file. If the process stops between
+those last two steps, the version 2 snapshot safely dominates the still-present
+older transactions on the next load. A mismatched version 2 baseline and an
+unknown future schema both fail closed. Regression tests cover legacy snapshot
+plus journal migration, exact reopen after migration, baseline substitution,
+future schemas, compaction, torn tails, stale revisions, and fixed file sets.
+
+This is the first completed store upgrade in the broader migration roadmap.
+Accepted Artifact source, runtime trace, and Bug Capsule migrations remain
+separate work; they must preserve their own digest and replay contracts rather
+than inheriting the editor format.
+
 ## Validation gates
 
 - Restore Tiptap and CodeMirror documents, selections, attachments, and undo
