@@ -286,9 +286,17 @@ pub const AgentBlockView = struct {
     }
 
     pub fn canAllowOnce(block: *const AgentBlockView) bool {
-        return block.isApprovalPending() and
-            block.risk == .read_only and
+        return block.isApprovalPending() and (block.isBrokeredMcpReview() or block.isWorkspaceReview());
+    }
+
+    pub fn isBrokeredMcpReview(block: *const AgentBlockView) bool {
+        return block.risk == .read_only and
             std.mem.eql(u8, block.operationKindLabel(), "MCP tool");
+    }
+
+    pub fn isWorkspaceReview(block: *const AgentBlockView) bool {
+        return block.risk == .workspace_write and
+            std.mem.eql(u8, block.operationKindLabel(), "Workspace edit");
     }
 
     pub fn operationId(block: *const AgentBlockView) []const u8 {
@@ -2236,6 +2244,9 @@ fn projectApprovalBlock(
         if (candidate.payload.kind) |kind| copyOperationKind(view, operationKindLabel(kind));
         if (candidate.payload.risk) |risk| view.risk = parseAgentRisk(risk);
         if (candidate.payload.state) |state| view.state = parseAgentOperationState(state);
+        if (view.isWorkspaceReview() and candidate.payload.summary != null) {
+            copyAgentBlockContent(view, candidate.payload.summary.?);
+        }
         break;
     }
 }
@@ -2605,7 +2616,7 @@ fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 
         .message => if (block.role == .user) 28 + text_extent else 14 + text_extent,
         .tool_call, .plan => if (block.expanded) 42 + text_extent else 30,
         .operation => 36 + @min(text_extent, agent_timeline_line_height),
-        .approval => 210 + @min(text_extent, agent_timeline_line_height * 8),
+        .approval => 118 + @min(text_extent, agent_timeline_line_height * 5),
     };
 }
 
@@ -2759,33 +2770,25 @@ fn agentApprovalNode(ui: *HyperTermUi, model: *const Model, block: *const AgentB
     const decision = if (!block.isApprovalPending())
         ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Decision: {s}", .{block.decisionLabel()}))
     else if (block.canAllowOnce())
-        ui.el(.alert, .{ .text = "Brokered MCP tool" }, .{
-            ui.column(.{ .gap = 7, .padding = 9 }, .{
-                ui.text(.{ .wrap = true }, "This read-only tool runs through the Rust permission broker and records a receipt."),
-                ui.column(.{ .gap = 7 }, .{
-                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .allow_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Allow once"),
-                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
-                    ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel request"),
-                }),
-            }),
+        ui.row(.{ .gap = 6, .cross = .center }, .{
+            ui.text(.{ .grow = 1, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (block.isWorkspaceReview()) "Rust-verified Diff · durable apply" else "Brokered read-only tool · receipt recorded"),
+            ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel"),
+            ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
+            ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .allow_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Allow once"),
         })
     else
-        ui.el(.alert, .{ .text = "Proposal-only safety gate" }, .{
-            ui.column(.{ .gap = 7, .padding = 9 }, .{
-                ui.text(.{ .wrap = true }, "Allow is unavailable until the Rust sandbox can enforce this exact effect."),
-                ui.column(.{ .gap = 7 }, .{
-                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
-                    ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel request"),
-                }),
-            }),
+        ui.row(.{ .gap = 6, .cross = .center }, .{
+            ui.text(.{ .grow = 1, .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "Allow unavailable until Rust can enforce this effect."),
+            ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel"),
+            ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
         });
     return ui.el(.card, .{ .style_tokens = .{ .border_color = .warning } }, .{
-        ui.column(.{ .gap = 9, .padding = 10 }, .{
-            ui.row(.{ .gap = 7, .cross = .center }, .{
-                ui.icon(.{ .width = 14, .height = 14, .style_tokens = .{ .foreground = .warning } }, "alert"),
+        ui.column(.{ .gap = 6, .padding = 8 }, .{
+            ui.row(.{ .gap = 6, .cross = .center }, .{
+                ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .warning } }, "alert"),
                 ui.text(.{ .grow = 1 }, block.approvalTitle()),
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
             }),
-            ui.text(.{ .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
             ui.text(.{ .wrap = true }, block.content()),
             decision,
         }),

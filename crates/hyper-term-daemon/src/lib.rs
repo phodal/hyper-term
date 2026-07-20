@@ -1358,6 +1358,7 @@ impl DaemonState {
             .iter()
             .map(|plan| plan.target_path.clone())
             .collect::<Vec<_>>();
+        let summary = isolated_acceptance_summary(source_operation_id, &target_paths);
         let operation = self.propose_operation(
             task_id,
             OperationKind::FileEdit,
@@ -1365,10 +1366,7 @@ impl DaemonState {
                 kind: "hyper_term.tier2.accept".into(),
                 payload_digest: binding_digest.clone(),
             },
-            format!(
-                "Apply {} reviewed Tier 2 file(s) from operation {source_operation_id}",
-                target_paths.len()
-            ),
+            summary,
             RiskClass::WorkspaceWrite,
             vec!["workspace.write".into(), "sandbox.tier2.accept".into()],
         )?;
@@ -2758,6 +2756,32 @@ fn isolated_acceptance_digest(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+fn isolated_acceptance_summary(
+    source_operation_id: OperationId,
+    target_paths: &[String],
+) -> String {
+    const MAX_PATH_PREVIEW_BYTES: usize = 320;
+    let mut preview = String::new();
+    for path in target_paths {
+        let separator_bytes = usize::from(!preview.is_empty()) * 2;
+        if preview.len() + separator_bytes + path.len() > MAX_PATH_PREVIEW_BYTES {
+            if !preview.is_empty() {
+                preview.push_str(", ");
+            }
+            preview.push_str("more files");
+            break;
+        }
+        if !preview.is_empty() {
+            preview.push_str(", ");
+        }
+        preview.push_str(path);
+    }
+    format!(
+        "Apply {} reviewed Tier 2 file(s) from operation {source_operation_id}: {preview}",
+        target_paths.len()
+    )
 }
 
 fn bounded_nonempty(

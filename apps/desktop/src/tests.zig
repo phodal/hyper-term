@@ -718,7 +718,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     try testing.expect(containsText(tree.root, "What changed?"));
     try testing.expect(containsText(tree.root, "BlockDocument"));
     try testing.expect(containsText(tree.root, "touch forbidden"));
-    try testing.expect(containsText(tree.root, "Allow is unavailable until the Rust sandbox"));
+    try testing.expect(containsText(tree.root, "Allow unavailable until Rust can enforce"));
     try testing.expect(findByLabel(tree.root, "Agent prompt composer") != null);
     try testing.expect(findByLabel(tree.root, "Send prompt") != null);
     const tokens = main.hyperTermTokens(&model);
@@ -980,13 +980,57 @@ test "read-only MCP approvals expose an exact Allow once action" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(containsText(tree.root, "This read-only tool runs through the Rust permission broker"));
-    try testing.expect(!containsText(tree.root, "Allow is unavailable until the Rust sandbox"));
+    try testing.expect(containsText(tree.root, "Brokered read-only tool · receipt recorded"));
+    try testing.expect(!containsText(tree.root, "Allow unavailable until Rust can enforce"));
     const allow = findByText(tree.root, .button, "Allow once").?;
     main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);
     const request = fx.pendingFetchAt(1).?;
     try testing.expectEqualStrings(
         "{\"operation_id\":\"44444444-4444-4444-8444-444444444444\",\"expected_revision\":3,\"decision\":\"allow_once\"}",
+        request.body,
+    );
+}
+
+test "reviewed Tier 2 workspace edits expose a compact exact approval" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"waiting_approval","error":null,"document":{"blocks":[
+        \\  {"block_id":"00000000-0000-4000-8000-000000000031","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"55555555-5555-4555-8555-555555555555","kind":"file_edit","summary":"Apply 1 reviewed Tier 2 file: src/main.rs","risk":"workspace_write","state":"waiting_human"}},
+        \\  {"block_id":"00000000-0000-4000-8000-000000000032","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"55555555-5555-4555-8555-555555555555","operation_revision":3,"prompt":"Allow this exact operation once?","decision":null}}
+        \\]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqual(@as(usize, 2), model.agentBlocks().len);
+    const approval = &model.agentBlocks()[1];
+    try testing.expect(approval.canAllowOnce());
+    try testing.expect(approval.isWorkspaceReview());
+    try testing.expectEqualStrings("Apply 1 reviewed Tier 2 file: src/main.rs", approval.content());
+    const options = main.agentTimelineOptions(&model);
+    try testing.expect(options.extent_estimate.?(options.extent_context, 1) < 180);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "Rust-verified Diff · durable apply"));
+    try testing.expect(!containsText(tree.root, "Proposal-only safety gate"));
+    const allow = findByText(tree.root, .button, "Allow once").?;
+    main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);
+    const request = fx.pendingFetchAt(1).?;
+    try testing.expectEqualStrings(
+        "{\"operation_id\":\"55555555-5555-4555-8555-555555555555\",\"expected_revision\":3,\"decision\":\"allow_once\"}",
         request.body,
     );
 }

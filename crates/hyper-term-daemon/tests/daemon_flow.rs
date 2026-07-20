@@ -211,6 +211,7 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         .propose_isolated_result_acceptance(task_id, operation.operation_id)
         .unwrap();
     assert_eq!(acceptance.target_paths, vec!["generated.txt"]);
+    assert!(acceptance.operation.summary.contains("generated.txt"));
     let acceptance_path = state_path
         .join("isolated-acceptances")
         .join(format!("{}.json", acceptance.operation.operation_id));

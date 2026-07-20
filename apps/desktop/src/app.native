@@ -70,36 +70,33 @@
                 </if>
                 <else>
                   <card border-color="warning">
-                    <column gap="9" padding="10">
-                      <row gap="7" cross="center">
-                        <icon name="alert" width="14" height="14" foreground="warning" />
+                    <column gap="6" padding="8">
+                      <row gap="6" cross="center">
+                        <icon name="alert" width="13" height="13" foreground="warning" />
                         <text grow="1"><span weight="medium">{block.approvalTitle}</span></text>
+                        <text foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
                       </row>
-                      <text wrap="true" foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
                       <text wrap="true">{block.content}</text>
                       <if test="{block.isApprovalPending}">
                         <if test="{block.canAllowOnce}">
-                          <alert text="Brokered MCP tool">
-                            <column gap="7" padding="9">
-                              <text wrap="true">This read-only tool runs through the Rust permission broker and records a receipt.</text>
-                              <column gap="7">
-                                <button size="sm" variant="primary" on-press="allow_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Allow once</button>
-                                <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
-                                <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel request</button>
-                              </column>
-                            </column>
-                          </alert>
+                          <row gap="6" cross="center">
+                            <if test="{block.isWorkspaceReview}">
+                              <text grow="1" foreground="text_muted">Rust-verified Diff · durable apply</text>
+                            </if>
+                            <else>
+                              <text grow="1" foreground="text_muted">Brokered read-only tool · receipt recorded</text>
+                            </else>
+                            <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel</button>
+                            <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
+                            <button size="sm" variant="primary" on-press="allow_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Allow once</button>
+                          </row>
                         </if>
                         <else>
-                          <alert text="Proposal-only safety gate">
-                            <column gap="7" padding="9">
-                              <text wrap="true">Allow is unavailable until the Rust sandbox can enforce this exact effect.</text>
-                              <column gap="7">
-                                <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
-                                <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel request</button>
-                              </column>
-                            </column>
-                          </alert>
+                          <row gap="6" cross="center">
+                            <text grow="1" wrap="true" foreground="text_muted">Allow unavailable until Rust can enforce this effect.</text>
+                            <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel</button>
+                            <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
+                          </row>
                         </else>
                       </if>
                       <else>
