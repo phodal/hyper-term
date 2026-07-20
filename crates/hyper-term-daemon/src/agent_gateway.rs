@@ -4719,9 +4719,9 @@ fn map_artifact_editor_store_error(error: ArtifactEditorStoreError) -> ArtifactE
         | ArtifactEditorStoreError::TooLarge
         | ArtifactEditorStoreError::TornJournal
         | ArtifactEditorStoreError::RevisionOverflow => ArtifactEditorError::InvalidRequest,
-        ArtifactEditorStoreError::Io(_) | ArtifactEditorStoreError::Json(_) => {
-            ArtifactEditorError::Store
-        }
+        ArtifactEditorStoreError::UnsupportedSchema(_)
+        | ArtifactEditorStoreError::Io(_)
+        | ArtifactEditorStoreError::Json(_) => ArtifactEditorError::Store,
     }
 }
 

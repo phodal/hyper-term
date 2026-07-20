@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const EDITOR_STATE_SCHEMA_VERSION: u32 = 1;
+const LEGACY_EDITOR_STATE_SCHEMA_VERSION: u32 = 1;
+const EDITOR_STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_EDITOR_FILES: usize = 100;
 const MAX_EDITOR_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_EDITOR_SELECTIONS: usize = 100;
@@ -63,6 +64,8 @@ struct StoredEditorCheckpoint {
     task_id: TaskId,
     artifact_id: ArtifactId,
     base_source_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_digest: Option<String>,
     revision: u64,
     entrypoint: String,
     files: BTreeMap<String, String>,
@@ -77,6 +80,8 @@ struct EditorTransaction {
     task_id: TaskId,
     artifact_id: ArtifactId,
     base_source_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_digest: Option<String>,
     revision: u64,
     changed_files: BTreeMap<String, String>,
     active_path: String,
@@ -106,6 +111,8 @@ impl ArtifactEditorStore {
         baseline_files: &BTreeMap<String, String>,
     ) -> Result<ArtifactEditorCheckpoint, ArtifactEditorStoreError> {
         validate_editor_state(entrypoint, baseline_files, entrypoint, &BTreeMap::new())?;
+        let baseline_digest =
+            editor_baseline_digest(base_source_revision, entrypoint, baseline_files)?;
         let task_root = self.task_root(task_id);
         if !task_root.exists() {
             return checkpoint_from_stored(StoredEditorCheckpoint {
@@ -113,6 +120,7 @@ impl ArtifactEditorStore {
                 task_id,
                 artifact_id,
                 base_source_revision,
+                baseline_digest: Some(baseline_digest),
                 revision: 0,
                 entrypoint: entrypoint.to_owned(),
                 files: baseline_files.clone(),
@@ -124,14 +132,17 @@ impl ArtifactEditorStore {
         validate_private_directory(&task_root)?;
         let snapshot_path = self.snapshot_path(task_id, artifact_id);
         let journal_path = self.journal_path(task_id, artifact_id);
+        let mut migration_required = false;
         let mut state = if snapshot_path.exists() {
             let encoded = read_bounded_file(&snapshot_path, MAX_EDITOR_STATE_BYTES)?;
-            let snapshot: StoredEditorCheckpoint = serde_json::from_slice(&encoded)?;
+            let mut snapshot: StoredEditorCheckpoint = serde_json::from_slice(&encoded)?;
+            migration_required |= migrate_stored_checkpoint(&mut snapshot, &baseline_digest)?;
             validate_stored_context(
                 &snapshot,
                 task_id,
                 artifact_id,
                 base_source_revision,
+                &baseline_digest,
                 entrypoint,
                 baseline_files,
             )?;
@@ -142,6 +153,7 @@ impl ArtifactEditorStore {
                 task_id,
                 artifact_id,
                 base_source_revision,
+                baseline_digest: Some(baseline_digest.clone()),
                 revision: 0,
                 entrypoint: entrypoint.to_owned(),
                 files: baseline_files.clone(),
@@ -162,12 +174,14 @@ impl ArtifactEditorStore {
                 if line.len() as u64 > MAX_EDITOR_STATE_BYTES {
                     return Err(ArtifactEditorStoreError::TooLarge);
                 }
-                let transaction: EditorTransaction = serde_json::from_slice(line)?;
+                let mut transaction: EditorTransaction = serde_json::from_slice(line)?;
+                migration_required |= migrate_transaction(&mut transaction, &baseline_digest)?;
                 validate_transaction_context(
                     &transaction,
                     task_id,
                     artifact_id,
                     base_source_revision,
+                    &baseline_digest,
                 )?;
                 if transaction.revision <= state.revision {
                     continue;
@@ -190,10 +204,15 @@ impl ArtifactEditorStore {
                     task_id,
                     artifact_id,
                     base_source_revision,
+                    &baseline_digest,
                     entrypoint,
                     baseline_files,
                 )?;
             }
+        }
+        if migration_required {
+            write_snapshot(&task_root, artifact_id, &state)?;
+            replace_journal_with_empty(&task_root, artifact_id)?;
         }
         checkpoint_from_stored(state)
     }
@@ -248,6 +267,11 @@ impl ArtifactEditorStore {
             task_id,
             artifact_id,
             base_source_revision: request.base_source_revision,
+            baseline_digest: Some(editor_baseline_digest(
+                request.base_source_revision,
+                entrypoint,
+                baseline_files,
+            )?),
             revision,
             changed_files,
             active_path: request.active_path.clone(),
@@ -261,6 +285,7 @@ impl ArtifactEditorStore {
             task_id,
             artifact_id,
             base_source_revision: request.base_source_revision,
+            baseline_digest: transaction.baseline_digest.clone(),
             revision,
             entrypoint: entrypoint.to_owned(),
             files: request.files,
@@ -298,11 +323,56 @@ impl ArtifactEditorStore {
     }
 }
 
+fn migrate_stored_checkpoint(
+    state: &mut StoredEditorCheckpoint,
+    expected_baseline_digest: &str,
+) -> Result<bool, ArtifactEditorStoreError> {
+    match state.schema_version {
+        LEGACY_EDITOR_STATE_SCHEMA_VERSION if state.baseline_digest.is_none() => {
+            state.schema_version = EDITOR_STATE_SCHEMA_VERSION;
+            state.baseline_digest = Some(expected_baseline_digest.to_owned());
+            Ok(true)
+        }
+        EDITOR_STATE_SCHEMA_VERSION
+            if state.baseline_digest.as_deref() == Some(expected_baseline_digest) =>
+        {
+            Ok(false)
+        }
+        LEGACY_EDITOR_STATE_SCHEMA_VERSION | EDITOR_STATE_SCHEMA_VERSION => {
+            Err(ArtifactEditorStoreError::ContextMismatch)
+        }
+        version => Err(ArtifactEditorStoreError::UnsupportedSchema(version)),
+    }
+}
+
+fn migrate_transaction(
+    transaction: &mut EditorTransaction,
+    expected_baseline_digest: &str,
+) -> Result<bool, ArtifactEditorStoreError> {
+    match transaction.schema_version {
+        LEGACY_EDITOR_STATE_SCHEMA_VERSION if transaction.baseline_digest.is_none() => {
+            transaction.schema_version = EDITOR_STATE_SCHEMA_VERSION;
+            transaction.baseline_digest = Some(expected_baseline_digest.to_owned());
+            Ok(true)
+        }
+        EDITOR_STATE_SCHEMA_VERSION
+            if transaction.baseline_digest.as_deref() == Some(expected_baseline_digest) =>
+        {
+            Ok(false)
+        }
+        LEGACY_EDITOR_STATE_SCHEMA_VERSION | EDITOR_STATE_SCHEMA_VERSION => {
+            Err(ArtifactEditorStoreError::ContextMismatch)
+        }
+        version => Err(ArtifactEditorStoreError::UnsupportedSchema(version)),
+    }
+}
+
 fn validate_stored_context(
     state: &StoredEditorCheckpoint,
     task_id: TaskId,
     artifact_id: ArtifactId,
     base_source_revision: u64,
+    baseline_digest: &str,
     entrypoint: &str,
     baseline_files: &BTreeMap<String, String>,
 ) -> Result<(), ArtifactEditorStoreError> {
@@ -310,6 +380,7 @@ fn validate_stored_context(
         || state.task_id != task_id
         || state.artifact_id != artifact_id
         || state.base_source_revision != base_source_revision
+        || state.baseline_digest.as_deref() != Some(baseline_digest)
         || state.entrypoint != entrypoint
     {
         return Err(ArtifactEditorStoreError::ContextMismatch);
@@ -328,11 +399,13 @@ fn validate_transaction_context(
     task_id: TaskId,
     artifact_id: ArtifactId,
     base_source_revision: u64,
+    baseline_digest: &str,
 ) -> Result<(), ArtifactEditorStoreError> {
     if transaction.schema_version != EDITOR_STATE_SCHEMA_VERSION
         || transaction.task_id != task_id
         || transaction.artifact_id != artifact_id
         || transaction.base_source_revision != base_source_revision
+        || transaction.baseline_digest.as_deref() != Some(baseline_digest)
         || transaction.revision == 0
         || transaction.changed_files.len() > MAX_EDITOR_FILES
     {
@@ -412,6 +485,7 @@ fn editor_state_digest(state: &StoredEditorCheckpoint) -> Result<String, Artifac
         state.schema_version,
         state.artifact_id,
         state.base_source_revision,
+        &state.baseline_digest,
         state.revision,
         &state.entrypoint,
         &state.files,
@@ -419,6 +493,15 @@ fn editor_state_digest(state: &StoredEditorCheckpoint) -> Result<String, Artifac
         state.view,
         &state.selections,
     ))?;
+    Ok(hex_digest(Sha256::digest(encoded)))
+}
+
+fn editor_baseline_digest(
+    base_source_revision: u64,
+    entrypoint: &str,
+    baseline_files: &BTreeMap<String, String>,
+) -> Result<String, ArtifactEditorStoreError> {
+    let encoded = serde_json::to_vec(&(base_source_revision, entrypoint, baseline_files))?;
     Ok(hex_digest(Sha256::digest(encoded)))
 }
 
@@ -539,6 +622,8 @@ pub(crate) enum ArtifactEditorStoreError {
     InvalidPath,
     #[error("artifact editor state context does not match the current artifact")]
     ContextMismatch,
+    #[error("artifact editor state schema {0} is not supported")]
+    UnsupportedSchema(u32),
     #[error("artifact editor state changed virtual file paths")]
     InvalidFileSet,
     #[error("artifact editor state is invalid")]
@@ -706,6 +791,136 @@ mod tests {
         assert!(matches!(
             store.load(task_id, artifact_id, 9, "/App.tsx", &baseline()),
             Err(ArtifactEditorStoreError::TornJournal)
+        ));
+    }
+
+    #[test]
+    fn legacy_snapshot_and_journal_migrate_to_a_bound_v2_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ArtifactEditorStore::open(temporary.path()).unwrap();
+        let task_id = TaskId::new();
+        let artifact_id = ArtifactId::new();
+        let task_root = store.ensure_task_root(task_id).unwrap();
+        let mut snapshot_files = baseline();
+        snapshot_files.insert("/theme.ts".into(), "export const color = 'amber';\n".into());
+        write_snapshot(
+            &task_root,
+            artifact_id,
+            &StoredEditorCheckpoint {
+                schema_version: LEGACY_EDITOR_STATE_SCHEMA_VERSION,
+                task_id,
+                artifact_id,
+                base_source_revision: 7,
+                baseline_digest: None,
+                revision: 1,
+                entrypoint: "/App.tsx".into(),
+                files: snapshot_files,
+                active_path: "/theme.ts".into(),
+                view: ArtifactEditorView::Diff,
+                selections: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        append_transaction(
+            &store.journal_path(task_id, artifact_id),
+            &EditorTransaction {
+                schema_version: LEGACY_EDITOR_STATE_SCHEMA_VERSION,
+                task_id,
+                artifact_id,
+                base_source_revision: 7,
+                baseline_digest: None,
+                revision: 2,
+                changed_files: BTreeMap::from([(
+                    "/App.tsx".into(),
+                    "export default () => 'migrated';\n".into(),
+                )]),
+                active_path: "/App.tsx".into(),
+                view: ArtifactEditorView::Code,
+                selections: BTreeMap::from([(
+                    "/App.tsx".into(),
+                    ArtifactEditorSelection {
+                        anchor: 4,
+                        head: 12,
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        let migrated = store
+            .load(task_id, artifact_id, 7, "/App.tsx", &baseline())
+            .unwrap();
+        assert_eq!(migrated.schema_version, EDITOR_STATE_SCHEMA_VERSION);
+        assert_eq!(migrated.revision, 2);
+        assert_eq!(
+            migrated.files["/App.tsx"],
+            "export default () => 'migrated';\n"
+        );
+        assert_eq!(migrated.selections["/App.tsx"].head, 12);
+
+        let encoded = read_bounded_file(
+            &store.snapshot_path(task_id, artifact_id),
+            MAX_EDITOR_STATE_BYTES,
+        )
+        .unwrap();
+        let snapshot: StoredEditorCheckpoint = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(snapshot.schema_version, EDITOR_STATE_SCHEMA_VERSION);
+        assert_eq!(
+            snapshot.baseline_digest.as_deref(),
+            Some(
+                editor_baseline_digest(7, "/App.tsx", &baseline())
+                    .unwrap()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            fs::metadata(store.journal_path(task_id, artifact_id))
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let reopened = ArtifactEditorStore::open(temporary.path())
+            .unwrap()
+            .load(task_id, artifact_id, 7, "/App.tsx", &baseline())
+            .unwrap();
+        assert_eq!(reopened, migrated);
+    }
+
+    #[test]
+    fn bound_v2_rejects_a_different_baseline_and_future_schema() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ArtifactEditorStore::open(temporary.path()).unwrap();
+        let task_id = TaskId::new();
+        let artifact_id = ArtifactId::new();
+        let task_root = store.ensure_task_root(task_id).unwrap();
+        let mut checkpoint = StoredEditorCheckpoint {
+            schema_version: EDITOR_STATE_SCHEMA_VERSION,
+            task_id,
+            artifact_id,
+            base_source_revision: 11,
+            baseline_digest: Some("0".repeat(64)),
+            revision: 1,
+            entrypoint: "/App.tsx".into(),
+            files: baseline(),
+            active_path: "/App.tsx".into(),
+            view: ArtifactEditorView::Code,
+            selections: BTreeMap::new(),
+        };
+        write_snapshot(&task_root, artifact_id, &checkpoint).unwrap();
+        assert!(matches!(
+            store.load(task_id, artifact_id, 11, "/App.tsx", &baseline()),
+            Err(ArtifactEditorStoreError::ContextMismatch)
+        ));
+
+        checkpoint.schema_version = EDITOR_STATE_SCHEMA_VERSION + 1;
+        checkpoint.baseline_digest =
+            Some(editor_baseline_digest(11, "/App.tsx", &baseline()).unwrap());
+        write_snapshot(&task_root, artifact_id, &checkpoint).unwrap();
+        assert!(matches!(
+            store.load(task_id, artifact_id, 11, "/App.tsx", &baseline()),
+            Err(ArtifactEditorStoreError::UnsupportedSchema(version))
+                if version == EDITOR_STATE_SCHEMA_VERSION + 1
         ));
     }
 }
