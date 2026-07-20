@@ -364,6 +364,38 @@ test "Agent NDJSON stream applies message patches and state without polling" {
     try testing.expectEqualStrings("Streaming", model.agentBlocks()[0].content());
 }
 
+test "Agent stream state repairs patches missed while the stream connects" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_stream_session_id = 2;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"session_id\":2,\"status\":\"running\",\"document\":{\"revision\":4,\"blocks\":[]}}",
+    } }, &fx);
+    const before = fx.pendingFetchCount();
+
+    main.update(&model, .{ .agent_stream_line = .{
+        .key = main.agent_stream_effect_key_base + 2,
+        .line =
+        \\{"type":"state","status":"waiting_approval","document_revision":7,"capabilities":{"config_options":[],"available_commands":[]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqual(@as(u64, 4), model.agent_document_revision);
+    try testing.expectEqual(@as(u64, 7), model.agent_snapshot_resync_revision);
+    try testing.expectEqual(before + 1, fx.pendingFetchCount());
+    try testing.expectEqual(main.agent_snapshot_effect_key_base + 2, fx.pendingFetchAt(before).?.key);
+}
+
 test "Agent NDJSON stream appends a reasoning activity without rebuilding the transcript" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
@@ -533,6 +565,14 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expectEqualStrings("Explain the PTY boundary", request.body);
     try testing.expectEqualStrings("", model.agentComposerText());
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+
+    main.update(&model, .{ .agent_turn_started = .{
+        .key = main.agent_turn_effect_key_base + 2,
+        .status = 202,
+        .body = "{\"session_id\":2,\"status\":\"running\"}",
+    } }, &fx);
+    try testing.expectEqual(@as(usize, 1), fx.pendingTimerCount());
+    try testing.expectEqual(main.agent_poll_timer_key_base + 2, fx.pendingTimerAt(0).?.key);
 }
 
 test "Agent stop control posts cancellation and enters compact stopping state" {

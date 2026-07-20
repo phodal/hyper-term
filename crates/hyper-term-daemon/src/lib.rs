@@ -2051,6 +2051,15 @@ impl DaemonState {
             .map_err(Into::into)
     }
 
+    pub fn block_revision(&self, task_id: TaskId) -> Result<u64, DaemonError> {
+        let authority = lock(&self.inner.authority)?;
+        Ok(authority
+            .projectors
+            .get(&task_id)
+            .ok_or(DaemonError::TaskNotFound(task_id))?
+            .revision())
+    }
+
     fn reconcile_interrupted_dispatches(&self) -> Result<(), DaemonError> {
         let interrupted = {
             let authority = lock(&self.inner.authority)?;

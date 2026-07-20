@@ -510,6 +510,10 @@ impl BlockProjector {
         })
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn upsert(
         &mut self,
         mut block: BlockEnvelope,

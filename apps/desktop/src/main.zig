@@ -1087,7 +1087,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .cancel_agent_turn => requestAgentCancel(model, fx),
-        .agent_turn_cancelled => |response| applyAgentCancelResponse(model, response),
+        .agent_turn_cancelled => |response| applyAgentCancelResponse(model, response, fx),
         .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
         .agent_stream_line => |line| applyAgentStreamLine(model, line, fx),
         .agent_stream_closed => |response| applyAgentStreamClosed(model, response, fx),
@@ -1553,7 +1553,7 @@ fn requestAgentTurn(model: *Model, fx: *Effects) void {
     model.agent_error_len = 0;
 }
 
-fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, _: *Effects) void {
+fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
     const session_id = effectSessionId(response.key, agent_turn_effect_key_base) orelse return;
     if (session_id != model.active_session_id) return;
     const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
@@ -1563,6 +1563,7 @@ fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, _:
         restorePendingAgentPrompt(model, session_id);
         return;
     }
+    scheduleAgentRefresh(session_id, fx);
 }
 
 fn requestAgentCancel(model: *Model, fx: *Effects) void {
@@ -1584,14 +1585,16 @@ fn requestAgentCancel(model: *Model, fx: *Effects) void {
     model.agent_command_picker_open = false;
 }
 
-fn applyAgentCancelResponse(model: *Model, response: native_sdk.EffectResponse) void {
+fn applyAgentCancelResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
     const session_id = effectSessionId(response.key, agent_cancel_effect_key_base) orelse return;
     if (session_id != model.active_session_id) return;
     const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
     if (!accepted) {
         model.agent_turn_status = .failed;
         setAgentError(model, "Agent turn could not be stopped safely");
+        return;
     }
+    scheduleAgentRefresh(session_id, fx);
 }
 
 fn requestAgentPermission(model: *Model, operation_id: []const u8, decision: []const u8, fx: *Effects) void {
@@ -1638,6 +1641,7 @@ fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectRespon
     }
     model.agent_turn_status = .running;
     requestAgentTier2Results(model, session_id, fx);
+    scheduleAgentRefresh(session_id, fx);
 }
 
 fn toggleAgentConfigPicker(model: *Model, index: u8) void {
@@ -1865,6 +1869,7 @@ const AgentStreamFrameWire = struct {
     type: []const u8,
     status: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
+    document_revision: ?u64 = null,
     capabilities: AgentCapabilitiesWire = .{},
     patch: ?AgentPatchWire = null,
     target_revision: ?u64 = null,
@@ -2222,7 +2227,11 @@ fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse
     } else {
         model.agent_snapshot_resync_revision = 0;
     }
-    if (model.agent_stream_session_id == 0) scheduleAgentStreamRetry(session_id, fx);
+    if (model.agent_turn_status == .running or model.agent_turn_status == .cancelling or
+        model.agent_stream_session_id == 0)
+    {
+        scheduleAgentRefresh(session_id, fx);
+    }
 }
 
 fn applyAgentStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects) void {
@@ -2231,7 +2240,7 @@ fn applyAgentStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects
     if (line.truncated or line.dropped_before != 0) {
         setAgentError(model, "Agent live updates exceeded the bounded stream");
         cancelAgentStream(model, session_id, fx);
-        scheduleAgentStreamRetry(session_id, fx);
+        scheduleAgentRefresh(session_id, fx);
         return;
     }
     const parsed = std.json.parseFromSlice(
@@ -2250,6 +2259,11 @@ fn applyAgentStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects
         projectAgentCapabilities(model, frame.capabilities);
         if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
         if (frame.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
+        if (frame.document_revision) |revision| {
+            if (revision > model.agent_document_revision) {
+                requestAgentPatchResync(model, session_id, revision, fx);
+            }
+        }
         reconcilePendingAgentPrompt(model, session_id);
         if (model.agent_turn_status == .completed or model.agent_turn_status == .failed or
             model.agent_turn_status == .ready)
@@ -2345,7 +2359,7 @@ fn applyAgentStreamClosed(model: *Model, response: native_sdk.EffectResponse, fx
         setAgentError(model, "Agent live updates disconnected; reconnecting");
     }
     requestAgentSnapshot(model, session_id, fx);
-    scheduleAgentStreamRetry(session_id, fx);
+    scheduleAgentRefresh(session_id, fx);
 }
 
 fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8) bool {
@@ -3084,7 +3098,7 @@ fn parseAgentTurnStatus(value: []const u8) AgentTurnStatus {
     return .idle;
 }
 
-fn scheduleAgentStreamRetry(session_id: u8, fx: *Effects) void {
+fn scheduleAgentRefresh(session_id: u8, fx: *Effects) void {
     fx.startTimer(.{
         .key = agent_poll_timer_key_base + session_id,
         .interval_ms = 500,

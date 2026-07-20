@@ -1268,6 +1268,7 @@ struct AgentStreamStateFrame {
     status: AgentStatus,
     turn_id: Option<String>,
     error: Option<String>,
+    document_revision: u64,
     capabilities: AgentSessionCapabilities,
 }
 
@@ -3062,6 +3063,11 @@ impl AgentGatewayRuntime {
         let turn_id = progress.turn_id.clone();
         let error = progress.error.clone();
         drop(progress);
+        let document_revision = self
+            .config
+            .daemon
+            .block_revision(session.task_id)
+            .map_err(|_| SessionError::Daemon)?;
         let capabilities = session
             .client
             .session_capabilities()
@@ -3070,6 +3076,7 @@ impl AgentGatewayRuntime {
             status,
             turn_id,
             error,
+            document_revision,
             capabilities,
         })
     }
@@ -7020,6 +7027,7 @@ done
             serde_json::from_slice(initial.as_ref()).expect("initial NDJSON state");
         assert_eq!(initial["type"], "state");
         assert_eq!(initial["status"], "ready");
+        assert!(initial["document_revision"].as_u64().is_some());
         assert!(initial.get("document").is_none());
 
         let unrelated_task = gateway
