@@ -218,8 +218,10 @@ flow covers restore, per-file dirty state, Diff, preview reload, and overflow.
 
 A real Deno integration test separately covers Artifact approval, compilation,
 replacement, source recovery, and stale revision rejection. Durable editor-
-transaction/selection journaling, reducer trace checkpoints, isolated Tier 2
-worktree merges, and arbitrary binary files remain open.
+transaction/selection journaling, reducer trace checkpoints, and arbitrary
+binary Artifact editing remain open. Tier 2 result acceptance has its own
+bounded binary transaction path and does not make the WebView editor a binary
+file authority.
 
 ## Validation gates
 

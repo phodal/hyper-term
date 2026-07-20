@@ -438,8 +438,8 @@ its effects into the user's working tree.
 - cancellation or environment destruction does not imply that a remote effect
   was rolled back.
 
-The implemented acceptance slice applies a bounded set of one to 32 UTF-8 files
-from the current immutable GenUI Artifact to explicit, unique
+The implemented Artifact acceptance slice applies a bounded set of one to 32
+UTF-8 files from the current immutable GenUI Artifact to explicit, unique
 workspace-relative paths. It is one digest-bound `FileEdit / WorkspaceWrite`
 operation rather than a side effect of Artifact compilation. A read-only first
 phase captures every parent directory device/inode and, for existing targets,
@@ -461,8 +461,9 @@ is durable, closing the crash window between filesystem recovery and the
 authority journal. Gateway startup classifies targets by device, inode, mode,
 and digest, completes an exact commit or rollback when possible, and leaves
 ambiguous external changes untouched. Ambiguity blocks later Workspace Apply
-operations but not Terminal sessions or read-only Agent interaction. This does
-not yet implement isolated Tier 2 worktree merge or binary patches.
+operations but not Terminal sessions or read-only Agent interaction. Tier 2
+result acceptance reuses this durable executor for exact byte additions,
+modifications, and deletions; the Artifact editor remains a text-only workflow.
 
 ## Approval and escalation
 
@@ -619,12 +620,18 @@ the source operation and Tier 2 inventory, and asks for another human
 permission decision. A successful task therefore never implies acceptance.
 Only the approved transaction can write the workspace; stale targets roll back,
 and the existing durable transaction journal handles crashes after application
-starts. The acceptance slice supports bounded UTF-8 additions, modifications,
-and explicit deletions. A deletion is a tombstone in the reviewed transaction,
-not an empty-file write: Rust hard-links the exact reviewed base as a private
-rollback backup, atomically unlinks only the matching device/inode, and restores
-the backup after an interrupted partial transaction. Type changes and binaries
-still fail closed.
+starts. The acceptance slice supports bounded regular-file byte additions,
+modifications, and explicit deletions. Valid UTF-8 content receives the bounded
+Rust-generated Diff; non-UTF-8 content is represented canonically as base64 in
+the operation-bound proposal and projected only as byte counts plus SHA-256,
+never as a fake textual patch. Binary base contents are not copied into the
+acceptance log: Rust retains only their bounded size and filesystem identity,
+then rechecks their device, inode, mode, and digest before installation or
+recovery. A deletion is a tombstone in the reviewed transaction, not an
+empty-file write: Rust hard-links the exact reviewed base as a private rollback
+backup, atomically unlinks only the matching device/inode, and restores the
+backup after an interrupted partial transaction. Type changes still fail
+closed.
 
 Unit tests exercise success, non-zero exit, cancellation, timeout, output
 flood, cleanup, dirty-worktree separation, durable result reopen, digest-bound
@@ -658,9 +665,10 @@ This remains an experimental Tier 2 baseline. The Agent gateway now recovers
 retained results, exposes a bounded side-effect-free Diff preview, and lets the
 Native review card request the separate workspace-apply permission only after
 the user has read that preview. Opening the Diff neither creates an operation
-nor mints a permission. The card now labels deletion inventory and renders the
-Rust-generated removal hunks before approval. Bounded binary acceptance, plus a
-release-gated boot test using the production pinned image, are still open.
+nor mints a permission. The card labels deletion inventory, renders
+Rust-generated text hunks, and shows bounded binary size plus a short SHA-256
+identifier before approval. A release-gated boot test using the production
+pinned image is still open.
 Opaque ACP provider workloads also remain on the Tier 1 control-process path
 until their credentials, dependencies, and broker channels can be staged into
 this environment without broadening its mounts.
@@ -912,8 +920,6 @@ Costs and constraints:
 
 ### Phase 4: Tier 2 environments
 
-- extend the implemented recoverable, read-before-approve text-file acceptance
-  operation with bounded binary artifacts;
 - qualify the experimental Lima/VZ backend with a production pinned image,
   restart recovery, bounded patch export, and release conformance tests;
 - evaluate whether a container backend is also useful for faster lower-risk

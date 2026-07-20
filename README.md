@@ -125,7 +125,7 @@ The important boundary is not Native versus Web. It is **who has authority**:
 | Codex and Claude packaged ACP adapters | Implemented baseline |
 | GitHub Copilot ACP discovery | Implemented baseline |
 | macOS Seatbelt plus managed proxy for Codex and ACP control processes | Implemented Tier 1 baseline |
-| Rust-owned exact-commit Tier 2 worktree, ephemeral Lima VM runner, read-before-approve Diff, and reviewed UTF-8 deletion apply | Experimental baseline |
+| Rust-owned exact-commit Tier 2 worktree, ephemeral Lima VM runner, read-before-approve Diff, and reviewed text/binary apply | Experimental baseline |
 | ACP/Codex brokered MCP tools: Diff, GenUI, and Deno LSP | Implemented baseline |
 | Generated artifact storage and isolated preview | Implemented baseline |
 | Multi-file Artifact editor, Diff, deterministic reducer replay, effect receipts, diagnostics, completion, and approved publish | Experimental |
@@ -329,12 +329,11 @@ Useful design documents:
 ## Roadmap
 
 - Harden terminal performance, accessibility, reconnect, and recovery gates.
-- Extend Tier 2 exact text-file acceptance with bounded binary patches without
-  giving the renderer write authority, and run a pinned
-  production image through the release conformance gate. The current Native
-  review card recovers retained results, marks deletions explicitly, and
-  previews a bounded Rust-generated Diff before it creates the separate
-  workspace-apply approval.
+- Run a pinned production Tier 2 image through the release conformance gate.
+  The Native review card recovers retained results, marks deletions explicitly,
+  renders bounded Rust-generated text Diffs, and identifies binary changes by
+  byte count and SHA-256 before it creates the separate workspace-apply
+  approval.
 - Version and migrate accepted-source, editor, runtime, and Bug Capsule schemas
   while preserving deterministic replay across Hyper Term upgrades.
 - Move opaque provider-internal execution from the read-only macOS Tier 1
