@@ -40,9 +40,15 @@ set -eu
 if [ "$#" -eq 0 ]; then
   exit 64
 fi
+uid="${SUDO_UID:?missing SUDO_UID}"
+gid="${SUDO_GID:?missing SUDO_GID}"
+home="/tmp/hyper-term-$uid"
+mkdir -p "$home"
+chown "$uid:$gid" "$home"
+chmod 0700 "$home"
 ulimit -n 256
 ulimit -u 256
-exec unshare --net -- env -i HOME=/tmp/hyper-term TMPDIR=/tmp PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@"
+exec unshare --net -- setpriv --reuid "$uid" --regid "$gid" --init-groups env -i HOME="$home" TMPDIR=/tmp PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@"
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
