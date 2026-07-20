@@ -619,8 +619,12 @@ the source operation and Tier 2 inventory, and asks for another human
 permission decision. A successful task therefore never implies acceptance.
 Only the approved transaction can write the workspace; stale targets roll back,
 and the existing durable transaction journal handles crashes after application
-starts. The first acceptance slice supports bounded UTF-8 additions and
-modifications and deliberately rejects deletions, type changes, and binaries.
+starts. The acceptance slice supports bounded UTF-8 additions, modifications,
+and explicit deletions. A deletion is a tombstone in the reviewed transaction,
+not an empty-file write: Rust hard-links the exact reviewed base as a private
+rollback backup, atomically unlinks only the matching device/inode, and restores
+the backup after an interrupted partial transaction. Type changes and binaries
+still fail closed.
 
 Unit tests exercise success, non-zero exit, cancellation, timeout, output
 flood, cleanup, dirty-worktree separation, durable result reopen, digest-bound
@@ -654,7 +658,8 @@ This remains an experimental Tier 2 baseline. The Agent gateway now recovers
 retained results, exposes a bounded side-effect-free Diff preview, and lets the
 Native review card request the separate workspace-apply permission only after
 the user has read that preview. Opening the Diff neither creates an operation
-nor mints a permission. Deletion and binary acceptance semantics, plus a
+nor mints a permission. The card now labels deletion inventory and renders the
+Rust-generated removal hunks before approval. Bounded binary acceptance, plus a
 release-gated boot test using the production pinned image, are still open.
 Opaque ACP provider workloads also remain on the Tier 1 control-process path
 until their credentials, dependencies, and broker channels can be staged into
@@ -908,7 +913,7 @@ Costs and constraints:
 ### Phase 4: Tier 2 environments
 
 - extend the implemented recoverable, read-before-approve text-file acceptance
-  operation with deletion semantics and bounded binary artifacts;
+  operation with bounded binary artifacts;
 - qualify the experimental Lima/VZ backend with a production pinned image,
   restart recovery, bounded patch export, and release conformance tests;
 - evaluate whether a container backend is also useful for faster lower-risk

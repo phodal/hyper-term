@@ -244,6 +244,14 @@ pub const AgentTier2ResultView = struct {
     pub fn acceptanceOperationId(result: *const AgentTier2ResultView) []const u8 {
         return result.acceptance_operation_id_storage[0..result.acceptance_operation_id_len];
     }
+
+    pub fn deletedFileCount(result: *const AgentTier2ResultView) usize {
+        var count: usize = 0;
+        for (result.files[0..result.file_count]) |*file| {
+            if (std.mem.eql(u8, file.kind(), "deleted")) count += 1;
+        }
+        return count;
+    }
 };
 
 pub const AgentBlockView = struct {
@@ -1683,6 +1691,7 @@ const AgentTier2PreviewHunkWire = struct {
 
 const AgentTier2PreviewChangeWire = struct {
     target_path: []const u8,
+    deleted: bool = false,
     hunks: []const AgentTier2PreviewHunkWire,
     truncated: bool = false,
 };
@@ -3168,6 +3177,8 @@ fn agentTier2ResultNode(
     const preview_ready = preview_selected and model.agent_tier2_preview_ready;
     const busy = model.agent_tier2_action_in_flight_session_id != 0;
     const first_file = if (result.file_count > 0) result.files[0].path() else "No accepted text files";
+    const deleted_files = result.deletedFileCount();
+    const first_file_deleted = result.file_count > 0 and std.mem.eql(u8, result.files[0].kind(), "deleted");
     const more_files = if (result.file_count > 1)
         ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("+{d} more", .{result.file_count - 1}))
     else
@@ -3209,11 +3220,18 @@ fn agentTier2ResultNode(
             ui.row(.{ .gap = 6, .cross = .center }, .{
                 ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .info } }, "edit"),
                 ui.text(.{ .grow = 1 }, "Tier 2 changes retained for review"),
-                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{d} files · {d} bytes", .{ result.file_count, result.changed_bytes })),
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (deleted_files == 0)
+                    ui.fmt("{d} files · {d} bytes", .{ result.file_count, result.changed_bytes })
+                else
+                    ui.fmt("{d} files · {d} deleted · {d} bytes", .{ result.file_count, deleted_files, result.changed_bytes })),
                 ui.el(.badge, .{ .variant = .secondary, .text = if (result.has_acceptance) "approval pending" else "not applied" }, .{}),
             }),
             ui.row(.{ .gap = 6, .cross = .center }, .{
                 ui.text(.{ .grow = 1, .size = .sm }, first_file),
+                if (first_file_deleted)
+                    ui.el(.badge, .{ .variant = .secondary, .text = "delete" }, .{})
+                else
+                    ui.el(.stack, .{}, .{}),
                 more_files,
                 if (!result.has_acceptance)
                     ui.button(.{

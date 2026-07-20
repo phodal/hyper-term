@@ -1149,16 +1149,19 @@ test "Tier 2 results show a bounded Diff before creating workspace approval" {
         .key = main.agent_tier2_results_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"results":[{"source_operation_id":"66666666-6666-4666-8666-666666666666","changed_bytes":17,"changed_files":[{"kind":"modified","path":"src/main.rs","bytes":17,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}
+        \\{"results":[{"source_operation_id":"66666666-6666-4666-8666-666666666666","changed_bytes":17,"changed_files":[{"kind":"deleted","path":"README.md","bytes":0,"content_sha256":null},{"kind":"modified","path":"src/main.rs","bytes":17,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}
         ,
     } }, &fx);
 
     try testing.expectEqual(@as(usize, 1), model.agentTier2Results().len);
+    try testing.expectEqual(@as(usize, 1), model.agentTier2Results()[0].deletedFileCount());
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(containsText(tree.root, "Tier 2 changes retained for review"));
-    try testing.expect(containsText(tree.root, "src/main.rs"));
+    try testing.expect(containsText(tree.root, "2 files · 1 deleted · 17 bytes"));
+    try testing.expect(containsText(tree.root, "README.md"));
+    try testing.expect(containsText(tree.root, "delete"));
     const review_diff = findByText(tree.root, .button, "Review Diff").?;
     main.update(&model, tree.msgForPointer(review_diff.id, .up).?, &fx);
     const preview_request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_tier2_preview_effect_key_base + 2).?).?;
@@ -1173,13 +1176,14 @@ test "Tier 2 results show a bounded Diff before creating workspace approval" {
         .key = main.agent_tier2_preview_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"source_operation_id":"66666666-6666-4666-8666-666666666666","result_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","changes":[{"target_path":"src/main.rs","hunks":[{"id":"h1","base_start":1,"base_lines":1,"proposed_start":1,"proposed_lines":1,"patch":"@@ -1 +1 @@\n-old\n+generated\n","truncated":false}],"truncated":false}],"truncated":false}
+        \\{"source_operation_id":"66666666-6666-4666-8666-666666666666","result_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","changes":[{"target_path":"README.md","deleted":true,"hunks":[{"id":"h0","base_start":1,"base_lines":1,"proposed_start":1,"proposed_lines":0,"patch":"@@ -1 +0,0 @@\n-remove me\n","truncated":false}],"truncated":false},{"target_path":"src/main.rs","deleted":false,"hunks":[{"id":"h1","base_start":1,"base_lines":1,"proposed_start":1,"proposed_lines":1,"patch":"@@ -1 +1 @@\n-old\n+generated\n","truncated":false}],"truncated":false}],"truncated":false}
         ,
     } }, &fx);
 
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "-remove me"));
     try testing.expect(containsText(tree.root, "+generated"));
     try testing.expect(containsText(tree.root, "Preview only · no workspace permission created"));
     const request_approval = findByText(tree.root, .button, "Request apply approval").?;
