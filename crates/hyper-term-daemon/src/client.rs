@@ -217,8 +217,28 @@ mod tests {
         let directory = tempdir().unwrap();
         let socket = directory.path().join("hyperd.sock");
         let state = DaemonState::open(directory.path().join("state")).unwrap();
-        let _server = spawn_unix_server(&socket, state).unwrap();
+        let _server = spawn_unix_server(&socket, state.clone()).unwrap();
         let mut client = ControlClient::connect(&socket, Duration::from_secs(1)).unwrap();
+
+        let direct_task_id = state
+            .create_task("event immediately after handshake".into())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "event emitted immediately after connect was not observed"
+            );
+            if let WireFrame::Response(response) = client.recv_timeout(remaining).unwrap()
+                && let ControlResponse::Event { event } = response.response
+                && event.task_id == direct_task_id
+                && matches!(event.payload, DomainEvent::TaskCreated { .. })
+            {
+                break;
+            }
+        }
+
         let task_id = match client
             .request(
                 ControlRequest::CreateTask {

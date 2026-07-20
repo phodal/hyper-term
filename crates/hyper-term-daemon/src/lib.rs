@@ -489,7 +489,7 @@ impl DaemonState {
             Actor::Policy,
             Some("operation entered the permission policy pipeline".into()),
         )?;
-        self.transition(
+        let waiting = self.transition(
             task_id,
             operation_id,
             2,
@@ -504,7 +504,7 @@ impl DaemonState {
             causation_id: None,
             correlation_id: None,
             payload: DomainEvent::PermissionRequested {
-                operation_revision: 3,
+                operation_revision: waiting.revision,
                 prompt: "Allow this exact operation once?".into(),
                 options: vec![
                     PermissionDecision::AllowOnce,
@@ -513,7 +513,11 @@ impl DaemonState {
                 ],
             },
         })?;
-        self.operation(operation_id)
+        // Return the state produced by this request. A fast permission
+        // decision may advance the shared operation before this function
+        // returns, but that later transition belongs on the ordered event
+        // stream rather than in the proposal response.
+        Ok(waiting)
     }
 
     pub fn decide_permission(
@@ -3078,6 +3082,10 @@ mod unix_server {
             }
             _ => return Err(DaemonError::HelloRequired),
         };
+        // Register the event stream before acknowledging the handshake. A
+        // client may act as soon as `connect` returns, so sending `Welcome`
+        // first leaves a window where authority events can be lost.
+        let control = state.subscribe_control()?;
         writer.response(
             Some(hello_request),
             ControlResponse::Welcome {
@@ -3090,7 +3098,6 @@ mod unix_server {
             client_id,
         };
 
-        let control = state.subscribe_control()?;
         let control_writer = writer.clone();
         thread::Builder::new()
             .name(format!("hyperd-events-{client_id}"))

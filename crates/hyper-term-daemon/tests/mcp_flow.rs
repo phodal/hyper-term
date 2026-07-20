@@ -84,7 +84,7 @@ fn approved_diff_tool_runs_through_mcp_and_leaves_a_receipt() {
     assert_eq!(authorized.state, OperationState::Authorized);
 
     let result = receive_id(&mut output, 7);
-    assert_eq!(result["result"]["isError"], false);
+    assert_eq!(result["result"]["isError"], false, "{result}");
     assert!(
         result["result"]["content"][0]["text"]
             .as_str()
