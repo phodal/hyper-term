@@ -557,11 +557,11 @@ execution, hermetic dependencies, resource isolation, and review-only
 acceptance still require Tier 2; protocol tool requests continue through the
 Rust broker instead of inheriting workspace write authority.
 
-### Implemented Tier 2 source-isolation foundation
+### Implemented Tier 2 Lima execution baseline
 
-`hyper-term-sandbox` now owns the first Tier 2 lifecycle boundary: creating and
-destroying a private detached Git worktree for one exact source commit. It does
-not copy the user's live working tree, so tracked dirty edits and untracked
+`hyper-term-sandbox` owns the Tier 2 source and execution lifecycle. It creates
+and destroys a private detached Git worktree for one exact source commit. It
+does not copy the user's live working tree, so tracked dirty edits and untracked
 files never enter the environment. The source repository and private state root
 cannot contain one another, task identifiers are path-safe, environment names
 are digest-derived, and a collision fails closed.
@@ -583,10 +583,44 @@ source state. Tests cover clean commit identity, source/worktree independence,
 private manifests, unsafe identifiers and nested roots, escaping symlinks,
 failed-creation cleanup, and worktree registry cleanup.
 
-This slice is not yet a Tier 2 execution claim. The ephemeral container or VM,
-resource and network enforcement, restart-time environment recovery, bounded
-diff export, and exact acceptance operation still have to be wired on top of
-this worktree identity.
+An approved shell operation that explicitly requests
+`sandbox.isolated_task` is compiled as `SandboxEnforcement::IsolatedTask` with
+the `LimaVm` backend. It cannot be sent to the host PTY path. The daemon consumes
+the same revision-bound, one-use capability lease used by Tier 1 before it
+materializes the exact commit or starts a VM.
+
+The Lima runner accepts only a local image with a caller-supplied lowercase
+SHA-256. Rust copies that image into the mode-0700 environment while hashing it,
+then gives Lima the private copy, removing the verify/use replacement window.
+Every task receives its own `LIMA_HOME`, digest-derived instance name, bounded
+CPU, memory, disk, wall time, process count, and output budget. Containerd,
+proxy propagation, host DNS, SSH agent forwarding, X11, and non-SSH port
+forwarding are disabled. The only host mount is the exact-commit worktree at
+`/workspace`.
+
+The VM needs a network while Lima boots and establishes its control channel,
+but the approved command is executed under Linux `unshare --net` with a cleared,
+fixed environment. Therefore task code has neither the VM boot network nor host
+environment variables. Rust passes argv without shell interpolation, streams
+bounded stdout and stderr, distinguishes non-zero exit, signal, timeout, and
+cancellation, and runs `stop --force` plus `delete --force` on every exit path.
+A cleanup failure suppresses the otherwise valid result and fails closed.
+
+After execution Rust inventories tracked and untracked changes without
+following symlinks, bounds file count and bytes, and records per-file content
+digests plus an aggregate inventory digest. The daemon retains the isolated
+result for review and exposes explicit discard; it never applies the result to
+the user's workspace. Unit tests exercise success, non-zero exit, cancellation,
+timeout, output flood, cleanup, dirty-worktree separation, and review inventory.
+On macOS the generated configuration is also validated by the installed Lima
+2.1.1 parser without booting a VM.
+
+This remains an experimental Tier 2 baseline. Restart-time recovery, a
+user-facing bounded patch/diff API, permission-gated exact acceptance, and a
+release-gated boot test using the production pinned image are still open.
+Opaque ACP provider workloads also remain on the Tier 1 control-process path
+until their credentials, dependencies, and broker channels can be staged into
+this environment without broadening its mounts.
 
 ## Audit and observability
 
@@ -835,11 +869,11 @@ Costs and constraints:
 
 ### Phase 4: Tier 2 environments
 
-- add isolated worktree/snapshot creation and acceptance operations;
-- add an ephemeral container backend with image digest, minimal mounts, resource
-  limits, cleanup, and artifact export;
-- evaluate a VM backend for stronger macOS isolation and workloads that cannot
-  be safely hosted by local containers;
+- complete acceptance operations on top of the implemented isolated worktree;
+- qualify the experimental Lima/VZ backend with a production pinned image,
+  restart recovery, bounded patch export, and release conformance tests;
+- evaluate whether a container backend is also useful for faster lower-risk
+  workloads without weakening the Lima isolation contract;
 - run opaque third-party Agent workloads in Tier 2 by default.
 
 ### Phase 5: Windows and provider reconciliation
@@ -933,8 +967,8 @@ negative boundaries with real child processes.
 The following choices require implementation spikes or separate ADRs:
 
 - the final serializable schema and profile configuration syntax;
-- whether macOS Tier 2 uses Docker, Apple's Virtualization framework, another
-  VM runtime, or multiple selectable backends;
+- whether the current Lima/VZ baseline remains the macOS default or is joined
+  by a lower-latency container/native-VZ backend;
 - the exact Windows minimum supported enforcement level;
 - the managed network proxy implementation and TLS inspection policy;
 - resource-limit mechanisms and defaults per platform;
