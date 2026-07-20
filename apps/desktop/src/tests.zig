@@ -1106,6 +1106,7 @@ test "Agent activity renders compact plans goals diffs terminals and hides low-s
     try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
     try testing.expect(containsText(tree.root, "Processed"));
     try testing.expect(containsText(tree.root, "Plan · Verify the edit after reviewing the comple…"));
+    try testing.expect(findByLabel(tree.root, "Agent context shelf") != null);
     try testing.expectEqual(@as(f32, 1), findByLabel(tree.root, "Agent turn plan").?.layout.grow);
     try testing.expectEqual(@as(f32, 1), findByLabel(tree.root, "Persistent Agent goal").?.layout.grow);
     try testing.expect(containsText(tree.root, "Goal · Ship the compact Agent UI without losing t…"));
@@ -1534,7 +1535,8 @@ test "Tier 2 results show a bounded Diff before creating workspace approval" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(containsText(tree.root, "Tier 2 changes retained for review"));
+    try testing.expect(findByLabel(tree.root, "Agent context shelf") != null);
+    try testing.expect(containsText(tree.root, "Retained changes"));
     try testing.expect(containsText(tree.root, "3 files · 1 deleted · 20 bytes"));
     try testing.expect(containsText(tree.root, "README.md"));
     try testing.expect(containsText(tree.root, "delete"));

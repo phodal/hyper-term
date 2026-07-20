@@ -1149,7 +1149,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -3810,33 +3810,38 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
     const content = if (model.agent_tier2_result_count == 0 and
         !model.agent_plan_visible and !model.agent_goal_visible)
         transcript
-    else blk: {
-        break :blk ui.column(.{ .grow = 1 }, .{
+    else
+        ui.column(.{ .grow = 1 }, .{
             transcript,
-            if (model.agent_tier2_result_count > 0)
-                agentTier2ResultsNode(ui, model)
-            else
-                ui.el(.stack, .{}, .{}),
-            if (model.agent_plan_visible)
-                ui.row(.{ .gap = 4, .padding = 4, .cross = .center }, .{
-                    agentPlanNode(ui, &model.agent_plan),
-                })
-            else
-                ui.el(.stack, .{}, .{}),
-            if (model.agent_goal_visible)
-                ui.row(.{ .gap = 4, .padding = 4, .cross = .center }, .{
-                    agentGoalNode(ui, &model.agent_goal),
-                })
-            else
-                ui.el(.stack, .{}, .{}),
+            agentContextShelfNode(ui, model),
         });
-    };
     if (model.hasAgentEditor()) return content;
     return ui.column(.{
         .grow = 1,
         .padding = 10,
         .semantics = .{ .label = "Agent reading rail" },
     }, .{content});
+}
+
+fn agentContextShelfNode(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
+    return ui.column(.{
+        .gap = 3,
+        .padding = 4,
+        .semantics = .{ .label = "Agent context shelf" },
+    }, .{
+        if (model.agent_tier2_result_count > 0)
+            agentTier2ResultsNode(ui, model)
+        else
+            ui.el(.stack, .{}, .{}),
+        if (model.agent_plan_visible)
+            agentPlanNode(ui, &model.agent_plan)
+        else
+            ui.el(.stack, .{}, .{}),
+        if (model.agent_goal_visible)
+            agentGoalNode(ui, &model.agent_goal)
+        else
+            ui.el(.stack, .{}, .{}),
+    });
 }
 
 fn agentTier2ResultsNode(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
@@ -3849,7 +3854,7 @@ fn agentTier2ResultsNode(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node
         node.* = agentTier2ResultNode(ui, model, result);
         node.key = .{ .str = result.sourceOperationId() };
     }
-    return ui.column(.{ .gap = 4, .padding = 4, .semantics = .{ .label = "Tier 2 review results" } }, .{nodes});
+    return ui.column(.{ .gap = 3, .semantics = .{ .label = "Tier 2 review results" } }, .{nodes});
 }
 
 fn agentTier2ResultNode(
@@ -3903,24 +3908,27 @@ fn agentTier2ResultNode(
             else
                 ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "WorkspaceWrite approval is waiting in the transcript."),
         });
-    return ui.el(.card, .{ .style_tokens = .{ .border_color = if (result.has_acceptance) .warning else .border } }, .{
-        ui.column(.{ .gap = 5, .padding = 7 }, .{
+    return ui.el(.card, .{
+        // Cards default to a roomy 24 px inset. This shelf is a compact
+        // status disclosure; the inner column owns its deliberate spacing.
+        .padding = 1,
+        .style_tokens = .{ .border_color = if (result.has_acceptance) .warning else .border },
+    }, .{
+        ui.column(.{ .gap = 5, .padding = 6 }, .{
             ui.row(.{ .gap = 6, .cross = .center }, .{
                 ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .info } }, "edit"),
-                ui.text(.{ .grow = 1 }, "Tier 2 changes retained for review"),
-                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (deleted_files == 0)
-                    ui.fmt("{d} files · {d} bytes", .{ result.file_count, result.changed_bytes })
-                else
-                    ui.fmt("{d} files · {d} deleted · {d} bytes", .{ result.file_count, deleted_files, result.changed_bytes })),
-                ui.el(.badge, .{ .variant = .secondary, .text = if (result.has_acceptance) "approval pending" else "not applied" }, .{}),
-            }),
-            ui.row(.{ .gap = 6, .cross = .center }, .{
+                ui.text(.{}, "Retained changes"),
                 ui.text(.{ .grow = 1, .size = .sm }, first_file),
                 if (first_file_deleted)
                     ui.el(.badge, .{ .variant = .secondary, .text = "delete" }, .{})
                 else
                     ui.el(.stack, .{}, .{}),
                 more_files,
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (deleted_files == 0)
+                    ui.fmt("{d} files · {d} bytes", .{ result.file_count, result.changed_bytes })
+                else
+                    ui.fmt("{d} files · {d} deleted · {d} bytes", .{ result.file_count, deleted_files, result.changed_bytes })),
+                ui.el(.badge, .{ .variant = .secondary, .text = if (result.has_acceptance) "approval pending" else "not applied" }, .{}),
                 if (!result.has_acceptance)
                     ui.button(.{
                         .size = .sm,
