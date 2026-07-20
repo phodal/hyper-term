@@ -902,6 +902,70 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
     });
 }
 
+test "ACP execution context stays compact until the user inspects it" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithProviders(terminal_url, agent_url, "codex-acp");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_codex_acp_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"ready","error":null,"context":{"schema_version":1,"sequence":2,"event_id":"11111111-1111-4111-8111-111111111111","recorded_at_ms":1,"task_id":"22222222-2222-4222-8222-222222222222","run_id":null,"operation_id":null,"causation_id":"33333333-3333-4333-8333-333333333333","correlation_id":"33333333-3333-4333-8333-333333333333","payload":{"type":"agent_execution_context_recorded","context":{"provider_id":"codex-acp","protocol":"acp","thread_id":"thread-1","receipts":[{"schema_version":1,"context_id":"agent-provider","context_revision":1,"mode":"hermetic","context_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","environment_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","clear_inherited":true,"bindings":[{}],"credential_bindings":[{}]},{"schema_version":1,"context_id":"mcp:hyper_term","context_revision":1,"mode":"hermetic","context_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","environment_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","clear_inherited":true,"bindings":[],"credential_bindings":[]}]}}},"document":{"revision":2,"blocks":[]}}
+        ,
+    } }, &fx);
+
+    try testing.expect(model.hasAgentExecutionContext());
+    try testing.expectEqualStrings("Hermetic · 2 contexts", model.agentExecutionContextSummary());
+    try testing.expectEqual(@as(usize, 2), model.agentExecutionContexts().len);
+    try testing.expectEqualStrings("agent-provider", model.agentExecutionContexts()[0].contextId());
+    try testing.expectEqualStrings("aaaaaaaa", model.agentExecutionContexts()[0].digestPrefix());
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tree = try buildTree(arena, &model);
+    const inspect = findByLabel(tree.root, "Inspect Agent execution context").?;
+    try testing.expect(findByLabel(tree.root, "Agent execution context details") == null);
+    main.update(&model, tree.msgForPointer(inspect.id, .up).?, &fx);
+
+    tree = try buildTree(arena, &model);
+    try testing.expect(findByLabel(tree.root, "Agent execution context details") != null);
+    try testing.expect(containsText(tree.root, "mcp:hyper_term"));
+    try testing.expect(containsText(tree.root, "1 environment bindings · 1 credential references"));
+    try testing.expect(containsText(tree.root, "cccccccc"));
+}
+
+test "ACP execution context rejects uncorrelated evidence" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithProviders(terminal_url, agent_url, "codex-acp");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_codex_acp_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"ready","context":{"event_id":"11111111-1111-4111-8111-111111111111","causation_id":"22222222-2222-4222-8222-222222222222","correlation_id":"33333333-3333-4333-8333-333333333333","payload":{"type":"agent_execution_context_recorded","context":{"provider_id":"codex-acp","protocol":"acp","thread_id":"thread-1","receipts":[{"schema_version":1,"context_id":"agent-provider","context_revision":1,"mode":"hermetic","context_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","environment_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","clear_inherited":true}]}}},"document":{"revision":2,"blocks":[]}}
+        ,
+    } }, &fx);
+
+    try testing.expect(!model.hasAgentExecutionContext());
+    try testing.expectEqual(main.AgentTurnStatus.failed, model.agent_turn_status);
+    try testing.expectEqualStrings("Agent execution context evidence was invalid", model.agentError());
+}
+
 test "Agent snapshot renders trusted operation and approval blocks" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";

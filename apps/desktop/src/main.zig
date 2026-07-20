@@ -50,6 +50,10 @@ const max_agent_tier2_path_bytes: usize = 256;
 const max_agent_tier2_diff_bytes: usize = 6 * 1024;
 const max_agent_capability_id_bytes: usize = 128;
 const max_agent_capability_label_bytes: usize = 192;
+const max_agent_execution_contexts: usize = 4;
+const max_agent_context_id_bytes: usize = 128;
+const agent_context_digest_bytes: usize = 64;
+const max_agent_context_summary_bytes: usize = 64;
 const ui_font_id: canvas.FontId = canvas.min_registered_font_id;
 const max_ui_font_bytes: usize = 24 * 1024 * 1024;
 const default_macos_ui_font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf";
@@ -268,6 +272,41 @@ pub const AgentDiffFileView = struct {
 
     pub fn path(file: *const AgentDiffFileView) []const u8 {
         return file.path_storage[0..file.path_len];
+    }
+};
+
+pub const AgentExecutionMode = enum {
+    hermetic,
+    project,
+    user,
+
+    pub fn label(mode: AgentExecutionMode) []const u8 {
+        return switch (mode) {
+            .hermetic => "Hermetic",
+            .project => "Project",
+            .user => "User",
+        };
+    }
+};
+
+pub const AgentExecutionContextView = struct {
+    context_id_storage: [max_agent_context_id_bytes]u8 = [_]u8{0} ** max_agent_context_id_bytes,
+    context_id_len: usize = 0,
+    mode: AgentExecutionMode = .hermetic,
+    digest_storage: [agent_context_digest_bytes]u8 = [_]u8{0} ** agent_context_digest_bytes,
+    binding_count: usize = 0,
+    credential_count: usize = 0,
+
+    pub fn contextId(context: *const AgentExecutionContextView) []const u8 {
+        return context.context_id_storage[0..context.context_id_len];
+    }
+
+    pub fn modeLabel(context: *const AgentExecutionContextView) []const u8 {
+        return context.mode.label();
+    }
+
+    pub fn digestPrefix(context: *const AgentExecutionContextView) []const u8 {
+        return context.digest_storage[0..8];
     }
 };
 
@@ -601,6 +640,12 @@ pub const Model = struct {
     agent_plan: AgentBlockView = .{},
     agent_plan_visible: bool = false,
     agent_projection_session_id: u8 = 0,
+    agent_execution_contexts: [max_agent_execution_contexts]AgentExecutionContextView = [_]AgentExecutionContextView{.{}} ** max_agent_execution_contexts,
+    agent_execution_context_count: usize = 0,
+    agent_execution_context_session_id: u8 = 0,
+    agent_execution_context_expanded: bool = false,
+    agent_execution_context_summary_storage: [max_agent_context_summary_bytes]u8 = [_]u8{0} ** max_agent_context_summary_bytes,
+    agent_execution_context_summary_len: usize = 0,
     agent_document_revision: u64 = 0,
     agent_stream_sequence: u64 = 0,
     agent_turn_status: AgentTurnStatus = .idle,
@@ -666,6 +711,11 @@ pub const Model = struct {
         "agent_plan",
         "agent_plan_visible",
         "agent_projection_session_id",
+        "agent_execution_contexts",
+        "agent_execution_context_count",
+        "agent_execution_context_session_id",
+        "agent_execution_context_summary_storage",
+        "agent_execution_context_summary_len",
         "agent_document_revision",
         "agent_stream_sequence",
         "agent_turn_status",
@@ -973,6 +1023,24 @@ pub const Model = struct {
         return model.hasEditableAgentArtifact() and !model.hasAgentEditor();
     }
 
+    pub fn hasAgentExecutionContext(model: *const Model) bool {
+        return model.activeSession().mode == .agent and
+            model.agent_execution_context_session_id == model.active_session_id and
+            model.agent_execution_context_count > 0;
+    }
+
+    pub fn hasAgentThreadToolbar(model: *const Model) bool {
+        return model.hasAgentExecutionContext() or model.canOpenAgentEditor();
+    }
+
+    pub fn agentExecutionContextSummary(model: *const Model) []const u8 {
+        return model.agent_execution_context_summary_storage[0..model.agent_execution_context_summary_len];
+    }
+
+    pub fn agentExecutionContexts(model: *const Model) []const AgentExecutionContextView {
+        return model.agent_execution_contexts[0..model.agent_execution_context_count];
+    }
+
     pub fn hasAgentEditor(model: *const Model) bool {
         return model.hasEditableAgentArtifact() and
             model.agent_editor_open_session_id == model.active_session_id;
@@ -1020,6 +1088,7 @@ pub const Msg = union(enum) {
     agent_config_updated: native_sdk.EffectResponse,
     insert_agent_command: u8,
     toggle_agent_block: u64,
+    toggle_agent_execution_context,
     reject_agent_effect: []const u8,
     allow_agent_effect: []const u8,
     cancel_agent_effect: []const u8,
@@ -1107,6 +1176,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     block.expanded = !block.expanded;
                     break;
                 }
+            }
+        },
+        .toggle_agent_execution_context => {
+            if (model.hasAgentExecutionContext()) {
+                model.agent_execution_context_expanded = !model.agent_execution_context_expanded;
             }
         },
         .reject_agent_effect => |operation_id| requestAgentPermission(model, operation_id, "reject_once", fx),
@@ -1822,9 +1896,37 @@ const AgentSnapshotWire = struct {
     status: []const u8,
     @"error": ?[]const u8 = null,
     capabilities: AgentCapabilitiesWire = .{},
+    context: ?AgentExecutionContextEventWire = null,
     document: struct {
         revision: u64 = 0,
         blocks: []const AgentBlockWire,
+    },
+};
+
+const AgentExecutionContextReceiptWire = struct {
+    schema_version: u16,
+    context_id: []const u8,
+    context_revision: u64,
+    mode: []const u8,
+    context_digest: []const u8,
+    environment_digest: []const u8,
+    clear_inherited: bool,
+    bindings: []const std.json.Value = &.{},
+    credential_bindings: []const std.json.Value = &.{},
+};
+
+const AgentExecutionContextEventWire = struct {
+    event_id: []const u8,
+    causation_id: ?[]const u8 = null,
+    correlation_id: ?[]const u8 = null,
+    payload: struct {
+        type: []const u8,
+        context: struct {
+            provider_id: []const u8,
+            protocol: []const u8,
+            thread_id: []const u8,
+            receipts: []const AgentExecutionContextReceiptWire,
+        },
     },
 };
 
@@ -2375,6 +2477,11 @@ fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8) bo
     if (parsed.value.session_id) |wire_session_id| {
         if (wire_session_id != session_id) return false;
     }
+    if (!projectAgentExecutionContext(model, session_id, parsed.value.context)) {
+        model.agent_turn_status = .failed;
+        setAgentError(model, "Agent execution context evidence was invalid");
+        return false;
+    }
     projectAgentCapabilities(model, parsed.value.capabilities);
     projectAgentBlocks(model, parsed.value.document.blocks);
     model.agent_document_revision = parsed.value.document.revision;
@@ -2383,6 +2490,106 @@ fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8) bo
     if (parsed.value.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
     reconcilePendingAgentPrompt(model, session_id);
     return true;
+}
+
+fn projectAgentExecutionContext(
+    model: *Model,
+    session_id: u8,
+    event: ?AgentExecutionContextEventWire,
+) bool {
+    const wire = event orelse {
+        clearAgentExecutionContext(model, session_id);
+        return true;
+    };
+    const causation_id = wire.causation_id orelse return false;
+    const correlation_id = wire.correlation_id orelse return false;
+    if (wire.event_id.len == 0 or
+        !std.mem.eql(u8, causation_id, correlation_id) or
+        !std.mem.eql(u8, wire.payload.type, "agent_execution_context_recorded") or
+        wire.payload.context.provider_id.len == 0 or
+        wire.payload.context.provider_id.len > max_agent_capability_id_bytes or
+        !std.mem.eql(u8, wire.payload.context.provider_id, model.activeSession().agent_provider.id()) or
+        wire.payload.context.protocol.len == 0 or
+        wire.payload.context.protocol.len > max_agent_capability_id_bytes or
+        wire.payload.context.thread_id.len == 0 or
+        wire.payload.context.thread_id.len > 4096 or
+        wire.payload.context.receipts.len == 0 or
+        wire.payload.context.receipts.len > max_agent_execution_contexts)
+    {
+        return false;
+    }
+    for (wire.payload.context.receipts, 0..) |receipt, index| {
+        if (receipt.schema_version != 1 or
+            receipt.context_revision == 0 or
+            receipt.context_id.len == 0 or
+            receipt.context_id.len > max_agent_context_id_bytes or
+            !isContextDigest(receipt.context_digest) or
+            !isContextDigest(receipt.environment_digest) or
+            receipt.bindings.len > 128 or
+            receipt.credential_bindings.len > 32)
+        {
+            return false;
+        }
+        const mode = parseAgentExecutionMode(receipt.mode) orelse return false;
+        if (mode == .hermetic and !receipt.clear_inherited) return false;
+        for (wire.payload.context.receipts[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.context_id, receipt.context_id)) return false;
+        }
+    }
+
+    clearAgentExecutionContext(model, session_id);
+    for (wire.payload.context.receipts) |receipt| {
+        const projected = &model.agent_execution_contexts[model.agent_execution_context_count];
+        copyCapabilityText(&projected.context_id_storage, &projected.context_id_len, receipt.context_id);
+        projected.mode = parseAgentExecutionMode(receipt.mode).?;
+        @memcpy(&projected.digest_storage, receipt.context_digest[0..agent_context_digest_bytes]);
+        projected.binding_count = receipt.bindings.len;
+        projected.credential_count = receipt.credential_bindings.len;
+        model.agent_execution_context_count += 1;
+    }
+    const first_mode = model.agent_execution_contexts[0].mode;
+    const same_mode = for (model.agent_execution_contexts[1..model.agent_execution_context_count]) |context| {
+        if (context.mode != first_mode) break false;
+    } else true;
+    const summary = if (same_mode)
+        std.fmt.bufPrint(
+            &model.agent_execution_context_summary_storage,
+            "{s} · {d} context{s}",
+            .{
+                first_mode.label(),
+                model.agent_execution_context_count,
+                if (model.agent_execution_context_count == 1) "" else "s",
+            },
+        ) catch return false
+    else
+        std.fmt.bufPrint(
+            &model.agent_execution_context_summary_storage,
+            "Mixed · {d} contexts",
+            .{model.agent_execution_context_count},
+        ) catch return false;
+    model.agent_execution_context_summary_len = summary.len;
+    return true;
+}
+
+fn clearAgentExecutionContext(model: *Model, session_id: u8) void {
+    for (&model.agent_execution_contexts) |*context| context.* = .{};
+    model.agent_execution_context_count = 0;
+    model.agent_execution_context_session_id = session_id;
+    model.agent_execution_context_expanded = false;
+    model.agent_execution_context_summary_len = 0;
+}
+
+fn parseAgentExecutionMode(value: []const u8) ?AgentExecutionMode {
+    if (std.mem.eql(u8, value, "hermetic")) return .hermetic;
+    if (std.mem.eql(u8, value, "project")) return .project;
+    if (std.mem.eql(u8, value, "user")) return .user;
+    return null;
+}
+
+fn isContextDigest(value: []const u8) bool {
+    return value.len == agent_context_digest_bytes and for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) break false;
+    } else true;
 }
 
 fn projectAgentCapabilities(model: *Model, capabilities: AgentCapabilitiesWire) void {
@@ -3147,6 +3354,7 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_plan = .{};
     model.agent_plan_visible = false;
     model.agent_projection_session_id = session_id;
+    clearAgentExecutionContext(model, session_id);
     model.agent_document_revision = 0;
     model.agent_stream_sequence = 0;
     model.agent_turn_status = .idle;

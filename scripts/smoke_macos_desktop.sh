@@ -187,9 +187,11 @@ PY
     'role=group name="Agent composer rail"' \
     'role=group name="Agent prompt composer"' \
     'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Inspect Agent execution context"' \
     'role=button name="Send prompt".*enabled=true'
   native automate assert --absent \
     'name="ACP artifact editor"' \
+    'name="Agent execution context details"' \
     'error event=' \
     'dispatch_errors=[1-9]'
 
@@ -211,6 +213,16 @@ for line in snapshot.splitlines():
 raise SystemExit(f"widget not found: {pattern.pattern}")
 PY
   }
+
+  smoke_context_id=$(smoke_widget_id 'role=button name="Inspect Agent execution context"')
+  native automate widget-click hyper-term-canvas "$smoke_context_id"
+  native automate assert \
+    'role=group name="Agent execution context details"' \
+    'agent:codex-acp:' \
+    'Hermetic' \
+    'credential references'
+  native automate widget-click hyper-term-canvas "$smoke_context_id"
+  native automate assert --absent 'name="Agent execution context details"'
 
   smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
   native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text 'Show the file change.'

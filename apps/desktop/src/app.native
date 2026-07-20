@@ -49,11 +49,30 @@
 
 <template name="agent-thread">
   <column min-width="400" grow="1" background="surface" label="Agent conversation">
-    <if test="{canOpenAgentEditor}">
+    <if test="{hasAgentThreadToolbar}">
       <row gap="5" padding="3" cross="center">
-        <text grow="1" foreground="text_muted">Agent artifact available</text>
-        <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open ACP artifact editor">Edit</button>
+        <if test="{hasAgentExecutionContext}">
+          <button size="sm" variant="ghost" icon="circle-dot" on-press="toggle_agent_execution_context" label="Inspect Agent execution context">{agentExecutionContextSummary}</button>
+        </if>
+        <spacer grow="1" />
+        <if test="{canOpenAgentEditor}">
+          <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open ACP artifact editor">Edit</button>
+        </if>
       </row>
+      <if test="{agent_execution_context_expanded}">
+        <column gap="4" padding="6" background="surface_subtle" label="Agent execution context details">
+          <for each="agentExecutionContexts" key="contextId" as="context">
+            <column gap="2" padding="4">
+              <row gap="7" cross="center">
+                <text grow="1"><span mono="true">{context.contextId}</span></text>
+                <badge variant="secondary">{context.modeLabel}</badge>
+                <text foreground="text_muted"><span mono="true">{context.digestPrefix}</span></text>
+              </row>
+              <text foreground="text_muted">{context.binding_count} environment bindings · {context.credential_count} credential references</text>
+            </column>
+          </for>
+        </column>
+      </if>
       <separator />
     </if>
     <!-- The Zig root replaces this labelled slot with a variable-height,
