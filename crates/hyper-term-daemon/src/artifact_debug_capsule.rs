@@ -660,31 +660,11 @@ mod tests {
 
     #[test]
     fn schema_v1_capsule_migrates_in_memory_after_legacy_digest_verification() {
-        let (artifact, editor, runtime) = fixture();
-        let mut legacy = build_bug_capsule(
-            &artifact,
-            &editor,
-            &runtime,
-            GenUiBugCapsuleEnvironment {
-                hyper_term_version: "0.1.0".into(),
-                os: "macos".into(),
-                architecture: "aarch64".into(),
-                deno_runtime_version: None,
-                deno_executable_digest: None,
-                compiler_script_digest: None,
-                compiler_wasm_digest: None,
-            },
-        )
-        .unwrap();
-        legacy.schema_version = LEGACY_BUG_CAPSULE_SCHEMA_VERSION;
-        legacy.accepted_source_digest.clear();
-        legacy.capsule_digest = None;
-        legacy.capsule_digest = Some(unsigned_digest(&legacy).unwrap());
-
+        let original = include_bytes!("../testdata/bug_capsule_v1.json");
+        let legacy: GenUiBugCapsule = serde_json::from_slice(original).unwrap();
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("legacy.bug-capsule.json");
-        let original = serde_json::to_vec_pretty(&legacy).unwrap();
-        std::fs::write(&path, &original).unwrap();
+        std::fs::write(&path, original).unwrap();
 
         let migrated = load_bug_capsule(&path).unwrap();
         assert_eq!(migrated.schema_version, BUG_CAPSULE_SCHEMA_VERSION);

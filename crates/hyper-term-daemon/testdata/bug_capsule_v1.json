@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "mode": "replay_only",
+  "artifact": {
+    "artifact_id": "9f2cc8af-1c97-4eef-b63f-29771c1de97b",
+    "source_revision": 7,
+    "entrypoint": "/App.tsx",
+    "content_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "compiler": {
+      "name": "esbuild-wasm",
+      "version": "0.28.1"
+    }
+  },
+  "accepted_source": [
+    {
+      "path": "/App.tsx",
+      "byte_count": 39,
+      "content_digest": "a581dbdd5109d09646f6d77cc944a4a9b391716b38049079e5ef3d28418a932b",
+      "modified": false
+    }
+  ],
+  "outputs": {
+    "bundle_bytes": 27,
+    "bundle_digest": "35a86a230a97a9b8c6a6f39864803a2561347ff1c920855bd2e7972bb3bf2753",
+    "css_bytes": 22,
+    "css_digest": "3a677bac26734d676498bc549e7ade900a428948e53ebd02d2f08f78d4f572e4",
+    "source_map_bytes": 31,
+    "source_map_digest": "1dbff15744c9140d2de44aee4339cf1d5fb35d2e3058a4a9235ddca5108dfb5c"
+  },
+  "editor": {
+    "base_source_revision": 7,
+    "revision": 2,
+    "state_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "active_path": "/App.tsx",
+    "view": "trace",
+    "files": [
+      {
+        "path": "/App.tsx",
+        "byte_count": 39,
+        "content_digest": "f65e28ef790ab0011794cbc39cad77b8ba1d21bdd919ebdc62886aceee78c484",
+        "modified": true
+      }
+    ]
+  },
+  "runtime": {
+    "artifact_id": "9f2cc8af-1c97-4eef-b63f-29771c1de97b",
+    "source_revision": 7,
+    "projection_digest": "77b9e746030f172f35cce044e1b5637e91b968de32424d6fb66d77eca250707e",
+    "events": [
+      {
+        "schema_version": 1,
+        "event_sequence": 1,
+        "artifact_id": "9f2cc8af-1c97-4eef-b63f-29771c1de97b",
+        "source_revision": 7,
+        "stream_id": "fd840dba-7e8e-48ef-b7eb-ff1982ceeefc",
+        "client_sequence": 1,
+        "kind": "console",
+        "name": "observation.excluded",
+        "payload": null,
+        "payload_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "redacted": true,
+        "recorded_at_ms": 0
+      }
+    ]
+  },
+  "runtime_truncated": false,
+  "omitted_runtime_events": 0,
+  "environment": {
+    "hyper_term_version": "0.1.0",
+    "os": "macos",
+    "architecture": "aarch64"
+  },
+  "inventory": [
+    {
+      "category": "artifact_metadata",
+      "inclusion": "included",
+      "item_count": 1,
+      "byte_count": 0,
+      "reason": "Accepted Rust authority metadata required to identify the replay target"
+    },
+    {
+      "category": "accepted_source_content",
+      "inclusion": "digest_only",
+      "item_count": 1,
+      "byte_count": 39,
+      "reason": "Virtual paths, byte counts, and SHA-256 only; source text is excluded by default"
+    },
+    {
+      "category": "editor_source_content",
+      "inclusion": "digest_only",
+      "item_count": 1,
+      "byte_count": 39,
+      "reason": "Checkpoint metadata and SHA-256 only; unpublished source text is excluded"
+    },
+    {
+      "category": "compiler_outputs",
+      "inclusion": "digest_only",
+      "item_count": 3,
+      "byte_count": 80,
+      "reason": "Bundle, CSS, and source map content are excluded; sizes and SHA-256 are included"
+    },
+    {
+      "category": "semantic_runtime_events",
+      "inclusion": "included",
+      "item_count": 1,
+      "byte_count": 364,
+      "reason": "Bounded Rust-redacted replay inputs; console and error payloads use excluded placeholders"
+    },
+    {
+      "category": "terminal_output",
+      "inclusion": "excluded",
+      "item_count": 0,
+      "byte_count": 0,
+      "reason": "Terminal output is untrusted and excluded by default"
+    },
+    {
+      "category": "provider_prompts",
+      "inclusion": "excluded",
+      "item_count": 0,
+      "byte_count": 0,
+      "reason": "Provider prompts and responses are excluded by default"
+    },
+    {
+      "category": "mcp_payloads",
+      "inclusion": "excluded",
+      "item_count": 0,
+      "byte_count": 0,
+      "reason": "MCP request and response payloads are excluded by default"
+    },
+    {
+      "category": "computer_use_and_screenshots",
+      "inclusion": "excluded",
+      "item_count": 0,
+      "byte_count": 0,
+      "reason": "Computer Use frames and screenshots are excluded by default"
+    },
+    {
+      "category": "environment_variables",
+      "inclusion": "excluded",
+      "item_count": 0,
+      "byte_count": 0,
+      "reason": "Environment values and credentials are never exported"
+    }
+  ],
+  "reproduction": [
+    "Open this JSON in a Hyper Term offline Bug Capsule viewer.",
+    "Verify capsule_digest before loading replay data.",
+    "Replay semantic events only; do not execute Shell, ACP, MCP, or Computer Use effects.",
+    "Match digest-only source and compiler outputs on the originating machine if deeper inspection is required."
+  ],
+  "capsule_digest": "f924f423dab241fe0031f70df5ccc4969caa18fd7434baa3204d2a1c36827600"
+}
