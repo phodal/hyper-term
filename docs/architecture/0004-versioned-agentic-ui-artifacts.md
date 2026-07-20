@@ -152,6 +152,17 @@ old Workbench URL cannot continue traversing revisions after the task advances.
 Pre-source artifacts remain previewable during migration but cannot claim
 editable-source availability.
 
+The private Artifact store now separates the compiler candidate contract from
+its durable format. New files use storage schema version 2: a bounded envelope
+contains the still-versioned candidate plus a SHA-256 identity over the source
+revision, entrypoint, and complete ordered virtual source tree. On first read,
+Rust validates an older raw version 1 candidate against the accepted journal
+metadata, writes the version 2 envelope through an fsynced atomic replacement,
+and preserves source-less legacy Artifacts as preview-only records. Source-tree
+substitution, unknown future storage schemas, symlink targets, oversized files,
+and journal metadata mismatches fail closed. This migration changes neither the
+Agent compiler input schema nor the accepted journal event.
+
 The trusted Workbench now keeps that complete fixed-path source tree as one
 draft. A horizontally responsive file strip selects each source without
 discarding edits in other files; dirty state is tracked per path, Deno LSP is
