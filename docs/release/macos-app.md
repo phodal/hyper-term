@@ -10,11 +10,11 @@ the workflow refuses to build when the release tag resolves elsewhere.
 
 Before packaging either architecture, the validation job launches the complete
 Rust supervisor with an automation-enabled Native renderer. The macOS smoke
-proves that the real window reaches its first-frame and canvas budgets, attaches
-the Terminal WebView, exposes accessible Terminal and Agent creation controls,
-and handles `Command-T` plus `Command-W`. Its Native snapshot, deterministic
-canvas screenshot, and supervisor log are retained as the
-`macos-desktop-smoke` workflow artifact.
+enforces a 750 ms cold-start first-frame cap for shared release runners and
+Native's canvas frame budget, attaches the Terminal WebView, exposes accessible
+Terminal and Agent creation controls, and handles `Command-T` plus `Command-W`.
+Its Native snapshot, deterministic canvas screenshot, and supervisor log are
+retained as the `macos-desktop-smoke` workflow artifact.
 
 The final bundle contains:
 

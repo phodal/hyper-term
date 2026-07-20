@@ -20,7 +20,7 @@ if [[ $(uname -s) != Darwin ]]; then
   echo "macOS desktop smoke requires a macOS host" >&2
   exit 1
 fi
-for smoke_command in native stat; do
+for smoke_command in native python3 stat; do
   if ! command -v "$smoke_command" >/dev/null 2>&1; then
     echo "required command is unavailable: $smoke_command" >&2
     exit 1
@@ -80,13 +80,30 @@ smoke_pid=$!
   native automate assert \
     'ready=true' \
     'gpu_nonblank=true' \
-    'gpu_first_frame_latency_budget_ok=true' \
     'canvas_frame_budget_ok=true' \
     'role=button name="New Terminal tab"' \
     'role=button name="New Agent tab"' \
     'role=button name="Close zsh 1"' \
     'hyper-term-terminal-view.*url="http://127.0.0.1:47437/.*tab=1"'
   native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
+  python3 - .zig-cache/native-sdk-automation/snapshot.txt <<'PY'
+import pathlib
+import re
+import sys
+
+snapshot = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r"\bgpu_first_frame_latency_ns=(\d+)\b", snapshot)
+if match is None:
+    raise SystemExit("Native snapshot is missing first-frame latency")
+latency_ns = int(match.group(1))
+cold_start_budget_ns = 750_000_000
+if latency_ns > cold_start_budget_ns:
+    raise SystemExit(
+        f"Native cold first frame took {latency_ns / 1_000_000:.1f} ms; "
+        f"budget is {cold_start_budget_ns / 1_000_000:.0f} ms"
+    )
+print(f"Native cold first frame: {latency_ns / 1_000_000:.1f} ms")
+PY
 
   native automate widget-key hyper-term-canvas cmd+t
   native automate assert \

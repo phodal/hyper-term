@@ -278,7 +278,8 @@ cargo build -p hyper-term-daemon --bin hyper-term-desktop
 ```
 
 The smoke starts the complete Rust supervisor and Native application in an
-isolated temporary directory. It verifies first-frame and canvas budgets, the
+isolated temporary directory. It enforces a 750 ms cold-start first-frame cap
+for shared release runners plus Native's canvas frame budget, then verifies the
 real terminal WebView attachment, default Terminal mode, `Command-T`,
 `Command-W`, accessibility labels, and a non-empty retained-canvas screenshot.
 The release workflow uploads the snapshot, screenshot, and supervisor log as
