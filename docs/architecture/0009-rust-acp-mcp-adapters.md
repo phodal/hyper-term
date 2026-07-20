@@ -194,6 +194,14 @@ set is enabled per release.
   5,972 ACP files; both offline version probes pass and the complete ad-hoc app
   is 184 MiB instead of 1.9 GiB. Real prompt gates pass through this exact
   pruned artifact for both providers.
+- Release validation now exercises both provider boundaries without credentials
+  or network access. The exact packaged Deno runtime loads the frozen Codex ACP
+  entrypoint and completes its translated app-server `initialize`; it also
+  loads the frozen Claude ACP entrypoint, creates a real ACP session, launches
+  the configured external Claude executable, and exchanges the official Claude
+  Agent SDK stream-JSON initialization and context-usage frames. The external
+  provider fixtures are deterministic, while the adapters and Rust client are
+  the production artifacts shipped in the app.
 - ACP v1 `session/new` and direct Codex sessions now receive the same
   digest-pinned `hyper-term-mcp` stdio server. Its enabled catalog is derived
   from the exact runtime configuration: Diff is always bounded and read-only;

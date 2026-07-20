@@ -30,12 +30,15 @@ The final bundle contains:
   manifest and the Deno lockfile used to reproduce them.
 
 The validation job does not stop at adapter `--version` output. After building
-the frozen runtime it launches the exact packaged Deno executable and real
-Codex ACP entrypoint, connects through `AcpAgentClient`, and completes an ACP
-`initialize` exchange against a deterministic external Codex app-server
-fixture. This proves the packaged adapter can load its dependency graph, spawn
-the configured provider path, translate the provider handshake, and return the
-official ACP capability response without requiring an account or network.
+the frozen runtime it launches the exact packaged Deno executable and both real
+ACP entrypoints through `AcpAgentClient`. Codex completes `initialize` against a
+deterministic external app-server fixture. Claude proceeds through
+`initialize -> session/new`, starts the configured external Claude executable,
+exchanges the official SDK stream-JSON initialization and context-usage control
+frames, and returns a non-empty ACP session. These gates prove both packaged
+adapters can load their dependency graphs, spawn only the configured provider
+paths, translate their distinct provider protocols, and return official ACP
+responses without requiring an account or network.
 
 The ACP runtime build follows Deno's production links into one self-contained
 tree but excludes the top-level `.pnpm` content store and installer metadata.
@@ -50,8 +53,8 @@ size guarantee.
 The adapter dependency tree may contain provider launcher metadata, but Hyper
 Term deliberately excludes platform-specific Codex and Claude binaries. The
 runtime contract requires a separately discovered, authenticated provider CLI;
-the release handshake supplies the same boundary with a deterministic fixture
-instead of accidentally testing an unusable bundled launcher.
+the release handshakes supply the same boundary with deterministic Codex and
+Claude fixtures instead of accidentally testing unusable bundled launchers.
 
 Native SDK first creates an unsigned `.app`. The workflow then composes the
 complete bundle, signs every Mach-O executable and the outer bundle, submits it
