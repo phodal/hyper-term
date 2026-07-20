@@ -8,6 +8,14 @@ The Native CLI binary and checksum come from the pinned Native SDK release. Its
 framework checkout is also pinned to the audited commit recorded by ADR 0013;
 the workflow refuses to build when the release tag resolves elsewhere.
 
+Before packaging either architecture, the validation job launches the complete
+Rust supervisor with an automation-enabled Native renderer. The macOS smoke
+proves that the real window reaches its first-frame and canvas budgets, attaches
+the Terminal WebView, exposes accessible Terminal and Agent creation controls,
+and handles `Command-T` plus `Command-W`. Its Native snapshot, deterministic
+canvas screenshot, and supervisor log are retained as the
+`macos-desktop-smoke` workflow artifact.
+
 The final bundle contains:
 
 - `Contents/MacOS/hyper-term`: the Rust desktop supervisor and PTY authority;

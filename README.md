@@ -268,6 +268,22 @@ deno task test
 deno task build:workbench
 ```
 
+Run the real macOS desktop smoke after building the terminal, Workbench,
+debug supervisor, and an automation-enabled Native renderer:
+
+```bash
+cargo build -p hyper-term-daemon --bin hyper-term-desktop
+(cd apps/desktop && native build --release=fast -Dautomation=true)
+./scripts/smoke_macos_desktop.sh
+```
+
+The smoke starts the complete Rust supervisor and Native application in an
+isolated temporary directory. It verifies first-frame and canvas budgets, the
+real terminal WebView attachment, default Terminal mode, `Command-T`,
+`Command-W`, accessibility labels, and a non-empty retained-canvas screenshot.
+The release workflow uploads the snapshot, screenshot, and supervisor log as
+evidence instead of treating a successful compile as desktop-runtime proof.
+
 Regenerate and test the README's vector UI preview:
 
 ```bash
