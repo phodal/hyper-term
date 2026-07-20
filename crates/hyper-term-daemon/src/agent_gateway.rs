@@ -5,7 +5,9 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -86,6 +88,8 @@ const MAX_ARTIFACT_DRAFT_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_TIER2_PREVIEW_CHANGES: usize = 32;
 const MAX_TIER2_PREVIEW_PATCH_BYTES: usize = 64 * 1024;
 const MAX_ACP_SHEBANG_BYTES: usize = 512;
+const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const PROVIDER_PROBE_MAX_STDOUT_BYTES: usize = 4 * 1024;
 const ARTIFACT_BOOTSTRAP_MARKER: &str = "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->";
 const CODEX_NETWORK_ALLOWED_HOSTS: &[&str] = &["api.openai.com", "auth.openai.com", "chatgpt.com"];
 const CLAUDE_NETWORK_ALLOWED_HOSTS: &[&str] = &[
@@ -108,6 +112,7 @@ pub struct AgentGatewayConfig {
     pub workspace: PathBuf,
     pub state_directory: PathBuf,
     pub daemon: DaemonState,
+    pub provider_home: PathBuf,
     pub codex_executable: Option<PathBuf>,
     pub codex_auth_file: Option<PathBuf>,
     pub acp_providers: Vec<AcpAgentProviderConfig>,
@@ -126,6 +131,54 @@ pub struct AcpAgentProviderConfig {
     pub arguments: Vec<OsString>,
     pub environment: BTreeMap<String, OsString>,
     pub implementation_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProviderReadiness {
+    Authenticated,
+    Available,
+    LoginRequired,
+    ProviderMissing,
+    ProbeFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProviderContainment {
+    NativeSeatbelt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AgentProviderStatus {
+    pub id: String,
+    pub protocol: String,
+    pub readiness: AgentProviderReadiness,
+    pub containment: AgentProviderContainment,
+}
+
+impl AgentProviderStatus {
+    fn new(id: &str, protocol: &str, readiness: AgentProviderReadiness) -> Self {
+        Self {
+            id: id.into(),
+            protocol: protocol.into(),
+            readiness,
+            containment: AgentProviderContainment::NativeSeatbelt,
+        }
+    }
+
+    pub fn usable(&self) -> bool {
+        matches!(
+            self.readiness,
+            AgentProviderReadiness::Authenticated | AgentProviderReadiness::Available
+        )
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProviderProbeOutcome {
+    Exited { success: bool, stdout: Vec<u8> },
+    TimedOut,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +234,8 @@ pub enum AgentGatewayError {
     InvalidWorkspace(PathBuf),
     #[error("agent gateway state directory is invalid: {0}")]
     InvalidStateDirectory(PathBuf),
+    #[error("agent gateway provider home is invalid: {0}")]
+    InvalidProviderHome(PathBuf),
     #[error("agent gateway GenUI runtime is invalid: {0}")]
     InvalidGenUiRuntime(String),
     #[error("agent gateway Workbench assets are invalid: {0}")]
@@ -601,6 +656,229 @@ struct AgentTier2PreviewHunkResponse {
     truncated: bool,
 }
 
+pub fn probe_agent_provider_statuses(config: &AgentGatewayConfig) -> Vec<AgentProviderStatus> {
+    let codex_readiness = config
+        .codex_executable
+        .as_deref()
+        .map(|executable| probe_authentication(config, executable, &["login", "status"], true))
+        .unwrap_or(AgentProviderReadiness::ProviderMissing);
+    let mut statuses = Vec::with_capacity(4);
+    if config.codex_executable.is_some() {
+        statuses.push(AgentProviderStatus::new(
+            "codex",
+            "codex-app-server-v2",
+            codex_readiness,
+        ));
+    }
+    for provider in &config.acp_providers {
+        let readiness = match provider.provider_id.as_str() {
+            "codex-acp" => provider
+                .environment
+                .get("CODEX_PATH")
+                .map(PathBuf::from)
+                .as_deref()
+                .map(|executable| {
+                    probe_authentication(config, executable, &["login", "status"], true)
+                })
+                .unwrap_or(AgentProviderReadiness::ProviderMissing),
+            "claude-acp" => provider
+                .environment
+                .get("CLAUDE_CODE_EXECUTABLE")
+                .map(PathBuf::from)
+                .as_deref()
+                .map(|executable| {
+                    probe_authentication(config, executable, &["auth", "status"], false)
+                })
+                .unwrap_or(AgentProviderReadiness::ProviderMissing),
+            "copilot-acp" => probe_copilot(&provider.executable, &provider.environment),
+            _ => continue,
+        };
+        statuses.push(AgentProviderStatus::new(
+            &provider.provider_id,
+            "acp-v1",
+            readiness,
+        ));
+    }
+    statuses
+}
+
+fn probe_known_agent_provider(
+    config: &AgentGatewayConfig,
+    provider_id: &str,
+) -> Option<AgentProviderStatus> {
+    probe_agent_provider_statuses(config)
+        .into_iter()
+        .find(|status| status.id == provider_id)
+}
+
+fn probe_authentication(
+    config: &AgentGatewayConfig,
+    executable: &Path,
+    arguments: &[&str],
+    codex: bool,
+) -> AgentProviderReadiness {
+    let mut environment = provider_probe_environment(&config.provider_home, executable);
+    if codex && let Some(codex_home) = config.codex_auth_file.as_deref().and_then(Path::parent) {
+        environment.insert("CODEX_HOME".into(), codex_home.as_os_str().to_owned());
+    }
+    match run_provider_probe(
+        executable,
+        arguments,
+        Some(&environment),
+        PROVIDER_PROBE_TIMEOUT,
+    ) {
+        Ok(ProviderProbeOutcome::Exited { success: true, .. }) => {
+            AgentProviderReadiness::Authenticated
+        }
+        Ok(ProviderProbeOutcome::Exited { success: false, .. }) => {
+            AgentProviderReadiness::LoginRequired
+        }
+        Ok(ProviderProbeOutcome::TimedOut) | Err(_) => AgentProviderReadiness::ProbeFailed,
+    }
+}
+
+fn probe_copilot(
+    executable: &Path,
+    environment: &BTreeMap<String, OsString>,
+) -> AgentProviderReadiness {
+    match run_provider_probe(
+        executable,
+        &["--version"],
+        Some(environment),
+        PROVIDER_PROBE_TIMEOUT,
+    ) {
+        Ok(ProviderProbeOutcome::Exited {
+            success: true,
+            stdout,
+        }) if String::from_utf8_lossy(&stdout).contains("GitHub Copilot CLI") => {
+            // Copilot authenticates during its ACP session and does not expose
+            // a read-only login status command.
+            AgentProviderReadiness::Available
+        }
+        Ok(_) | Err(_) => AgentProviderReadiness::ProbeFailed,
+    }
+}
+
+fn provider_probe_environment(home: &Path, executable: &Path) -> BTreeMap<String, OsString> {
+    let mut path_entries = Vec::with_capacity(5);
+    if let Some(parent) = executable.parent() {
+        path_entries.push(parent.to_owned());
+    }
+    for entry in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        let path = PathBuf::from(entry);
+        if !path_entries.contains(&path) {
+            path_entries.push(path);
+        }
+    }
+    let path =
+        std::env::join_paths(path_entries).unwrap_or_else(|_| OsString::from("/usr/bin:/bin"));
+    let user = home
+        .file_name()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::ffi::OsStr::new("user"))
+        .to_owned();
+    BTreeMap::from([
+        ("HOME".into(), home.as_os_str().to_owned()),
+        ("PATH".into(), path),
+        ("TERM".into(), "dumb".into()),
+        ("USER".into(), user.clone()),
+        ("LOGNAME".into(), user),
+    ])
+}
+
+fn run_provider_probe(
+    executable: &Path,
+    arguments: &[&str],
+    environment: Option<&BTreeMap<String, OsString>>,
+    timeout: Duration,
+) -> Result<ProviderProbeOutcome, String> {
+    let mut command = Command::new(executable);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    if let Some(environment) = environment {
+        command.env_clear().envs(environment);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "cannot start provider probe {}: {error}",
+            executable.display()
+        )
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "provider probe stdout is unavailable".to_owned())?;
+    let reader = thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut retained = Vec::with_capacity(PROVIDER_PROBE_MAX_STDOUT_BYTES);
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let remaining = PROVIDER_PROBE_MAX_STDOUT_BYTES.saturating_sub(retained.len());
+                    retained.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                Err(_) => break,
+            }
+        }
+        retained
+    });
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                break ProviderProbeOutcome::Exited {
+                    success: status.success(),
+                    stdout: Vec::new(),
+                };
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                terminate_provider_probe(&mut child);
+                break ProviderProbeOutcome::TimedOut;
+            }
+            Err(error) => {
+                terminate_provider_probe(&mut child);
+                let _ = reader.join();
+                return Err(format!(
+                    "cannot inspect provider probe {}: {error}",
+                    executable.display()
+                ));
+            }
+        }
+    };
+    let retained = reader
+        .join()
+        .map_err(|_| "provider probe output reader panicked".to_owned())?;
+    Ok(match outcome {
+        ProviderProbeOutcome::Exited { success, .. } => ProviderProbeOutcome::Exited {
+            success,
+            stdout: retained,
+        },
+        ProviderProbeOutcome::TimedOut => ProviderProbeOutcome::TimedOut,
+    })
+}
+
+fn terminate_provider_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        // SAFETY: the process group contains only the probe created above.
+        unsafe { libc::kill(process_group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 pub async fn spawn_agent_gateway(
     mut config: AgentGatewayConfig,
 ) -> Result<AgentGatewayHandle, AgentGatewayError> {
@@ -614,6 +892,15 @@ pub async fn spawn_agent_gateway(
         .workspace
         .canonicalize()
         .map_err(|_| AgentGatewayError::InvalidWorkspace(config.workspace.clone()))?;
+    config.provider_home = config
+        .provider_home
+        .canonicalize()
+        .map_err(|_| AgentGatewayError::InvalidProviderHome(config.provider_home.clone()))?;
+    if !config.provider_home.is_dir() {
+        return Err(AgentGatewayError::InvalidProviderHome(
+            config.provider_home.clone(),
+        ));
+    }
     std::fs::create_dir_all(&config.state_directory)?;
     config.state_directory = config
         .state_directory
@@ -724,6 +1011,10 @@ pub async fn spawn_agent_gateway(
     };
     let router = Router::new()
         .route(
+            "/agent/providers",
+            get(agent_provider_statuses).post(agent_provider_statuses),
+        )
+        .route(
             "/agent/session",
             get(snapshot_session)
                 .post(start_session)
@@ -804,6 +1095,23 @@ pub async fn spawn_agent_gateway(
         task: Some(task),
         runtime,
     })
+}
+
+async fn agent_provider_statuses(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    if let Err(response) = authorize_gateway_token(&runtime, &query) {
+        return *response;
+    }
+    let config = runtime.config.clone();
+    match tokio::task::spawn_blocking(move || probe_agent_provider_statuses(&config)).await {
+        Ok(statuses) => json_response(StatusCode::OK, &statuses),
+        Err(_) => status_response(
+            StatusCode::BAD_GATEWAY,
+            "Agent provider readiness could not be refreshed",
+        ),
+    }
 }
 
 async fn workbench_index(
@@ -2478,6 +2786,18 @@ impl AgentGatewayRuntime {
         if sessions.len() >= MAX_AGENT_SESSIONS {
             return Err(StartError::Capacity);
         }
+        // A staged Codex auth candidate is the desktop contract and must pass
+        // the read-only readiness gate. Library callers that intentionally do
+        // not stage credentials may still let app-server negotiate its own
+        // authentication. ACP registrations always use the explicit provider
+        // readiness contract.
+        let enforce_readiness = provider_id != "codex" || self.config.codex_auth_file.is_some();
+        if enforce_readiness
+            && let Some(status) = probe_known_agent_provider(&self.config, provider_id)
+            && !status.usable()
+        {
+            return Err(StartError::Unavailable);
+        }
         let task_id = self
             .config
             .daemon
@@ -2567,6 +2887,12 @@ impl AgentGatewayRuntime {
                     runtime.compiler_wasm.clone(),
                 ]);
             }
+            let auth_file = self
+                .config
+                .codex_auth_file
+                .as_deref()
+                .filter(|path| path.is_file())
+                .map(Path::to_owned);
             let client = CodexAppServerClient::launch(CodexAppServerConfig {
                 executable,
                 executable_sha256,
@@ -2574,7 +2900,7 @@ impl AgentGatewayRuntime {
                 workspace: self.config.workspace.clone(),
                 codex_home: session_root.join("codex-home"),
                 scratch_directory: session_root.join("scratch"),
-                auth_file: self.config.codex_auth_file.clone(),
+                auth_file,
                 brokered_mcp_server: mcp.map(|mcp| CodexMcpServerConfig {
                     executable: mcp.executable,
                     executable_sha256: mcp.executable_sha256,
@@ -2622,9 +2948,13 @@ impl AgentGatewayRuntime {
             for directory in [&isolated_home, &codex_home, &scratch] {
                 create_private_runtime_root(directory).map_err(|_| StartError::Driver)?;
             }
-            stage_codex_auth_file(self.config.codex_auth_file.as_deref(), &codex_home)
-                .map_err(|_| StartError::Driver)?;
-            if let Some(auth_file) = self.config.codex_auth_file.as_deref() {
+            let auth_file = self
+                .config
+                .codex_auth_file
+                .as_deref()
+                .filter(|path| path.is_file());
+            stage_codex_auth_file(auth_file, &codex_home).map_err(|_| StartError::Driver)?;
+            if let Some(auth_file) = auth_file {
                 let mut seen = read_paths.iter().cloned().collect::<HashSet<_>>();
                 add_existing_acp_read_path(&mut read_paths, &mut seen, auth_file);
             }
@@ -5613,6 +5943,88 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_endpoint_observes_login_without_gateway_restart() {
+        let temporary = tempfile::tempdir().expect("temporary provider home");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let marker = temporary.path().join("authenticated");
+        let codex = temporary.path().join("codex");
+        let provider_fixture = r#"#!/bin/sh
+if [ "${1:-} ${2:-}" = "login status" ]; then
+  [ -f '__AUTH_MARKER__' ]
+  exit
+fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"refresh-fixture"}}' ;;
+    *'"method":"model/list"'*) printf '%s\n' '{"id":2,"result":{"data":[{"model":"gpt-test","displayName":"GPT Test","description":"Fixture","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"Medium"}],"defaultReasoningEffort":"medium","isDefault":true}]}}' ;;
+    *'"method":"skills/list"'*) printf '%s\n' '{"id":3,"result":{"data":[]}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":4,"result":{"thread":{"id":"refresh-thread"}}}' ;;
+  esac
+done
+"#
+        .replace("__AUTH_MARKER__", &marker.display().to_string());
+        std::fs::write(&codex, provider_fixture).expect("provider fixture");
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700))
+            .expect("provider fixture permissions");
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            token: token.clone(),
+            workspace,
+            state_directory: temporary.path().join("gateway-state"),
+            daemon: DaemonState::open(temporary.path().join("daemon-state")).expect("daemon"),
+            provider_home: temporary.path().to_owned(),
+            codex_executable: Some(codex),
+            codex_auth_file: Some(temporary.path().join(".codex/auth.json")),
+            acp_providers: Vec::new(),
+            mcp_executable: None,
+            genui_runtime: None,
+            workbench_assets: None,
+            debug_capsule: None,
+            tier2_runner: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .expect("gateway");
+        let path = format!("/agent/providers?token={token}");
+        let (status, body) = request_path(gateway.address(), &path, "POST", b"{}").await;
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains("\"readiness\":\"login_required\""));
+        let session_path = format!("/agent/session?token={token}&session_id=1&provider=codex");
+        assert_eq!(
+            request_path(gateway.address(), &session_path, "POST", b"{}")
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        );
+
+        std::fs::write(&marker, "ready").expect("complete login");
+        let (status, body) = request_path(gateway.address(), &path, "POST", b"{}").await;
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains("\"readiness\":\"authenticated\""));
+        let (status, body) = request_path(gateway.address(), &session_path, "POST", b"{}").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        gateway.shutdown().await.expect("shutdown");
+    }
+
+    #[test]
+    fn provider_probe_timeout_reaps_its_process_group() {
+        let temporary = tempfile::tempdir().expect("temporary provider");
+        let executable = temporary.path().join("stuck-provider");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 5\n").expect("provider fixture");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("provider fixture permissions");
+        let started = Instant::now();
+        assert_eq!(
+            run_provider_probe(&executable, &["--version"], None, Duration::from_millis(50))
+                .expect("bounded probe"),
+            ProviderProbeOutcome::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[cfg(target_os = "macos")]
     fn run_git(cwd: &Path, arguments: &[&str]) {
         let output = std::process::Command::new("/usr/bin/git")
@@ -6154,6 +6566,7 @@ mod tests {
             workspace,
             state_directory: temporary.path().join("gateway-state"),
             daemon: DaemonState::open(temporary.path().join("daemon-state")).unwrap(),
+            provider_home: temporary.path().to_owned(),
             codex_executable: None,
             codex_auth_file: None,
             acp_providers: Vec::new(),
@@ -6215,6 +6628,7 @@ mod tests {
             workspace: workspace.clone(),
             state_directory: temporary.path().join("gateway-state"),
             daemon: daemon.clone(),
+            provider_home: temporary.path().to_owned(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
@@ -6373,6 +6787,7 @@ mod tests {
             workspace,
             state_directory: state,
             daemon,
+            provider_home: temporary.path().to_owned(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
@@ -6526,6 +6941,7 @@ mod tests {
             workspace,
             state_directory: gateway_state.clone(),
             daemon,
+            provider_home: temporary.path().to_owned(),
             codex_executable: None,
             codex_auth_file: None,
             acp_providers: vec![AcpAgentProviderConfig {
@@ -6695,6 +7111,7 @@ mod tests {
             workspace: workspace.clone(),
             state_directory: temporary.path().join("gateway-state"),
             daemon: daemon.clone(),
+            provider_home: temporary.path().to_owned(),
             codex_executable: None,
             codex_auth_file: None,
             acp_providers: vec![AcpAgentProviderConfig {
@@ -7172,6 +7589,7 @@ mod tests {
             workspace,
             state_directory: temporary.path().join("gateway-state"),
             daemon: daemon.clone(),
+            provider_home: temporary.path().to_owned(),
             codex_executable: None,
             codex_auth_file: None,
             acp_providers: vec![AcpAgentProviderConfig {
@@ -7335,6 +7753,7 @@ mod tests {
             workspace,
             state_directory: temporary.path().join("gateway-state"),
             daemon: daemon.clone(),
+            provider_home: temporary.path().to_owned(),
             codex_executable: None,
             codex_auth_file: None,
             acp_providers: vec![AcpAgentProviderConfig {
@@ -7596,6 +8015,7 @@ mod tests {
             workspace,
             state_directory: gateway_state,
             daemon: daemon.clone(),
+            provider_home: temporary.path().to_owned(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
@@ -7936,6 +8356,7 @@ mod tests {
             workspace: workspace.clone(),
             state_directory: temporary.path().join("gateway-state"),
             daemon: daemon.clone(),
+            provider_home: temporary.path().to_owned(),
             codex_executable: None,
             codex_auth_file: None,
             acp_providers: vec![AcpAgentProviderConfig {
@@ -8096,6 +8517,7 @@ mod tests {
             workspace,
             state_directory: state,
             daemon,
+            provider_home: temporary.path().to_owned(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
@@ -8244,6 +8666,7 @@ mod tests {
             workspace,
             state_directory: state,
             daemon: daemon.clone(),
+            provider_home: temporary.path().to_owned(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
@@ -8367,6 +8790,7 @@ mod tests {
                 workspace: workspace.canonicalize().unwrap(),
                 state_directory: state_directory.canonicalize().unwrap(),
                 daemon: DaemonState::open(temporary.path().join("daemon-state")).unwrap(),
+                provider_home: temporary.path().to_owned(),
                 codex_executable: None,
                 codex_auth_file: None,
                 acp_providers: Vec::new(),

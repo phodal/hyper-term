@@ -65,6 +65,7 @@ async fn acp_agent_discovers_the_real_brokered_deno_tool_catalog() {
         workspace,
         state_directory: temporary.path().join("gateway-state"),
         daemon,
+        provider_home: temporary.path().to_owned(),
         codex_executable: None,
         codex_auth_file: None,
         acp_providers: vec![AcpAgentProviderConfig {

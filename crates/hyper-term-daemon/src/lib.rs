@@ -71,7 +71,8 @@ pub use artifact_debug_capsule::{BugCapsuleError, load_bug_capsule};
 
 pub use agent_gateway::{
     AcpAgentProviderConfig, AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle,
-    AgentGenUiRuntimeConfig, spawn_agent_gateway,
+    AgentGenUiRuntimeConfig, AgentProviderContainment, AgentProviderReadiness, AgentProviderStatus,
+    probe_agent_provider_statuses, spawn_agent_gateway,
 };
 #[cfg(unix)]
 pub use client::{ControlClient, ControlClientError};

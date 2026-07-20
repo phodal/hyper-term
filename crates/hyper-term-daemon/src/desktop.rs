@@ -7,11 +7,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, ExitStatus};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -19,14 +17,14 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use hyper_term_daemon::{
     AcpAgentProviderConfig, AgentGatewayConfig, AgentGenUiRuntimeConfig, DaemonState,
-    TerminalGatewayConfig, load_bug_capsule, spawn_agent_gateway, spawn_terminal_gateway,
-    spawn_unix_server,
+    TerminalGatewayConfig, load_bug_capsule, probe_agent_provider_statuses, spawn_agent_gateway,
+    spawn_terminal_gateway, spawn_unix_server,
 };
 use uuid::Uuid;
 
 use hyper_term_drivers::sha256_file;
 use hyper_term_sandbox::{LimaImage, LimaRunnerConfig, LimaTaskRunner};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 const DESKTOP_TERMINAL_ADDRESS: &str = "127.0.0.1:47437";
 const TERMINAL_URL_ENV: &str = "HYPER_TERM_TERMINAL_URL";
@@ -34,8 +32,6 @@ const AGENT_URL_ENV: &str = "HYPER_TERM_AGENT_URL";
 const AGENT_PROVIDERS_ENV: &str = "HYPER_TERM_AGENT_PROVIDERS";
 const AGENT_PROVIDER_STATUS_ENV: &str = "HYPER_TERM_AGENT_PROVIDER_STATUS";
 const BUG_CAPSULE_URL_ENV: &str = "HYPER_TERM_BUG_CAPSULE_URL";
-const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const PROVIDER_PROBE_MAX_STDOUT_BYTES: usize = 4 * 1024;
 const ACP_PACKAGE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
 const ACP_RUNTIME_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const ACP_RUNTIME_MAX_FILES: usize = 8 * 1024;
@@ -123,36 +119,19 @@ fn run() -> Result<i32, String> {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let provider_inventory = resolved.agent_provider_inventory(&home)?;
-        let agent_provider_ids = provider_inventory
-            .iter()
-            .filter(|provider| provider.usable())
-            .map(|provider| provider.id.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        let provider_status = serde_json::to_string(&provider_inventory)
-            .map_err(|error| format!("cannot serialize Agent provider status: {error}"))?;
-        let codex_ready = provider_inventory.iter().any(|provider| {
-            provider.id == "codex" && provider.readiness == AgentProviderReadiness::Authenticated
-        });
-        let ready_acp_providers = provider_inventory
-            .iter()
-            .filter(|provider| provider.usable())
-            .map(|provider| provider.id.as_str())
-            .collect::<Vec<_>>();
-        let acp_providers = resolved
-            .acp_providers(&home)?
-            .into_iter()
-            .filter(|provider| ready_acp_providers.contains(&provider.provider_id.as_str()))
-            .collect();
-        let agent_gateway = spawn_agent_gateway(AgentGatewayConfig {
+        // Keep installed providers in the Rust gateway even when they are not
+        // authenticated yet. Readiness is re-probed at the session boundary,
+        // so a login completed in a Terminal tab takes effect without restart.
+        let acp_providers = resolved.acp_providers(&home)?;
+        let agent_gateway_config = AgentGatewayConfig {
             bind: "127.0.0.1:0".parse().expect("agent loopback bind is valid"),
             token: agent_token.clone(),
             workspace: resolved.shell_cwd.clone(),
             state_directory: resolved.state_directory.join("agent-runtime"),
             daemon: daemon.clone(),
-            codex_executable: codex_ready.then(|| resolved.codex.clone()).flatten(),
-            codex_auth_file: codex_ready.then(|| resolved.codex_auth.clone()).flatten(),
+            provider_home: home.clone(),
+            codex_executable: resolved.codex.clone(),
+            codex_auth_file: resolved.codex_auth.clone(),
             acp_providers,
             mcp_executable: resolved.mcp.clone(),
             genui_runtime: resolved
@@ -170,9 +149,19 @@ fn run() -> Result<i32, String> {
             debug_capsule: debug_capsule.clone(),
             tier2_runner,
             control_socket,
-        })
-        .await
-        .map_err(|error| error.to_string())?;
+        };
+        let provider_inventory = probe_agent_provider_statuses(&agent_gateway_config);
+        let agent_provider_ids = provider_inventory
+            .iter()
+            .filter(|provider| provider.usable())
+            .map(|provider| provider.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let provider_status = serde_json::to_string(&provider_inventory)
+            .map_err(|error| format!("cannot serialize Agent provider status: {error}"))?;
+        let agent_gateway = spawn_agent_gateway(agent_gateway_config)
+            .await
+            .map_err(|error| error.to_string())?;
         let terminal_url = format!("http://{}/?token={terminal_token}", gateway.address());
         let agent_url = format!("http://{}/?token={agent_token}", agent_gateway.address());
         let bug_capsule_url = debug_capsule.as_ref().map(|_| {
@@ -453,6 +442,7 @@ impl Options {
                 .filter(|value| !value.is_empty())
         });
         let tier2 = resolve_tier2(lima, lima_image, lima_image_sha256)?;
+        let codex_auth_explicit = self.codex_auth.is_some();
         Ok(ResolvedOptions {
             ui: self
                 .ui
@@ -467,10 +457,13 @@ impl Options {
                 .unwrap_or_else(|| default_state_directory(home)),
             shell_cwd: self.shell_cwd.unwrap_or_else(|| home.to_owned()),
             codex,
-            codex_auth: self.codex_auth.or_else(|| {
-                let candidate = home.join(".codex/auth.json");
-                candidate.is_file().then_some(candidate)
-            }),
+            // Retain the default candidate even before login. The gateway can
+            // then stage credentials created from a built-in terminal without
+            // requiring the desktop host to restart.
+            codex_auth: self
+                .codex_auth
+                .or_else(|| Some(home.join(".codex/auth.json"))),
+            codex_auth_explicit,
             codex_acp,
             claude_agent_acp,
             claude,
@@ -495,6 +488,7 @@ struct ResolvedOptions {
     shell_cwd: PathBuf,
     codex: Option<PathBuf>,
     codex_auth: Option<PathBuf>,
+    codex_auth_explicit: bool,
     codex_acp: Option<ResolvedAcpAdapter>,
     claude_agent_acp: Option<ResolvedAcpAdapter>,
     claude: Option<PathBuf>,
@@ -555,54 +549,6 @@ struct ResolvedAcpAdapter {
     executable: PathBuf,
     arguments: Vec<OsString>,
     implementation_version: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum AgentProviderReadiness {
-    Authenticated,
-    Available,
-    LoginRequired,
-    ProviderMissing,
-    ProbeFailed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum AgentProviderContainment {
-    NativeSeatbelt,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct DesktopAgentProviderStatus {
-    id: String,
-    protocol: String,
-    readiness: AgentProviderReadiness,
-    containment: AgentProviderContainment,
-}
-
-impl DesktopAgentProviderStatus {
-    fn new(id: &str, protocol: &str, readiness: AgentProviderReadiness) -> Self {
-        Self {
-            id: id.into(),
-            protocol: protocol.into(),
-            readiness,
-            containment: AgentProviderContainment::NativeSeatbelt,
-        }
-    }
-
-    fn usable(&self) -> bool {
-        matches!(
-            self.readiness,
-            AgentProviderReadiness::Authenticated | AgentProviderReadiness::Available
-        )
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum ProbeOutcome {
-    Exited { success: bool, stdout: Vec<u8> },
-    TimedOut,
 }
 
 impl ResolvedAcpAdapter {
@@ -666,7 +612,7 @@ impl ResolvedOptions {
             validate_executable(codex)?;
         }
         if let Some(codex_auth) = &self.codex_auth
-            && (!codex_auth.is_absolute() || !codex_auth.is_file())
+            && (!codex_auth.is_absolute() || (self.codex_auth_explicit && !codex_auth.is_file()))
         {
             return Err(format!(
                 "Codex auth file is unavailable: {}",
@@ -715,70 +661,6 @@ impl ResolvedOptions {
             }
         }
         Ok(())
-    }
-
-    fn agent_provider_inventory(
-        &self,
-        home: &Path,
-    ) -> Result<Vec<DesktopAgentProviderStatus>, String> {
-        let codex_readiness = self
-            .codex
-            .as_deref()
-            .map(|executable| {
-                probe_agent_authentication(
-                    executable,
-                    &["login", "status"],
-                    home,
-                    self.codex_auth.as_deref().and_then(Path::parent),
-                )
-            })
-            .transpose()?
-            .unwrap_or(AgentProviderReadiness::ProviderMissing);
-        let claude_readiness = self
-            .claude
-            .as_deref()
-            .map(|executable| {
-                probe_agent_authentication(executable, &["auth", "status"], home, None)
-            })
-            .transpose()?
-            .unwrap_or(AgentProviderReadiness::ProviderMissing);
-        let copilot_readiness = self
-            .copilot
-            .as_deref()
-            .map(probe_copilot_availability)
-            .transpose()?
-            .unwrap_or(AgentProviderReadiness::ProviderMissing);
-
-        let mut providers = Vec::with_capacity(4);
-        if self.codex.is_some() {
-            providers.push(DesktopAgentProviderStatus::new(
-                "codex",
-                "codex-app-server-v2",
-                codex_readiness,
-            ));
-        }
-        if self.codex_acp.is_some() {
-            providers.push(DesktopAgentProviderStatus::new(
-                "codex-acp",
-                "acp-v1",
-                codex_readiness,
-            ));
-        }
-        if self.claude_agent_acp.is_some() {
-            providers.push(DesktopAgentProviderStatus::new(
-                "claude-acp",
-                "acp-v1",
-                claude_readiness,
-            ));
-        }
-        if self.copilot.is_some() {
-            providers.push(DesktopAgentProviderStatus::new(
-                "copilot-acp",
-                "acp-v1",
-                copilot_readiness,
-            ));
-        }
-        Ok(providers)
     }
 
     fn acp_providers(&self, home: &Path) -> Result<Vec<AcpAgentProviderConfig>, String> {
@@ -1048,142 +930,6 @@ fn acp_environment(home: &Path, executable: &Path) -> Result<BTreeMap<String, Os
         ("USER".into(), desktop_user_name(home)),
         ("LOGNAME".into(), desktop_user_name(home)),
     ]))
-}
-
-fn probe_agent_authentication(
-    executable: &Path,
-    arguments: &[&str],
-    home: &Path,
-    tool_home: Option<&Path>,
-) -> Result<AgentProviderReadiness, String> {
-    let mut environment = acp_environment(home, executable)?;
-    if let Some(tool_home) = tool_home {
-        environment.insert("CODEX_HOME".into(), tool_home.as_os_str().to_owned());
-    }
-    match run_bounded_probe(
-        executable,
-        arguments,
-        Some(&environment),
-        PROVIDER_PROBE_TIMEOUT,
-    )? {
-        ProbeOutcome::Exited { success: true, .. } => Ok(AgentProviderReadiness::Authenticated),
-        ProbeOutcome::Exited { success: false, .. } => Ok(AgentProviderReadiness::LoginRequired),
-        ProbeOutcome::TimedOut => Ok(AgentProviderReadiness::ProbeFailed),
-    }
-}
-
-fn probe_copilot_availability(executable: &Path) -> Result<AgentProviderReadiness, String> {
-    match run_bounded_probe(executable, &["--version"], None, PROVIDER_PROBE_TIMEOUT)? {
-        ProbeOutcome::Exited {
-            success: true,
-            stdout,
-        } if String::from_utf8_lossy(&stdout).contains("GitHub Copilot CLI") => {
-            // Copilot has no read-only login-status command. Its ACP server
-            // advertises and performs authentication as part of the session.
-            Ok(AgentProviderReadiness::Available)
-        }
-        ProbeOutcome::Exited { .. } | ProbeOutcome::TimedOut => {
-            Ok(AgentProviderReadiness::ProbeFailed)
-        }
-    }
-}
-
-fn run_bounded_probe(
-    executable: &Path,
-    arguments: &[&str],
-    environment: Option<&BTreeMap<String, OsString>>,
-    timeout: Duration,
-) -> Result<ProbeOutcome, String> {
-    let mut command = Command::new(executable);
-    command
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    if let Some(environment) = environment {
-        command.env_clear().envs(environment);
-    }
-    let mut child = command.spawn().map_err(|error| {
-        format!(
-            "cannot start provider probe {}: {error}",
-            executable.display()
-        )
-    })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "provider probe stdout is unavailable".to_owned())?;
-    let reader = thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut retained = Vec::with_capacity(PROVIDER_PROBE_MAX_STDOUT_BYTES);
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match stdout.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    let remaining = PROVIDER_PROBE_MAX_STDOUT_BYTES.saturating_sub(retained.len());
-                    retained.extend_from_slice(&buffer[..read.min(remaining)]);
-                }
-                Err(_) => break,
-            }
-        }
-        retained
-    });
-
-    let deadline = Instant::now() + timeout;
-    let outcome = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                break ProbeOutcome::Exited {
-                    success: status.success(),
-                    stdout: Vec::new(),
-                };
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                terminate_probe(&mut child);
-                break ProbeOutcome::TimedOut;
-            }
-            Err(error) => {
-                terminate_probe(&mut child);
-                let _ = reader.join();
-                return Err(format!(
-                    "cannot inspect provider probe {}: {error}",
-                    executable.display()
-                ));
-            }
-        }
-    };
-    let retained = reader
-        .join()
-        .map_err(|_| "provider probe output reader panicked".to_owned())?;
-    Ok(match outcome {
-        ProbeOutcome::Exited { success, .. } => ProbeOutcome::Exited {
-            success,
-            stdout: retained,
-        },
-        ProbeOutcome::TimedOut => ProbeOutcome::TimedOut,
-    })
-}
-
-fn terminate_probe(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        // The probe starts in its own process group, so a stuck adapter cannot
-        // keep inherited stdout open through an unobserved descendant.
-        let process_group = -(child.id() as i32);
-        // SAFETY: `process_group` names only the child group created above.
-        unsafe {
-            libc::kill(process_group, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn desktop_user_name(home: &Path) -> OsString {
@@ -1591,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_inventory_and_acp_environment_are_explicit() {
+    fn acp_provider_environment_is_explicit() {
         let temporary = tempfile::tempdir().expect("temporary providers");
         let codex = temporary.path().join("codex");
         let claude = temporary.path().join("claude");
@@ -1621,6 +1367,7 @@ mod tests {
             shell_cwd: "/tmp".into(),
             codex: Some(codex.clone()),
             codex_auth: None,
+            codex_auth_explicit: false,
             codex_acp: Some(ResolvedAcpAdapter::installed(
                 "/opt/homebrew/bin/codex-acp".into(),
             )),
@@ -1633,21 +1380,6 @@ mod tests {
             genui_runtime: None,
             tier2: None,
         };
-        assert_eq!(
-            resolved
-                .agent_provider_inventory(temporary.path())
-                .expect("provider inventory")
-                .into_iter()
-                .map(|provider| (provider.id, provider.readiness))
-                .collect::<Vec<_>>(),
-            vec![
-                ("codex".into(), AgentProviderReadiness::Authenticated),
-                ("codex-acp".into(), AgentProviderReadiness::Authenticated),
-                ("claude-acp".into(), AgentProviderReadiness::LoginRequired),
-                ("copilot-acp".into(), AgentProviderReadiness::Available),
-            ]
-        );
-
         let environment = acp_environment(
             Path::new("/Users/example"),
             Path::new("/opt/homebrew/bin/codex-acp"),
@@ -1685,24 +1417,6 @@ mod tests {
             .map(OsString::from)
             .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn provider_probe_times_out_and_kills_a_stuck_process() {
-        let temporary = tempfile::tempdir().expect("temporary provider");
-        let executable = temporary.path().join("stuck-provider");
-        std::fs::write(&executable, "#!/bin/sh\nsleep 5\n").expect("fake provider");
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-
-        let started = Instant::now();
-        assert_eq!(
-            run_bounded_probe(&executable, &["--version"], None, Duration::from_millis(50))
-                .expect("probe"),
-            ProbeOutcome::TimedOut
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
