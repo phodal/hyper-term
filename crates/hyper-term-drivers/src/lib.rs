@@ -10,6 +10,7 @@ mod deno_genui;
 mod deno_lsp;
 mod execution_context;
 mod mcp;
+mod mcp_client;
 mod process;
 mod structured_agent;
 
@@ -21,5 +22,6 @@ pub use codex_containment::AgentContainmentConfig;
 pub use deno_genui::*;
 pub use deno_lsp::*;
 pub use mcp::*;
+pub use mcp_client::*;
 pub use process::*;
 pub use structured_agent::*;

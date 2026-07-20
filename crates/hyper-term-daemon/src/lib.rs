@@ -858,7 +858,10 @@ impl DaemonState {
     ) -> Result<OperationRecord, DaemonError> {
         let record = self.operation(operation_id)?;
         validate_operation_scope(&record, task_id, expected_revision)?;
-        if !matches!(record.action, OperationAction::Opaque { .. }) {
+        if !matches!(
+            record.action,
+            OperationAction::Opaque { .. } | OperationAction::McpServerLaunch { .. }
+        ) {
             return Err(DaemonError::GenericDispatchRequiresOpaqueAction);
         }
         if record.state != OperationState::Authorized {
@@ -883,7 +886,10 @@ impl DaemonState {
     ) -> Result<OperationRecord, DaemonError> {
         let record = self.operation(operation_id)?;
         validate_operation_scope(&record, task_id, expected_revision)?;
-        if !matches!(record.action, OperationAction::Opaque { .. }) {
+        if !matches!(
+            record.action,
+            OperationAction::Opaque { .. } | OperationAction::McpServerLaunch { .. }
+        ) {
             return Err(DaemonError::GenericDispatchRequiresOpaqueAction);
         }
         let outcome = completion.outcome.unwrap_or(if completion.succeeded {
@@ -2567,8 +2573,59 @@ impl OutputObservation {
 }
 
 fn validate_action_kind(kind: &OperationKind, action: &OperationAction) -> Result<(), DaemonError> {
-    if matches!(kind, OperationKind::Shell) != matches!(action, OperationAction::Shell { .. }) {
+    let valid = match (kind, action) {
+        (OperationKind::Shell, OperationAction::Shell { .. }) => true,
+        (OperationKind::McpServerLaunch, OperationAction::McpServerLaunch { launch }) => {
+            return validate_mcp_server_launch(launch);
+        }
+        (
+            OperationKind::FileEdit
+            | OperationKind::AgentTool
+            | OperationKind::McpTool
+            | OperationKind::ComputerUse
+            | OperationKind::ArtifactBuild
+            | OperationKind::Other(_),
+            OperationAction::Opaque { .. },
+        ) => true,
+        _ => false,
+    };
+    if !valid {
         return Err(DaemonError::ActionKindMismatch);
+    }
+    Ok(())
+}
+
+fn validate_mcp_server_launch(
+    launch: &hyper_term_protocol::LocalMcpServerLaunch,
+) -> Result<(), DaemonError> {
+    if launch.schema_version != hyper_term_protocol::LOCAL_MCP_LAUNCH_SCHEMA_VERSION
+        || launch.server_id.is_empty()
+        || launch.server_id.len() > 64
+        || !launch
+            .server_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        || launch.argument_count > 64
+        || !launch.executable.is_absolute()
+        || !launch.working_directory.is_absolute()
+        || !is_sha256(&launch.executable_sha256)
+        || launch
+            .roots_snapshot_sha256
+            .as_deref()
+            .is_some_and(|digest| !is_sha256(digest))
+    {
+        return Err(DaemonError::InvalidMcpServerLaunch);
+    }
+    let executable =
+        fs::canonicalize(&launch.executable).map_err(|_| DaemonError::InvalidMcpServerLaunch)?;
+    let working_directory = fs::canonicalize(&launch.working_directory)
+        .map_err(|_| DaemonError::InvalidMcpServerLaunch)?;
+    if executable != launch.executable
+        || !executable.is_file()
+        || working_directory != launch.working_directory
+        || !working_directory.is_dir()
+    {
+        return Err(DaemonError::InvalidMcpServerLaunch);
     }
     Ok(())
 }
@@ -3611,6 +3668,8 @@ pub enum DaemonError {
     InconsistentOperationOutcome,
     #[error("operation kind and action payload do not match")]
     ActionKindMismatch,
+    #[error("local MCP server launch identity is invalid")]
+    InvalidMcpServerLaunch,
     #[error("terminal dispatch only supports an exact shell action")]
     UnsupportedTerminalAction,
     #[error("sandboxed Agent commands require an explicit working directory")]
@@ -3694,6 +3753,7 @@ impl DaemonError {
             Self::OperationNotAuthorized(_) => "operation_not_authorized",
             Self::OperationNotDispatching(_) => "operation_not_dispatching",
             Self::ActionKindMismatch
+            | Self::InvalidMcpServerLaunch
             | Self::UnsupportedTerminalAction
             | Self::GenericDispatchRequiresOpaqueAction
             | Self::ArtifactAcceptanceRequiresGenUiCompile => "unsupported_action",

@@ -13,10 +13,11 @@ use hyper_term_daemon::{DaemonError, DaemonState, spawn_unix_server};
 use hyper_term_protocol::{
     BlockPayload, ClientId, ContextDigest, ContextReceipt, ControlRequest, ControlRequestEnvelope,
     ControlResponse, DomainEvent, EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest,
-    ExecutionMode, GenUiArtifactCandidate, GenUiCompilerIdentity, OperationAction,
-    OperationCompletion, OperationKind, OperationOutcome, OperationState, PermissionDecision,
-    RequestId, RiskClass, TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize,
-    WireFrame, read_frame, write_frame,
+    ExecutionMode, GenUiArtifactCandidate, GenUiCompilerIdentity, LocalMcpCredentialScope,
+    LocalMcpServerLaunch, LocalMcpServerLifecycle, McpArgumentsDigest, McpRuntimeIdentityDigest,
+    OperationAction, OperationCompletion, OperationKind, OperationOutcome, OperationState,
+    PermissionDecision, RequestId, RiskClass, SandboxProfileDigest, TerminalCommand,
+    TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame, read_frame, write_frame,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -766,6 +767,95 @@ fn opaque_tool_dispatch_requires_permission_and_records_its_receipt() {
                 )
             })
     );
+}
+
+#[test]
+fn local_mcp_server_launch_is_separately_authorized_and_redacted() {
+    let directory = tempdir().expect("tempdir");
+    let state = DaemonState::open(directory.path().join("state")).expect("open daemon");
+    let task_id = state.create_task("Reviewed local MCP".into()).unwrap();
+    let executable = std::fs::canonicalize("/bin/sh").unwrap();
+    let executable_sha256 = Sha256::digest(std::fs::read(&executable).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let working_directory = directory.path().canonicalize().unwrap();
+    let launch = LocalMcpServerLaunch {
+        schema_version: hyper_term_protocol::LOCAL_MCP_LAUNCH_SCHEMA_VERSION,
+        server_id: "fixture_read".into(),
+        executable,
+        executable_sha256,
+        arguments_digest: McpArgumentsDigest::parse("a".repeat(64)).unwrap(),
+        argument_count: 2,
+        working_directory,
+        context_digest: ContextDigest::parse("b".repeat(64)).unwrap(),
+        sandbox_profile_digest: SandboxProfileDigest::parse("c".repeat(64)).unwrap(),
+        roots_snapshot_sha256: Some("d".repeat(64)),
+        lifecycle: LocalMcpServerLifecycle::OneTask,
+        credential_scope: LocalMcpCredentialScope::ServerLifetime,
+        runtime_identity_digest: McpRuntimeIdentityDigest::parse("e".repeat(64)).unwrap(),
+    };
+    let proposed = state
+        .propose_operation(
+            task_id,
+            OperationKind::McpServerLaunch,
+            OperationAction::McpServerLaunch {
+                launch: launch.clone(),
+            },
+            "Start pinned fixture_read MCP for this Agent task".into(),
+            RiskClass::ExternalEffect,
+            vec!["mcp.server.launch".into()],
+        )
+        .unwrap();
+    assert_eq!(proposed.state, OperationState::WaitingHuman);
+    assert!(matches!(
+        state.begin_operation(task_id, proposed.operation_id, proposed.revision),
+        Err(DaemonError::OperationNotAuthorized(
+            OperationState::WaitingHuman
+        ))
+    ));
+
+    let authorized = state
+        .decide_permission(
+            task_id,
+            proposed.operation_id,
+            proposed.revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let dispatching = state
+        .begin_operation(task_id, proposed.operation_id, authorized.revision)
+        .unwrap();
+    state
+        .complete_operation(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision,
+            OperationCompletion {
+                executor: "hyper-term-mcp-client".into(),
+                succeeded: true,
+                outcome: Some(OperationOutcome::Succeeded),
+                summary: "MCP initialized and its catalog identity was recorded".into(),
+                result_digest: Some(launch.runtime_identity_digest.to_string()),
+            },
+        )
+        .unwrap();
+
+    let events = std::fs::read_to_string(directory.path().join("state/events.jsonl")).unwrap();
+    assert!(events.contains("mcp_server_launch"));
+    assert!(events.contains("fixture_read"));
+    assert!(!events.contains("secret-token"));
+    assert!(matches!(
+        state.propose_operation(
+            task_id,
+            OperationKind::McpTool,
+            OperationAction::McpServerLaunch { launch },
+            "wrong kind".into(),
+            RiskClass::ReadOnly,
+            Vec::new(),
+        ),
+        Err(DaemonError::ActionKindMismatch)
+    ));
 }
 
 #[test]

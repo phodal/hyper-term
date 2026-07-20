@@ -43,6 +43,7 @@ pub enum OperationKind {
     Shell,
     FileEdit,
     AgentTool,
+    McpServerLaunch,
     McpTool,
     ComputerUse,
     ArtifactBuild,
@@ -54,6 +55,9 @@ pub enum OperationKind {
 pub enum OperationAction {
     Shell {
         command: TerminalCommand,
+    },
+    McpServerLaunch {
+        launch: crate::LocalMcpServerLaunch,
     },
     Opaque {
         kind: String,
