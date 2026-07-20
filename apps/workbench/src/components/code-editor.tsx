@@ -33,6 +33,8 @@ export interface EditorLocation {
 
 interface CodeEditorProps {
   value: string;
+  documentPath: string;
+  draftFiles: Readonly<Record<string, string>>;
   onChange(value: string): void;
   readOnly?: boolean;
   revealLocation?: EditorLocation;
@@ -86,6 +88,8 @@ const editorTheme = EditorView.theme({
 export function CodeEditor(
   {
     value,
+    documentPath,
+    draftFiles,
     onChange,
     readOnly = false,
     revealLocation,
@@ -104,6 +108,8 @@ export function CodeEditor(
   onLanguageStatusRef.current = onLanguageStatus;
   const onSelectionChangeRef = useRef(onSelectionChange);
   onSelectionChangeRef.current = onSelectionChange;
+  const draftFilesRef = useRef(draftFiles);
+  draftFilesRef.current = draftFiles;
 
   useEffect(() => {
     if (!parent.current) return;
@@ -115,7 +121,10 @@ export function CodeEditor(
           onLanguageStatusRef.current?.("checking");
           try {
             const diagnostics = await languageService.diagnostics(
-              editor.state.doc.toString(),
+              {
+                ...draftFilesRef.current,
+                [documentPath]: editor.state.doc.toString(),
+              },
             );
             onLanguageStatusRef.current?.("ready");
             return diagnostics.map((diagnostic) => ({
@@ -139,7 +148,13 @@ export function CodeEditor(
           }
         }, { delay: 420 }),
         autocompletion({
-          override: [languageCompletionSource(languageService)],
+          override: [
+            languageCompletionSource(
+              languageService,
+              documentPath,
+              () => draftFilesRef.current,
+            ),
+          ],
           activateOnTyping: true,
         }),
       );
@@ -179,7 +194,7 @@ export function CodeEditor(
       view.current = null;
       next.destroy();
     };
-  }, [languageService, readOnly]);
+  }, [documentPath, languageService, readOnly]);
 
   useEffect(() => {
     const current = view.current;
@@ -231,7 +246,11 @@ export function CodeEditor(
   return <div className="code-editor" ref={parent} />;
 }
 
-function languageCompletionSource(languageService: EditorLanguageService) {
+function languageCompletionSource(
+  languageService: EditorLanguageService,
+  documentPath: string,
+  readDraftFiles: () => Readonly<Record<string, string>>,
+) {
   return async (
     context: CompletionContext,
   ): Promise<CompletionResult | null> => {
@@ -248,7 +267,10 @@ function languageCompletionSource(languageService: EditorLanguageService) {
       onDocChange: true,
     });
     const completions = await languageService.completions(
-      context.state.doc.toString(),
+      {
+        ...readDraftFiles(),
+        [documentPath]: context.state.doc.toString(),
+      },
       { line: line.number - 1, character: context.pos - line.from },
       controller.signal,
     );

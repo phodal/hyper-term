@@ -8,6 +8,10 @@ const context = {
   sessionId: 2,
   token: "abcdef0123456789abcdef0123456789",
 };
+const draftFiles = {
+  "/App.tsx": "const items = []; items.",
+  "/theme.ts": "export const accent = '#d7ff72';",
+};
 
 Deno.test("artifact language service binds every request to its Rust context", async () => {
   let captured: Request | undefined;
@@ -27,7 +31,7 @@ Deno.test("artifact language service binds every request to its Rust context", a
     }));
   });
   const completions = await service.completions(
-    "const items = []; items.",
+    draftFiles,
     { line: 0, character: 23 },
     new AbortController().signal,
   );
@@ -41,7 +45,7 @@ Deno.test("artifact language service binds every request to its Rust context", a
   assertEquals(await captured.json(), {
     source_revision: 7,
     document_path: "/App.tsx",
-    source: "const items = []; items.",
+    draft_files: draftFiles,
     kind: "completion",
     position: { line: 0, character: 23 },
   });
@@ -62,7 +66,11 @@ Deno.test("artifact language service rejects mismatched Rust responses", async (
       })),
   );
   await assertRejects(
-    () => service.diagnostics("export default null;"),
+    () =>
+      service.diagnostics({
+        ...draftFiles,
+        "/App.tsx": "export default null;",
+      }),
     Error,
     "did not match the editor context",
   );

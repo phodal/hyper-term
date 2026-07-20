@@ -7706,10 +7706,17 @@ done
                     schema_version: 1,
                     source_revision: 4,
                     entrypoint: "/main.ts".into(),
-                    source_files: BTreeMap::from([(
-                        "/main.ts".into(),
-                        "const answer: string = 42;\n".into(),
-                    )]),
+                    source_files: BTreeMap::from([
+                        (
+                            "/main.ts".into(),
+                            "import { answer } from \"./value.ts\";\nconst result: string = answer;\n"
+                                .into(),
+                        ),
+                        (
+                            "/value.ts".into(),
+                            "export const answer = \"ok\";\n".into(),
+                        ),
+                    ]),
                     bundle: bundle.into(),
                     css: css.into(),
                     source_map: "{\"version\":3}".into(),
@@ -7730,25 +7737,48 @@ done
             "/agent/artifact/{}/lsp?token={token}&session_id=8",
             accepted.artifact_id
         );
+        let incomplete_draft = serde_json::to_vec(&serde_json::json!({
+            "source_revision": 4,
+            "document_path": "/main.ts",
+            "draft_files": {
+                "/main.ts": "export default 1;\n"
+            },
+            "kind": "diagnostics"
+        }))
+        .unwrap();
+        assert_eq!(
+            request_path(gateway.address(), &lsp_path, "POST", &incomplete_draft,)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST.as_u16()
+        );
         let diagnostics = serde_json::to_vec(&serde_json::json!({
             "source_revision": 4,
             "document_path": "/main.ts",
-            "source": "const answer: string = 42;\n",
+            "draft_files": {
+                "/main.ts": "import { answer } from \"./value.ts\";\nconst result: string = answer;\n",
+                "/value.ts": "export const answer = 42;\n"
+            },
             "kind": "diagnostics"
         }))
         .unwrap();
         let (status, body) = request_path(gateway.address(), &lsp_path, "POST", &diagnostics).await;
         assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
         let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            response["diagnostics"]
-                .as_array()
-                .is_some_and(|items| !items.is_empty())
-        );
+        assert!(response["diagnostics"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("not assignable to type 'string'"))
+            })
+        }));
         let completion = serde_json::to_vec(&serde_json::json!({
             "source_revision": 4,
             "document_path": "/main.ts",
-            "source": "const value = \"ok\";\nvalue.\n",
+            "draft_files": {
+                "/main.ts": "const value = \"ok\";\nvalue.\n",
+                "/value.ts": "export const answer = 42;\n"
+            },
             "kind": "completion",
             "position": {"line": 1, "character": 6}
         }))
@@ -8237,7 +8267,9 @@ done
         let lsp_request = serde_json::to_vec(&serde_json::json!({
             "source_revision": 9,
             "document_path": "/App.tsx",
-            "source": "export default () => <main>ready</main>;",
+            "draft_files": {
+                "/App.tsx": "export default () => <main>ready</main>;"
+            },
             "kind": "diagnostics"
         }))
         .unwrap();

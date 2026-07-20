@@ -206,6 +206,18 @@ browser flow proves a two-file relative import, per-file LSP readiness, draft
 retention across file and review switches, and explicit multi-file Workspace
 Apply mapping without page overflow.
 
+The editor LSP consumes that same complete in-memory draft rather than only
+the selected document. Every diagnostics or completion request carries the
+fixed virtual file inventory, bounded to 100 files and 1 MiB. Rust rejects
+missing, additional, invalid, or stale paths before the private Deno session is
+touched. The session synchronizes imported files before the selected document;
+when any dependency changes it advances the selected document version and
+invalidates cached diagnostics. A real Deno test changes an imported module
+without changing the active file and observes the resulting cross-file type
+error, while the authenticated gateway test proves incomplete snapshots fail
+closed. Live build, preview, and LSP therefore see one draft revision instead
+of disagreeing about unsaved imports.
+
 Time Travel no longer depends on the lifetime of that mounted React tree. The
 Workbench requests a bounded newest-first Artifact projection from the Rust
 journal and lazily fetches the exact source of a selected historical revision.

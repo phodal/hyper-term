@@ -21,7 +21,8 @@ const LSP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LSP_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const LSP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_EDITOR_SOURCE_BYTES: usize = 1024 * 1024;
+const MAX_EDITOR_DRAFT_FILES: usize = 100;
+const MAX_EDITOR_DRAFT_BYTES: usize = 1024 * 1024;
 const MAX_EDITOR_DOCUMENT_PATH_BYTES: usize = 256;
 const MAX_EDITOR_COMPLETIONS: usize = 128;
 const MAX_EDITOR_DIAGNOSTICS: usize = 256;
@@ -47,7 +48,7 @@ pub(crate) struct EditorLspPosition {
 pub(crate) struct EditorLspRequest {
     pub source_revision: u64,
     pub document_path: String,
-    pub source: String,
+    pub draft_files: BTreeMap<String, String>,
     pub kind: EditorLspRequestKind,
     #[serde(default)]
     pub position: Option<EditorLspPosition>,
@@ -60,12 +61,28 @@ impl EditorLspRequest {
                 "source_revision must be positive".into(),
             ));
         }
-        if self.source.len() > MAX_EDITOR_SOURCE_BYTES {
+        if self.draft_files.is_empty() || self.draft_files.len() > MAX_EDITOR_DRAFT_FILES {
             return Err(EditorLspError::InvalidRequest(format!(
-                "source exceeds the {MAX_EDITOR_SOURCE_BYTES}-byte editor bound"
+                "draft must contain between 1 and {MAX_EDITOR_DRAFT_FILES} files"
+            )));
+        }
+        let mut draft_bytes = 0usize;
+        for (path, source) in &self.draft_files {
+            validate_virtual_path(path)?;
+            draft_bytes = draft_bytes
+                .checked_add(path.len())
+                .and_then(|bytes| bytes.checked_add(source.len()))
+                .ok_or_else(|| EditorLspError::InvalidRequest("draft size overflowed".into()))?;
+        }
+        if draft_bytes > MAX_EDITOR_DRAFT_BYTES {
+            return Err(EditorLspError::InvalidRequest(format!(
+                "draft exceeds the {MAX_EDITOR_DRAFT_BYTES}-byte editor bound"
             )));
         }
         validate_virtual_path(&self.document_path)?;
+        let source = self.draft_files.get(&self.document_path).ok_or_else(|| {
+            EditorLspError::InvalidRequest("document_path must identify a file in the draft".into())
+        })?;
         match self.kind {
             EditorLspRequestKind::Diagnostics if self.position.is_some() => {
                 return Err(EditorLspError::InvalidRequest(
@@ -76,8 +93,7 @@ impl EditorLspRequest {
                 let position = self.position.ok_or_else(|| {
                     EditorLspError::InvalidRequest("completion requires a position".into())
                 })?;
-                let line = self
-                    .source
+                let line = source
                     .split('\n')
                     .nth(position.line as usize)
                     .ok_or_else(|| {
@@ -198,9 +214,7 @@ impl EditorLspService {
         if request.source_revision != artifact.metadata.source_revision {
             return Err(EditorLspError::StaleRevision);
         }
-        if !artifact.source_files.contains_key(&request.document_path) {
-            return Err(EditorLspError::DocumentUnavailable);
-        }
+        validate_draft_inventory(&request.draft_files, &artifact.source_files)?;
         let key = EditorLspKey {
             session_id,
             artifact_id: artifact.metadata.artifact_id,
@@ -338,11 +352,11 @@ impl ArtifactLspSession {
         artifact_id: ArtifactId,
         request: EditorLspRequest,
     ) -> Result<EditorLspResponse, EditorLspError> {
+        self.sync_draft(&request.document_path, &request.draft_files)?;
         let document = self
             .documents
             .get_mut(&request.document_path)
             .ok_or(EditorLspError::DocumentUnavailable)?;
-        sync_document(&self.client, document, &request.source)?;
         let (diagnostics, completions) = match request.kind {
             EditorLspRequestKind::Diagnostics => {
                 if document.diagnostics_version != Some(document.version) {
@@ -388,6 +402,38 @@ impl ArtifactLspSession {
             completions,
         })
     }
+
+    fn sync_draft(
+        &mut self,
+        active_path: &str,
+        draft_files: &BTreeMap<String, String>,
+    ) -> Result<(), EditorLspError> {
+        let mut changed = false;
+        for (path, source) in draft_files {
+            if path == active_path {
+                continue;
+            }
+            let document = self
+                .documents
+                .get_mut(path)
+                .ok_or(EditorLspError::DocumentUnavailable)?;
+            changed |= sync_document(&self.client, document, source, false)?;
+        }
+        let active_source = draft_files
+            .get(active_path)
+            .ok_or(EditorLspError::DocumentUnavailable)?;
+        let active = self
+            .documents
+            .get_mut(active_path)
+            .ok_or(EditorLspError::DocumentUnavailable)?;
+        changed |= sync_document(&self.client, active, active_source, changed)?;
+        if changed {
+            for document in self.documents.values_mut() {
+                document.diagnostics_version = None;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn wait_for_document_diagnostics(
@@ -423,9 +469,10 @@ fn sync_document(
     client: &DenoLspClient,
     document: &mut EditorDocument,
     source: &str,
-) -> Result<(), EditorLspError> {
-    if document.source.as_deref() == Some(source) {
-        return Ok(());
+    force: bool,
+) -> Result<bool, EditorLspError> {
+    if document.source.as_deref() == Some(source) && !force {
+        return Ok(false);
     }
     document.version = document
         .version
@@ -461,7 +508,7 @@ fn sync_document(
     }
     document.source = Some(source.to_owned());
     document.diagnostics_version = None;
-    Ok(())
+    Ok(true)
 }
 
 fn normalize_diagnostics(
@@ -579,6 +626,18 @@ fn validate_virtual_path(path: &str) -> Result<(), EditorLspError> {
     Ok(())
 }
 
+fn validate_draft_inventory(
+    draft_files: &BTreeMap<String, String>,
+    accepted_files: &BTreeMap<String, String>,
+) -> Result<(), EditorLspError> {
+    if draft_files.len() != accepted_files.len() || draft_files.keys().ne(accepted_files.keys()) {
+        return Err(EditorLspError::InvalidRequest(
+            "draft file inventory must match the accepted artifact".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn language_id(path: &Path) -> &'static str {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("ts") => "typescript",
@@ -665,7 +724,7 @@ mod tests {
         let request = EditorLspRequest {
             source_revision: 2,
             document_path: "/App.tsx".into(),
-            source: "export default 1;".into(),
+            draft_files: BTreeMap::from([("/App.tsx".into(), "export default 1;".into())]),
             kind: EditorLspRequestKind::Completion,
             position: None,
         };
@@ -675,6 +734,20 @@ mod tests {
         ));
         assert!(validate_virtual_path("/../escape.ts").is_err());
         assert!(validate_virtual_path("/App.tsx").is_ok());
+
+        let accepted = BTreeMap::from([
+            ("/App.tsx".into(), "export default 1;".into()),
+            ("/theme.ts".into(), "export const color = 'lime';".into()),
+        ]);
+        let missing = BTreeMap::from([("/App.tsx".into(), "export default 1;".into())]);
+        let additional = BTreeMap::from([
+            ("/App.tsx".into(), "export default 1;".into()),
+            ("/theme.ts".into(), "export const color = 'lime';".into()),
+            ("/escape.ts".into(), "export default 2;".into()),
+        ]);
+        assert!(validate_draft_inventory(&accepted, &accepted).is_ok());
+        assert!(validate_draft_inventory(&missing, &accepted).is_err());
+        assert!(validate_draft_inventory(&additional, &accepted).is_err());
     }
 
     #[test]
@@ -721,14 +794,20 @@ mod tests {
                     version: "0.28.1".into(),
                 },
             },
-            source_files: BTreeMap::from([(
-                "/main.ts".into(),
-                "const answer: string = 42;\n".into(),
-            )]),
+            source_files: BTreeMap::from([
+                (
+                    "/main.ts".into(),
+                    "import { answer } from \"./value.ts\";\nconst result: string = answer;\n"
+                        .into(),
+                ),
+                ("/value.ts".into(), "export const answer = \"ok\";\n".into()),
+            ]),
             bundle: String::new(),
             css: String::new(),
             source_map: String::new(),
         };
+        let mut cross_file_draft = artifact.source_files.clone();
+        cross_file_draft.insert("/value.ts".into(), "export const answer = 42;\n".into());
         let diagnostics = service
             .query(
                 8,
@@ -736,7 +815,7 @@ mod tests {
                 EditorLspRequest {
                     source_revision: 3,
                     document_path: "/main.ts".into(),
-                    source: "const answer: string = 42;\n".into(),
+                    draft_files: cross_file_draft,
                     kind: EditorLspRequestKind::Diagnostics,
                     position: None,
                 },
@@ -746,7 +825,12 @@ mod tests {
             diagnostics
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.severity == "error")
+                .any(|diagnostic| diagnostic.severity == "error"
+                    && diagnostic
+                        .message
+                        .contains("not assignable to type 'string'")),
+            "cross-file draft diagnostic was not observed: {:?}",
+            diagnostics.diagnostics
         );
 
         let completion = service
@@ -756,7 +840,13 @@ mod tests {
                 EditorLspRequest {
                     source_revision: 3,
                     document_path: "/main.ts".into(),
-                    source: "const value = \"ok\";\nvalue.toUpperCase();\n".into(),
+                    draft_files: BTreeMap::from([
+                        (
+                            "/main.ts".into(),
+                            "const value = \"ok\";\nvalue.toUpperCase();\n".into(),
+                        ),
+                        ("/value.ts".into(), "export const answer = 42;\n".into()),
+                    ]),
                     kind: EditorLspRequestKind::Completion,
                     position: Some(EditorLspPosition {
                         line: 1,
@@ -774,7 +864,13 @@ mod tests {
                 EditorLspRequest {
                     source_revision: 3,
                     document_path: "/main.ts".into(),
-                    source: "const value = \"ok\";\nvalue.toUpperCase();\n".into(),
+                    draft_files: BTreeMap::from([
+                        (
+                            "/main.ts".into(),
+                            "const value = \"ok\";\nvalue.toUpperCase();\n".into(),
+                        ),
+                        ("/value.ts".into(), "export const answer = 42;\n".into()),
+                    ]),
                     kind: EditorLspRequestKind::Diagnostics,
                     position: None,
                 },

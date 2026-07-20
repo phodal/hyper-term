@@ -605,6 +605,8 @@ export function GenUiStudio({
         {view === "code" && (
           <CodeEditor
             value={source}
+            documentPath={activePath}
+            draftFiles={files}
             onChange={updateSource}
             readOnly={publishBusy}
             revealLocation={runtimeLocation?.file === activePath

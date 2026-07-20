@@ -18,9 +18,11 @@ export interface EditorCompletion {
 }
 
 export interface EditorLanguageService {
-  diagnostics(source: string): Promise<EditorDiagnostic[]>;
+  diagnostics(
+    draftFiles: Readonly<Record<string, string>>,
+  ): Promise<EditorDiagnostic[]>;
   completions(
-    source: string,
+    draftFiles: Readonly<Record<string, string>>,
     position: EditorPosition,
     signal: AbortSignal,
   ): Promise<EditorCompletion[]>;
@@ -55,11 +57,13 @@ export class ArtifactLanguageService implements EditorLanguageService {
       globalThis.fetch(input, init),
   ) {}
 
-  diagnostics(source: string): Promise<EditorDiagnostic[]> {
+  diagnostics(
+    draftFiles: Readonly<Record<string, string>>,
+  ): Promise<EditorDiagnostic[]> {
     this.#diagnosticController?.abort();
     const controller = new AbortController();
     this.#diagnosticController = controller;
-    return this.#request({ kind: "diagnostics", source }, controller.signal)
+    return this.#request({ kind: "diagnostics", draftFiles }, controller.signal)
       .then((response) => response.diagnostics)
       .finally(() => {
         if (this.#diagnosticController === controller) {
@@ -69,18 +73,25 @@ export class ArtifactLanguageService implements EditorLanguageService {
   }
 
   completions(
-    source: string,
+    draftFiles: Readonly<Record<string, string>>,
     position: EditorPosition,
     signal: AbortSignal,
   ): Promise<EditorCompletion[]> {
-    return this.#request({ kind: "completion", source, position }, signal)
+    return this.#request({ kind: "completion", draftFiles, position }, signal)
       .then((response) => response.completions);
   }
 
   async #request(
     request:
-      | { kind: "diagnostics"; source: string }
-      | { kind: "completion"; source: string; position: EditorPosition },
+      | {
+        kind: "diagnostics";
+        draftFiles: Readonly<Record<string, string>>;
+      }
+      | {
+        kind: "completion";
+        draftFiles: Readonly<Record<string, string>>;
+        position: EditorPosition;
+      },
     signal: AbortSignal,
   ): Promise<EditorLspResponse> {
     const query = new URLSearchParams({
@@ -98,7 +109,7 @@ export class ArtifactLanguageService implements EditorLanguageService {
         body: JSON.stringify({
           source_revision: this.context.sourceRevision,
           document_path: this.context.documentPath,
-          source: request.source,
+          draft_files: request.draftFiles,
           kind: request.kind,
           ...(request.kind === "completion"
             ? { position: request.position }
