@@ -3,7 +3,7 @@
 <template name="agent-composer">
   <column padding="4">
     <input-group label="Agent prompt composer" height="{agentComposerHeight}">
-      <textarea size="sm" text="{agentComposerText}" placeholder="Ask, use /commands, or mention a $skill" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerInputDisabled}" label="Agent prompt" />
+      <textarea size="sm" text="{agentComposerText}" placeholder="Ask, use /commands, or mention a $skill" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerInputDisabled}" autofocus="{agentGoalEditing}" label="Agent prompt" />
       <input-group-actions>
         <if test="{agent_command_count > 0}">
           <stack>

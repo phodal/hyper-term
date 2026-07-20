@@ -74,6 +74,7 @@ pub const agent_tier2_preview_effect_key_base: u64 = 0x4854_4b00;
 pub const agent_tier2_review_effect_key_base: u64 = 0x4854_4c00;
 pub const agent_tier2_discard_effect_key_base: u64 = 0x4854_4d00;
 pub const agent_provider_refresh_effect_key: u64 = 0x4854_4e00;
+pub const agent_goal_effect_key_base: u64 = 0x4854_5000;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -205,6 +206,20 @@ pub const AgentGoalStatus = enum {
     usage_limited,
     budget_limited,
     complete,
+};
+
+pub const AgentGoalAction = enum {
+    pause_goal,
+    resume_goal,
+    clear_goal,
+
+    pub fn command(action: AgentGoalAction) []const u8 {
+        return switch (action) {
+            .pause_goal => "/goal pause",
+            .resume_goal => "/goal resume",
+            .clear_goal => "/goal clear",
+        };
+    }
 };
 
 pub const AgentGoalView = struct {
@@ -669,6 +684,9 @@ pub const Model = struct {
     agent_plan_visible: bool = false,
     agent_goal: AgentGoalView = .{},
     agent_goal_visible: bool = false,
+    agent_goal_menu_open: bool = false,
+    agent_goal_editing: bool = false,
+    agent_goal_in_flight_session_id: u8 = 0,
     agent_projection_session_id: u8 = 0,
     agent_execution_contexts: [max_agent_execution_contexts]AgentExecutionContextView = [_]AgentExecutionContextView{.{}} ** max_agent_execution_contexts,
     agent_execution_context_count: usize = 0,
@@ -742,6 +760,11 @@ pub const Model = struct {
         "agent_plan_visible",
         "agent_goal",
         "agent_goal_visible",
+        "agent_goal_menu_open",
+        "agent_goal_editing",
+        "agent_goal_in_flight_session_id",
+        "agentGoalActionDisabled",
+        "agentGoalEditDisabled",
         "agent_projection_session_id",
         "agent_execution_contexts",
         "agent_execution_context_count",
@@ -1004,6 +1027,22 @@ pub const Model = struct {
         return if (model.agent_goal_visible) &model.agent_goal else null;
     }
 
+    pub fn agentGoalEditing(model: *const Model) bool {
+        return model.agent_goal_editing;
+    }
+
+    pub fn agentGoalActionDisabled(model: *const Model) bool {
+        return !model.agent_goal_visible or
+            model.activeSession().agent_provider != .codex or
+            model.agent_goal_in_flight_session_id != 0 or
+            model.agentSubmitDisabled();
+    }
+
+    pub fn agentGoalEditDisabled(model: *const Model) bool {
+        const current = std.mem.trim(u8, model.agent_composer_buffer.text(), " \t\r\n");
+        return current.len > 0 and !std.mem.startsWith(u8, current, "/goal ");
+    }
+
     pub fn hasAgentBlocks(model: *const Model) bool {
         return model.agent_block_count > 0;
     }
@@ -1125,6 +1164,11 @@ pub const Msg = union(enum) {
     insert_agent_command: u8,
     toggle_agent_block: u64,
     toggle_agent_goal,
+    toggle_agent_goal_menu,
+    dismiss_agent_goal_menu,
+    edit_agent_goal,
+    apply_agent_goal_action: AgentGoalAction,
+    agent_goal_updated: native_sdk.EffectResponse,
     toggle_agent_execution_context,
     reject_agent_effect: []const u8,
     allow_agent_effect: []const u8,
@@ -1149,7 +1193,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -1187,7 +1231,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .terminal_session_closed => {},
         .agent_session_started => |response| applyAgentStartResponse(model, response, fx),
         .agent_session_closed => {},
-        .agent_composer_changed => |edit| model.agent_composer_buffer.apply(edit),
+        .agent_composer_changed => |edit| {
+            model.agent_goal_editing = false;
+            model.agent_composer_buffer.apply(edit);
+        },
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .cancel_agent_turn => requestAgentCancel(model, fx),
@@ -1219,6 +1266,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .toggle_agent_goal => model.agent_goal.expanded = !model.agent_goal.expanded,
+        .toggle_agent_goal_menu => {
+            if (!model.agentGoalActionDisabled()) {
+                // Dropping the source focus request here creates a fresh
+                // false -> true edge when Edit is selected again.
+                model.agent_goal_editing = false;
+                model.agent_goal_menu_open = !model.agent_goal_menu_open;
+            }
+        },
+        .dismiss_agent_goal_menu => model.agent_goal_menu_open = false,
+        .edit_agent_goal => editAgentGoal(model),
+        .apply_agent_goal_action => |action| requestAgentGoalAction(model, action, fx),
+        .agent_goal_updated => |response| applyAgentGoalResponse(model, response, fx),
         .toggle_agent_execution_context => {
             if (model.hasAgentExecutionContext()) {
                 model.agent_execution_context_expanded = !model.agent_execution_context_expanded;
@@ -1318,6 +1377,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         fx.cancel(agent_tier2_preview_effect_key_base + session_id);
         fx.cancel(agent_tier2_review_effect_key_base + session_id);
         fx.cancel(agent_tier2_discard_effect_key_base + session_id);
+        fx.cancel(agent_goal_effect_key_base + session_id);
         if (model.agent_permission_in_flight_session_id == session_id) {
             model.agent_permission_in_flight_session_id = 0;
         }
@@ -1329,6 +1389,9 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         }
         if (model.agent_tier2_action_in_flight_session_id == session_id) {
             model.agent_tier2_action_in_flight_session_id = 0;
+        }
+        if (model.agent_goal_in_flight_session_id == session_id) {
+            model.agent_goal_in_flight_session_id = 0;
         }
     }
 
@@ -1662,8 +1725,53 @@ fn requestAgentTurn(model: *Model, fx: *Effects) void {
         .on_response = Effects.responseMsg(.agent_turn_started),
     });
     model.agent_composer_buffer.clear();
+    model.agent_goal_editing = false;
     model.agent_turn_status = .running;
     model.agent_error_len = 0;
+}
+
+fn editAgentGoal(model: *Model) void {
+    if (model.agentGoalActionDisabled()) return;
+    const current = std.mem.trim(u8, model.agent_composer_buffer.text(), " \t\r\n");
+    if (current.len > 0 and !std.mem.startsWith(u8, current, "/goal ")) return;
+    var storage: [max_agent_prompt_bytes]u8 = undefined;
+    const goal_command = std.fmt.bufPrint(&storage, "/goal {s}", .{model.agent_goal.objective()}) catch return;
+    model.agent_composer_buffer.set(goal_command);
+    model.agent_goal_editing = true;
+    model.agent_goal_menu_open = false;
+}
+
+fn requestAgentGoalAction(model: *Model, action: AgentGoalAction, fx: *Effects) void {
+    if (model.agentGoalActionDisabled()) return;
+    const session_id = model.active_session_id;
+    var storage: [agent_effect_url_capacity + 8]u8 = undefined;
+    const request_url = writeAgentTurnUrl(model, session_id, storage[0..]) orelse return;
+    fx.fetch(.{
+        .key = agent_goal_effect_key_base + session_id,
+        .method = .POST,
+        .url = request_url,
+        .body = action.command(),
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_goal_updated),
+    });
+    model.agent_goal_in_flight_session_id = session_id;
+    model.agent_goal_menu_open = false;
+    model.agent_error_len = 0;
+}
+
+fn applyAgentGoalResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    const session_id = effectSessionId(response.key, agent_goal_effect_key_base) orelse return;
+    if (model.agent_goal_in_flight_session_id == session_id) {
+        model.agent_goal_in_flight_session_id = 0;
+    }
+    if (session_id != model.active_session_id) return;
+    const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
+    if (!accepted) {
+        setAgentError(model, "Persistent Goal could not be updated");
+        model.agent_turn_status = .failed;
+        return;
+    }
+    scheduleAgentRefresh(session_id, fx);
 }
 
 fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
@@ -3177,7 +3285,10 @@ fn projectAgentGoal(model: *Model, wire: ?AgentGoalWire) void {
     model.agent_goal = .{};
     model.agent_goal.expanded = was_expanded;
     model.agent_goal_visible = false;
-    const goal = wire orelse return;
+    const goal = wire orelse {
+        model.agent_goal_menu_open = false;
+        return;
+    };
     const objective = std.mem.trim(u8, goal.objective, " \t\r\n");
     if (objective.len == 0) return;
     model.agent_goal.status = parseAgentGoalStatus(goal.status) orelse return;
@@ -3478,6 +3589,9 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_plan_visible = false;
     model.agent_goal = .{};
     model.agent_goal_visible = false;
+    model.agent_goal_menu_open = false;
+    model.agent_goal_editing = false;
+    model.agent_goal_in_flight_session_id = 0;
     model.agent_projection_session_id = session_id;
     clearAgentExecutionContext(model, session_id);
     model.agent_document_revision = 0;
@@ -3838,7 +3952,7 @@ fn agentContextShelfNode(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node
         else
             ui.el(.stack, .{}, .{}),
         if (model.agent_goal_visible)
-            agentGoalNode(ui, &model.agent_goal)
+            agentGoalNode(ui, model)
         else
             ui.el(.stack, .{}, .{}),
     });
@@ -4051,7 +4165,8 @@ fn agentPlanNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Nod
     });
 }
 
-fn agentGoalNode(ui: *HyperTermUi, goal: *const AgentGoalView) HyperTermUi.Node {
+fn agentGoalNode(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
+    const goal = &model.agent_goal;
     const objective = goal.objective();
     const title_length = utf8DisplayColumnPrefixLength(objective, max_agent_goal_step_columns);
     const title = if (title_length < objective.len)
@@ -4075,12 +4190,62 @@ fn agentGoalNode(ui: *HyperTermUi, goal: *const AgentGoalView) HyperTermUi.Node 
                 .on_press = .toggle_agent_goal,
             }, title),
             ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, goal.meta()),
+            agentGoalActionsNode(ui, model),
         }),
         if (goal.expanded)
             ui.text(.{ .padding = 6, .wrap = true }, objective)
         else
             ui.el(.stack, .{}, .{}),
     });
+}
+
+fn agentGoalActionsNode(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
+    var children: [2]HyperTermUi.Node = undefined;
+    children[0] = ui.button(.{
+        .size = .icon,
+        .variant = .ghost,
+        .icon = "menu",
+        .disabled = model.agentGoalActionDisabled(),
+        .on_press = .toggle_agent_goal_menu,
+        .semantics = .{ .label = "Goal actions" },
+    }, "");
+    var child_count: usize = 1;
+    if (model.agent_goal_menu_open) {
+        var items: [3]HyperTermUi.Node = undefined;
+        var item_count: usize = 0;
+        items[item_count] = agentGoalMenuItem(ui, "Edit goal", .edit_agent_goal, .default, model.agentGoalEditDisabled());
+        item_count += 1;
+        if (model.agent_goal.status == .paused) {
+            items[item_count] = agentGoalMenuItem(ui, "Resume goal", .{ .apply_agent_goal_action = .resume_goal }, .default, false);
+        } else {
+            items[item_count] = agentGoalMenuItem(ui, "Pause goal", .{ .apply_agent_goal_action = .pause_goal }, .default, false);
+        }
+        item_count += 1;
+        items[item_count] = agentGoalMenuItem(ui, "Clear goal", .{ .apply_agent_goal_action = .clear_goal }, .destructive, false);
+        item_count += 1;
+        children[child_count] = ui.el(.dropdown_menu, .{
+            .width = 170,
+            .gap = 2,
+            .anchor = .above,
+            .anchor_alignment = .end,
+            .on_dismiss = .dismiss_agent_goal_menu,
+            .semantics = .{ .label = "Goal actions" },
+        }, items[0..item_count]);
+        child_count += 1;
+    }
+    return ui.stack(.{}, children[0..child_count]);
+}
+
+fn agentGoalMenuItem(
+    ui: *HyperTermUi,
+    label: []const u8,
+    msg: Msg,
+    variant: canvas.WidgetVariant,
+    disabled: bool,
+) HyperTermUi.Node {
+    var item = ui.el(.menu_item, .{ .variant = variant, .disabled = disabled, .on_press = msg }, .{});
+    item.widget.text = label;
+    return item;
 }
 
 fn agentActivityNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {

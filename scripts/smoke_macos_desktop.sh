@@ -6,6 +6,7 @@ smoke_supervisor=${1:-"$smoke_repo_root/target/debug/hyper-term-desktop"}
 smoke_renderer=${2:-"$smoke_repo_root/apps/desktop/zig-out/bin/hyper-term"}
 smoke_acp_fixture="$smoke_repo_root/scripts/fixtures/acp_diff_agent.sh"
 smoke_terminal_acp_fixture="$smoke_repo_root/scripts/fixtures/acp_terminal_agent.sh"
+smoke_codex_goal_fixture="$smoke_repo_root/scripts/fixtures/codex_goal_agent.sh"
 smoke_lima_fixture="$smoke_repo_root/scripts/fixtures/fake_limactl.sh"
 smoke_artifact_dir=${HYPER_TERM_SMOKE_ARTIFACT_DIR:-}
 smoke_first_frame_budget_ms=${HYPER_TERM_SMOKE_FIRST_FRAME_BUDGET_MS:-750}
@@ -51,6 +52,10 @@ if [[ ! -x "$smoke_terminal_acp_fixture" ]]; then
   echo "desktop terminal ACP fixture is unavailable: $smoke_terminal_acp_fixture" >&2
   exit 1
 fi
+if [[ ! -x "$smoke_codex_goal_fixture" ]]; then
+  echo "desktop Codex Goal fixture is unavailable: $smoke_codex_goal_fixture" >&2
+  exit 1
+fi
 if [[ ! -x "$smoke_lima_fixture" ]]; then
   echo "desktop Lima fixture is unavailable: $smoke_lima_fixture" >&2
   exit 1
@@ -81,10 +86,13 @@ smoke_lima="$smoke_root/limactl"
 smoke_lima_image="$smoke_root/tier2.qcow2"
 smoke_acp="$smoke_root/acp-diff-agent"
 smoke_terminal_acp="$smoke_root/acp-terminal-agent"
+smoke_codex_goal="$smoke_root/codex-goal-agent"
 cp "$smoke_acp_fixture" "$smoke_acp"
 chmod 700 "$smoke_acp"
 cp "$smoke_terminal_acp_fixture" "$smoke_terminal_acp"
 chmod 700 "$smoke_terminal_acp"
+cp "$smoke_codex_goal_fixture" "$smoke_codex_goal"
+chmod 700 "$smoke_codex_goal"
 cp "$smoke_lima_fixture" "$smoke_lima"
 chmod 700 "$smoke_lima"
 printf 'local pinned smoke image' > "$smoke_lima_image"
@@ -116,7 +124,7 @@ trap 'exit 143' TERM
     --terminal-assets "$smoke_repo_root/dist/terminal" \
     --workbench-assets "$smoke_repo_root/dist/workbench" \
     --shell-cwd "$smoke_workspace" \
-    --codex "$smoke_acp" \
+    --codex "$smoke_codex_goal" \
     --codex-acp "$smoke_acp" \
     --claude-agent-acp "$smoke_terminal_acp" \
     --claude "$smoke_terminal_acp" \
@@ -187,21 +195,6 @@ PY
   smoke_terminal_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-terminal.png
   cp "$smoke_screenshot" "$smoke_terminal_screenshot"
 
-  native automate shortcut hyper-term.new-codex-acp-agent
-  native automate assert \
-    'role=group name="Agent conversation"' \
-    'role=group name="Agent reading rail"' \
-    'role=group name="Agent composer rail"' \
-    'role=group name="Agent prompt composer"' \
-    'role=textbox name="Agent prompt".*enabled=true' \
-    'role=button name="Inspect Agent execution context"' \
-    'role=button name="Send prompt".*enabled=true'
-  native automate assert --absent \
-    'name="ACP artifact editor"' \
-    'name="Agent execution context details"' \
-    'error event=' \
-    'dispatch_errors=[1-9]'
-
   smoke_widget_id() {
     python3 - .zig-cache/native-sdk-automation/snapshot.txt "$1" <<'PY'
 import pathlib
@@ -220,6 +213,67 @@ for line in snapshot.splitlines():
 raise SystemExit(f"widget not found: {pattern.pattern}")
 PY
   }
+
+  native automate shortcut hyper-term.new-codex-agent
+  native automate assert \
+    'role=group name="Agent conversation"' \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Send prompt".*enabled=true'
+  smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text '/goal Ship the compact Agent UI'
+  smoke_send_id=$(smoke_widget_id 'role=button name="Send prompt".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_send_id"
+  native automate assert \
+    'role=group name="Persistent Agent goal"' \
+    'role=button name="Goal actions".*enabled=true' \
+    'Goal · Ship the compact Agent UI' \
+    'active · 1m · 1200 / 50000 tokens'
+  smoke_goal_actions_id=$(smoke_widget_id 'role=button name="Goal actions".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_goal_actions_id"
+  native automate assert \
+    'role=menuitem name="Edit goal".*enabled=true' \
+    'role=menuitem name="Pause goal".*enabled=true' \
+    'role=menuitem name="Clear goal".*enabled=true'
+  smoke_edit_goal_id=$(smoke_widget_id 'role=menuitem name="Edit goal".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_edit_goal_id"
+  native automate assert \
+    'role=textbox name="Agent prompt".*focused=true' \
+    'role=textbox name="Agent prompt".*text="/goal Ship the compact Agent UI"'
+  smoke_goal_actions_id=$(smoke_widget_id 'role=button name="Goal actions".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_goal_actions_id"
+  smoke_pause_goal_id=$(smoke_widget_id 'role=menuitem name="Pause goal".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_pause_goal_id"
+  native automate assert \
+    'role=button name="Goal actions".*enabled=true' \
+    'paused · 1m · 1200 / 50000 tokens'
+  smoke_goal_actions_id=$(smoke_widget_id 'role=button name="Goal actions".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_goal_actions_id"
+  native automate assert \
+    'role=menuitem name="Resume goal".*enabled=true' \
+    'role=menuitem name="Clear goal".*enabled=true'
+  native automate screenshot hyper-term-canvas
+  cp "$smoke_screenshot" .zig-cache/native-sdk-automation/screenshot-hyper-term-goal.png
+  native automate widget-key hyper-term-canvas cmd+w
+  native automate assert --absent \
+    'role=group name="Persistent Agent goal"' \
+    'role=menuitem name="Resume goal"' \
+    'error event=' \
+    'dispatch_errors=[1-9]'
+
+  native automate shortcut hyper-term.new-codex-acp-agent
+  native automate assert \
+    'role=group name="Agent conversation"' \
+    'role=group name="Agent reading rail"' \
+    'role=group name="Agent composer rail"' \
+    'role=group name="Agent prompt composer"' \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Inspect Agent execution context"' \
+    'role=button name="Send prompt".*enabled=true'
+  native automate assert --absent \
+    'name="ACP artifact editor"' \
+    'name="Agent execution context details"' \
+    'error event=' \
+    'dispatch_errors=[1-9]'
 
   smoke_context_id=$(smoke_widget_id 'role=button name="Inspect Agent execution context"')
   native automate widget-click hyper-term-canvas "$smoke_context_id"
@@ -309,6 +363,9 @@ if [[ -n "$smoke_artifact_dir" ]]; then
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png" \
     "$smoke_artifact_dir/screenshot-hyper-term-agent.png"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-goal.png" \
+    "$smoke_artifact_dir/screenshot-hyper-term-goal.png"
   cp "$smoke_log" "$smoke_artifact_dir/hyper-term-smoke.log"
 fi
 

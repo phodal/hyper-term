@@ -1114,6 +1114,52 @@ test "Agent activity renders compact plans goals diffs terminals and hides low-s
     try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Processed").?.icon);
     try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Plan · Verify the edit after reviewing the comple…").?.icon);
     try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Goal · Ship the compact Agent UI without losing t…").?.icon);
+    const goal_actions = findByLabel(tree.root, "Goal actions").?;
+    try testing.expect(!goal_actions.state.disabled);
+    main.update(&model, tree.msgForPointer(goal_actions.id, .up).?, &fx);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByText(tree.root, .menu_item, "Edit goal") != null);
+    try testing.expect(findByText(tree.root, .menu_item, "Pause goal") != null);
+    try testing.expect(findByText(tree.root, .menu_item, "Clear goal") != null);
+
+    const edit_goal = findByText(tree.root, .menu_item, "Edit goal").?;
+    main.update(&model, tree.msgForPointer(edit_goal.id, .up).?, &fx);
+    try testing.expectEqualStrings(
+        "/goal Ship the compact Agent UI without losing terminal speed",
+        model.agentComposerText(),
+    );
+    try testing.expect(model.agentGoalEditing());
+    try testing.expect(!model.agent_goal_menu_open);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(tree.root, "Agent prompt").?.autofocus);
+
+    main.update(&model, .toggle_agent_goal_menu, &fx);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    const pause_goal = findByText(tree.root, .menu_item, "Pause goal").?;
+    main.update(&model, tree.msgForPointer(pause_goal.id, .up).?, &fx);
+    const goal_request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_goal_effect_key_base + 2).?).?;
+    try testing.expectEqual(std.http.Method.POST, goal_request.method);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session/turn?token=abcdef0123456789abcdef0123456789&session_id=2",
+        goal_request.url,
+    );
+    try testing.expectEqualStrings("/goal pause", goal_request.body);
+    try testing.expect(model.agentGoalActionDisabled());
+    main.update(&model, .{ .agent_goal_updated = .{
+        .key = main.agent_goal_effect_key_base + 2,
+        .status = 202,
+        .body = "{\"session_id\":2,\"status\":\"ready\"}",
+    } }, &fx);
+    try testing.expect(!model.agentGoalActionDisabled());
+    try testing.expectEqual(@as(usize, 1), fx.pendingTimerCount());
+    try testing.expectEqualStrings("/goal resume", main.AgentGoalAction.resume_goal.command());
+    try testing.expectEqualStrings("/goal clear", main.AgentGoalAction.clear_goal.command());
 
     main.update(&model, .toggle_agent_goal, &fx);
     arena_state.deinit();
