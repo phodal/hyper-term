@@ -63,6 +63,7 @@ pub const agent_tier2_results_effect_key_base: u64 = 0x4854_4a00;
 pub const agent_tier2_preview_effect_key_base: u64 = 0x4854_4b00;
 pub const agent_tier2_review_effect_key_base: u64 = 0x4854_4c00;
 pub const agent_tier2_discard_effect_key_base: u64 = 0x4854_4d00;
+pub const agent_provider_refresh_effect_key: u64 = 0x4854_4e00;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -503,6 +504,7 @@ pub const Model = struct {
     active_session_id: u8 = 1,
     next_session_id: u8 = 2,
     agent_provider_picker_open: bool = false,
+    agent_provider_refresh_in_flight: bool = false,
     selected_agent_provider: AgentProvider = .codex,
     available_agent_providers: u8 = 0,
     authenticated_agent_providers: u8 = 0,
@@ -568,6 +570,7 @@ pub const Model = struct {
         "session_slots",
         "session_count",
         "next_session_id",
+        "agentProviderUnavailable",
         "available_agent_providers",
         "authenticated_agent_providers",
         "session_auth_agent_providers",
@@ -669,6 +672,17 @@ pub const Model = struct {
 
     pub fn agentProviderUnavailable(model: *const Model) bool {
         return model.agent_base_url_len == 0 or model.available_agent_providers == 0;
+    }
+
+    pub fn agentProviderPickerUnavailable(model: *const Model) bool {
+        return model.agent_base_url_len == 0;
+    }
+
+    pub fn agentProviderRefreshLabel(model: *const Model) []const u8 {
+        return if (model.agent_provider_refresh_in_flight)
+            "Checking providers…"
+        else
+            "Refresh providers";
     }
 
     pub fn codexProviderAvailable(model: *const Model) bool {
@@ -881,6 +895,8 @@ pub const Msg = union(enum) {
     choose_agent,
     toggle_agent_provider_picker,
     dismiss_agent_provider_picker,
+    refresh_agent_providers,
+    agent_providers_refreshed: native_sdk.EffectResponse,
     choose_codex_agent,
     choose_codex_acp_agent,
     choose_claude_acp_agent,
@@ -928,7 +944,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -944,8 +960,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             _ = appendSession(model, .terminal);
         },
         .choose_agent => createAgentSession(model, model.selected_agent_provider, fx),
-        .toggle_agent_provider_picker => model.agent_provider_picker_open = !model.agent_provider_picker_open,
+        .toggle_agent_provider_picker => toggleAgentProviderPicker(model, fx),
         .dismiss_agent_provider_picker => model.agent_provider_picker_open = false,
+        .refresh_agent_providers => requestAgentProviderRefresh(model, fx),
+        .agent_providers_refreshed => |response| applyAgentProviderRefresh(model, response),
         .choose_codex_agent => createAgentSession(model, .codex, fx),
         .choose_codex_acp_agent => createAgentSession(model, .codex_acp, fx),
         .choose_claude_acp_agent => createAgentSession(model, .claude_acp, fx),
@@ -1118,6 +1136,51 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     if (was_active) {
         resetAgentProjection(model, model.active_session_id);
         requestActiveAgentStream(model, fx);
+    }
+}
+
+fn toggleAgentProviderPicker(model: *Model, fx: *Effects) void {
+    model.agent_provider_picker_open = !model.agent_provider_picker_open;
+    if (model.agent_provider_picker_open) requestAgentProviderRefresh(model, fx);
+}
+
+fn requestAgentProviderRefresh(model: *Model, fx: *Effects) void {
+    if (model.agent_base_url_len == 0 or model.agent_provider_refresh_in_flight) return;
+    var storage: [agent_effect_url_capacity]u8 = undefined;
+    const request_url = writeAgentProviderUrl(model, storage[0..]) orelse return;
+    model.agent_provider_refresh_in_flight = true;
+    fx.fetch(.{
+        .key = agent_provider_refresh_effect_key,
+        .method = .POST,
+        .url = request_url,
+        .body = "{}",
+        .timeout_ms = 10_000,
+        .on_response = Effects.responseMsg(.agent_providers_refreshed),
+    });
+}
+
+fn writeAgentProviderUrl(model: *const Model, storage: []u8) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(
+        storage,
+        "{s}/agent/providers?token={s}",
+        .{ origin, token },
+    ) catch null;
+}
+
+fn applyAgentProviderRefresh(model: *Model, response: native_sdk.EffectResponse) void {
+    if (response.key != agent_provider_refresh_effect_key) return;
+    model.agent_provider_refresh_in_flight = false;
+    if (response.outcome != .ok or response.status != 200 or response.truncated) return;
+    if (!applyAgentProviderStatus(model, response.body)) return;
+    const ready = model.authenticated_agent_providers | model.session_auth_agent_providers;
+    if (!model.agentProviderReady(model.selected_agent_provider)) {
+        model.selected_agent_provider = firstAvailableAgentProvider(ready) orelse
+            firstAvailableAgentProvider(model.available_agent_providers) orelse .codex;
     }
 }
 

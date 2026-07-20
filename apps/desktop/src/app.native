@@ -208,7 +208,7 @@
       <stack>
         <button-group gap="0" label="New Agent session">
           <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" label="New Agent tab">Agent</button>
-          <button size="sm" variant="outline" icon="chevron-down" on-press="toggle_agent_provider_picker" disabled="{agentProviderUnavailable}" label="Choose provider for a new Agent tab"></button>
+          <button size="sm" variant="outline" icon="chevron-down" on-press="toggle_agent_provider_picker" disabled="{agentProviderPickerUnavailable}" label="Choose provider for a new Agent tab"></button>
         </button-group>
         <if test="{agent_provider_picker_open}">
           <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="8" width="360" on-dismiss="dismiss_agent_provider_picker">
@@ -224,6 +224,8 @@
             <if test="{copilotAcpProviderAvailable}">
               <menu-item selected="{selected_agent_provider == 'copilot_acp'}" disabled="{copilotAcpProviderDisabled}" on-press="choose_copilot_acp_agent">{copilotAcpProviderMenuLabel}</menu-item>
             </if>
+            <separator />
+            <menu-item icon="refresh-cw" disabled="{agent_provider_refresh_in_flight}" on-press="refresh_agent_providers">{agentProviderRefreshLabel}</menu-item>
           </dropdown-menu>
         </if>
       </stack>

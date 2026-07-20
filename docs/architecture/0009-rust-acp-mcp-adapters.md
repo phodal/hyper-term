@@ -157,14 +157,20 @@ set is enabled per release.
 - Fixtures cover initialization, session creation, prompt streaming, session
   updates, permission proposals, and MCP capability negotiation.
 - The desktop supervisor clears the adapter environment, verifies executable
-  digests, runs authentication and version probes with a two-second process-group
-  timeout and 4 KiB output cap, and exposes a strict bounded provider inventory
-  to the Native host.
+  digests, and delegates authentication/version readiness to one Rust-owned
+  probe implementation with a two-second process-group timeout and 4 KiB
+  output cap. The same implementation produces the startup inventory, serves
+  authenticated `POST /agent/providers` refreshes, and gates creation of each
+  known provider session; startup and runtime status therefore cannot drift.
 - Native tabs are bound to their selected provider. Direct Codex app-server,
   Codex ACP, Claude ACP, and `copilot --acp --stdio` are separate provider
   registrations chosen explicitly from the Agent menu rather than inferred
   from terminal contents. Disabled menu entries retain the reason they cannot
-  start; the Native layer never probes credentials or launches a provider.
+  start. Opening the provider disclosure requests a bounded refresh, so a
+  `codex login` or `claude auth login` completed in a normal Terminal tab takes
+  effect without restarting Hyper Term. Native never probes credentials or
+  launches a provider, and a failed refresh preserves the last complete status
+  projection.
 - ACP resolution is explicit path first, then the digest-inventoried bundled
   runtime, then a recognized installed package. This keeps automatic startup
   on the adapter version tested with the desktop build while preserving exact

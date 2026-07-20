@@ -170,6 +170,11 @@ remain anchored selectors in that row. Direct Codex selections are sent through
 the Rust adapter on the next `turn/start`; Native state is only the projection.
 An active turn disables dispatch and configuration changes but leaves the text
 area editable, so the next prompt can be prepared while streaming continues.
+Provider selection follows the same disclosure rule: readiness detail and its
+manual refresh action live only inside the compact Agent menu. Opening it asks
+the authenticated Rust gateway to re-probe installed providers, allowing a
+login completed in a Terminal tab to enable Codex or Claude immediately without
+adding persistent status chrome to the workspace.
 
 Outside ACP artifact editing, transcript, Goal, and composer share one centered
 760-point reading rail. Activity labels take only their intrinsic width; their

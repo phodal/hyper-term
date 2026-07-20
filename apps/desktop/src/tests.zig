@@ -161,10 +161,14 @@ test "Agent provider picker creates a provider-bound ACP tab" {
     try testing.expectEqual(main.SessionMode.agent, model.activeSession().mode);
     try testing.expectEqual(main.AgentProvider.codex_acp, model.activeSession().agent_provider);
     try testing.expectEqualStrings("Codex ACP", model.activeSession().title);
-    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
+    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/providers?token=abcdef0123456789abcdef0123456789",
+        fx.pendingFetchAt(0).?.url,
+    );
     try testing.expectEqualStrings(
         "http://127.0.0.1:55321/agent/session?token=abcdef0123456789abcdef0123456789&session_id=2&provider=codex-acp",
-        fx.pendingFetchAt(0).?.url,
+        fx.pendingFetchAt(1).?.url,
     );
 }
 
@@ -203,9 +207,59 @@ test "Agent provider status disables unready adapters and enables Copilot ACP" {
     const copilot = findAnyByText(tree.root, "Copilot · ACP · auth on session").?;
     main.update(&model, tree.msgForPointer(copilot.id, .up).?, &fx);
     try testing.expectEqual(main.AgentProvider.copilot_acp, model.activeSession().agent_provider);
-    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
-    try testing.expect(std.mem.endsWith(u8, fx.pendingFetchAt(0).?.url, "provider=copilot-acp"));
+    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
+    try testing.expect(std.mem.endsWith(u8, fx.pendingFetchAt(1).?.url, "provider=copilot-acp"));
     try testing.expectEqualStrings("Agent connecting", model.agentStatus());
+}
+
+test "Agent provider picker refreshes authentication without restarting" {
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    const signed_out =
+        \\[
+        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"login_required","containment":"native_seatbelt"},
+        \\  {"id":"codex-acp","protocol":"acp-v1","readiness":"login_required","containment":"native_seatbelt"}
+        \\]
+    ;
+    var model = main.initialModelWithProviderStatus("", agent_url, "", signed_out);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .toggle_agent_provider_picker, &fx);
+    try testing.expect(model.agent_provider_picker_open);
+    try testing.expect(model.agent_provider_refresh_in_flight);
+    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
+    const refresh = fx.pendingFetchAt(0).?;
+    try testing.expectEqual(std.http.Method.POST, refresh.method);
+    try testing.expectEqualStrings("{}", refresh.body);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/providers?token=abcdef0123456789abcdef0123456789",
+        refresh.url,
+    );
+
+    const signed_in =
+        \\[
+        \\  {"id":"codex","protocol":"codex-app-server-v2","readiness":"authenticated","containment":"native_seatbelt"},
+        \\  {"id":"codex-acp","protocol":"acp-v1","readiness":"authenticated","containment":"native_seatbelt"}
+        \\]
+    ;
+    main.update(&model, .{ .agent_providers_refreshed = .{
+        .key = main.agent_provider_refresh_effect_key,
+        .status = 200,
+        .body = signed_in,
+    } }, &fx);
+    try testing.expect(!model.agent_provider_refresh_in_flight);
+    try testing.expect(model.agentProviderReady(.codex));
+    try testing.expect(model.agentProviderReady(.codex_acp));
+
+    main.update(&model, .refresh_agent_providers, &fx);
+    main.update(&model, .{ .agent_providers_refreshed = .{
+        .key = main.agent_provider_refresh_effect_key,
+        .status = 502,
+        .body = "{}",
+    } }, &fx);
+    try testing.expect(model.agentProviderReady(.codex));
+    try testing.expect(model.agentProviderReady(.codex_acp));
 }
 
 test "malformed Agent provider status fails closed" {

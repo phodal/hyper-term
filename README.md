@@ -136,7 +136,9 @@ The important boundary is not Native versus Web. It is **who has authority**:
 
 Agent providers require a compatible CLI already installed and authenticated on
 the local machine. Hyper Term packages the adapter runtime, not the provider
-CLI or account credentials. Agent sessions started from an oversized directory
+CLI or account credentials. The Agent provider menu refreshes Rust-owned login
+status when opened, so authentication completed in a Terminal tab is available
+without restarting the app. Agent sessions started from an oversized directory
 such as the user's home still retain Diff and GenUI MCP tools, but Deno LSP is
 omitted until a bounded workspace can be snapshotted safely.
 
