@@ -38,6 +38,7 @@ type Fetcher = typeof fetch;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_SOURCE_BYTES = 1024 * 1024;
+const SUPPORTED_CHECKPOINT_SCHEMAS = new Set([1, 2]);
 
 export class ArtifactEditorCheckpointClient {
   constructor(
@@ -160,7 +161,8 @@ function validCheckpoint(
 ): boolean {
   try {
     if (
-      !checkpoint || checkpoint.schema_version !== 1 ||
+      !checkpoint ||
+      !SUPPORTED_CHECKPOINT_SCHEMAS.has(checkpoint.schema_version) ||
       checkpoint.artifact_id !== context.artifactId ||
       checkpoint.base_source_revision !== context.sourceRevision ||
       !Number.isSafeInteger(checkpoint.revision) || checkpoint.revision < 0 ||

@@ -17,7 +17,7 @@ const context: ArtifactEditorCheckpointContext = {
 
 function checkpoint(revision = 0) {
   return {
-    schema_version: 1,
+    schema_version: 2,
     artifact_id: context.artifactId,
     base_source_revision: 7,
     revision,
@@ -29,6 +29,18 @@ function checkpoint(revision = 0) {
     selections: {},
   };
 }
+
+Deno.test("artifact editor checkpoint accepts a legacy v1 response during upgrade", async () => {
+  const client = new ArtifactEditorCheckpointClient(
+    context,
+    () =>
+      Promise.resolve(Response.json({ ...checkpoint(), schema_version: 1 })),
+  );
+  assertEquals(
+    (await client.load(new AbortController().signal)).schema_version,
+    1,
+  );
+});
 
 Deno.test("artifact editor checkpoint loads and saves exact Rust state", async () => {
   const requests: Array<{ url: string; init?: RequestInit }> = [];
