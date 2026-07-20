@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +28,11 @@ use hyper_term_protocol::{
     TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame, read_frame,
     write_frame,
 };
-use hyper_term_sandbox::MacOsSeatbeltLauncher;
+use hyper_term_sandbox::{
+    IsolatedTaskReceipt, IsolatedTaskRequest, IsolatedTaskTermination, IsolatedWorktree,
+    IsolatedWorktreeError, IsolatedWorktreeManager, IsolatedWorktreeRequest,
+    LimaIsolatedTaskLauncher, LimaRunnerError, LimaTaskRunner, MacOsSeatbeltLauncher,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -71,6 +76,10 @@ const BLOCK_SUBSCRIBER_CAPACITY: usize = 512;
 const OBSERVATION_BATCH_BYTES: u64 = 64 * 1024;
 const SANDBOX_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
 const MAX_GENUI_ARTIFACT_HISTORY: usize = 64;
+const ISOLATED_TASK_CAPABILITY: &str = "sandbox.isolated_task";
+const ISOLATED_TASK_WALL_TIME_MS: u64 = 10 * 60 * 1_000;
+const ISOLATED_TASK_MAX_PROCESSES: u32 = 256;
+const ISOLATED_TASK_MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GenUiArtifactHistoryEntry {
@@ -99,6 +108,8 @@ struct DaemonInner {
     sandbox_leases: Mutex<CapabilityLeaseLedger>,
     authorized_sandboxes: Mutex<HashMap<OperationId, AuthorizedSandbox>>,
     sandbox_executions: Mutex<HashMap<TerminalId, SandboxExecutionContext>>,
+    isolated_worktree_manager: IsolatedWorktreeManager,
+    isolated_results: Mutex<HashMap<OperationId, IsolatedResult>>,
     state_directory: PathBuf,
     artifacts: ArtifactStore,
     artifact_acceptance: Mutex<()>,
@@ -107,6 +118,12 @@ struct DaemonInner {
 
 impl Drop for DaemonInner {
     fn drop(&mut self) {
+        if let Ok(results) = self.isolated_results.get_mut() {
+            for (_, result) in results.drain() {
+                let _ = self.isolated_worktree_manager.destroy(&result.environment);
+                cleanup_scratch_directory(&result.scratch_directory);
+            }
+        }
         cleanup_scratch_directory(&self.scratch_root);
     }
 }
@@ -148,6 +165,11 @@ struct SandboxExecutionContext {
     scratch_directory: PathBuf,
 }
 
+struct IsolatedResult {
+    environment: IsolatedWorktree,
+    scratch_directory: PathBuf,
+}
+
 #[derive(Clone, Copy)]
 struct InputLease {
     lease_id: InputLeaseId,
@@ -167,6 +189,7 @@ impl DaemonState {
         fs::create_dir_all(state_directory.as_ref())?;
         let state_directory = fs::canonicalize(state_directory.as_ref())?;
         let artifacts = ArtifactStore::open(&state_directory)?;
+        let isolated_worktree_manager = IsolatedWorktreeManager::discover()?;
         let journal = JsonlJournal::open(state_directory.join("events.jsonl"))?;
         let mut operations = OperationReducer::default();
         let mut projectors = HashMap::new();
@@ -215,6 +238,8 @@ impl DaemonState {
                 sandbox_leases: Mutex::new(CapabilityLeaseLedger::default()),
                 authorized_sandboxes: Mutex::new(HashMap::new()),
                 sandbox_executions: Mutex::new(HashMap::new()),
+                isolated_worktree_manager,
+                isolated_results: Mutex::new(HashMap::new()),
                 state_directory,
                 artifacts,
                 artifact_acceptance: Mutex::new(()),
@@ -489,6 +514,10 @@ impl DaemonState {
         let scratch_directory = fs::canonicalize(scratch_directory)?;
 
         let result = (|| {
+            let isolated_task = record
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == ISOLATED_TASK_CAPABILITY);
             let mut rules = ["/System", "/usr", "/bin", "/sbin", "/Library"]
                 .into_iter()
                 .map(PathBuf::from)
@@ -522,7 +551,11 @@ impl DaemonState {
             });
 
             let profile = hyper_term_protocol::SandboxProfile {
-                enforcement: SandboxEnforcement::Native,
+                enforcement: if isolated_task {
+                    SandboxEnforcement::IsolatedTask
+                } else {
+                    SandboxEnforcement::Native
+                },
                 filesystem: SandboxFileSystemPolicy { rules },
                 network: SandboxNetworkPolicy::Offline,
                 environment: SandboxEnvironmentPolicy {
@@ -546,20 +579,32 @@ impl DaemonState {
                     allow_any_executable: true,
                     allowed_executables: Vec::new(),
                 },
-                resources: SandboxResourceLimits::default(),
+                resources: if isolated_task {
+                    SandboxResourceLimits {
+                        wall_time_ms: Some(ISOLATED_TASK_WALL_TIME_MS),
+                        max_processes: Some(ISOLATED_TASK_MAX_PROCESSES),
+                        max_output_bytes: Some(ISOLATED_TASK_MAX_OUTPUT_BYTES),
+                    }
+                } else {
+                    SandboxResourceLimits::default()
+                },
                 lifetime: SandboxLifetime::OneOperation,
             };
             let actor = Actor::System;
-            let plan = self
-                .inner
-                .sandbox_launcher
-                .compile(&SandboxCompileRequest {
-                    operation_id: record.operation_id,
-                    operation_revision: authorized_revision,
-                    actor: actor.clone(),
-                    command: command.clone(),
-                    profile,
-                })?;
+            let mut normalized_command = command.clone();
+            normalized_command.cwd = Some(workspace.clone());
+            let compile_request = SandboxCompileRequest {
+                operation_id: record.operation_id,
+                operation_revision: authorized_revision,
+                actor: actor.clone(),
+                command: normalized_command,
+                profile,
+            };
+            let plan = if isolated_task {
+                LimaIsolatedTaskLauncher.compile(&compile_request)?
+            } else {
+                self.inner.sandbox_launcher.compile(&compile_request)?
+            };
             if !plan.compiled.enforced
                 || plan.compiled.backend
                     == hyper_term_protocol::SandboxBackendKind::TestOnlyUnenforced
@@ -904,6 +949,189 @@ impl DaemonState {
         self.inner.artifacts.read(&accepted).map_err(Into::into)
     }
 
+    /// Runs an explicitly approved shell operation in a Tier 2 VM and retains
+    /// its exact-commit result for later review or discard. This method never
+    /// applies changes to the user's workspace.
+    pub fn dispatch_isolated_task(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        runner: &LimaTaskRunner,
+        cancelled: &AtomicBool,
+    ) -> Result<IsolatedTaskReceipt, DaemonError> {
+        let record = self.operation(operation_id)?;
+        validate_operation_scope(&record, task_id, expected_revision)?;
+        if record.state != OperationState::Authorized {
+            return Err(DaemonError::OperationNotAuthorized(record.state));
+        }
+        if !record
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == ISOLATED_TASK_CAPABILITY)
+        {
+            return Err(DaemonError::IsolatedTaskCapabilityRequired);
+        }
+        if runner.task_timeout().as_millis() > ISOLATED_TASK_WALL_TIME_MS as u128
+            || runner.max_output_bytes() as u64 > ISOLATED_TASK_MAX_OUTPUT_BYTES
+        {
+            return Err(DaemonError::IsolatedRunnerPolicyMismatch);
+        }
+        if lock(&self.inner.isolated_results)?.contains_key(&operation_id) {
+            return Err(DaemonError::IsolatedResultAlreadyExists(operation_id));
+        }
+        let OperationAction::Shell { .. } = record.action else {
+            return Err(DaemonError::UnsupportedTerminalAction);
+        };
+        let authorized = self.consume_authorized_sandbox(&record)?;
+        if authorized.plan.compiled.backend != hyper_term_protocol::SandboxBackendKind::LimaVm
+            || authorized.plan.compiled.profile.enforcement != SandboxEnforcement::IsolatedTask
+        {
+            cleanup_scratch_directory(&authorized.scratch_directory);
+            return Err(DaemonError::IsolatedRunnerPolicyMismatch);
+        }
+        if let Err(error) = self.transition(
+            task_id,
+            operation_id,
+            expected_revision,
+            OperationState::Dispatching,
+            Actor::System,
+            Some("one-use Tier 2 lease consumed before VM materialization".into()),
+        ) {
+            cleanup_scratch_directory(&authorized.scratch_directory);
+            return Err(error);
+        }
+        let started_at_ms = now_ms()?;
+        let command = authorized.plan.command.clone();
+        let workspace = command
+            .cwd
+            .as_deref()
+            .ok_or(DaemonError::SandboxWorkingDirectoryRequired)?;
+        let environment =
+            match self
+                .inner
+                .isolated_worktree_manager
+                .create(&IsolatedWorktreeRequest {
+                    source_workspace: workspace.to_path_buf(),
+                    state_root: authorized.scratch_directory.clone(),
+                    task_id: operation_id.to_string(),
+                    revision: Some("HEAD".into()),
+                }) {
+                Ok(environment) => environment,
+                Err(error) => {
+                    cleanup_scratch_directory(&authorized.scratch_directory);
+                    let _ = self.transition(
+                        task_id,
+                        operation_id,
+                        expected_revision + 1,
+                        OperationState::Failed,
+                        Actor::System,
+                        Some(format!("Tier 2 worktree materialization failed: {error}")),
+                    );
+                    return Err(error.into());
+                }
+            };
+        let mut argv = Vec::with_capacity(command.env.len() + command.args.len() + 2);
+        if !command.env.is_empty() {
+            argv.push("/usr/bin/env".into());
+            argv.extend(
+                command
+                    .env
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}")),
+            );
+        }
+        argv.push(command.program.clone());
+        argv.extend(command.args.clone());
+        let receipt = match runner.run(
+            &self.inner.isolated_worktree_manager,
+            &environment,
+            &IsolatedTaskRequest { argv },
+            cancelled,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = self.inner.isolated_worktree_manager.destroy(&environment);
+                cleanup_scratch_directory(&authorized.scratch_directory);
+                let _ = self.record_sandbox_receipt(
+                    task_id,
+                    operation_id,
+                    expected_revision + 1,
+                    &authorized.plan.compiled,
+                    started_at_ms,
+                    now_ms().unwrap_or(started_at_ms),
+                    SandboxOutcome::Unknown,
+                    None,
+                );
+                let _ = self.transition(
+                    task_id,
+                    operation_id,
+                    expected_revision + 1,
+                    OperationState::Failed,
+                    Actor::System,
+                    Some(format!("Tier 2 execution failed closed: {error}")),
+                );
+                return Err(error.into());
+            }
+        };
+        let (outcome, state) = match (&receipt.termination, receipt.exit_code) {
+            (IsolatedTaskTermination::Exited, Some(0)) => {
+                (SandboxOutcome::Succeeded, OperationState::Succeeded)
+            }
+            (IsolatedTaskTermination::Cancelled, _) => {
+                (SandboxOutcome::Denied, OperationState::Cancelled)
+            }
+            (IsolatedTaskTermination::TimedOut | IsolatedTaskTermination::Signaled, _) => {
+                (SandboxOutcome::Violated, OperationState::Violated)
+            }
+            (IsolatedTaskTermination::Exited, _) => {
+                (SandboxOutcome::Failed, OperationState::Failed)
+            }
+        };
+        let previous = lock(&self.inner.isolated_results)?.insert(
+            operation_id,
+            IsolatedResult {
+                environment,
+                scratch_directory: authorized.scratch_directory,
+            },
+        );
+        debug_assert!(previous.is_none());
+        self.record_sandbox_receipt(
+            task_id,
+            operation_id,
+            expected_revision + 1,
+            &authorized.plan.compiled,
+            receipt.started_at_ms,
+            receipt.finished_at_ms,
+            outcome,
+            receipt.exit_code.and_then(|code| u32::try_from(code).ok()),
+        )?;
+        self.transition(
+            task_id,
+            operation_id,
+            expected_revision + 1,
+            state,
+            Actor::System,
+            Some(format!(
+                "Tier 2 result retained for review: {} changed files, inventory {}",
+                receipt.changes.changed_files.len(),
+                receipt.changes.inventory_sha256
+            )),
+        )?;
+        Ok(receipt)
+    }
+
+    pub fn discard_isolated_result(&self, operation_id: OperationId) -> Result<(), DaemonError> {
+        let result = lock(&self.inner.isolated_results)?
+            .remove(&operation_id)
+            .ok_or(DaemonError::IsolatedResultMissing(operation_id))?;
+        self.inner
+            .isolated_worktree_manager
+            .destroy(&result.environment)?;
+        cleanup_scratch_directory(&result.scratch_directory);
+        Ok(())
+    }
+
     pub fn dispatch_terminal(
         &self,
         task_id: TaskId,
@@ -919,6 +1147,13 @@ impl DaemonState {
         let OperationAction::Shell { command } = record.action.clone() else {
             return Err(DaemonError::UnsupportedTerminalAction);
         };
+        if record
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == ISOLATED_TASK_CAPABILITY)
+        {
+            return Err(DaemonError::IsolatedTaskRequiresVmDispatch);
+        }
 
         let authorized = self.consume_authorized_sandbox(&record)?;
         let started_at_ms = now_ms()?;
@@ -2414,6 +2649,16 @@ pub enum DaemonError {
     WorkspaceInsideDaemonState,
     #[error("sandbox backend did not produce an enforced operating-system boundary")]
     UnenforcedSandboxBackend,
+    #[error("Tier 2 dispatch requires the sandbox.isolated_task capability")]
+    IsolatedTaskCapabilityRequired,
+    #[error("Tier 2 runner exceeds the limits approved by the permission broker")]
+    IsolatedRunnerPolicyMismatch,
+    #[error("Tier 2 operations must use VM dispatch instead of the host PTY")]
+    IsolatedTaskRequiresVmDispatch,
+    #[error("operation {0} already has a retained Tier 2 result")]
+    IsolatedResultAlreadyExists(OperationId),
+    #[error("operation {0} has no retained Tier 2 result")]
+    IsolatedResultMissing(OperationId),
     #[error("operation {0} has no live one-use sandbox authorization")]
     SandboxAuthorizationMissing(OperationId),
     #[error("operation {0} already has a live sandbox authorization")]
@@ -2440,6 +2685,10 @@ pub enum DaemonError {
     UnsafeSocketPath(PathBuf),
     #[error("daemon socket is already in use: {0}")]
     SocketInUse(PathBuf),
+    #[error(transparent)]
+    IsolatedWorktree(#[from] IsolatedWorktreeError),
+    #[error(transparent)]
+    LimaRunner(#[from] LimaRunnerError),
 }
 
 impl DaemonError {
@@ -2466,6 +2715,13 @@ impl DaemonError {
             Self::SandboxAuthorizationMissing(_)
             | Self::SandboxAuthorizationAlreadyExists(_)
             | Self::UnenforcedSandboxBackend
+            | Self::IsolatedTaskCapabilityRequired
+            | Self::IsolatedRunnerPolicyMismatch
+            | Self::IsolatedTaskRequiresVmDispatch
+            | Self::IsolatedResultAlreadyExists(_)
+            | Self::IsolatedResultMissing(_)
+            | Self::IsolatedWorktree(_)
+            | Self::LimaRunner(_)
             | Self::Sandbox(_)
             | Self::SandboxLease(_) => "sandbox_error",
             Self::InvalidBoundedText { .. }

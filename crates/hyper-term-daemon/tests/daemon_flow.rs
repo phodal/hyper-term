@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,9 @@ use hyper_term_protocol::{
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
+
+#[cfg(target_os = "macos")]
+use hyper_term_sandbox::{LimaImage, LimaRunnerConfig, LimaTaskRunner};
 
 #[cfg(target_os = "macos")]
 fn shell(script: &str, cwd: &Path) -> OperationAction {
@@ -47,6 +51,134 @@ fn propose_shell(
             vec!["shell".into()],
         )
         .expect("propose operation")
+}
+
+#[cfg(target_os = "macos")]
+fn run_git(cwd: &Path, arguments: &[&str]) {
+    let output = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(cwd)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn fake_lima_runner(root: &Path) -> (LimaTaskRunner, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = root.join("limactl");
+    let log = root.join("limactl.log");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nfor argument in \"$@\"; do\n  case \"$argument\" in validate|start|shell|stop|delete) action=\"$argument\"; break;; esac\ndone\nprintf '%s\\n' \"$action\" >> '{}'\nif [ \"$action\" = shell ]; then\n  printf 'isolated only\\n' > \"$LIMA_HOME/../worktree/generated.txt\"\n  printf 'tier2 stream\\n'\nfi\n",
+        log.display()
+    );
+    std::fs::write(&executable, script).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let image = root.join("image.qcow2");
+    std::fs::write(&image, b"local pinned image").unwrap();
+    let config = LimaRunnerConfig {
+        image: LimaImage {
+            path: image,
+            sha256: Sha256::digest(b"local pinned image")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            arch: "aarch64".into(),
+        },
+        vm_type: "vz".into(),
+        cpus: 2,
+        memory_mib: 1_024,
+        disk_gib: 4,
+        start_timeout: Duration::from_secs(2),
+        task_timeout: Duration::from_secs(2),
+        max_output_bytes: 64 * 1024,
+    };
+    (
+        LimaTaskRunner::with_executable(executable, config).unwrap(),
+        log,
+    )
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_workspace() {
+    let directory = tempdir().unwrap();
+    let workspace = directory.path().join("repository");
+    std::fs::create_dir(&workspace).unwrap();
+    run_git(&workspace, &["init", "-q"]);
+    run_git(&workspace, &["config", "user.name", "Hyper Term Test"]);
+    run_git(
+        &workspace,
+        &["config", "user.email", "hyper-term@example.invalid"],
+    );
+    std::fs::write(workspace.join("README.md"), "source\n").unwrap();
+    run_git(&workspace, &["add", "."]);
+    run_git(&workspace, &["commit", "-qm", "fixture"]);
+
+    let state = DaemonState::open(directory.path().join("daemon-state")).unwrap();
+    let task_id = state.create_task("isolated task".into()).unwrap();
+    let operation = state
+        .propose_operation(
+            task_id,
+            OperationKind::Shell,
+            shell("printf generated > generated.txt", &workspace),
+            "run in an exact-commit VM".into(),
+            RiskClass::WorkspaceWrite,
+            vec!["shell".into(), "sandbox.isolated_task".into()],
+        )
+        .unwrap();
+    let authorized = state
+        .decide_permission(
+            task_id,
+            operation.operation_id,
+            operation.revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    assert!(matches!(
+        state.dispatch_terminal(
+            task_id,
+            operation.operation_id,
+            authorized.revision,
+            TerminalSize::default()
+        ),
+        Err(DaemonError::IsolatedTaskRequiresVmDispatch)
+    ));
+
+    let (runner, log) = fake_lima_runner(directory.path());
+    let receipt = state
+        .dispatch_isolated_task(
+            task_id,
+            operation.operation_id,
+            authorized.revision,
+            &runner,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(receipt.stdout, "tier2 stream\n");
+    assert_eq!(receipt.changes.changed_files.len(), 1);
+    assert_eq!(
+        receipt.changes.changed_files[0].path,
+        Path::new("generated.txt")
+    );
+    assert!(!workspace.join("generated.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "validate\nstart\nshell\nstop\ndelete\n"
+    );
+    state
+        .discard_isolated_result(operation.operation_id)
+        .unwrap();
+    assert!(matches!(
+        state.discard_isolated_result(operation.operation_id),
+        Err(DaemonError::IsolatedResultMissing(id)) if id == operation.operation_id
+    ));
 }
 
 #[test]

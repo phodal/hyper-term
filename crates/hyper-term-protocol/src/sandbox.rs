@@ -77,6 +77,7 @@ pub enum SandboxEnforcement {
 #[serde(rename_all = "snake_case")]
 pub enum SandboxBackendKind {
     MacOsSeatbelt,
+    LimaVm,
     LinuxBubblewrap,
     WindowsRestrictedToken,
     TestOnlyUnenforced,

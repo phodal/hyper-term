@@ -503,6 +503,7 @@ fn audited_command(
 pub(crate) fn sandbox_permission_profile(plan: &SandboxLaunchPlan) -> String {
     let backend = match plan.compiled.backend {
         SandboxBackendKind::MacOsSeatbelt => "macos-seatbelt",
+        SandboxBackendKind::LimaVm => "lima-vm",
         SandboxBackendKind::LinuxBubblewrap => "linux-bubblewrap",
         SandboxBackendKind::WindowsRestrictedToken => "windows-restricted-token",
         SandboxBackendKind::TestOnlyUnenforced => "test-only-unenforced",

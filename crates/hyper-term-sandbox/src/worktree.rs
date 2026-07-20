@@ -15,6 +15,8 @@ const MAX_SOURCE_FILES: usize = 50_000;
 const MAX_SOURCE_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CHANGED_FILES: usize = 4_096;
+const MAX_CHANGED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A request to materialize one immutable Git commit as a private Tier 2 input.
 ///
@@ -48,6 +50,35 @@ pub struct IsolatedWorktree {
     pub environment_root: PathBuf,
     pub manifest_path: PathBuf,
     pub manifest: IsolatedWorktreeManifest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolatedChangeKind {
+    Added,
+    Deleted,
+    Modified,
+    TypeChanged,
+    Untracked,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolatedChange {
+    pub kind: IsolatedChangeKind,
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub content_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolatedChangeReport {
+    pub environment_id: String,
+    pub source_revision: String,
+    pub changed_files: Vec<IsolatedChange>,
+    pub changed_bytes: u64,
+    pub inventory_sha256: String,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +205,39 @@ impl IsolatedWorktreeManager {
         )?;
         fs::remove_dir_all(&canonical_environment_root)?;
         Ok(())
+    }
+
+    /// Inventories the result without following links or reading outside the worktree.
+    ///
+    /// This is deliberately a review artifact, not an apply operation. A later
+    /// permission-gated acceptance step must revalidate the receipt before it
+    /// writes anything into the user's workspace.
+    pub fn inspect_changes(
+        &self,
+        environment: &IsolatedWorktree,
+    ) -> Result<IsolatedChangeReport, IsolatedWorktreeError> {
+        verify_live_environment(environment)?;
+        let tracked = self.git(
+            &environment.manifest.worktree,
+            [
+                OsStr::new("diff"),
+                OsStr::new("--name-status"),
+                OsStr::new("-z"),
+                OsStr::new("--no-renames"),
+                OsStr::new("HEAD"),
+                OsStr::new("--"),
+            ],
+        )?;
+        let untracked = self.git(
+            &environment.manifest.worktree,
+            [
+                OsStr::new("ls-files"),
+                OsStr::new("--others"),
+                OsStr::new("--exclude-standard"),
+                OsStr::new("-z"),
+            ],
+        )?;
+        build_change_report(environment, &tracked.stdout, &untracked.stdout)
     }
 
     fn remove_registered_worktree(
@@ -322,6 +386,12 @@ pub enum IsolatedWorktreeError {
     SourceTooLarge,
     #[error("materialized worktree does not exactly match the source commit")]
     WorktreeNotClean,
+    #[error("isolated result exceeds {MAX_CHANGED_FILES} changed files")]
+    TooManyChangedFiles,
+    #[error("isolated result exceeds {MAX_CHANGED_BYTES} changed bytes")]
+    ChangedResultTooLarge,
+    #[error("unsupported isolated result entry: {0}")]
+    UnsupportedChange(String),
     #[error("refusing unsafe isolated-environment cleanup at {0}")]
     UnsafeCleanup(PathBuf),
     #[error("isolated-environment manifest does not match the live handle")]
@@ -344,6 +414,145 @@ struct TreeEntry {
     mode: u32,
     object_id: String,
     path: PathBuf,
+}
+
+fn verify_live_environment(environment: &IsolatedWorktree) -> Result<(), IsolatedWorktreeError> {
+    let stored = read_manifest(&environment.manifest_path)?;
+    if stored != environment.manifest
+        || environment.manifest.worktree != environment.environment_root.join("worktree")
+    {
+        return Err(IsolatedWorktreeError::ManifestMismatch);
+    }
+    let canonical_root = fs::canonicalize(&environment.environment_root)?;
+    let canonical_worktree = fs::canonicalize(&environment.manifest.worktree)?;
+    if !canonical_worktree.starts_with(&canonical_root) {
+        return Err(IsolatedWorktreeError::ManifestMismatch);
+    }
+    Ok(())
+}
+
+fn build_change_report(
+    environment: &IsolatedWorktree,
+    tracked: &[u8],
+    untracked: &[u8],
+) -> Result<IsolatedChangeReport, IsolatedWorktreeError> {
+    let mut changes = Vec::new();
+    let tracked_fields = tracked
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if tracked_fields.len() % 2 != 0 {
+        return Err(IsolatedWorktreeError::UnsupportedChange(
+            "malformed Git name-status output".into(),
+        ));
+    }
+    for pair in tracked_fields.chunks_exact(2) {
+        let status = std::str::from_utf8(pair[0])
+            .map_err(|_| IsolatedWorktreeError::UnsupportedChange("non-UTF-8 Git status".into()))?;
+        let kind = match status {
+            "A" => IsolatedChangeKind::Added,
+            "D" => IsolatedChangeKind::Deleted,
+            "M" => IsolatedChangeKind::Modified,
+            "T" => IsolatedChangeKind::TypeChanged,
+            value => return Err(IsolatedWorktreeError::UnsupportedChange(value.into())),
+        };
+        changes.push(inspect_change(environment, pair[1], kind)?);
+    }
+    for path in untracked
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+    {
+        changes.push(inspect_change(
+            environment,
+            path,
+            IsolatedChangeKind::Untracked,
+        )?);
+    }
+    if changes.len() > MAX_CHANGED_FILES {
+        return Err(IsolatedWorktreeError::TooManyChangedFiles);
+    }
+    changes.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut changed_bytes = 0_u64;
+    let mut inventory = Sha256::new();
+    for change in &changes {
+        changed_bytes = changed_bytes
+            .checked_add(change.bytes)
+            .ok_or(IsolatedWorktreeError::ChangedResultTooLarge)?;
+        if changed_bytes > MAX_CHANGED_BYTES {
+            return Err(IsolatedWorktreeError::ChangedResultTooLarge);
+        }
+        inventory.update(format!("{:?}", change.kind).as_bytes());
+        inventory.update([0]);
+        inventory.update(change.path.to_string_lossy().as_bytes());
+        inventory.update([0]);
+        inventory.update(change.bytes.to_le_bytes());
+        inventory.update([0]);
+        if let Some(digest) = &change.content_sha256 {
+            inventory.update(digest.as_bytes());
+        }
+        inventory.update([0]);
+    }
+    Ok(IsolatedChangeReport {
+        environment_id: environment.manifest.environment_id.clone(),
+        source_revision: environment.manifest.source_revision.clone(),
+        changed_files: changes,
+        changed_bytes,
+        inventory_sha256: encode_hex(inventory.finalize().as_slice()),
+    })
+}
+
+fn inspect_change(
+    environment: &IsolatedWorktree,
+    path_bytes: &[u8],
+    kind: IsolatedChangeKind,
+) -> Result<IsolatedChange, IsolatedWorktreeError> {
+    let path_text = std::str::from_utf8(path_bytes)
+        .map_err(|_| IsolatedWorktreeError::UnsupportedChange("non-UTF-8 result path".into()))?;
+    let path = PathBuf::from(path_text);
+    validate_source_path(&path)?;
+    if kind == IsolatedChangeKind::Deleted {
+        return Ok(IsolatedChange {
+            kind,
+            path,
+            bytes: 0,
+            content_sha256: None,
+        });
+    }
+    let target = environment.manifest.worktree.join(&path);
+    let metadata = fs::symlink_metadata(&target)?;
+    let contents = if metadata.is_file() {
+        if metadata.len() > MAX_CHANGED_BYTES {
+            return Err(IsolatedWorktreeError::ChangedResultTooLarge);
+        }
+        fs::read(&target)?
+    } else if metadata.file_type().is_symlink() {
+        let link = fs::read_link(&target)?;
+        let parent = target.parent().ok_or_else(|| {
+            IsolatedWorktreeError::UnsafeSymlink(path.to_string_lossy().into_owned())
+        })?;
+        if link.is_absolute()
+            || lexical_normalize(parent, &link)
+                .is_none_or(|resolved| !resolved.starts_with(&environment.manifest.worktree))
+        {
+            return Err(IsolatedWorktreeError::UnsafeSymlink(
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+        link.as_os_str().to_string_lossy().as_bytes().to_vec()
+    } else {
+        return Err(IsolatedWorktreeError::UnsupportedChange(
+            path.to_string_lossy().into_owned(),
+        ));
+    };
+    if contents.len() as u64 > MAX_CHANGED_BYTES {
+        return Err(IsolatedWorktreeError::ChangedResultTooLarge);
+    }
+    Ok(IsolatedChange {
+        kind,
+        path,
+        bytes: contents.len() as u64,
+        content_sha256: Some(encode_hex(Sha256::digest(&contents).as_slice())),
+    })
 }
 
 fn canonical_git_root(
@@ -1070,5 +1279,45 @@ mod tests {
                 .count()
                 == 1
         );
+    }
+
+    #[test]
+    fn inventories_modified_deleted_and_untracked_results_without_applying_them() {
+        let (temporary, repository) = repository();
+        let manager = IsolatedWorktreeManager::discover().unwrap();
+        let environment = manager
+            .create(&IsolatedWorktreeRequest {
+                source_workspace: repository.clone(),
+                state_root: temporary.path().join("state"),
+                task_id: "review".into(),
+                revision: None,
+            })
+            .unwrap();
+        fs::write(
+            environment.manifest.worktree.join("README.md"),
+            "isolated result\n",
+        )
+        .unwrap();
+        fs::remove_file(environment.manifest.worktree.join("src/data.bin")).unwrap();
+        fs::write(
+            environment.manifest.worktree.join("new.txt"),
+            "new result\n",
+        )
+        .unwrap();
+
+        let report = manager.inspect_changes(&environment).unwrap();
+        assert_eq!(report.changed_files.len(), 3);
+        assert_eq!(report.changed_files[0].path, Path::new("README.md"));
+        assert_eq!(report.changed_files[0].kind, IsolatedChangeKind::Modified);
+        assert_eq!(report.changed_files[1].path, Path::new("new.txt"));
+        assert_eq!(report.changed_files[1].kind, IsolatedChangeKind::Untracked);
+        assert_eq!(report.changed_files[2].path, Path::new("src/data.bin"));
+        assert_eq!(report.changed_files[2].kind, IsolatedChangeKind::Deleted);
+        assert_eq!(report.inventory_sha256.len(), 64);
+        assert_eq!(
+            fs::read_to_string(repository.join("README.md")).unwrap(),
+            "committed\n"
+        );
+        manager.destroy(&environment).unwrap();
     }
 }
