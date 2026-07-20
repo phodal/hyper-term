@@ -19,6 +19,15 @@ diagnostics and completion come from a Rust-supervised Deno LSP process against
 the current artifact's private snapshot. Draft updates travel as bounded LSP
 document changes, not filesystem writes.
 
+The conversation follows a response-first density model: assistant prose is
+unboxed, reasoning and tool activity are grouped into compact disclosures, and
+the active Goal is one summary row until expanded. The reading surface and
+composer stretch with the window instead of preserving a narrow fixed rail. The
+composer keeps commands and Skills at the leading edge while provider-owned
+model and reasoning controls sit beside Send. Controls are rendered only when a
+real provider capability exists; attachment, voice, and permission affordances
+must not be simulated by inert chrome.
+
 Each structured Agent session also receives Hyper Term as a digest-pinned stdio
 MCP server. Its Diff and GenUI tools operate only on bounded request data. The
 Deno LSP tool sees a private per-session text snapshot created by Rust, not the
