@@ -41,6 +41,10 @@ const max_agent_prompt_bytes: usize = 16 * 1024;
 const max_agent_config_options: usize = 4;
 const max_agent_config_choices: usize = 24;
 const max_agent_commands: usize = 24;
+const max_agent_tier2_results: usize = 4;
+const max_agent_tier2_files: usize = 12;
+const max_agent_tier2_path_bytes: usize = 256;
+const max_agent_tier2_diff_bytes: usize = 6 * 1024;
 const max_agent_capability_id_bytes: usize = 128;
 const max_agent_capability_label_bytes: usize = 192;
 const ui_font_id: canvas.FontId = canvas.min_registered_font_id;
@@ -55,6 +59,10 @@ pub const agent_poll_timer_key_base: u64 = 0x4854_4600;
 pub const agent_permission_effect_key_base: u64 = 0x4854_4700;
 pub const agent_config_effect_key_base: u64 = 0x4854_4800;
 pub const agent_stream_effect_key_base: u64 = 0x4854_4900;
+pub const agent_tier2_results_effect_key_base: u64 = 0x4854_4a00;
+pub const agent_tier2_preview_effect_key_base: u64 = 0x4854_4b00;
+pub const agent_tier2_review_effect_key_base: u64 = 0x4854_4c00;
+pub const agent_tier2_discard_effect_key_base: u64 = 0x4854_4d00;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -199,6 +207,44 @@ pub const AgentOperationState = enum {
 };
 
 pub const AgentDecision = enum { none, reject_once, cancelled, other };
+
+pub const AgentTier2FileView = struct {
+    path_storage: [max_agent_tier2_path_bytes]u8 = [_]u8{0} ** max_agent_tier2_path_bytes,
+    path_len: usize = 0,
+    kind_storage: [16]u8 = [_]u8{0} ** 16,
+    kind_len: usize = 0,
+    bytes: u64 = 0,
+
+    pub fn path(file: *const AgentTier2FileView) []const u8 {
+        return file.path_storage[0..file.path_len];
+    }
+
+    pub fn kind(file: *const AgentTier2FileView) []const u8 {
+        return file.kind_storage[0..file.kind_len];
+    }
+};
+
+pub const AgentTier2ResultView = struct {
+    source_operation_id_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
+    source_operation_id_len: usize = 0,
+    changed_bytes: u64 = 0,
+    files: [max_agent_tier2_files]AgentTier2FileView = [_]AgentTier2FileView{.{}} ** max_agent_tier2_files,
+    file_count: usize = 0,
+    files_truncated: bool = false,
+    has_acceptance: bool = false,
+    acceptance_operation_id_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
+    acceptance_operation_id_len: usize = 0,
+    acceptance_revision: u64 = 0,
+    acceptance_state: AgentOperationState = .proposed,
+
+    pub fn sourceOperationId(result: *const AgentTier2ResultView) []const u8 {
+        return result.source_operation_id_storage[0..result.source_operation_id_len];
+    }
+
+    pub fn acceptanceOperationId(result: *const AgentTier2ResultView) []const u8 {
+        return result.acceptance_operation_id_storage[0..result.acceptance_operation_id_len];
+    }
+};
 
 pub const AgentBlockView = struct {
     id: u64 = 0,
@@ -493,6 +539,17 @@ pub const Model = struct {
     agent_command_count: usize = 0,
     agent_config_in_flight_session_id: u8 = 0,
     agent_command_picker_open: bool = false,
+    agent_tier2_results: [max_agent_tier2_results]AgentTier2ResultView = [_]AgentTier2ResultView{.{}} ** max_agent_tier2_results,
+    agent_tier2_result_count: usize = 0,
+    agent_tier2_projection_session_id: u8 = 0,
+    agent_tier2_results_in_flight_session_id: u8 = 0,
+    agent_tier2_action_in_flight_session_id: u8 = 0,
+    agent_tier2_preview_source_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
+    agent_tier2_preview_source_len: usize = 0,
+    agent_tier2_diff_storage: [max_agent_tier2_diff_bytes]u8 = [_]u8{0} ** max_agent_tier2_diff_bytes,
+    agent_tier2_diff_len: usize = 0,
+    agent_tier2_diff_truncated: bool = false,
+    agent_tier2_preview_ready: bool = false,
 
     /// Read by update, token, and derived-binding code rather than bound
     /// directly by the declarative view.
@@ -543,12 +600,25 @@ pub const Model = struct {
         "agent_config_option_count",
         "agent_commands",
         "agent_config_in_flight_session_id",
+        "agent_tier2_results",
+        "agent_tier2_result_count",
+        "agent_tier2_projection_session_id",
+        "agent_tier2_results_in_flight_session_id",
+        "agent_tier2_action_in_flight_session_id",
+        "agent_tier2_preview_source_storage",
+        "agent_tier2_preview_source_len",
+        "agent_tier2_diff_storage",
+        "agent_tier2_diff_len",
+        "agent_tier2_diff_truncated",
+        "agent_tier2_preview_ready",
         "terminalReady",
         "terminalUrl",
         "genUiWorkbenchUrl",
         "hasGenUiArtifact",
         "hasEditableAgentArtifact",
         "agentError",
+        "agentTier2Results",
+        "agentTier2Diff",
     };
 
     pub fn openSessions(model: *const Model) []const Session {
@@ -745,6 +815,14 @@ pub const Model = struct {
         return model.agent_commands[0..model.agent_command_count];
     }
 
+    pub fn agentTier2Results(model: *const Model) []const AgentTier2ResultView {
+        return model.agent_tier2_results[0..model.agent_tier2_result_count];
+    }
+
+    pub fn agentTier2Diff(model: *const Model) []const u8 {
+        return model.agent_tier2_diff_storage[0..model.agent_tier2_diff_len];
+    }
+
     pub fn openAgentConfigChoices(model: *const Model) []const AgentConfigChoiceView {
         for (model.agent_config_options[0..model.agent_config_option_count]) |*option| {
             if (option.picker_open) return option.choices[0..option.choice_count];
@@ -824,6 +902,13 @@ pub const Msg = union(enum) {
     cancel_agent_effect: []const u8,
     agent_permission_decided: native_sdk.EffectResponse,
     agent_poll: native_sdk.EffectTimer,
+    agent_tier2_results_received: native_sdk.EffectResponse,
+    preview_agent_tier2_result: []const u8,
+    agent_tier2_preview_received: native_sdk.EffectResponse,
+    request_agent_tier2_review: []const u8,
+    agent_tier2_review_requested: native_sdk.EffectResponse,
+    discard_agent_tier2_result: []const u8,
+    agent_tier2_result_discarded: native_sdk.EffectResponse,
     open_agent_editor,
     close_agent_editor,
     agent_split_resized: f32,
@@ -835,7 +920,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -904,6 +989,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .agent_poll => |timer| {
             if (timer.outcome == .fired) requestActiveAgentStream(model, fx);
         },
+        .agent_tier2_results_received => |response| applyAgentTier2ResultsResponse(model, response),
+        .preview_agent_tier2_result => |operation_id| requestAgentTier2Preview(model, operation_id, fx),
+        .agent_tier2_preview_received => |response| applyAgentTier2PreviewResponse(model, response),
+        .request_agent_tier2_review => |operation_id| requestAgentTier2Review(model, operation_id, fx),
+        .agent_tier2_review_requested => |response| applyAgentTier2ReviewResponse(model, response, fx),
+        .discard_agent_tier2_result => |operation_id| requestAgentTier2Discard(model, operation_id, fx),
+        .agent_tier2_result_discarded => |response| applyAgentTier2DiscardResponse(model, response, fx),
         .open_agent_editor => {
             if (model.hasEditableAgentArtifact()) {
                 model.agent_editor_open_session_id = model.active_session_id;
@@ -978,11 +1070,21 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         cancelAgentStream(model, session_id, fx);
         fx.cancel(agent_permission_effect_key_base + session_id);
         fx.cancel(agent_config_effect_key_base + session_id);
+        fx.cancel(agent_tier2_results_effect_key_base + session_id);
+        fx.cancel(agent_tier2_preview_effect_key_base + session_id);
+        fx.cancel(agent_tier2_review_effect_key_base + session_id);
+        fx.cancel(agent_tier2_discard_effect_key_base + session_id);
         if (model.agent_permission_in_flight_session_id == session_id) {
             model.agent_permission_in_flight_session_id = 0;
         }
         if (model.agent_config_in_flight_session_id == session_id) {
             model.agent_config_in_flight_session_id = 0;
+        }
+        if (model.agent_tier2_results_in_flight_session_id == session_id) {
+            model.agent_tier2_results_in_flight_session_id = 0;
+        }
+        if (model.agent_tier2_action_in_flight_session_id == session_id) {
+            model.agent_tier2_action_in_flight_session_id = 0;
         }
     }
 
@@ -1100,6 +1202,109 @@ fn writeAgentConfigUrl(model: *const Model, session_id: u8, storage: []u8) ?[]co
     ) catch null;
 }
 
+fn writeAgentTier2Url(
+    model: *const Model,
+    session_id: u8,
+    suffix: []const u8,
+    storage: []u8,
+) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(
+        storage,
+        "{s}/agent/session/tier2{s}?token={s}&session_id={d}",
+        .{ origin, suffix, token, session_id },
+    ) catch null;
+}
+
+fn requestAgentTier2Results(model: *Model, session_id: u8, fx: *Effects) void {
+    if (session_id != model.active_session_id or
+        model.activeSession().mode != .agent or
+        model.agent_tier2_results_in_flight_session_id != 0) return;
+    var url_storage: [agent_effect_url_capacity + 32]u8 = undefined;
+    const request_url = writeAgentTier2Url(model, session_id, "", &url_storage) orelse return;
+    fx.fetch(.{
+        .key = agent_tier2_results_effect_key_base + session_id,
+        .url = request_url,
+        .timeout_ms = 4_000,
+        .on_response = Effects.responseMsg(.agent_tier2_results_received),
+    });
+    model.agent_tier2_results_in_flight_session_id = session_id;
+}
+
+fn requestAgentTier2Preview(model: *Model, operation_id: []const u8, fx: *Effects) void {
+    if (!validOperationId(operation_id)) return;
+    if (model.agent_tier2_preview_ready and
+        std.mem.eql(u8, model.agent_tier2_preview_source_storage[0..model.agent_tier2_preview_source_len], operation_id))
+    {
+        clearAgentTier2Preview(model);
+        return;
+    }
+    if (model.agent_tier2_action_in_flight_session_id != 0 or
+        findAgentTier2Result(model, operation_id) == null) return;
+    const session_id = model.active_session_id;
+    var url_storage: [agent_effect_url_capacity + 32]u8 = undefined;
+    const request_url = writeAgentTier2Url(model, session_id, "/preview", &url_storage) orelse return;
+    var body_storage: [96]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_storage, "{{\"source_operation_id\":\"{s}\"}}", .{operation_id}) catch return;
+    copyAgentTier2PreviewSource(model, operation_id);
+    model.agent_tier2_preview_ready = false;
+    model.agent_tier2_diff_len = 0;
+    model.agent_tier2_diff_truncated = false;
+    fx.fetch(.{
+        .key = agent_tier2_preview_effect_key_base + session_id,
+        .method = .POST,
+        .url = request_url,
+        .body = body,
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_tier2_preview_received),
+    });
+    model.agent_tier2_action_in_flight_session_id = session_id;
+}
+
+fn requestAgentTier2Review(model: *Model, operation_id: []const u8, fx: *Effects) void {
+    const result = findAgentTier2Result(model, operation_id) orelse return;
+    if (!model.agent_tier2_preview_ready or result.has_acceptance or
+        model.agent_tier2_action_in_flight_session_id != 0 or
+        !std.mem.eql(u8, model.agent_tier2_preview_source_storage[0..model.agent_tier2_preview_source_len], operation_id)) return;
+    const session_id = model.active_session_id;
+    var url_storage: [agent_effect_url_capacity + 32]u8 = undefined;
+    const request_url = writeAgentTier2Url(model, session_id, "/review", &url_storage) orelse return;
+    var body_storage: [96]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_storage, "{{\"source_operation_id\":\"{s}\"}}", .{operation_id}) catch return;
+    fx.fetch(.{
+        .key = agent_tier2_review_effect_key_base + session_id,
+        .method = .POST,
+        .url = request_url,
+        .body = body,
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_tier2_review_requested),
+    });
+    model.agent_tier2_action_in_flight_session_id = session_id;
+}
+
+fn requestAgentTier2Discard(model: *Model, operation_id: []const u8, fx: *Effects) void {
+    const result = findAgentTier2Result(model, operation_id) orelse return;
+    if (result.has_acceptance or model.agent_tier2_action_in_flight_session_id != 0) return;
+    const session_id = model.active_session_id;
+    var url_storage: [agent_effect_url_capacity + 32]u8 = undefined;
+    const request_url = writeAgentTier2Url(model, session_id, "/discard", &url_storage) orelse return;
+    var body_storage: [96]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_storage, "{{\"source_operation_id\":\"{s}\"}}", .{operation_id}) catch return;
+    fx.fetch(.{
+        .key = agent_tier2_discard_effect_key_base + session_id,
+        .method = .POST,
+        .url = request_url,
+        .body = body,
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_tier2_result_discarded),
+    });
+    model.agent_tier2_action_in_flight_session_id = session_id;
+}
+
 fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
     if (response.key <= agent_start_effect_key_base) return;
     const raw_session_id = response.key - agent_start_effect_key_base;
@@ -1196,7 +1401,7 @@ fn requestAgentPermission(model: *Model, operation_id: []const u8, decision: []c
     model.agent_error_len = 0;
 }
 
-fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectResponse, _: *Effects) void {
+fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
     const session_id = effectSessionId(response.key, agent_permission_effect_key_base) orelse return;
     if (model.agent_permission_in_flight_session_id == session_id) {
         model.agent_permission_in_flight_session_id = 0;
@@ -1209,6 +1414,7 @@ fn applyAgentPermissionResponse(model: *Model, response: native_sdk.EffectRespon
         return;
     }
     model.agent_turn_status = .running;
+    requestAgentTier2Results(model, session_id, fx);
 }
 
 fn toggleAgentConfigPicker(model: *Model, index: u8) void {
@@ -1447,6 +1653,243 @@ const AgentCapabilitiesResponseWire = struct {
     capabilities: AgentCapabilitiesWire,
 };
 
+const AgentTier2FileWire = struct {
+    kind: []const u8,
+    path: []const u8,
+    bytes: u64,
+};
+
+const AgentTier2AcceptanceWire = struct {
+    operation_id: []const u8,
+    operation_revision: u64,
+    state: []const u8,
+};
+
+const AgentTier2ResultWire = struct {
+    source_operation_id: []const u8,
+    changed_bytes: u64,
+    changed_files: []const AgentTier2FileWire,
+    acceptance: ?AgentTier2AcceptanceWire = null,
+};
+
+const AgentTier2ResultsWire = struct {
+    results: []const AgentTier2ResultWire,
+};
+
+const AgentTier2PreviewHunkWire = struct {
+    patch: []const u8,
+    truncated: bool = false,
+};
+
+const AgentTier2PreviewChangeWire = struct {
+    target_path: []const u8,
+    hunks: []const AgentTier2PreviewHunkWire,
+    truncated: bool = false,
+};
+
+const AgentTier2PreviewWire = struct {
+    source_operation_id: []const u8,
+    changes: []const AgentTier2PreviewChangeWire,
+    truncated: bool = false,
+};
+
+fn applyAgentTier2ResultsResponse(model: *Model, response: native_sdk.EffectResponse) void {
+    const session_id = effectSessionId(response.key, agent_tier2_results_effect_key_base) orelse return;
+    if (model.agent_tier2_results_in_flight_session_id == session_id) {
+        model.agent_tier2_results_in_flight_session_id = 0;
+    }
+    if (session_id != model.active_session_id) return;
+    if (response.outcome != .ok or response.status != 200 or response.truncated) {
+        setAgentError(model, "Tier 2 review results could not be refreshed");
+        return;
+    }
+    const parsed = std.json.parseFromSlice(
+        AgentTier2ResultsWire,
+        std.heap.page_allocator,
+        response.body,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        setAgentError(model, "Tier 2 review results were invalid");
+        return;
+    };
+    defer parsed.deinit();
+    projectAgentTier2Results(model, session_id, parsed.value.results);
+}
+
+fn projectAgentTier2Results(model: *Model, session_id: u8, results: []const AgentTier2ResultWire) void {
+    for (&model.agent_tier2_results) |*result| result.* = .{};
+    model.agent_tier2_result_count = 0;
+    var cursor = results.len;
+    while (cursor > 0 and model.agent_tier2_result_count < max_agent_tier2_results) {
+        cursor -= 1;
+        const wire = results[cursor];
+        if (!validOperationId(wire.source_operation_id)) continue;
+        const result = &model.agent_tier2_results[model.agent_tier2_result_count];
+        copyTier2Id(
+            &result.source_operation_id_storage,
+            &result.source_operation_id_len,
+            wire.source_operation_id,
+        );
+        result.changed_bytes = wire.changed_bytes;
+        for (wire.changed_files) |file| {
+            if (result.file_count == max_agent_tier2_files) {
+                result.files_truncated = true;
+                break;
+            }
+            if (file.path.len == 0 or file.path.len > max_agent_tier2_path_bytes or
+                !std.unicode.utf8ValidateSlice(file.path)) continue;
+            const target = &result.files[result.file_count];
+            copyTier2Text(&target.path_storage, &target.path_len, file.path);
+            copyTier2Text(&target.kind_storage, &target.kind_len, file.kind);
+            target.bytes = file.bytes;
+            result.file_count += 1;
+        }
+        if (wire.acceptance) |acceptance| {
+            if (validOperationId(acceptance.operation_id) and acceptance.operation_revision > 0) {
+                result.has_acceptance = true;
+                copyTier2Id(
+                    &result.acceptance_operation_id_storage,
+                    &result.acceptance_operation_id_len,
+                    acceptance.operation_id,
+                );
+                result.acceptance_revision = acceptance.operation_revision;
+                result.acceptance_state = parseAgentOperationState(acceptance.state);
+            }
+        }
+        model.agent_tier2_result_count += 1;
+    }
+    model.agent_tier2_projection_session_id = session_id;
+    if (model.agent_tier2_preview_source_len > 0 and
+        findAgentTier2Result(
+            model,
+            model.agent_tier2_preview_source_storage[0..model.agent_tier2_preview_source_len],
+        ) == null)
+    {
+        clearAgentTier2Preview(model);
+    }
+}
+
+fn applyAgentTier2PreviewResponse(model: *Model, response: native_sdk.EffectResponse) void {
+    const session_id = effectSessionId(response.key, agent_tier2_preview_effect_key_base) orelse return;
+    if (model.agent_tier2_action_in_flight_session_id == session_id) {
+        model.agent_tier2_action_in_flight_session_id = 0;
+    }
+    if (session_id != model.active_session_id) return;
+    if (response.outcome != .ok or response.status != 200 or response.truncated) {
+        clearAgentTier2Preview(model);
+        setAgentError(model, "Tier 2 Diff could not be prepared safely");
+        return;
+    }
+    const parsed = std.json.parseFromSlice(
+        AgentTier2PreviewWire,
+        std.heap.page_allocator,
+        response.body,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        clearAgentTier2Preview(model);
+        setAgentError(model, "Tier 2 Diff response was invalid");
+        return;
+    };
+    defer parsed.deinit();
+    if (!validOperationId(parsed.value.source_operation_id) or
+        !std.mem.eql(
+            u8,
+            parsed.value.source_operation_id,
+            model.agent_tier2_preview_source_storage[0..model.agent_tier2_preview_source_len],
+        )) return;
+    model.agent_tier2_diff_len = 0;
+    model.agent_tier2_diff_truncated = parsed.value.truncated;
+    for (parsed.value.changes, 0..) |change, change_index| {
+        if (change_index > 0) appendAgentTier2Diff(model, "\n");
+        appendAgentTier2Diff(model, change.target_path);
+        appendAgentTier2Diff(model, "\n");
+        for (change.hunks) |hunk| {
+            appendAgentTier2Diff(model, hunk.patch);
+            if (hunk.patch.len > 0 and hunk.patch[hunk.patch.len - 1] != '\n') {
+                appendAgentTier2Diff(model, "\n");
+            }
+            model.agent_tier2_diff_truncated = model.agent_tier2_diff_truncated or hunk.truncated;
+        }
+        model.agent_tier2_diff_truncated = model.agent_tier2_diff_truncated or change.truncated;
+    }
+    model.agent_tier2_preview_ready = true;
+    model.agent_error_len = 0;
+}
+
+fn applyAgentTier2ReviewResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    const session_id = effectSessionId(response.key, agent_tier2_review_effect_key_base) orelse return;
+    if (model.agent_tier2_action_in_flight_session_id == session_id) {
+        model.agent_tier2_action_in_flight_session_id = 0;
+    }
+    if (session_id != model.active_session_id) return;
+    if (response.outcome != .ok or response.status != 202 or response.truncated) {
+        setAgentError(model, "Tier 2 workspace review could not enter the permission broker");
+        return;
+    }
+    requestAgentTier2Results(model, session_id, fx);
+    requestAgentSnapshot(model, session_id, fx);
+}
+
+fn applyAgentTier2DiscardResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    const session_id = effectSessionId(response.key, agent_tier2_discard_effect_key_base) orelse return;
+    if (model.agent_tier2_action_in_flight_session_id == session_id) {
+        model.agent_tier2_action_in_flight_session_id = 0;
+    }
+    if (session_id != model.active_session_id) return;
+    if (response.outcome != .ok or response.status != 204) {
+        setAgentError(model, "Tier 2 result could not be discarded");
+        return;
+    }
+    clearAgentTier2Preview(model);
+    requestAgentTier2Results(model, session_id, fx);
+}
+
+fn findAgentTier2Result(model: *const Model, operation_id: []const u8) ?*const AgentTier2ResultView {
+    for (model.agentTier2Results()) |*result| {
+        if (std.mem.eql(u8, result.sourceOperationId(), operation_id)) return result;
+    }
+    return null;
+}
+
+fn copyAgentTier2PreviewSource(model: *Model, operation_id: []const u8) void {
+    copyTier2Id(
+        &model.agent_tier2_preview_source_storage,
+        &model.agent_tier2_preview_source_len,
+        operation_id,
+    );
+}
+
+fn clearAgentTier2Preview(model: *Model) void {
+    model.agent_tier2_preview_source_len = 0;
+    model.agent_tier2_diff_len = 0;
+    model.agent_tier2_diff_truncated = false;
+    model.agent_tier2_preview_ready = false;
+}
+
+fn appendAgentTier2Diff(model: *Model, value: []const u8) void {
+    if (model.agent_tier2_diff_len == model.agent_tier2_diff_storage.len) {
+        model.agent_tier2_diff_truncated = true;
+        return;
+    }
+    const available = model.agent_tier2_diff_storage.len - model.agent_tier2_diff_len;
+    const length = utf8BoundedLength(value, available);
+    @memcpy(model.agent_tier2_diff_storage[model.agent_tier2_diff_len..][0..length], value[0..length]);
+    model.agent_tier2_diff_len += length;
+    model.agent_tier2_diff_truncated = model.agent_tier2_diff_truncated or length < value.len;
+}
+
+fn copyTier2Id(storage: *[max_agent_operation_id_bytes]u8, length: *usize, value: []const u8) void {
+    const retained = @min(value.len, storage.len);
+    @memcpy(storage[0..retained], value[0..retained]);
+    length.* = retained;
+}
+
+fn copyTier2Text(storage: anytype, length: *usize, value: []const u8) void {
+    const retained = utf8BoundedLength(value, storage.len);
+    @memcpy(storage[0..retained], value[0..retained]);
+    length.* = retained;
+}
+
 const AgentToolContentWire = struct {
     type: []const u8,
     text: ?[]const u8 = null,
@@ -1532,6 +1975,7 @@ fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse
         return;
     }
     if (!applyAgentSnapshotPayload(model, session_id, response.body)) return;
+    requestAgentTier2Results(model, session_id, fx);
     if (model.agent_document_revision < model.agent_snapshot_resync_revision) {
         requestAgentSnapshot(model, session_id, fx);
     } else {
@@ -1565,6 +2009,11 @@ fn applyAgentStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects
         projectAgentCapabilities(model, frame.capabilities);
         if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
         if (frame.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
+        if (model.agent_turn_status == .completed or model.agent_turn_status == .failed or
+            model.agent_turn_status == .ready)
+        {
+            requestAgentTier2Results(model, session_id, fx);
+        }
         return;
     }
     if (std.mem.eql(u8, frame.type, "resync")) {
@@ -2379,6 +2828,15 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_command_count = 0;
     model.agent_config_in_flight_session_id = 0;
     model.agent_command_picker_open = false;
+    for (&model.agent_tier2_results) |*result| result.* = .{};
+    model.agent_tier2_result_count = 0;
+    model.agent_tier2_projection_session_id = session_id;
+    model.agent_tier2_results_in_flight_session_id = 0;
+    model.agent_tier2_action_in_flight_session_id = 0;
+    model.agent_tier2_preview_source_len = 0;
+    model.agent_tier2_diff_len = 0;
+    model.agent_tier2_diff_truncated = false;
+    model.agent_tier2_preview_ready = false;
     clearGenUiArtifact(model);
 }
 
@@ -2653,17 +3111,24 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
             ui.text(.{ .padding = 6, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Older activity is compacted · showing the latest {d} blocks", .{max_agent_blocks})),
             timeline,
         });
-    const content = if (!model.agent_plan_visible)
+    const content = if (model.agent_tier2_result_count == 0 and !model.agent_plan_visible)
         transcript
     else blk: {
         const goal_width: f32 = if (model.hasAgentEditor()) 360 else 560;
         break :blk ui.column(.{ .grow = 1 }, .{
             transcript,
-            ui.row(.{ .gap = 4, .padding = 4, .cross = .center }, .{
-                ui.spacer(1),
-                agentGoalNode(ui, &model.agent_plan, goal_width),
-                ui.spacer(1),
-            }),
+            if (model.agent_tier2_result_count > 0)
+                agentTier2ResultsNode(ui, model)
+            else
+                ui.el(.stack, .{}, .{}),
+            if (model.agent_plan_visible)
+                ui.row(.{ .gap = 4, .padding = 4, .cross = .center }, .{
+                    ui.spacer(1),
+                    agentGoalNode(ui, &model.agent_plan, goal_width),
+                    ui.spacer(1),
+                })
+            else
+                ui.el(.stack, .{}, .{}),
         });
     };
     if (model.hasAgentEditor()) return content;
@@ -2674,6 +3139,100 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
             .semantics = .{ .label = "Agent reading rail" },
         }, .{content}),
         ui.spacer(1),
+    });
+}
+
+fn agentTier2ResultsNode(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
+    const results = model.agentTier2Results();
+    const nodes = ui.arena.alloc(HyperTermUi.Node, results.len) catch {
+        ui.failed = true;
+        return ui.column(.{}, .{});
+    };
+    for (results, nodes) |*result, *node| {
+        node.* = agentTier2ResultNode(ui, model, result);
+        node.key = .{ .str = result.sourceOperationId() };
+    }
+    return ui.column(.{ .gap = 4, .padding = 4, .semantics = .{ .label = "Tier 2 review results" } }, .{nodes});
+}
+
+fn agentTier2ResultNode(
+    ui: *HyperTermUi,
+    model: *const Model,
+    result: *const AgentTier2ResultView,
+) HyperTermUi.Node {
+    const preview_selected = std.mem.eql(
+        u8,
+        result.sourceOperationId(),
+        model.agent_tier2_preview_source_storage[0..model.agent_tier2_preview_source_len],
+    );
+    const preview_ready = preview_selected and model.agent_tier2_preview_ready;
+    const busy = model.agent_tier2_action_in_flight_session_id != 0;
+    const first_file = if (result.file_count > 0) result.files[0].path() else "No accepted text files";
+    const more_files = if (result.file_count > 1)
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("+{d} more", .{result.file_count - 1}))
+    else
+        ui.el(.stack, .{}, .{});
+    const preview = if (!preview_ready)
+        ui.el(.stack, .{}, .{})
+    else
+        ui.column(.{ .gap = 5 }, .{
+            ui.scroll(.{
+                .height = 180,
+                .semantics = .{ .label = "Rust-verified Tier 2 Diff" },
+                .style_tokens = .{ .background = .surface_subtle, .radius = .md },
+            }, if (model.agent_tier2_diff_len == 0)
+                ui.text(.{ .padding = 7, .style_tokens = .{ .foreground = .text_muted } }, "No textual Diff was produced.")
+            else
+                ui.paragraph(.{ .padding = 7, .wrap = true }, &.{.{
+                    .text = model.agentTier2Diff(),
+                    .monospace = true,
+                }})),
+            if (model.agent_tier2_diff_truncated)
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Diff preview clipped to the bounded desktop budget.")
+            else
+                ui.el(.stack, .{}, .{}),
+            if (!result.has_acceptance)
+                ui.row(.{ .gap = 6, .cross = .center }, .{
+                    ui.text(.{ .grow = 1, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "Preview only · no workspace permission created"),
+                    ui.button(.{
+                        .size = .sm,
+                        .variant = .primary,
+                        .disabled = busy,
+                        .on_press = Msg{ .request_agent_tier2_review = result.sourceOperationId() },
+                    }, "Request apply approval"),
+                })
+            else
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "WorkspaceWrite approval is waiting in the transcript."),
+        });
+    return ui.el(.card, .{ .style_tokens = .{ .border_color = if (result.has_acceptance) .warning else .border } }, .{
+        ui.column(.{ .gap = 5, .padding = 7 }, .{
+            ui.row(.{ .gap = 6, .cross = .center }, .{
+                ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .info } }, "edit"),
+                ui.text(.{ .grow = 1 }, "Tier 2 changes retained for review"),
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{d} files · {d} bytes", .{ result.file_count, result.changed_bytes })),
+                ui.el(.badge, .{ .variant = .secondary, .text = if (result.has_acceptance) "approval pending" else "not applied" }, .{}),
+            }),
+            ui.row(.{ .gap = 6, .cross = .center }, .{
+                ui.text(.{ .grow = 1, .size = .sm }, first_file),
+                more_files,
+                if (!result.has_acceptance)
+                    ui.button(.{
+                        .size = .sm,
+                        .variant = .ghost,
+                        .disabled = busy,
+                        .on_press = Msg{ .discard_agent_tier2_result = result.sourceOperationId() },
+                    }, "Discard")
+                else
+                    ui.el(.stack, .{}, .{}),
+                ui.button(.{
+                    .size = .sm,
+                    .variant = .outline,
+                    .disabled = busy,
+                    .on_press = Msg{ .preview_agent_tier2_result = result.sourceOperationId() },
+                }, if (preview_ready) "Hide Diff" else if (preview_selected) "Loading Diff" else "Review Diff"),
+            }),
+            preview,
+        }),
     });
 }
 

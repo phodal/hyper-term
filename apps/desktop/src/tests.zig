@@ -57,6 +57,13 @@ fn widgetCount(widget: canvas.Widget) usize {
     return count;
 }
 
+fn pendingFetchIndexByKey(fx: *main.Effects, key: u64) ?usize {
+    for (0..fx.pendingFetchCount()) |index| {
+        if (fx.pendingFetchAt(index).?.key == key) return index;
+    }
+    return null;
+}
+
 test "default session is an ordinary terminal" {
     var model = main.initialModel();
     try testing.expectEqualStrings("hidden_inset", @tagName(main.shell_scene.windows[0].titlebar));
@@ -399,7 +406,9 @@ test "Agent patches observed during a snapshot force a follow-up resync" {
         .body = "{\"session_id\":2,\"status\":\"running\",\"document\":{\"revision\":4,\"blocks\":[]}}",
     } }, &fx);
 
-    try testing.expectEqual(before + 1, fx.pendingFetchCount());
+    try testing.expectEqual(before + 2, fx.pendingFetchCount());
+    try testing.expect(pendingFetchIndexByKey(&fx, main.agent_tier2_results_effect_key_base + 2) != null);
+    try testing.expect(pendingFetchIndexByKey(&fx, main.agent_snapshot_effect_key_base + 2) != null);
     try testing.expectEqual(@as(u64, 5), model.agent_snapshot_resync_revision);
 }
 
@@ -456,8 +465,7 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     model.agent_composer_buffer.set("Explain the PTY boundary");
     main.update(&model, .send_agent_prompt, &fx);
 
-    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
-    const request = fx.pendingFetchAt(1).?;
+    const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_turn_effect_key_base + 2).?).?;
     try testing.expectEqual(std.http.Method.POST, request.method);
     try testing.expectEqualStrings(
         "http://127.0.0.1:55321/agent/session/turn?token=abcdef0123456789abcdef0123456789&session_id=2",
@@ -506,8 +514,7 @@ test "ACP composer renders provider capabilities and routes configuration throug
     tree = try buildTree(arena, &model);
     const deep = findAnyByText(tree.root, "Deep").?;
     main.update(&model, tree.msgForPointer(deep.id, .up).?, &fx);
-    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
-    const request = fx.pendingFetchAt(1).?;
+    const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_config_effect_key_base + 2).?).?;
     try testing.expectEqual(std.http.Method.POST, request.method);
     try testing.expect(std.mem.endsWith(u8, request.url, "/agent/session/config?token=abcdef0123456789abcdef0123456789&session_id=2"));
     try testing.expectEqualStrings(
@@ -770,8 +777,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     const reject = findByText(tree.root, .button, "Reject").?;
     main.update(&model, tree.msgForPointer(reject.id, .up).?, &fx);
     try testing.expect(model.agentPermissionBusy());
-    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
-    const request = fx.pendingFetchAt(1).?;
+    const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
     try testing.expectEqual(std.http.Method.POST, request.method);
     try testing.expectEqualStrings(
         "http://127.0.0.1:55321/agent/session/permission?token=abcdef0123456789abcdef0123456789&session_id=2",
@@ -1069,7 +1075,7 @@ test "read-only MCP approvals expose an exact Allow once action" {
     try testing.expect(!containsText(tree.root, "Allow unavailable until Rust can enforce"));
     const allow = findByText(tree.root, .button, "Allow once").?;
     main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);
-    const request = fx.pendingFetchAt(1).?;
+    const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
     try testing.expectEqualStrings(
         "{\"operation_id\":\"44444444-4444-4444-8444-444444444444\",\"expected_revision\":3,\"decision\":\"allow_once\"}",
         request.body,
@@ -1113,11 +1119,78 @@ test "reviewed Tier 2 workspace edits expose a compact exact approval" {
     try testing.expect(!containsText(tree.root, "Proposal-only safety gate"));
     const allow = findByText(tree.root, .button, "Allow once").?;
     main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);
-    const request = fx.pendingFetchAt(1).?;
+    const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
     try testing.expectEqualStrings(
         "{\"operation_id\":\"55555555-5555-4555-8555-555555555555\",\"expected_revision\":3,\"decision\":\"allow_once\"}",
         request.body,
     );
+}
+
+test "Tier 2 results show a bounded Diff before creating workspace approval" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    const source_operation_id = "66666666-6666-4666-8666-666666666666";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"session_id\":2,\"status\":\"completed\",\"document\":{\"revision\":1,\"blocks\":[]}}",
+    } }, &fx);
+    try testing.expect(pendingFetchIndexByKey(&fx, main.agent_tier2_results_effect_key_base + 2) != null);
+
+    main.update(&model, .{ .agent_tier2_results_received = .{
+        .key = main.agent_tier2_results_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"results":[{"source_operation_id":"66666666-6666-4666-8666-666666666666","changed_bytes":17,"changed_files":[{"kind":"modified","path":"src/main.rs","bytes":17,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}
+        ,
+    } }, &fx);
+
+    try testing.expectEqual(@as(usize, 1), model.agentTier2Results().len);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "Tier 2 changes retained for review"));
+    try testing.expect(containsText(tree.root, "src/main.rs"));
+    const review_diff = findByText(tree.root, .button, "Review Diff").?;
+    main.update(&model, tree.msgForPointer(review_diff.id, .up).?, &fx);
+    const preview_request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_tier2_preview_effect_key_base + 2).?).?;
+    try testing.expect(std.mem.endsWith(u8, preview_request.url, "/agent/session/tier2/preview?token=abcdef0123456789abcdef0123456789&session_id=2"));
+    try testing.expectEqualStrings(
+        "{\"source_operation_id\":\"66666666-6666-4666-8666-666666666666\"}",
+        preview_request.body,
+    );
+    try testing.expect(!model.agentPermissionBusy());
+
+    main.update(&model, .{ .agent_tier2_preview_received = .{
+        .key = main.agent_tier2_preview_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"source_operation_id":"66666666-6666-4666-8666-666666666666","result_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","changes":[{"target_path":"src/main.rs","hunks":[{"id":"h1","base_start":1,"base_lines":1,"proposed_start":1,"proposed_lines":1,"patch":"@@ -1 +1 @@\n-old\n+generated\n","truncated":false}],"truncated":false}],"truncated":false}
+        ,
+    } }, &fx);
+
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "+generated"));
+    try testing.expect(containsText(tree.root, "Preview only · no workspace permission created"));
+    const request_approval = findByText(tree.root, .button, "Request apply approval").?;
+    main.update(&model, tree.msgForPointer(request_approval.id, .up).?, &fx);
+    const approval_request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_tier2_review_effect_key_base + 2).?).?;
+    try testing.expect(std.mem.endsWith(u8, approval_request.url, "/agent/session/tier2/review?token=abcdef0123456789abcdef0123456789&session_id=2"));
+    try testing.expectEqualStrings(
+        "{\"source_operation_id\":\"66666666-6666-4666-8666-666666666666\"}",
+        approval_request.body,
+    );
+    try testing.expectEqualStrings(source_operation_id, model.agentTier2Results()[0].sourceOperationId());
 }
 
 test "untrusted operation metadata cannot enter trusted approval chrome" {

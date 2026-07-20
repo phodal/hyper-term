@@ -192,6 +192,12 @@ struct IsolatedAcceptance {
     binding_digest: String,
 }
 
+struct PreparedIsolatedAcceptance {
+    workspace: PathBuf,
+    plan: WorkspaceApplySetPlan,
+    binding_digest: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct StoredIsolatedAcceptance {
     schema_version: u32,
@@ -206,6 +212,14 @@ struct StoredIsolatedAcceptance {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsolatedAcceptanceReview {
     pub operation: OperationRecord,
+    pub source_operation_id: OperationId,
+    pub result_digest: String,
+    pub target_paths: Vec<String>,
+    pub changes: Vec<IsolatedAcceptanceChange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IsolatedAcceptancePreview {
     pub source_operation_id: OperationId,
     pub result_digest: String,
     pub target_paths: Vec<String>,
@@ -1320,39 +1334,10 @@ impl DaemonState {
                 source_operation_id,
             ));
         }
-        let result = lock(&self.inner.isolated_results)?
-            .get(&source_operation_id)
-            .cloned()
-            .ok_or(DaemonError::IsolatedResultMissing(source_operation_id))?;
-        let mut requests = Vec::new();
-        for change in &result.receipt.changes.changed_files {
-            if !matches!(
-                change.kind,
-                hyper_term_sandbox::IsolatedChangeKind::Added
-                    | hyper_term_sandbox::IsolatedChangeKind::Modified
-                    | hyper_term_sandbox::IsolatedChangeKind::Untracked
-            ) {
-                return Err(DaemonError::UnsupportedIsolatedAcceptance);
-            }
-            let digest = change
-                .content_sha256
-                .as_deref()
-                .ok_or(DaemonError::IsolatedResultDigestMismatch)?;
-            let bytes =
-                self.read_isolated_result_file(source_operation_id, &change.path, digest)?;
-            let content =
-                String::from_utf8(bytes).map_err(|_| DaemonError::UnsupportedIsolatedAcceptance)?;
-            requests.push((change.path.to_string_lossy().into_owned(), content));
-        }
-        let workspace = result.environment.manifest.source_workspace.clone();
-        let plan = prepare_workspace_apply_set(&workspace, requests)
-            .map_err(|error| DaemonError::WorkspaceApply(error.to_string()))?;
-        let binding_digest = isolated_acceptance_digest(
-            source_operation_id,
-            &result.receipt.changes.inventory_sha256,
-            &workspace,
-            &plan,
-        )?;
+        let prepared = self.prepare_isolated_result_acceptance(task_id, source_operation_id)?;
+        let workspace = prepared.workspace;
+        let plan = prepared.plan;
+        let binding_digest = prepared.binding_digest;
         let target_paths = plan
             .plans
             .iter()
@@ -1403,6 +1388,77 @@ impl DaemonState {
         self.isolated_acceptance_review(operation.operation_id)
     }
 
+    pub fn preview_isolated_result_acceptance(
+        &self,
+        task_id: TaskId,
+        source_operation_id: OperationId,
+    ) -> Result<IsolatedAcceptancePreview, DaemonError> {
+        let prepared = self.prepare_isolated_result_acceptance(task_id, source_operation_id)?;
+        Ok(IsolatedAcceptancePreview {
+            source_operation_id,
+            result_digest: prepared.plan.result_digest.clone(),
+            target_paths: prepared
+                .plan
+                .plans
+                .iter()
+                .map(|plan| plan.target_path.clone())
+                .collect(),
+            changes: isolated_acceptance_changes(&prepared.plan),
+        })
+    }
+
+    fn prepare_isolated_result_acceptance(
+        &self,
+        task_id: TaskId,
+        source_operation_id: OperationId,
+    ) -> Result<PreparedIsolatedAcceptance, DaemonError> {
+        let source_operation = self.operation(source_operation_id)?;
+        if source_operation.task_id != task_id {
+            return Err(DaemonError::OperationTaskMismatch {
+                expected: source_operation.task_id,
+                actual: task_id,
+            });
+        }
+        let result = lock(&self.inner.isolated_results)?
+            .get(&source_operation_id)
+            .cloned()
+            .ok_or(DaemonError::IsolatedResultMissing(source_operation_id))?;
+        let mut requests = Vec::new();
+        for change in &result.receipt.changes.changed_files {
+            if !matches!(
+                change.kind,
+                hyper_term_sandbox::IsolatedChangeKind::Added
+                    | hyper_term_sandbox::IsolatedChangeKind::Modified
+                    | hyper_term_sandbox::IsolatedChangeKind::Untracked
+            ) {
+                return Err(DaemonError::UnsupportedIsolatedAcceptance);
+            }
+            let digest = change
+                .content_sha256
+                .as_deref()
+                .ok_or(DaemonError::IsolatedResultDigestMismatch)?;
+            let bytes =
+                self.read_isolated_result_file(source_operation_id, &change.path, digest)?;
+            let content =
+                String::from_utf8(bytes).map_err(|_| DaemonError::UnsupportedIsolatedAcceptance)?;
+            requests.push((change.path.to_string_lossy().into_owned(), content));
+        }
+        let workspace = result.environment.manifest.source_workspace.clone();
+        let plan = prepare_workspace_apply_set(&workspace, requests)
+            .map_err(|error| DaemonError::WorkspaceApply(error.to_string()))?;
+        let binding_digest = isolated_acceptance_digest(
+            source_operation_id,
+            &result.receipt.changes.inventory_sha256,
+            &workspace,
+            &plan,
+        )?;
+        Ok(PreparedIsolatedAcceptance {
+            workspace,
+            plan,
+            binding_digest,
+        })
+    }
+
     pub fn isolated_acceptance_review(
         &self,
         operation_id: OperationId,
@@ -1422,18 +1478,7 @@ impl DaemonState {
                 .iter()
                 .map(|plan| plan.target_path.clone())
                 .collect(),
-            changes: acceptance
-                .plan
-                .plans
-                .iter()
-                .map(|plan| IsolatedAcceptanceChange {
-                    target_path: plan.target_path.clone(),
-                    base_digest: plan.base_digest().map(str::to_owned),
-                    proposed_digest: plan.proposed_digest.clone(),
-                    before: plan.base_content().to_owned(),
-                    after: plan.proposed_content.clone(),
-                })
-                .collect(),
+            changes: isolated_acceptance_changes(&acceptance.plan),
         })
     }
 
@@ -2733,6 +2778,19 @@ fn safe_isolated_result_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(name) if name != ".git"))
+}
+
+fn isolated_acceptance_changes(plan: &WorkspaceApplySetPlan) -> Vec<IsolatedAcceptanceChange> {
+    plan.plans
+        .iter()
+        .map(|plan| IsolatedAcceptanceChange {
+            target_path: plan.target_path.clone(),
+            base_digest: plan.base_digest().map(str::to_owned),
+            proposed_digest: plan.proposed_digest.clone(),
+            before: plan.base_content().to_owned(),
+            after: plan.proposed_content.clone(),
+        })
+        .collect()
 }
 
 fn isolated_acceptance_digest(

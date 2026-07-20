@@ -650,9 +650,12 @@ gateway. Only then does ACP initialization advertise its Terminal client
 capability. Without that runner, `terminal/create` remains unadvertised rather
 than falling back to the ordinary user-owned PTY or an unenforced host process.
 
-This remains an experimental Tier 2 baseline. Recovery of a pending pre-apply
-review, a user-facing bounded patch/diff API, deletion and binary acceptance semantics,
-and a release-gated boot test using the production pinned image are still open.
+This remains an experimental Tier 2 baseline. The Agent gateway now recovers
+retained results, exposes a bounded side-effect-free Diff preview, and lets the
+Native review card request the separate workspace-apply permission only after
+the user has read that preview. Opening the Diff neither creates an operation
+nor mints a permission. Deletion and binary acceptance semantics, plus a
+release-gated boot test using the production pinned image, are still open.
 Opaque ACP provider workloads also remain on the Tier 1 control-process path
 until their credentials, dependencies, and broker channels can be staged into
 this environment without broadening its mounts.
@@ -904,8 +907,8 @@ Costs and constraints:
 
 ### Phase 4: Tier 2 environments
 
-- extend the implemented text-file acceptance operation with pending-review
-  recovery, deletion semantics, and bounded binary artifacts;
+- extend the implemented recoverable, read-before-approve text-file acceptance
+  operation with deletion semantics and bounded binary artifacts;
 - qualify the experimental Lima/VZ backend with a production pinned image,
   restart recovery, bounded patch export, and release conformance tests;
 - evaluate whether a container backend is also useful for faster lower-risk

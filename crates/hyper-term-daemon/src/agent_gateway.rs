@@ -60,7 +60,7 @@ use crate::workspace_diff::{
     select_workspace_hunks,
 };
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
-use crate::{DaemonError, DaemonState, IsolatedAcceptanceReview};
+use crate::{DaemonError, DaemonState, IsolatedAcceptancePreview, IsolatedAcceptanceReview};
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
@@ -83,6 +83,8 @@ const MAX_WORKBENCH_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EDITOR_LSP_BODY_BYTES: usize = 1024 * 1024 + 64 * 1024;
 const MAX_ARTIFACT_DRAFT_FILES: usize = 100;
 const MAX_ARTIFACT_DRAFT_SOURCE_BYTES: usize = 1024 * 1024;
+const MAX_TIER2_PREVIEW_CHANGES: usize = 32;
+const MAX_TIER2_PREVIEW_PATCH_BYTES: usize = 64 * 1024;
 const MAX_ACP_SHEBANG_BYTES: usize = 512;
 const ARTIFACT_BOOTSTRAP_MARKER: &str = "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->";
 const CODEX_NETWORK_ALLOWED_HOSTS: &[&str] = &["api.openai.com", "auth.openai.com", "chatgpt.com"];
@@ -564,17 +566,35 @@ struct AgentTier2ReviewResponse {
     operation_revision: u64,
     state: OperationState,
     result_digest: String,
-    changes: Vec<AgentTier2ReviewChangeResponse>,
+    changed_file_count: usize,
 }
 
-#[derive(Clone, Serialize)]
-struct AgentTier2ReviewChangeResponse {
+#[derive(Serialize)]
+struct AgentTier2PreviewResponse {
+    source_operation_id: OperationId,
+    result_digest: String,
+    changes: Vec<AgentTier2PreviewChangeResponse>,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+struct AgentTier2PreviewChangeResponse {
     target_path: String,
     base_digest: Option<String>,
     proposed_digest: String,
-    before: String,
-    after: String,
-    hunks: Vec<WorkspaceDiffHunk>,
+    hunks: Vec<AgentTier2PreviewHunkResponse>,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+struct AgentTier2PreviewHunkResponse {
+    id: String,
+    base_start: usize,
+    base_lines: usize,
+    proposed_start: usize,
+    proposed_lines: usize,
+    patch: String,
+    truncated: bool,
 }
 
 pub async fn spawn_agent_gateway(
@@ -710,6 +730,7 @@ pub async fn spawn_agent_gateway(
         .route("/agent/session/config", post(set_session_config))
         .route("/agent/session/permission", post(decide_permission))
         .route("/agent/session/tier2", get(tier2_results))
+        .route("/agent/session/tier2/preview", post(preview_tier2_result))
         .route("/agent/session/tier2/review", post(propose_tier2_review))
         .route("/agent/session/tier2/discard", post(discard_tier2_result))
         .route(
@@ -1878,6 +1899,35 @@ async fn tier2_results(
         Err(_) => status_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Tier 2 review results could not be read",
+        ),
+    }
+}
+
+async fn preview_tier2_result(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let request = match serde_json::from_slice::<AgentTier2SourceRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return status_response(StatusCode::BAD_REQUEST, "Tier 2 result is invalid"),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.preview_tier2_result(session_id, request.source_operation_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::OK, &response),
+        Ok(Err(SessionError::NotFound)) => {
+            status_response(StatusCode::NOT_FOUND, "Tier 2 result is unavailable")
+        }
+        Ok(Err(_)) | Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Tier 2 Diff could not be prepared safely",
         ),
     }
 }
@@ -3788,6 +3838,23 @@ impl AgentGatewayRuntime {
         Ok(AgentTier2ResultsResponse { results })
     }
 
+    fn preview_tier2_result(
+        &self,
+        session_id: u16,
+        source_operation_id: OperationId,
+    ) -> Result<AgentTier2PreviewResponse, SessionError> {
+        let session = self.session(session_id)?;
+        let preview = self
+            .config
+            .daemon
+            .preview_isolated_result_acceptance(session.task_id, source_operation_id)
+            .map_err(|error| match error {
+                DaemonError::IsolatedResultMissing(_) => SessionError::NotFound,
+                _ => SessionError::Daemon,
+            })?;
+        Ok(tier2_preview_response(preview))
+    }
+
     fn propose_tier2_review(
         &self,
         session_id: u16,
@@ -4743,30 +4810,72 @@ fn workspace_apply_response(
     }
 }
 
-fn tier2_review_response(review: IsolatedAcceptanceReview) -> AgentTier2ReviewResponse {
-    let changes = review
-        .changes
-        .into_iter()
-        .map(|change| {
-            let diff = review_workspace_diff(&change.target_path, &change.before, &change.after);
-            AgentTier2ReviewChangeResponse {
-                target_path: change.target_path,
-                base_digest: change.base_digest,
-                proposed_digest: change.proposed_digest,
-                before: change.before,
-                after: change.after,
-                hunks: diff.hunks,
+fn tier2_preview_response(preview: IsolatedAcceptancePreview) -> AgentTier2PreviewResponse {
+    let mut remaining_patch_bytes = MAX_TIER2_PREVIEW_PATCH_BYTES;
+    let mut response_truncated = preview.changes.len() > MAX_TIER2_PREVIEW_CHANGES;
+    let mut changes = Vec::new();
+    for change in preview.changes.into_iter().take(MAX_TIER2_PREVIEW_CHANGES) {
+        let diff = review_workspace_diff(&change.target_path, &change.before, &change.after);
+        let mut change_truncated = false;
+        let mut hunks = Vec::new();
+        let hunk_count = diff.hunks.len();
+        for (hunk_index, hunk) in diff.hunks.into_iter().enumerate() {
+            let retained_bytes = utf8_prefix_len(&hunk.patch, remaining_patch_bytes);
+            let truncated = retained_bytes < hunk.patch.len();
+            hunks.push(AgentTier2PreviewHunkResponse {
+                id: hunk.id,
+                base_start: hunk.base_start,
+                base_lines: hunk.base_lines,
+                proposed_start: hunk.proposed_start,
+                proposed_lines: hunk.proposed_lines,
+                patch: hunk.patch[..retained_bytes].to_owned(),
+                truncated,
+            });
+            remaining_patch_bytes = remaining_patch_bytes.saturating_sub(retained_bytes);
+            if truncated || (remaining_patch_bytes == 0 && hunk_index + 1 < hunk_count) {
+                change_truncated = true;
+                response_truncated = true;
+                break;
             }
-        })
-        .collect();
+        }
+        changes.push(AgentTier2PreviewChangeResponse {
+            target_path: change.target_path,
+            base_digest: change.base_digest,
+            proposed_digest: change.proposed_digest,
+            hunks,
+            truncated: change_truncated,
+        });
+        if remaining_patch_bytes == 0 {
+            response_truncated = true;
+            break;
+        }
+    }
+    AgentTier2PreviewResponse {
+        source_operation_id: preview.source_operation_id,
+        result_digest: preview.result_digest,
+        changes,
+        truncated: response_truncated,
+    }
+}
+
+fn tier2_review_response(review: IsolatedAcceptanceReview) -> AgentTier2ReviewResponse {
+    let changed_file_count = review.changes.len();
     AgentTier2ReviewResponse {
         source_operation_id: review.source_operation_id,
         operation_id: review.operation.operation_id,
         operation_revision: review.operation.revision,
         state: review.operation.state,
         result_digest: review.result_digest,
-        changes,
+        changed_file_count,
     }
+}
+
+fn utf8_prefix_len(value: &str, capacity: usize) -> usize {
+    let mut end = value.len().min(capacity);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -6161,19 +6270,32 @@ mod tests {
             "source_operation_id": operation.operation_id,
         }))
         .unwrap();
+        let preview_path = format!("/agent/session/tier2/preview?token={token}&session_id=6");
+        let (status, body) =
+            request_path(gateway.address(), &preview_path, "POST", &source_body).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let preview: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preview["changes"][0]["target_path"], "generated.txt");
+        assert!(
+            preview["changes"][0]["hunks"][0]["patch"]
+                .as_str()
+                .unwrap()
+                .contains("from tier2")
+        );
+        let (_, body) = request_path(gateway.address(), &tier2_path, "GET", b"").await;
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["results"][0]
+                .get("acceptance")
+                .is_none(),
+            "opening a Diff must not create an approval"
+        );
         let review_path = format!("/agent/session/tier2/review?token={token}&session_id=6");
         let (status, body) =
             request_path(gateway.address(), &review_path, "POST", &source_body).await;
         assert_eq!(status, StatusCode::ACCEPTED.as_u16());
         let review: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(review["state"], "waiting_human");
-        assert_eq!(review["changes"][0]["target_path"], "generated.txt");
-        assert!(
-            review["changes"][0]["hunks"][0]["patch"]
-                .as_str()
-                .unwrap()
-                .contains("from tier2")
-        );
+        assert_eq!(review["changed_file_count"], 1);
 
         let discard_path = format!("/agent/session/tier2/discard?token={token}&session_id=6");
         assert_eq!(

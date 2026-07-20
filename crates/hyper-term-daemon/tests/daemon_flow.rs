@@ -207,6 +207,24 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
             .unwrap(),
         b"isolated only\n"
     );
+    let preview = state
+        .preview_isolated_result_acceptance(task_id, operation.operation_id)
+        .unwrap();
+    assert_eq!(preview.target_paths, vec!["generated.txt"]);
+    assert_eq!(preview.changes[0].before, "");
+    assert_eq!(preview.changes[0].after, "isolated only\n");
+    assert!(
+        state
+            .isolated_acceptance_reviews(task_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        std::fs::read_dir(state_path.join("isolated-acceptances"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
     let acceptance = state
         .propose_isolated_result_acceptance(task_id, operation.operation_id)
         .unwrap();
