@@ -188,6 +188,8 @@ pub enum BlockPayload {
         kind: OperationKind,
         summary: String,
         risk: RiskClass,
+        #[serde(default)]
+        required_capabilities: Vec<String>,
         state: OperationState,
     },
     Approval {

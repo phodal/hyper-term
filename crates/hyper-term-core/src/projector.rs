@@ -115,6 +115,7 @@ impl BlockProjector {
                 action: _,
                 summary,
                 risk,
+                required_capabilities,
                 ..
             } => {
                 let operation_id = event
@@ -131,6 +132,7 @@ impl BlockProjector {
                         kind: kind.clone(),
                         summary: summary.clone(),
                         risk: *risk,
+                        required_capabilities: required_capabilities.clone(),
                         state: OperationState::Proposed,
                     },
                 );
@@ -799,6 +801,69 @@ mod tests {
             .snapshot()
             .unwrap();
         assert_eq!(first.semantic_digest, second.semantic_digest);
+    }
+
+    #[test]
+    fn operation_capabilities_and_permission_options_survive_projection() {
+        let task_id = TaskId::new();
+        let operation_id = OperationId::new();
+        let events = [
+            event(
+                1,
+                task_id,
+                Some(operation_id),
+                DomainEvent::OperationProposed {
+                    revision: 1,
+                    kind: OperationKind::Shell,
+                    action: hyper_term_protocol::OperationAction::Shell {
+                        command: hyper_term_protocol::TerminalCommand {
+                            program: "cargo".into(),
+                            args: vec!["test".into()],
+                            cwd: None,
+                            env: Default::default(),
+                        },
+                    },
+                    summary: "Agent terminal in Tier 2: cargo test".into(),
+                    risk: RiskClass::ExternalEffect,
+                    required_capabilities: vec!["shell".into(), "sandbox.isolated_task".into()],
+                },
+            ),
+            event(
+                2,
+                task_id,
+                Some(operation_id),
+                DomainEvent::PermissionRequested {
+                    operation_revision: 3,
+                    prompt: "Allow this exact operation once?".into(),
+                    options: vec![
+                        PermissionDecision::AllowOnce,
+                        PermissionDecision::RejectOnce,
+                        PermissionDecision::Cancelled,
+                    ],
+                },
+            ),
+        ];
+
+        let snapshot = BlockProjector::replay(task_id, &events)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert!(snapshot.blocks.iter().any(|block| matches!(
+            &block.payload,
+            BlockPayload::Operation {
+                operation_id: id,
+                required_capabilities,
+                ..
+            } if *id == operation_id && required_capabilities == &["shell", "sandbox.isolated_task"]
+        )));
+        assert!(snapshot.blocks.iter().any(|block| matches!(
+            &block.payload,
+            BlockPayload::Approval {
+                operation_id: id,
+                options,
+                ..
+            } if *id == operation_id && options.contains(&PermissionDecision::AllowOnce)
+        )));
     }
 
     #[test]

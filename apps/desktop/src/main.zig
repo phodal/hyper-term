@@ -212,7 +212,7 @@ pub const AgentOperationState = enum {
     unknown_execution,
 };
 
-pub const AgentDecision = enum { none, reject_once, cancelled, other };
+pub const AgentDecision = enum { none, allow_once, reject_once, cancelled, other };
 
 pub const AgentTier2FileView = struct {
     path_storage: [max_agent_tier2_path_bytes]u8 = [_]u8{0} ** max_agent_tier2_path_bytes,
@@ -302,6 +302,8 @@ pub const AgentBlockView = struct {
     diff_file_count: usize = 0,
     diff_files_truncated: bool = false,
     operation_revision: u64 = 0,
+    allow_once_available: bool = false,
+    tier2_isolated: bool = false,
     risk: AgentRisk = .unknown,
     state: AgentOperationState = .proposed,
     decision: AgentDecision = .none,
@@ -368,7 +370,8 @@ pub const AgentBlockView = struct {
     }
 
     pub fn canAllowOnce(block: *const AgentBlockView) bool {
-        return block.isApprovalPending() and (block.isBrokeredMcpReview() or block.isWorkspaceReview());
+        return block.isApprovalPending() and block.allow_once_available and
+            (block.isBrokeredMcpReview() or block.isWorkspaceReview() or block.isTier2TerminalReview());
     }
 
     pub fn isBrokeredMcpReview(block: *const AgentBlockView) bool {
@@ -379,6 +382,18 @@ pub const AgentBlockView = struct {
     pub fn isWorkspaceReview(block: *const AgentBlockView) bool {
         return block.risk == .workspace_write and
             std.mem.eql(u8, block.operationKindLabel(), "Workspace edit");
+    }
+
+    pub fn isTier2TerminalReview(block: *const AgentBlockView) bool {
+        return block.tier2_isolated and block.risk == .external_effect and
+            std.mem.eql(u8, block.operationKindLabel(), "Shell command");
+    }
+
+    pub fn approvalBoundaryLabel(block: *const AgentBlockView) []const u8 {
+        if (block.isWorkspaceReview()) return "Rust-verified Diff · durable apply";
+        if (block.isBrokeredMcpReview()) return "Brokered read-only tool · receipt recorded";
+        if (block.isTier2TerminalReview()) return "Isolated Tier 2 command · no ordinary PTY access";
+        return "Allow unavailable until Rust can enforce this effect.";
     }
 
     pub fn operationId(block: *const AgentBlockView) []const u8 {
@@ -416,6 +431,7 @@ pub const AgentBlockView = struct {
     pub fn approvalTitle(block: *const AgentBlockView) []const u8 {
         return switch (block.decision) {
             .none => "Approval required",
+            .allow_once => "Allowed once",
             .reject_once => "Request rejected",
             .cancelled => "Request cancelled",
             .other => "Approval resolved",
@@ -425,6 +441,7 @@ pub const AgentBlockView = struct {
     pub fn decisionLabel(block: *const AgentBlockView) []const u8 {
         return switch (block.decision) {
             .none => "pending",
+            .allow_once => "allowed once",
             .reject_once => "rejected once",
             .cancelled => "cancelled",
             .other => "resolved",
@@ -2165,7 +2182,9 @@ const AgentBlockWire = struct {
         summary: ?[]const u8 = null,
         risk: ?[]const u8 = null,
         state: ?[]const u8 = null,
+        required_capabilities: ?[]const []const u8 = null,
         prompt: ?[]const u8 = null,
+        options: ?[]const []const u8 = null,
         decision: ?[]const u8 = null,
         artifact: ?struct {
             artifact_id: []const u8,
@@ -2917,6 +2936,7 @@ fn projectOperationBlock(view: *AgentBlockView, block: AgentBlockWire) void {
     copyOperationId(view, block.payload.operation_id.?);
     copyOperationKind(view, operationKindLabel(block.payload.kind));
     view.risk = parseAgentRisk(block.payload.risk.?);
+    view.tier2_isolated = stringListContains(block.payload.required_capabilities, "sandbox.isolated_task");
     view.state = parseAgentOperationState(block.payload.state.?);
 }
 
@@ -2929,6 +2949,7 @@ fn projectApprovalBlock(
     copyAgentBlockContent(view, block.payload.prompt.?);
     copyOperationId(view, block.payload.operation_id.?);
     view.operation_revision = block.payload.operation_revision.?;
+    view.allow_once_available = stringListContains(block.payload.options, "allow_once");
     view.decision = parseAgentDecision(block.payload.decision);
     view.state = if (view.decision == .none) .waiting_human else .cancelled;
     view.risk = .external_effect;
@@ -2940,12 +2961,21 @@ fn projectApprovalBlock(
             !std.mem.eql(u8, candidate.payload.operation_id.?, block.payload.operation_id.?)) continue;
         if (candidate.payload.kind) |kind| copyOperationKind(view, operationKindLabel(kind));
         if (candidate.payload.risk) |risk| view.risk = parseAgentRisk(risk);
+        view.tier2_isolated = stringListContains(candidate.payload.required_capabilities, "sandbox.isolated_task");
         if (candidate.payload.state) |state| view.state = parseAgentOperationState(state);
         if (view.isWorkspaceReview() and candidate.payload.summary != null) {
             copyAgentBlockContent(view, candidate.payload.summary.?);
         }
         break;
     }
+}
+
+fn stringListContains(values: ?[]const []const u8, expected: []const u8) bool {
+    const items = values orelse return false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item, expected)) return true;
+    }
+    return false;
 }
 
 fn stableAgentBlockId(block_id: ?[]const u8, fallback_index: usize) u64 {
@@ -3031,6 +3061,7 @@ fn parseAgentOperationState(value: []const u8) AgentOperationState {
 
 fn parseAgentDecision(value: ?[]const u8) AgentDecision {
     const decision = value orelse return .none;
+    if (std.mem.eql(u8, decision, "allow_once")) return .allow_once;
     if (std.mem.eql(u8, decision, "reject_once")) return .reject_once;
     if (std.mem.eql(u8, decision, "cancelled")) return .cancelled;
     return .other;
@@ -3705,14 +3736,14 @@ fn agentApprovalNode(ui: *HyperTermUi, model: *const Model, block: *const AgentB
         ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Decision: {s}", .{block.decisionLabel()}))
     else if (block.canAllowOnce())
         ui.row(.{ .gap = 6, .cross = .center }, .{
-            ui.text(.{ .grow = 1, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (block.isWorkspaceReview()) "Rust-verified Diff · durable apply" else "Brokered read-only tool · receipt recorded"),
+            ui.text(.{ .grow = 1, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.approvalBoundaryLabel()),
             ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel"),
             ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
             ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .allow_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Allow once"),
         })
     else
         ui.row(.{ .gap = 6, .cross = .center }, .{
-            ui.text(.{ .grow = 1, .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "Allow unavailable until Rust can enforce this effect."),
+            ui.text(.{ .grow = 1, .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.approvalBoundaryLabel()),
             ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel"),
             ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
         });
