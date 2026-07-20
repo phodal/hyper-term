@@ -9,9 +9,14 @@ use std::os::unix::fs::PermissionsExt;
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, GenUiArtifactCandidate, GenUiCompileDiagnostic,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
+const LEGACY_STORED_ARTIFACT_SCHEMA_VERSION: u16 = 1;
+const STORED_ARTIFACT_SCHEMA_VERSION: u16 = 2;
 const MAX_BUNDLE_BYTES: usize = 768 * 1024;
 const MAX_CSS_BYTES: usize = 256 * 1024;
 const MAX_SOURCE_MAP_BYTES: usize = 768 * 1024;
@@ -31,6 +36,14 @@ pub(crate) struct StoredGenUiArtifact {
     pub bundle: String,
     pub css: String,
     pub source_map: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredArtifactEnvelope {
+    schema_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_source_digest: Option<String>,
+    candidate: GenUiArtifactCandidate,
 }
 
 impl ArtifactStore {
@@ -54,32 +67,10 @@ impl ArtifactStore {
             content_digest: candidate.content_digest.clone(),
             compiler: candidate.compiler.clone(),
         };
-        let encoded = serde_json::to_vec(&candidate)?;
-        if encoded.len() as u64 > MAX_STORED_ARTIFACT_BYTES {
-            return Err(ArtifactStoreError::StoredArtifactTooLarge(encoded.len()));
-        }
+        let envelope = stored_envelope(candidate)?;
+        let encoded = encode_stored_artifact(&envelope)?;
         let destination = self.path(metadata.artifact_id);
-        let temporary = self.root.join(format!(".{}.tmp", metadata.artifact_id));
-        let result = (|| {
-            let mut options = OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            file.write_all(&encoded)?;
-            file.flush()?;
-            file.sync_all()?;
-            fs::rename(&temporary, &destination)?;
-            File::open(&self.root)?.sync_all()?;
-            Ok::<(), ArtifactStoreError>(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result?;
+        write_new_artifact(&self.root, &destination, &encoded)?;
         Ok(metadata)
     }
 
@@ -88,18 +79,29 @@ impl ArtifactStore {
         accepted: &AcceptedGenUiArtifact,
     ) -> Result<StoredGenUiArtifact, ArtifactStoreError> {
         let path = self.path(accepted.artifact_id);
-        let metadata = fs::metadata(&path)?;
-        if !metadata.is_file() || metadata.len() > MAX_STORED_ARTIFACT_BYTES {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_STORED_ARTIFACT_BYTES
+        {
             return Err(ArtifactStoreError::InvalidStoredArtifact);
         }
         let mut encoded = Vec::with_capacity(metadata.len() as usize);
-        File::open(path)?
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        options
+            .open(&path)?
             .take(MAX_STORED_ARTIFACT_BYTES + 1)
             .read_to_end(&mut encoded)?;
         if encoded.len() as u64 > MAX_STORED_ARTIFACT_BYTES {
             return Err(ArtifactStoreError::InvalidStoredArtifact);
         }
-        let candidate: GenUiArtifactCandidate = serde_json::from_slice(&encoded)?;
+        let (candidate, migration_required) = decode_stored_artifact(&encoded)?;
         validate_candidate(&candidate, false)?;
         if candidate.source_revision != accepted.source_revision
             || candidate.entrypoint != accepted.entrypoint
@@ -107,6 +109,11 @@ impl ArtifactStore {
             || candidate.compiler != accepted.compiler
         {
             return Err(ArtifactStoreError::MetadataMismatch);
+        }
+        if migration_required {
+            let envelope = stored_envelope(candidate.clone())?;
+            let migrated = encode_stored_artifact(&envelope)?;
+            atomic_replace_artifact(&self.root, &path, &migrated)?;
         }
         Ok(StoredGenUiArtifact {
             metadata: accepted.clone(),
@@ -120,6 +127,115 @@ impl ArtifactStore {
     fn path(&self, artifact_id: ArtifactId) -> PathBuf {
         self.root.join(format!("{artifact_id}.json"))
     }
+}
+
+fn stored_envelope(
+    candidate: GenUiArtifactCandidate,
+) -> Result<StoredArtifactEnvelope, ArtifactStoreError> {
+    let accepted_source_digest = if candidate.source_files.is_empty() {
+        None
+    } else {
+        Some(accepted_source_digest(&candidate)?)
+    };
+    Ok(StoredArtifactEnvelope {
+        schema_version: STORED_ARTIFACT_SCHEMA_VERSION,
+        accepted_source_digest,
+        candidate,
+    })
+}
+
+fn encode_stored_artifact(
+    envelope: &StoredArtifactEnvelope,
+) -> Result<Vec<u8>, ArtifactStoreError> {
+    let encoded = serde_json::to_vec(envelope)?;
+    if encoded.len() as u64 > MAX_STORED_ARTIFACT_BYTES {
+        return Err(ArtifactStoreError::StoredArtifactTooLarge(encoded.len()));
+    }
+    Ok(encoded)
+}
+
+fn decode_stored_artifact(
+    encoded: &[u8],
+) -> Result<(GenUiArtifactCandidate, bool), ArtifactStoreError> {
+    let value: Value = serde_json::from_slice(encoded)?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .ok_or(ArtifactStoreError::InvalidStoredArtifact)?;
+    match schema_version {
+        LEGACY_STORED_ARTIFACT_SCHEMA_VERSION if value.get("candidate").is_none() => {
+            let candidate = serde_json::from_value(value)?;
+            Ok((candidate, true))
+        }
+        STORED_ARTIFACT_SCHEMA_VERSION => {
+            let envelope: StoredArtifactEnvelope = serde_json::from_value(value)?;
+            if envelope.candidate.schema_version != LEGACY_STORED_ARTIFACT_SCHEMA_VERSION {
+                return Err(ArtifactStoreError::InvalidMetadata);
+            }
+            let expected = if envelope.candidate.source_files.is_empty() {
+                None
+            } else {
+                Some(accepted_source_digest(&envelope.candidate)?)
+            };
+            if envelope.accepted_source_digest != expected {
+                return Err(ArtifactStoreError::AcceptedSourceDigestMismatch);
+            }
+            Ok((envelope.candidate, false))
+        }
+        version => Err(ArtifactStoreError::UnsupportedStoredSchema(version)),
+    }
+}
+
+fn accepted_source_digest(
+    candidate: &GenUiArtifactCandidate,
+) -> Result<String, ArtifactStoreError> {
+    let encoded = serde_json::to_vec(&(
+        "hyper-term.accepted-source",
+        LEGACY_STORED_ARTIFACT_SCHEMA_VERSION,
+        candidate.source_revision,
+        &candidate.entrypoint,
+        &candidate.source_files,
+    ))?;
+    Ok(hex_digest(Sha256::digest(encoded)))
+}
+
+fn write_new_artifact(
+    root: &Path,
+    destination: &Path,
+    encoded: &[u8],
+) -> Result<(), ArtifactStoreError> {
+    let temporary = root.join(format!(".artifact-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(encoded)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        File::open(root)?.sync_all()?;
+        Ok::<(), ArtifactStoreError>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn atomic_replace_artifact(
+    root: &Path,
+    destination: &Path,
+    encoded: &[u8],
+) -> Result<(), ArtifactStoreError> {
+    write_new_artifact(root, destination, encoded)
 }
 
 fn validate_candidate(
@@ -256,6 +372,10 @@ pub(crate) enum ArtifactStoreError {
     StoredArtifactTooLarge(usize),
     #[error("stored artifact is not a bounded regular file")]
     InvalidStoredArtifact,
+    #[error("stored artifact schema {0} is not supported")]
+    UnsupportedStoredSchema(u16),
+    #[error("stored artifact accepted-source digest does not match its source tree")]
+    AcceptedSourceDigestMismatch,
     #[error("stored artifact metadata no longer matches the accepted journal event")]
     MetadataMismatch,
 }
@@ -302,6 +422,13 @@ mod tests {
         );
         assert_eq!(stored.bundle, "bundle");
         assert_eq!(stored.source_map, "{}");
+        let encoded = fs::read(store.path(accepted.artifact_id)).unwrap();
+        let envelope: StoredArtifactEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(envelope.schema_version, STORED_ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(
+            envelope.accepted_source_digest,
+            Some(accepted_source_digest(&envelope.candidate).unwrap())
+        );
         let mode = fs::metadata(store.path(accepted.artifact_id))
             .unwrap()
             .permissions()
@@ -350,5 +477,39 @@ mod tests {
         let stored = store.read(&accepted).unwrap();
         assert!(stored.source_files.is_empty());
         assert_eq!(stored.bundle, "legacy");
+        let encoded = fs::read(store.path(accepted.artifact_id)).unwrap();
+        let envelope: StoredArtifactEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(envelope.schema_version, STORED_ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(envelope.accepted_source_digest, None);
+        assert!(envelope.candidate.source_files.is_empty());
+    }
+
+    #[test]
+    fn v2_source_identity_and_future_schema_fail_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::open(temporary.path()).unwrap();
+        let accepted = store.persist(candidate("identity")).unwrap();
+        let path = store.path(accepted.artifact_id);
+        let encoded = fs::read(&path).unwrap();
+        let mut envelope: StoredArtifactEnvelope = serde_json::from_slice(&encoded).unwrap();
+        envelope.candidate.source_files.insert(
+            "/App.tsx".into(),
+            "export default () => 'substituted';".into(),
+        );
+        fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            store.read(&accepted),
+            Err(ArtifactStoreError::AcceptedSourceDigestMismatch)
+        ));
+
+        envelope.schema_version = STORED_ARTIFACT_SCHEMA_VERSION + 1;
+        envelope.accepted_source_digest =
+            Some(accepted_source_digest(&envelope.candidate).unwrap());
+        fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            store.read(&accepted),
+            Err(ArtifactStoreError::UnsupportedStoredSchema(version))
+                if version == STORED_ARTIFACT_SCHEMA_VERSION + 1
+        ));
     }
 }
