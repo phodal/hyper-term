@@ -210,6 +210,17 @@ The package contains the Rust supervisor, Native SDK renderer, terminal and
 Workbench assets, and the pinned Deno/ACP runtime. It does not require a global
 Node.js runtime after packaging.
 
+Verify the exact assembled bundle without opening a window:
+
+```bash
+"dist/macos/Hyper Term.app/Contents/MacOS/hyper-term" --verify-bundle
+```
+
+This re-hashes the packaged Terminal, Workbench, GenUI, and ACP inventories,
+checks the bundled Deno 2.9.3 executable, and rejects missing, added, symlinked,
+or modified frontend assets. The release workflow runs the same command after
+signing and notarization and before creating each GitHub archive.
+
 ACP terminal-host requests are available only when the desktop supervisor has
 an explicitly pinned Tier 2 backend. Hyper Term never downloads a VM image and
 never falls back to the user's ordinary PTY. With Lima 2.1.1 or newer and a

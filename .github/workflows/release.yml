@@ -530,6 +530,14 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app"
           spctl --assess --type execute --verbose=4 "$app"
 
+      - name: Verify the final application bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term" \
+            --verify-bundle \
+            | grep -F "Hyper Term bundle verified:"
+
       - name: Create release archive
         shell: bash
         env:

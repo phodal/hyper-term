@@ -70,6 +70,16 @@ read-only workspace and a private writable session home. Opaque
 provider-internal execution and hermetic acceptance still require Tier 2 under
 ADR 0014.
 
+Immediately before archiving, the final Rust entry point runs
+`--verify-bundle`. This uses the paths derived from its actual `.app` location,
+not build-directory overrides. It verifies the complete Terminal and Workbench
+inventories against their Deno-generated sizes and SHA-256 digests, validates
+the GenUI runtime manifest, rechecks every ACP runtime file and both adapter
+entrypoints, and executes the packaged Deno only for an exact bounded 2.9.3
+version probe. The check rejects extra frontend files and symbolic links, so a
+successful build or signature alone cannot publish an incomplete or modified
+application bundle.
+
 The application can opt into that Tier 2 backend at launch with an explicit
 `limactl` executable, local VZ-compatible image, and pinned SHA-256. The image
 is not bundled or downloaded. ACP Terminal client capability is advertised

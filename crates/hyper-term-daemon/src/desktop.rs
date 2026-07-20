@@ -4,7 +4,7 @@
 //! authenticated loopback gateway, state paths, and the native renderer child.
 //! The renderer still never spawns shells or receives a privileged bridge.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -36,6 +36,9 @@ const ACP_PACKAGE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
 const ACP_RUNTIME_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const ACP_RUNTIME_MAX_FILES: usize = 8 * 1024;
 const ACP_RUNTIME_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+const BUNDLE_ASSET_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const BUNDLE_ASSET_MAX_FILES: usize = 1024;
+const BUNDLE_ASSET_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const DESKTOP_HELP: &str = "Hyper Term desktop host\n\nUsage: hyper-term-desktop [OPTIONS]\n\n\
 Options:\n  --ui PATH                 Native renderer executable\n  \
 --terminal-assets PATH    Built terminal renderer directory\n  \
@@ -56,6 +59,7 @@ Options:\n  --ui PATH                 Native renderer executable\n  \
 --lima PATH               Explicit limactl executable for Tier 2 tasks\n  \
 --lima-image PATH         Local VZ-compatible image for Tier 2 tasks\n  \
 --lima-image-sha256 HEX   Pinned SHA-256 for the Tier 2 image\n  \
+--verify-bundle           Verify this packaged application and exit\n  \
 -h, --help                Show this help";
 
 fn main() {
@@ -81,8 +85,21 @@ fn run() -> Result<i32, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is not available for desktop state and shell cwd".to_owned())?;
+    let verify_bundle = options.verify_bundle;
     let resolved = options.resolve(&executable, &home)?;
     resolved.validate()?;
+    if verify_bundle {
+        let report = resolved.verify_bundle(&executable)?;
+        println!(
+            "Hyper Term bundle verified: terminal={} workbench={} runtime={} acp_adapters={} deno={}",
+            report.terminal_files,
+            report.workbench_files,
+            report.runtime_files,
+            report.acp_adapters,
+            report.deno_version
+        );
+        return Ok(0);
+    }
     let tier2_runner = resolved.tier2_runner()?;
     let debug_capsule = resolved
         .bug_capsule
@@ -269,6 +286,7 @@ struct Options {
     lima: Option<PathBuf>,
     lima_image: Option<PathBuf>,
     lima_image_sha256: Option<String>,
+    verify_bundle: bool,
     help: bool,
 }
 
@@ -335,6 +353,7 @@ impl Options {
                     options.lima_image_sha256 =
                         Some(required_value(&mut arguments, "--lima-image-sha256")?);
                 }
+                Some("--verify-bundle") => options.verify_bundle = true,
                 Some("-h" | "--help") => options.help = true,
                 Some(other) => return Err(format!("unknown argument: {other}")),
                 None => return Err("desktop arguments must be valid UTF-8 option names".into()),
@@ -513,6 +532,15 @@ struct ResolvedTier2 {
     image_sha256: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct BundleVerification {
+    terminal_files: usize,
+    workbench_files: usize,
+    runtime_files: usize,
+    acp_adapters: usize,
+    deno_version: String,
+}
+
 impl ResolvedTier2 {
     fn runner(&self) -> Result<LimaTaskRunner, String> {
         let config = LimaRunnerConfig::macos_vz(LimaImage {
@@ -663,6 +691,71 @@ impl ResolvedOptions {
         Ok(())
     }
 
+    fn verify_bundle(&self, executable: &Path) -> Result<BundleVerification, String> {
+        let contents = executable
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "desktop executable is not inside a macOS bundle layout".to_owned())?;
+        let resources = contents.join("Resources");
+        let expected_ui = executable.with_file_name("hyper-term-ui");
+        let expected_mcp = executable.with_file_name("hyper-term-mcp");
+        let expected_terminal = resources.join("terminal");
+        let expected_workbench = resources.join("workbench");
+        let expected_runtime = resources.join("runtime");
+
+        if self.ui != expected_ui
+            || self.mcp.as_deref() != Some(expected_mcp.as_path())
+            || self.terminal_assets != expected_terminal
+            || self.workbench_assets.as_deref() != Some(expected_workbench.as_path())
+        {
+            return Err("bundle verification requires the packaged renderer, MCP connector, terminal, and Workbench paths".into());
+        }
+        let runtime = self.genui_runtime.as_ref().ok_or_else(|| {
+            "bundle verification requires the packaged Deno and GenUI runtime".to_owned()
+        })?;
+        if runtime.deno_executable != expected_runtime.join("deno")
+            || runtime.compiler_script != expected_runtime.join("genui-compiler.js")
+            || runtime.compiler_wasm != expected_runtime.join("esbuild.wasm")
+            || runtime.preview_shell != expected_runtime.join("genui/preview.html")
+        {
+            return Err("bundle verification requires the packaged GenUI runtime paths".into());
+        }
+
+        let terminal_files = verify_asset_manifest(
+            &expected_terminal,
+            AssetManifestKind::Frontend,
+            &["index.html"],
+        )?;
+        let workbench_files = verify_asset_manifest(
+            &expected_workbench,
+            AssetManifestKind::Frontend,
+            &[
+                "index.html",
+                "compiler.worker.js",
+                "esbuild.wasm",
+                "genui/preview.html",
+            ],
+        )?;
+        let runtime_files = verify_asset_manifest(
+            &expected_runtime,
+            AssetManifestKind::Runtime,
+            &["genui-compiler.js", "esbuild.wasm", "genui/preview.html"],
+        )?;
+        let acp_adapters = load_bundled_acp_runtime(&expected_runtime, &runtime.deno_executable)?;
+        if acp_adapters.len() != 2 {
+            return Err("bundle verification requires both packaged ACP adapters".into());
+        }
+        let deno_version = verify_bundled_deno(&runtime.deno_executable)?;
+
+        Ok(BundleVerification {
+            terminal_files,
+            workbench_files,
+            runtime_files,
+            acp_adapters: acp_adapters.len(),
+            deno_version,
+        })
+    }
+
     fn acp_providers(&self, home: &Path) -> Result<Vec<AcpAgentProviderConfig>, String> {
         let mut providers = Vec::with_capacity(3);
         if let Some(adapter) = &self.codex_acp {
@@ -751,6 +844,234 @@ struct BundledAcpFileManifest {
     path: String,
     bytes: u64,
     sha256: String,
+}
+
+#[derive(Clone, Copy)]
+enum AssetManifestKind {
+    Frontend,
+    Runtime,
+}
+
+#[derive(Deserialize)]
+struct AssetBuildManifest {
+    schema_version: u32,
+    builder: Option<AssetBuilderIdentity>,
+    runtime: Option<BundledAcpRuntimeIdentity>,
+    protocol_version: Option<u32>,
+    files: Vec<BundledAcpFileManifest>,
+}
+
+#[derive(Deserialize)]
+struct AssetBuilderIdentity {
+    runtime: String,
+    version: String,
+}
+
+fn verify_asset_manifest(
+    root: &Path,
+    kind: AssetManifestKind,
+    required_files: &[&str],
+) -> Result<usize, String> {
+    let manifest_path = root.join("build-manifest.json");
+    let manifest_metadata = std::fs::symlink_metadata(&manifest_path).map_err(|error| {
+        format!(
+            "cannot inspect asset manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    if manifest_metadata.file_type().is_symlink()
+        || !manifest_metadata.is_file()
+        || manifest_metadata.len() == 0
+        || manifest_metadata.len() > BUNDLE_ASSET_MANIFEST_MAX_BYTES
+    {
+        return Err(format!(
+            "asset manifest size is invalid: {}",
+            manifest_path.display()
+        ));
+    }
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "cannot read asset manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: AssetBuildManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "cannot parse asset manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    let identity_is_supported = match kind {
+        AssetManifestKind::Frontend
+            if manifest.runtime.is_none() && manifest.protocol_version.is_none() =>
+        {
+            manifest
+                .builder
+                .as_ref()
+                .is_some_and(|identity| identity.runtime == "deno" && identity.version == "2.9.3")
+        }
+        AssetManifestKind::Runtime
+            if manifest.builder.is_none() && manifest.protocol_version == Some(1) =>
+        {
+            manifest
+                .runtime
+                .as_ref()
+                .is_some_and(|identity| identity.name == "deno" && identity.version == "2.9.3")
+        }
+        _ => false,
+    };
+    if manifest.schema_version != 1 || !identity_is_supported {
+        return Err(format!(
+            "asset manifest identity is unsupported: {}",
+            manifest_path.display()
+        ));
+    }
+    if manifest.files.is_empty() || manifest.files.len() > BUNDLE_ASSET_MAX_FILES {
+        return Err(format!(
+            "asset manifest inventory is invalid: {}",
+            manifest_path.display()
+        ));
+    }
+
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve asset root {}: {error}", root.display()))?;
+    let mut inventoried = BTreeSet::new();
+    let mut total_bytes = 0_u64;
+    for file in &manifest.files {
+        let relative_path = validate_bundled_relative_path(&file.path)?;
+        if !is_sha256(&file.sha256) {
+            return Err(format!("asset file digest is invalid: {}", file.path));
+        }
+        total_bytes = total_bytes
+            .checked_add(file.bytes)
+            .ok_or_else(|| "asset manifest byte count overflowed".to_owned())?;
+        if total_bytes > BUNDLE_ASSET_MAX_TOTAL_BYTES {
+            return Err(format!(
+                "asset inventory exceeds its byte budget: {}",
+                root.display()
+            ));
+        }
+        let path = canonical_root.join(&relative_path);
+        let link_metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("asset file is unavailable: {}: {error}", file.path))?;
+        if link_metadata.file_type().is_symlink() {
+            return Err(format!(
+                "asset file must not be a symbolic link: {}",
+                file.path
+            ));
+        }
+        let canonical_path = path
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve asset file {}: {error}", file.path))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(format!("asset file escapes its root: {}", file.path));
+        }
+        let metadata = std::fs::metadata(&canonical_path)
+            .map_err(|error| format!("cannot inspect asset file {}: {error}", file.path))?;
+        if !metadata.is_file() || metadata.len() != file.bytes {
+            return Err(format!("asset file size changed: {}", file.path));
+        }
+        let actual = sha256_file(&canonical_path)
+            .map_err(|error| format!("cannot hash asset file {}: {error}", file.path))?;
+        if actual != file.sha256 {
+            return Err(format!("asset file digest changed: {}", file.path));
+        }
+        if !inventoried.insert(file.path.clone()) {
+            return Err(format!("asset file is duplicated: {}", file.path));
+        }
+    }
+    for required in required_files {
+        if !inventoried.contains(*required) {
+            return Err(format!(
+                "asset inventory is missing {required}: {}",
+                root.display()
+            ));
+        }
+    }
+    if matches!(kind, AssetManifestKind::Frontend) {
+        let mut actual = BTreeSet::new();
+        collect_asset_files(&canonical_root, &canonical_root, &mut actual)?;
+        actual.remove("build-manifest.json");
+        if actual != inventoried {
+            return Err(format!(
+                "frontend asset inventory does not match its directory: {}",
+                root.display()
+            ));
+        }
+    }
+    Ok(manifest.files.len())
+}
+
+fn collect_asset_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(directory).map_err(|error| {
+        format!(
+            "cannot enumerate asset directory {}: {error}",
+            directory.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| format!("cannot enumerate asset entry: {error}"))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect asset entry {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "asset directory contains a symbolic link: {}",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            collect_asset_files(root, &path, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "asset directory contains a special file: {}",
+                path.display()
+            ));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| format!("asset file escapes its root: {}", path.display()))?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| format!("asset path is not UTF-8: {}", path.display()))?;
+        if files.len() == BUNDLE_ASSET_MAX_FILES || !files.insert(relative.to_owned()) {
+            return Err(format!(
+                "asset directory inventory is invalid: {}",
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_bundled_deno(executable: &Path) -> Result<String, String> {
+    let output = Command::new(executable)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .map_err(|error| format!("cannot run packaged Deno: {error}"))?;
+    if !output.status.success() || output.stdout.len() > 4096 || output.stderr.len() > 4096 {
+        return Err("packaged Deno version probe failed or exceeded its output bound".into());
+    }
+    let version = String::from_utf8(output.stdout)
+        .map_err(|_| "packaged Deno version output is not UTF-8".to_owned())?
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    if version != "deno 2.9.3 (stable, release, aarch64-apple-darwin)"
+        && version != "deno 2.9.3 (stable, release, x86_64-apple-darwin)"
+    {
+        return Err(format!("packaged Deno version is unsupported: {version}"));
+    }
+    Ok(version)
 }
 
 fn load_bundled_acp_runtime(
@@ -1196,6 +1517,7 @@ mod tests {
             "/tmp/tier2.qcow2".into(),
             "--lima-image-sha256".into(),
             "a".repeat(64).into(),
+            "--verify-bundle".into(),
         ])
         .expect("options");
         assert_eq!(options.ui, Some(PathBuf::from("/tmp/hyper-term-ui")));
@@ -1232,6 +1554,7 @@ mod tests {
         assert_eq!(options.lima, Some(PathBuf::from("/tmp/limactl")));
         assert_eq!(options.lima_image, Some(PathBuf::from("/tmp/tier2.qcow2")));
         assert_eq!(options.lima_image_sha256, Some("a".repeat(64)));
+        assert!(options.verify_bundle);
     }
 
     #[test]
@@ -1244,6 +1567,114 @@ mod tests {
         assert!(DESKTOP_HELP.contains("--workbench-assets PATH"));
         assert!(DESKTOP_HELP.contains("--bug-capsule PATH"));
         assert!(DESKTOP_HELP.contains("--lima-image-sha256 HEX"));
+        assert!(DESKTOP_HELP.contains("--verify-bundle"));
+    }
+
+    #[test]
+    fn packaged_frontend_manifest_rejects_tampering_and_uninventoried_files() {
+        let temporary = tempfile::tempdir().expect("temporary frontend");
+        let root = temporary.path();
+        let index = root.join("index.html");
+        std::fs::write(&index, b"<main>Hyper Term</main>").expect("index");
+        write_asset_manifest(root, AssetManifestKind::Frontend, &["index.html"]);
+
+        assert_eq!(
+            verify_asset_manifest(root, AssetManifestKind::Frontend, &["index.html"])
+                .expect("verified frontend"),
+            1
+        );
+        std::fs::write(root.join("unexpected.js"), b"alert(1)").expect("unexpected asset");
+        assert!(
+            verify_asset_manifest(root, AssetManifestKind::Frontend, &["index.html"])
+                .unwrap_err()
+                .contains("does not match")
+        );
+        std::fs::remove_file(root.join("unexpected.js")).expect("remove unexpected asset");
+        std::fs::write(&index, b"<main>tampered</main>").expect("tampered index");
+        assert!(
+            verify_asset_manifest(root, AssetManifestKind::Frontend, &["index.html"])
+                .unwrap_err()
+                .contains("size changed")
+        );
+    }
+
+    #[test]
+    fn packaged_runtime_manifest_requires_the_pinned_deno_identity() {
+        let temporary = tempfile::tempdir().expect("temporary runtime");
+        let root = temporary.path();
+        std::fs::write(root.join("genui-compiler.js"), b"export {};").expect("compiler");
+        write_asset_manifest(root, AssetManifestKind::Runtime, &["genui-compiler.js"]);
+        assert_eq!(
+            verify_asset_manifest(root, AssetManifestKind::Runtime, &["genui-compiler.js"])
+                .expect("verified runtime"),
+            1
+        );
+
+        let manifest_path = root.join("build-manifest.json");
+        let manifest = std::fs::read_to_string(&manifest_path).expect("manifest");
+        std::fs::write(&manifest_path, manifest.replace("2.9.3", "2.9.2"))
+            .expect("changed runtime identity");
+        assert!(
+            verify_asset_manifest(root, AssetManifestKind::Runtime, &["genui-compiler.js"])
+                .unwrap_err()
+                .contains("identity is unsupported")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_asset_manifest_must_not_be_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary frontend");
+        let root = temporary.path();
+        std::fs::write(root.join("index.html"), b"<main>Hyper Term</main>").expect("index");
+        write_asset_manifest(root, AssetManifestKind::Frontend, &["index.html"]);
+        std::fs::rename(
+            root.join("build-manifest.json"),
+            root.join("real-build-manifest.json"),
+        )
+        .expect("move manifest");
+        symlink("real-build-manifest.json", root.join("build-manifest.json"))
+            .expect("manifest symlink");
+
+        assert!(
+            verify_asset_manifest(root, AssetManifestKind::Frontend, &["index.html"])
+                .unwrap_err()
+                .contains("manifest size is invalid")
+        );
+    }
+
+    fn write_asset_manifest(root: &Path, kind: AssetManifestKind, files: &[&str]) {
+        let files = files
+            .iter()
+            .map(|relative| {
+                let path = root.join(relative);
+                serde_json::json!({
+                    "path": relative,
+                    "bytes": std::fs::metadata(&path).expect("asset metadata").len(),
+                    "sha256": sha256_file(&path).expect("asset digest"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = match kind {
+            AssetManifestKind::Frontend => serde_json::json!({
+                "schema_version": 1,
+                "builder": { "runtime": "deno", "version": "2.9.3" },
+                "files": files,
+            }),
+            AssetManifestKind::Runtime => serde_json::json!({
+                "schema_version": 1,
+                "runtime": { "name": "deno", "version": "2.9.3" },
+                "protocol_version": 1,
+                "files": files,
+            }),
+        };
+        std::fs::write(
+            root.join("build-manifest.json"),
+            serde_json::to_vec_pretty(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest file");
     }
 
     #[test]

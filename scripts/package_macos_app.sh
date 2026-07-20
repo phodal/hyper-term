@@ -88,6 +88,8 @@ codesign \
   "$hyper_staging_app/Contents/Resources/runtime/deno"
 codesign --force --sign - "$hyper_staging_app"
 codesign --verify --deep --strict "$hyper_staging_app"
+"$hyper_staging_app/Contents/MacOS/hyper-term" --verify-bundle \
+  | grep -F "Hyper Term bundle verified:" >/dev/null
 
 hyper_bundle_executable=$(plutil -extract CFBundleExecutable raw -o - \
   "$hyper_staging_app/Contents/Info.plist")
