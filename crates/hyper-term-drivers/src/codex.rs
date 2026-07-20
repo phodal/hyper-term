@@ -18,11 +18,12 @@ use crate::codex_containment::{
 };
 use crate::{
     AgentAvailableCommand, AgentClientError, AgentDriverEvent, AgentEffectAuthorization,
-    AgentEffectKind, AgentEffectProposal, AgentSessionCapabilities, AgentSessionConfigChoice,
-    AgentSessionConfigKind, AgentSessionConfigOption, AgentSessionConfigValue,
-    DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
-    DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
-    StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
+    AgentEffectKind, AgentEffectProposal, AgentGoalStatus, AgentSessionCapabilities,
+    AgentSessionConfigChoice, AgentSessionConfigKind, AgentSessionConfigOption,
+    AgentSessionConfigValue, AgentThreadGoal, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError,
+    DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
+    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox,
+    sha256_file,
 };
 
 const MAX_PENDING_APPROVALS: usize = 128;
@@ -31,7 +32,8 @@ const MAX_BUFFERED_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CODEX_MODELS: usize = 24;
 const MAX_CODEX_REASONING_EFFORTS: usize = 16;
-const MAX_CODEX_SKILLS: usize = 24;
+// Reserve one slot in the desktop's bounded command palette for `/goal`.
+const MAX_CODEX_SKILLS: usize = 23;
 const MAX_CODEX_PLAN_ENTRIES: usize = 128;
 const HYPER_TERM_MCP_TOOLS: &[&str] = &[
     "hyper_term.genui.compile",
@@ -68,6 +70,7 @@ pub struct CodexAppServerClient {
     model_catalog: Mutex<Vec<CodexModelCapability>>,
     session_capabilities: Mutex<AgentSessionCapabilities>,
     turn_config: Mutex<CodexTurnConfig>,
+    thread_goal: Mutex<Option<AgentThreadGoal>>,
     workspace: String,
     staged_auth_file: Option<PathBuf>,
 }
@@ -127,6 +130,16 @@ struct CodexSkillWire {
     name: String,
     description: String,
     enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadGoalWire {
+    objective: String,
+    status: String,
+    token_budget: Option<i64>,
+    tokens_used: i64,
+    time_used_seconds: i64,
 }
 
 impl CodexAppServerClient {
@@ -248,6 +261,7 @@ impl CodexAppServerClient {
             model_catalog: Mutex::new(Vec::new()),
             session_capabilities: Mutex::new(AgentSessionCapabilities::default()),
             turn_config: Mutex::new(CodexTurnConfig::default()),
+            thread_goal: Mutex::new(None),
             workspace: workspace_text,
             staged_auth_file,
         })
@@ -460,7 +474,7 @@ impl CodexAppServerClient {
             model: Some(selected.model.clone()),
             reasoning_effort: Some(selected.default_reasoning_effort.clone()),
         };
-        let available_commands = self
+        let mut available_commands = self
             .request_raw(
                 "skills/list",
                 json!({"cwds": [self.workspace], "forceReload": false}),
@@ -468,6 +482,11 @@ impl CodexAppServerClient {
             )
             .and_then(normalize_codex_skills)
             .unwrap_or_default();
+        available_commands.push(AgentAvailableCommand {
+            name: "goal".into(),
+            description: "Set or clear a persistent Codex goal".into(),
+            input_hint: Some("Describe the goal, or type clear".into()),
+        });
         let capabilities = AgentSessionCapabilities {
             config_options: codex_config_options(&catalog, &turn_config)?,
             available_commands,
@@ -573,6 +592,48 @@ impl CodexAppServerClient {
         }
     }
 
+    fn set_goal(
+        &self,
+        thread_id: &str,
+        objective: Option<&str>,
+        status: Option<AgentGoalStatus>,
+        timeout: Duration,
+    ) -> Result<AgentThreadGoal, CodexAdapterError> {
+        let thread_id = bounded(thread_id.to_owned(), 4096)?;
+        let objective = objective
+            .map(|value| bounded(value.trim().to_owned(), 16 * 1024))
+            .transpose()?;
+        let status = status.map(codex_goal_status_name);
+        let response = self.request_raw(
+            "thread/goal/set",
+            json!({"threadId": thread_id, "objective": objective, "status": status}),
+            timeout,
+        )?;
+        let wire: CodexThreadGoalWire =
+            serde_json::from_value(response.pointer("/result/goal").cloned().ok_or_else(
+                || CodexAdapterError::InvalidMessage("thread/goal/set returned no goal".into()),
+            )?)?;
+        let goal = normalize_codex_goal(wire)?;
+        *lock(&self.thread_goal)? = Some(goal.clone());
+        Ok(goal)
+    }
+
+    fn clear_goal(&self, thread_id: &str, timeout: Duration) -> Result<bool, CodexAdapterError> {
+        let thread_id = bounded(thread_id.to_owned(), 4096)?;
+        let response =
+            self.request_raw("thread/goal/clear", json!({"threadId": thread_id}), timeout)?;
+        let cleared = response
+            .pointer("/result/cleared")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                CodexAdapterError::InvalidMessage("thread/goal/clear returned no result".into())
+            })?;
+        if cleared {
+            *lock(&self.thread_goal)? = None;
+        }
+        Ok(cleared)
+    }
+
     fn normalize_message(
         &self,
         sequence: u64,
@@ -607,6 +668,28 @@ impl CodexAppServerClient {
         }
         let params = payload.get("params").unwrap_or(&Value::Null);
         match method {
+            Some("thread/goal/updated") => {
+                let wire: CodexThreadGoalWire =
+                    serde_json::from_value(params.get("goal").cloned().ok_or_else(|| {
+                        CodexAdapterError::InvalidMessage(
+                            "thread goal update omitted its goal".into(),
+                        )
+                    })?)?;
+                *lock(&self.thread_goal)? = Some(normalize_codex_goal(wire)?);
+                Ok(AgentDriverEvent::ProtocolNotice {
+                    sequence,
+                    method: method.map(ToOwned::to_owned),
+                    payload_sha256: sha256_value(&payload)?,
+                })
+            }
+            Some("thread/goal/cleared") => {
+                *lock(&self.thread_goal)? = None;
+                Ok(AgentDriverEvent::ProtocolNotice {
+                    sequence,
+                    method: method.map(ToOwned::to_owned),
+                    payload_sha256: sha256_value(&payload)?,
+                })
+            }
             Some("item/agentMessage/delta") => Ok(AgentDriverEvent::MessageDelta {
                 sequence,
                 thread_id: required_string(params, "threadId")?,
@@ -697,6 +780,28 @@ impl StructuredAgentClient for CodexAppServerClient {
 
     fn session_capabilities(&self) -> Result<AgentSessionCapabilities, AgentClientError> {
         Ok(lock(&self.session_capabilities)?.clone())
+    }
+
+    fn thread_goal(&self) -> Result<Option<AgentThreadGoal>, AgentClientError> {
+        Ok(lock(&self.thread_goal)?.clone())
+    }
+
+    fn set_thread_goal(
+        &self,
+        session_id: &str,
+        objective: Option<&str>,
+        status: Option<AgentGoalStatus>,
+        timeout: Duration,
+    ) -> Result<AgentThreadGoal, AgentClientError> {
+        Ok(self.set_goal(session_id, objective, status, timeout)?)
+    }
+
+    fn clear_thread_goal(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+    ) -> Result<bool, AgentClientError> {
+        Ok(self.clear_goal(session_id, timeout)?)
     }
 
     fn set_session_config_option(
@@ -1001,6 +1106,40 @@ fn normalize_codex_skills(
         .collect()
 }
 
+fn normalize_codex_goal(wire: CodexThreadGoalWire) -> Result<AgentThreadGoal, CodexAdapterError> {
+    let status = match wire.status.as_str() {
+        "active" => AgentGoalStatus::Active,
+        "paused" => AgentGoalStatus::Paused,
+        "blocked" => AgentGoalStatus::Blocked,
+        "usageLimited" => AgentGoalStatus::UsageLimited,
+        "budgetLimited" => AgentGoalStatus::BudgetLimited,
+        "complete" => AgentGoalStatus::Complete,
+        _ => {
+            return Err(CodexAdapterError::InvalidMessage(
+                "thread goal returned an unknown status".into(),
+            ));
+        }
+    };
+    Ok(AgentThreadGoal {
+        objective: bounded(wire.objective, 16 * 1024)?,
+        status,
+        token_budget: wire.token_budget.filter(|value| *value > 0),
+        tokens_used: wire.tokens_used.max(0),
+        time_used_seconds: wire.time_used_seconds.max(0),
+    })
+}
+
+fn codex_goal_status_name(status: AgentGoalStatus) -> &'static str {
+    match status {
+        AgentGoalStatus::Active => "active",
+        AgentGoalStatus::Paused => "paused",
+        AgentGoalStatus::Blocked => "blocked",
+        AgentGoalStatus::UsageLimited => "usageLimited",
+        AgentGoalStatus::BudgetLimited => "budgetLimited",
+        AgentGoalStatus::Complete => "complete",
+    }
+}
+
 fn codex_config_options(
     catalog: &[CodexModelCapability],
     turn_config: &CodexTurnConfig,
@@ -1272,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_plan_updates_become_bounded_goal_entries() {
+    fn turn_plan_updates_become_bounded_plan_entries() {
         assert_eq!(
             normalize_codex_plan(&json!({
                 "plan": [
@@ -1326,8 +1465,9 @@ while IFS= read -r line; do
     *'"method":"model/list"'*) printf '%s\n' '{"id":2,"result":{"data":[{"model":"gpt-a","displayName":"GPT A","description":"Fast model","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Low"},{"reasoningEffort":"medium","description":"Medium"}],"defaultReasoningEffort":"medium","isDefault":true},{"model":"gpt-b","displayName":"GPT B","description":"Deep model","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"high","description":"High"}],"defaultReasoningEffort":"high","isDefault":false}]}}' ;;
     *'"method":"skills/list"'*) printf '%s\n' '{"id":3,"result":{"data":[{"cwd":"workspace","skills":[{"name":"native-sdk","description":"Build Native UI","enabled":true},{"name":"disabled","description":"Hidden","enabled":false}],"errors":[]}]}}' ;;
     *'"method":"thread/start"'*) printf '%s\n' '{"id":4,"result":{"thread":{"id":"thread-1"}}}' ;;
+    *'"method":"thread/goal/set"'*) printf '%s\n' '{"id":5,"result":{"goal":{"threadId":"thread-1","objective":"Ship the compact Agent UI","status":"active","tokenBudget":50000,"tokensUsed":1200,"timeUsedSeconds":90,"createdAt":1,"updatedAt":2}}}' ;;
     *'"method":"turn/start"'*'"model":"gpt-b"'*'"effort":"high"'*)
-      printf '%s\n' '{"id":5,"result":{"turn":{"id":"turn-1"}}}'
+      printf '%s\n' '{"id":6,"result":{"turn":{"id":"turn-1"}}}'
       printf '%s\n' '{"method":"turn/plan/updated","params":{"threadId":"thread-1","turnId":"turn-1","explanation":"Inspect before editing","plan":[{"step":"Inspect the repository","status":"completed"},{"step":"Review the architecture","status":"inProgress"},{"step":"Summarize the findings","status":"pending"}]}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}'
       ;;
@@ -1363,11 +1503,18 @@ done
         assert_eq!(initial.config_options.len(), 2);
         assert_eq!(
             initial.available_commands,
-            vec![AgentAvailableCommand {
-                name: "$native-sdk".into(),
-                description: "Build Native UI".into(),
-                input_hint: Some("Describe how this skill should help".into()),
-            }]
+            vec![
+                AgentAvailableCommand {
+                    name: "$native-sdk".into(),
+                    description: "Build Native UI".into(),
+                    input_hint: Some("Describe how this skill should help".into()),
+                },
+                AgentAvailableCommand {
+                    name: "goal".into(),
+                    description: "Set or clear a persistent Codex goal".into(),
+                    input_hint: Some("Describe the goal, or type clear".into()),
+                },
+            ]
         );
         let updated = client
             .set_session_config_option(
@@ -1424,6 +1571,24 @@ done
         );
         assert_eq!(
             client
+                .set_thread_goal(
+                    &thread_id,
+                    Some("Ship the compact Agent UI"),
+                    Some(AgentGoalStatus::Active),
+                    fixture_timeout,
+                )
+                .unwrap(),
+            AgentThreadGoal {
+                objective: "Ship the compact Agent UI".into(),
+                status: AgentGoalStatus::Active,
+                token_budget: Some(50_000),
+                tokens_used: 1_200,
+                time_used_seconds: 90,
+            }
+        );
+        assert_eq!(client.thread_goal().unwrap().unwrap().tokens_used, 1_200);
+        assert_eq!(
+            client
                 .start_turn(&thread_id, "Build it", fixture_timeout)
                 .unwrap(),
             "turn-1"
@@ -1431,7 +1596,7 @@ done
         assert_eq!(
             client.next_event(fixture_timeout).unwrap(),
             AgentDriverEvent::PlanUpdated {
-                sequence: 6,
+                sequence: 7,
                 thread_id: "thread-1".into(),
                 turn_id: "turn-1".into(),
                 entries: vec![
@@ -1456,7 +1621,7 @@ done
         assert_eq!(
             client.next_event(fixture_timeout).unwrap(),
             AgentDriverEvent::TurnCompleted {
-                sequence: 7,
+                sequence: 8,
                 thread_id: "thread-1".into(),
                 turn_id: Some("turn-1".into()),
                 status: Some("completed".into()),

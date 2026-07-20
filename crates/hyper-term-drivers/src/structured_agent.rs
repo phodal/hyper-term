@@ -4,9 +4,9 @@ use hyper_term_protocol::ContextReceipt;
 use thiserror::Error;
 
 use crate::{
-    AcpAdapterError, AgentDriverEvent, AgentEffectAuthorization, AgentHostResponse,
-    AgentSessionCapabilities, AgentSessionConfigValue, CodexAdapterError, DriverState,
-    ExternalRequestId, StructuredAgentProtocol,
+    AcpAdapterError, AgentDriverEvent, AgentEffectAuthorization, AgentGoalStatus,
+    AgentHostResponse, AgentSessionCapabilities, AgentSessionConfigValue, AgentThreadGoal,
+    CodexAdapterError, DriverState, ExternalRequestId, StructuredAgentProtocol,
 };
 
 /// Renderer-independent port used by the daemon for every structured coding agent.
@@ -30,6 +30,29 @@ pub trait StructuredAgentClient: Send + Sync {
     fn cancel_turn(&self, session_id: &str, turn_id: &str) -> Result<(), AgentClientError>;
     fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AgentClientError>;
     fn session_capabilities(&self) -> Result<AgentSessionCapabilities, AgentClientError>;
+    fn thread_goal(&self) -> Result<Option<AgentThreadGoal>, AgentClientError> {
+        Ok(None)
+    }
+    fn set_thread_goal(
+        &self,
+        _session_id: &str,
+        _objective: Option<&str>,
+        _status: Option<AgentGoalStatus>,
+        _timeout: Duration,
+    ) -> Result<AgentThreadGoal, AgentClientError> {
+        Err(AgentClientError::Unsupported(
+            "provider does not support persistent goals".into(),
+        ))
+    }
+    fn clear_thread_goal(
+        &self,
+        _session_id: &str,
+        _timeout: Duration,
+    ) -> Result<bool, AgentClientError> {
+        Err(AgentClientError::Unsupported(
+            "provider does not support persistent goals".into(),
+        ))
+    }
     fn set_session_config_option(
         &self,
         session_id: &str,

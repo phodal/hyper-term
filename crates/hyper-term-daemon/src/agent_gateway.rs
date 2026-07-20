@@ -22,11 +22,12 @@ use axum::routing::{get, post};
 use hyper_term_core::OperationRecord;
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentContainmentConfig, AgentDriverEvent,
-    AgentEffectAuthorization, AgentEffectKind, AgentHostOperation, AgentHostRequest,
-    AgentHostResponse, AgentSessionCapabilities, AgentSessionConfigValue, CodexAppServerClient,
-    CodexAppServerConfig, CodexMcpServerConfig, DenoGenUiCompiler, DenoGenUiConfig, DriverState,
-    ExternalRequestId, GenUiCompileRequest, LocalMcpServerConfig, StructuredAgentClient,
-    StructuredAgentProtocol, sha256_file, stage_codex_auth_file,
+    AgentEffectAuthorization, AgentEffectKind, AgentGoalStatus, AgentHostOperation,
+    AgentHostRequest, AgentHostResponse, AgentSessionCapabilities, AgentSessionConfigValue,
+    AgentThreadGoal, CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig,
+    DenoGenUiCompiler, DenoGenUiConfig, DriverState, ExternalRequestId, GenUiCompileRequest,
+    LocalMcpServerConfig, StructuredAgentClient, StructuredAgentProtocol, sha256_file,
+    stage_codex_auth_file,
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, EventEnvelope,
@@ -433,6 +434,7 @@ struct AgentSnapshotResponse {
     turn_id: Option<String>,
     error: Option<String>,
     capabilities: AgentSessionCapabilities,
+    goal: Option<AgentThreadGoal>,
     context: Option<EventEnvelope>,
     document: BlockDocument,
 }
@@ -1425,6 +1427,7 @@ struct AgentStreamStateFrame {
     error: Option<String>,
     document_revision: u64,
     capabilities: AgentSessionCapabilities,
+    goal: Option<AgentThreadGoal>,
 }
 
 #[derive(Serialize)]
@@ -2296,7 +2299,16 @@ async fn start_turn(
         Ok(prompt) if !prompt.trim().is_empty() => prompt,
         _ => return status_response(StatusCode::BAD_REQUEST, "Agent prompt is invalid"),
     };
-    match runtime.submit_turn(session_id, prompt) {
+    let is_goal_command = prompt.trim() == "/goal" || prompt.trim().starts_with("/goal ");
+    let result = if is_goal_command {
+        tokio::task::spawn_blocking(move || runtime.apply_goal_command(session_id, &prompt))
+            .await
+            .map_err(|_| SessionError::Thread)
+            .and_then(|result| result)
+    } else {
+        runtime.submit_turn(session_id, prompt)
+    };
+    match result {
         Ok(response) => json_response(StatusCode::ACCEPTED, &response),
         Err(SessionError::NotFound) => {
             status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
@@ -2308,6 +2320,10 @@ async fn start_turn(
         Err(SessionError::PromptTooLarge) => status_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "Agent prompt exceeds its bound",
+        ),
+        Err(SessionError::Unsupported | SessionError::InvalidConfig) => status_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Agent provider does not support this goal command",
         ),
         Err(_) => status_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3287,6 +3303,10 @@ impl AgentGatewayRuntime {
             .client
             .session_capabilities()
             .map_err(|_| SessionError::Driver)?;
+        let goal = session
+            .client
+            .thread_goal()
+            .map_err(|_| SessionError::Driver)?;
         let context = self
             .config
             .daemon
@@ -3298,6 +3318,7 @@ impl AgentGatewayRuntime {
             turn_id,
             error,
             capabilities,
+            goal,
             context,
             document,
         })
@@ -3325,12 +3346,17 @@ impl AgentGatewayRuntime {
             .client
             .session_capabilities()
             .map_err(|_| SessionError::Driver)?;
+        let goal = session
+            .client
+            .thread_goal()
+            .map_err(|_| SessionError::Driver)?;
         Ok(AgentStreamStateFrame {
             status,
             turn_id,
             error,
             document_revision,
             capabilities,
+            goal,
         })
     }
 
@@ -4340,6 +4366,58 @@ impl AgentGatewayRuntime {
                 EditorLspError::InvalidRuntime => EditorRequestError::RuntimeUnavailable,
                 _ => EditorRequestError::Driver,
             })
+    }
+
+    fn apply_goal_command(
+        &self,
+        session_id: u16,
+        command: &str,
+    ) -> Result<AgentTurnResponse, SessionError> {
+        let session = self.session(session_id)?;
+        {
+            let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
+            if matches!(
+                progress.status,
+                AgentStatus::Running | AgentStatus::Cancelling | AgentStatus::WaitingApproval
+            ) {
+                return Err(SessionError::Busy);
+            }
+        }
+        let argument = command
+            .trim()
+            .strip_prefix("/goal")
+            .ok_or(SessionError::InvalidConfig)?
+            .trim();
+        if argument.eq_ignore_ascii_case("clear") {
+            session
+                .client
+                .clear_thread_goal(&session.thread_id, START_TURN_TIMEOUT)
+                .map_err(|error| match error {
+                    hyper_term_drivers::AgentClientError::Unsupported(_) => {
+                        SessionError::Unsupported
+                    }
+                    _ => SessionError::Driver,
+                })?;
+        } else if !argument.is_empty() {
+            let (objective, status) = match argument {
+                "pause" => (None, Some(AgentGoalStatus::Paused)),
+                "resume" => (None, Some(AgentGoalStatus::Active)),
+                _ => (Some(argument), Some(AgentGoalStatus::Active)),
+            };
+            session
+                .client
+                .set_thread_goal(&session.thread_id, objective, status, START_TURN_TIMEOUT)
+                .map_err(|error| match error {
+                    hyper_term_drivers::AgentClientError::Unsupported(_) => {
+                        SessionError::Unsupported
+                    }
+                    _ => SessionError::Driver,
+                })?;
+        }
+        Ok(AgentTurnResponse {
+            session_id,
+            status: AgentStatus::Ready,
+        })
     }
 
     fn submit_turn(
@@ -7488,7 +7566,7 @@ done
         let fake_codex = temporary.path().join("codex");
         std::fs::write(
             &fake_codex,
-            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake-codex\"}}' ;;\n    *'\"method\":\"model/list\"'*) printf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"model\":\"gpt-test\",\"displayName\":\"GPT Test\",\"description\":\"Fixture\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"medium\",\"description\":\"Medium\"}],\"defaultReasoningEffort\":\"medium\",\"isDefault\":true}]}}' ;;\n    *'\"method\":\"skills/list\"'*) printf '%s\\n' '{\"id\":3,\"result\":{\"data\":[]}}' ;;\n    *'\"method\":\"thread/start\"'*) printf '%s\\n' '{\"id\":4,\"result\":{\"thread\":{\"id\":\"thread-3\"}}}' ;;\n    *'\"method\":\"turn/start\"'*)\n      printf '%s\\n' '{\"id\":5,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'\n      printf '%s\\n' '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-3\",\"turnId\":\"turn-1\",\"itemId\":\"message-1\",\"delta\":\"Hyper Term \"}}'\n      printf '%s\\n' '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-3\",\"turnId\":\"turn-1\",\"itemId\":\"message-1\",\"delta\":\"Agent is live.\"}}'\n      printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-3\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}' ;;\n  esac\ndone\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake-codex\"}}' ;;\n    *'\"method\":\"model/list\"'*) printf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"model\":\"gpt-test\",\"displayName\":\"GPT Test\",\"description\":\"Fixture\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"medium\",\"description\":\"Medium\"}],\"defaultReasoningEffort\":\"medium\",\"isDefault\":true}]}}' ;;\n    *'\"method\":\"skills/list\"'*) printf '%s\\n' '{\"id\":3,\"result\":{\"data\":[]}}' ;;\n    *'\"method\":\"thread/start\"'*) printf '%s\\n' '{\"id\":4,\"result\":{\"thread\":{\"id\":\"thread-3\"}}}' ;;\n    *'\"method\":\"thread/goal/set\"'*) printf '%s\\n' '{\"id\":5,\"result\":{\"goal\":{\"threadId\":\"thread-3\",\"objective\":\"Ship the compact Agent UI\",\"status\":\"active\",\"tokenBudget\":50000,\"tokensUsed\":1200,\"timeUsedSeconds\":90,\"createdAt\":1,\"updatedAt\":2}}}' ;;\n    *'\"method\":\"turn/start\"'*)\n      printf '%s\\n' '{\"id\":6,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'\n      printf '%s\\n' '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-3\",\"turnId\":\"turn-1\",\"itemId\":\"message-1\",\"delta\":\"Hyper Term \"}}'\n      printf '%s\\n' '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-3\",\"turnId\":\"turn-1\",\"itemId\":\"message-1\",\"delta\":\"Agent is live.\"}}'\n      printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-3\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}' ;;\n  esac\ndone\n",
         )
         .expect("fake Codex");
         let mut permissions = std::fs::metadata(&fake_codex)
@@ -7530,6 +7608,21 @@ done
         assert_eq!(response["status"], "ready");
         assert_eq!(response["thread_id"], "thread-3");
 
+        let turn_path = format!("/agent/session/turn?token={token}&session_id=3");
+        let (status, body) = request_path(
+            gateway.address(),
+            &turn_path,
+            "POST",
+            b"/goal Ship the compact Agent UI",
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
+        let (_, body) = request(gateway.address(), &token, 3, "GET").await;
+        let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["goal"]["objective"], "Ship the compact Agent UI");
+        assert_eq!(snapshot["goal"]["status"], "active");
+        assert_eq!(snapshot["goal"]["time_used_seconds"], 90);
+
         let stream_response = stream_session(
             State(gateway.runtime.clone()),
             Query(AgentSessionQuery {
@@ -7555,6 +7648,7 @@ done
             serde_json::from_slice(initial.as_ref()).expect("initial NDJSON state");
         assert_eq!(initial["type"], "state");
         assert_eq!(initial["status"], "ready");
+        assert_eq!(initial["goal"]["objective"], "Ship the compact Agent UI");
         assert!(initial["document_revision"].as_u64().is_some());
         assert!(initial.get("document").is_none());
 
@@ -7585,7 +7679,7 @@ done
 
         let (status, body) = request_path(
             gateway.address(),
-            &format!("/agent/session/turn?token={token}&session_id=3"),
+            &turn_path,
             "POST",
             b"Reply with the live marker",
         )
