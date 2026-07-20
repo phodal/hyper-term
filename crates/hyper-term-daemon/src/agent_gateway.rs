@@ -4736,6 +4736,8 @@ fn map_runtime_trace_store_error(error: RuntimeTraceStoreError) -> RuntimeTraceE
         | RuntimeTraceStoreError::TornJournal
         | RuntimeTraceStoreError::TooLarge => RuntimeTraceError::InvalidRequest,
         RuntimeTraceStoreError::Clock
+        | RuntimeTraceStoreError::UnsupportedStorageSchema(_)
+        | RuntimeTraceStoreError::StoredEventDigestMismatch
         | RuntimeTraceStoreError::Io(_)
         | RuntimeTraceStoreError::Json(_) => RuntimeTraceError::Store,
     }

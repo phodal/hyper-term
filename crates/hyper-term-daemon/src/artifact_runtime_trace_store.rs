@@ -16,6 +16,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const RUNTIME_TRACE_SCHEMA_VERSION: u16 = 1;
+const LEGACY_RUNTIME_TRACE_STORAGE_SCHEMA_VERSION: u16 = 1;
+const RUNTIME_TRACE_STORAGE_SCHEMA_VERSION: u16 = 2;
 const MAX_TRACE_EVENTS_PER_APPEND: usize = 16;
 const MAX_TRACE_EVENTS_PROJECTED: usize = 256;
 const MAX_TRACE_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
@@ -28,9 +30,36 @@ const REDACTED_VALUE: &str = "[REDACTED]";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredRuntimeTraceEvent {
+    #[serde(
+        default = "legacy_runtime_trace_storage_schema",
+        skip_serializing_if = "is_legacy_runtime_trace_storage_schema"
+    )]
+    storage_schema_version: u16,
     task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_digest: Option<String>,
     #[serde(flatten)]
     event: GenUiRuntimeTraceEvent,
+}
+
+fn legacy_runtime_trace_storage_schema() -> u16 {
+    LEGACY_RUNTIME_TRACE_STORAGE_SCHEMA_VERSION
+}
+
+fn is_legacy_runtime_trace_storage_schema(version: &u16) -> bool {
+    *version == LEGACY_RUNTIME_TRACE_STORAGE_SCHEMA_VERSION
+}
+
+impl StoredRuntimeTraceEvent {
+    fn new(task_id: TaskId, event: GenUiRuntimeTraceEvent) -> Result<Self, RuntimeTraceStoreError> {
+        let event_digest = stored_event_digest(task_id, &event)?;
+        Ok(Self {
+            storage_schema_version: RUNTIME_TRACE_STORAGE_SCHEMA_VERSION,
+            task_id,
+            event_digest: Some(event_digest),
+            event,
+        })
+    }
 }
 
 pub(crate) struct ArtifactRuntimeTraceStore {
@@ -135,7 +164,7 @@ impl ArtifactRuntimeTraceStore {
                 redacted: prepared.redacted,
                 recorded_at_ms: now_ms()?,
             };
-            let stored = StoredRuntimeTraceEvent { task_id, event };
+            let stored = StoredRuntimeTraceEvent::new(task_id, event)?;
             by_client.insert(key, prepared.payload_digest);
             stream_tails.insert(prepared.stream_id, prepared.client_sequence);
             accepted.push(stored);
@@ -167,6 +196,7 @@ impl ArtifactRuntimeTraceStore {
         }
         let mut events = Vec::new();
         let mut last_sequence = 0;
+        let mut migration_required = false;
         for line in encoded
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
@@ -174,7 +204,8 @@ impl ArtifactRuntimeTraceStore {
             if line.len() > MAX_TRACE_EVENT_BYTES {
                 return Err(RuntimeTraceStoreError::TooLarge);
             }
-            let stored: StoredRuntimeTraceEvent = serde_json::from_slice(line)?;
+            let mut stored: StoredRuntimeTraceEvent = serde_json::from_slice(line)?;
+            migration_required |= migrate_stored_event(&mut stored)?;
             let expected_digest = trace_digest(
                 stored.event.stream_id,
                 stored.event.client_sequence,
@@ -195,6 +226,9 @@ impl ArtifactRuntimeTraceStore {
             }
             last_sequence = stored.event.event_sequence;
             events.push(stored);
+        }
+        if migration_required {
+            replace_events(&task_root, &path, &events)?;
         }
         Ok(events)
     }
@@ -245,6 +279,65 @@ impl ArtifactRuntimeTraceStore {
 
     fn journal_path(&self, task_id: TaskId, artifact_id: ArtifactId) -> PathBuf {
         self.task_root(task_id).join(format!("{artifact_id}.jsonl"))
+    }
+}
+
+fn replace_events(
+    task_root: &Path,
+    path: &Path,
+    events: &[StoredRuntimeTraceEvent],
+) -> Result<(), RuntimeTraceStoreError> {
+    let mut encoded = Vec::new();
+    for event in events {
+        let mut line = serde_json::to_vec(event)?;
+        if line.len() > MAX_TRACE_EVENT_BYTES {
+            return Err(RuntimeTraceStoreError::TooLarge);
+        }
+        line.push(b'\n');
+        encoded.extend(line);
+    }
+    if encoded.len() as u64 > MAX_TRACE_JOURNAL_BYTES {
+        return Err(RuntimeTraceStoreError::TooLarge);
+    }
+    let temporary = task_root.join(format!(".runtime-trace-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(task_root)?.sync_all()?;
+        Ok::<(), RuntimeTraceStoreError>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn migrate_stored_event(
+    stored: &mut StoredRuntimeTraceEvent,
+) -> Result<bool, RuntimeTraceStoreError> {
+    let expected = stored_event_digest(stored.task_id, &stored.event)?;
+    match stored.storage_schema_version {
+        LEGACY_RUNTIME_TRACE_STORAGE_SCHEMA_VERSION if stored.event_digest.is_none() => {
+            stored.storage_schema_version = RUNTIME_TRACE_STORAGE_SCHEMA_VERSION;
+            stored.event_digest = Some(expected);
+            Ok(true)
+        }
+        RUNTIME_TRACE_STORAGE_SCHEMA_VERSION
+            if stored.event_digest.as_deref() == Some(expected.as_str()) =>
+        {
+            Ok(false)
+        }
+        LEGACY_RUNTIME_TRACE_STORAGE_SCHEMA_VERSION | RUNTIME_TRACE_STORAGE_SCHEMA_VERSION => {
+            Err(RuntimeTraceStoreError::StoredEventDigestMismatch)
+        }
+        version => Err(RuntimeTraceStoreError::UnsupportedStorageSchema(version)),
     }
 }
 
@@ -338,6 +431,30 @@ fn trace_digest(
         kind,
         name,
         payload,
+    ))?;
+    Ok(hex_digest(Sha256::digest(canonical)))
+}
+
+fn stored_event_digest(
+    task_id: TaskId,
+    event: &GenUiRuntimeTraceEvent,
+) -> Result<String, RuntimeTraceStoreError> {
+    let canonical = serde_json::to_vec(&(
+        "hyper-term.runtime-trace-event",
+        RUNTIME_TRACE_STORAGE_SCHEMA_VERSION,
+        task_id,
+        event.schema_version,
+        event.event_sequence,
+        event.artifact_id,
+        event.source_revision,
+        event.stream_id,
+        event.client_sequence,
+        event.kind,
+        &event.name,
+        &event.payload,
+        &event.payload_digest,
+        event.redacted,
+        event.recorded_at_ms,
     ))?;
     Ok(hex_digest(Sha256::digest(canonical)))
 }
@@ -501,6 +618,10 @@ pub(crate) enum RuntimeTraceStoreError {
     InvalidEvent,
     #[error("runtime trace context does not match the current artifact")]
     ContextMismatch,
+    #[error("runtime trace storage schema {0} is not supported")]
+    UnsupportedStorageSchema(u16),
+    #[error("runtime trace stored event digest does not match its event")]
+    StoredEventDigestMismatch,
     #[error("runtime trace journal has a torn tail")]
     TornJournal,
     #[error("runtime trace exceeds its bound")]
@@ -657,7 +778,64 @@ mod tests {
         fs::write(path, encoded.replace("\"count\":1", "\"count\":2")).unwrap();
         assert!(matches!(
             store.load(task_id, artifact_id, 4),
-            Err(RuntimeTraceStoreError::ContextMismatch)
+            Err(RuntimeTraceStoreError::StoredEventDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn legacy_journal_migrates_without_changing_the_replay_projection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ArtifactRuntimeTraceStore::open(temporary.path()).unwrap();
+        let task_id = TaskId::new();
+        let artifact_id = ArtifactId::new();
+        let projection = store
+            .append(
+                task_id,
+                artifact_id,
+                12,
+                vec![input(Uuid::new_v4(), 1, serde_json::json!({"count": 7}))],
+            )
+            .unwrap();
+        let path = store.journal_path(task_id, artifact_id);
+        let encoded = fs::read(&path).unwrap();
+        let mut stored: StoredRuntimeTraceEvent =
+            serde_json::from_slice(encoded.strip_suffix(b"\n").unwrap()).unwrap();
+        stored.storage_schema_version = LEGACY_RUNTIME_TRACE_STORAGE_SCHEMA_VERSION;
+        stored.event_digest = None;
+        let mut legacy = serde_json::to_vec(&stored).unwrap();
+        legacy.push(b'\n');
+        fs::write(&path, legacy).unwrap();
+
+        let migrated = store.load(task_id, artifact_id, 12).unwrap();
+        assert_eq!(migrated, projection);
+        let encoded = fs::read(&path).unwrap();
+        let stored: StoredRuntimeTraceEvent =
+            serde_json::from_slice(encoded.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(
+            stored.storage_schema_version,
+            RUNTIME_TRACE_STORAGE_SCHEMA_VERSION
+        );
+        assert!(stored.event_digest.as_deref().is_some_and(is_sha256));
+
+        let mut tampered = stored.clone();
+        tampered.event.recorded_at_ms = tampered.event.recorded_at_ms.saturating_add(1);
+        let mut encoded = serde_json::to_vec(&tampered).unwrap();
+        encoded.push(b'\n');
+        fs::write(&path, encoded).unwrap();
+        assert!(matches!(
+            store.load(task_id, artifact_id, 12),
+            Err(RuntimeTraceStoreError::StoredEventDigestMismatch)
+        ));
+
+        tampered.storage_schema_version = RUNTIME_TRACE_STORAGE_SCHEMA_VERSION + 1;
+        tampered.event_digest = Some(stored_event_digest(task_id, &tampered.event).unwrap());
+        let mut encoded = serde_json::to_vec(&tampered).unwrap();
+        encoded.push(b'\n');
+        fs::write(&path, encoded).unwrap();
+        assert!(matches!(
+            store.load(task_id, artifact_id, 12),
+            Err(RuntimeTraceStoreError::UnsupportedStorageSchema(version))
+                if version == RUNTIME_TRACE_STORAGE_SCHEMA_VERSION + 1
         ));
     }
 
