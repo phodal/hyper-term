@@ -233,6 +233,9 @@ pub struct IsolatedAcceptanceChange {
     pub base_digest: Option<String>,
     pub proposed_digest: String,
     pub deleted: bool,
+    pub binary: bool,
+    pub base_bytes: u64,
+    pub proposed_bytes: u64,
     pub before: String,
     pub after: String,
 }
@@ -1447,11 +1450,9 @@ impl DaemonState {
                 .ok_or(DaemonError::IsolatedResultDigestMismatch)?;
             let bytes =
                 self.read_isolated_result_file(source_operation_id, &change.path, digest)?;
-            let content =
-                String::from_utf8(bytes).map_err(|_| DaemonError::UnsupportedIsolatedAcceptance)?;
-            requests.push(WorkspaceApplyRequest::Write {
+            requests.push(WorkspaceApplyRequest::WriteBytes {
                 target_path: change.path.to_string_lossy().into_owned(),
-                proposed_content: content,
+                proposed_bytes: bytes,
             });
         }
         let workspace = result.environment.manifest.source_workspace.clone();
@@ -2804,6 +2805,9 @@ fn isolated_acceptance_changes(plan: &WorkspaceApplySetPlan) -> Vec<IsolatedAcce
             base_digest: plan.base_digest().map(str::to_owned),
             proposed_digest: plan.proposed_digest.clone(),
             deleted: plan.deletes_target(),
+            binary: plan.is_binary(),
+            base_bytes: plan.base_bytes_len(),
+            proposed_bytes: plan.proposed_bytes_len(),
             before: plan.base_content().to_owned(),
             after: plan.proposed_content.clone(),
         })
@@ -3493,7 +3497,7 @@ pub enum DaemonError {
     InvalidIsolatedResultPath,
     #[error("Tier 2 result content no longer matches its reviewed digest")]
     IsolatedResultDigestMismatch,
-    #[error("Tier 2 result contains type changes, binary data, or unsupported bounds")]
+    #[error("Tier 2 result contains type changes or unsupported bounds")]
     UnsupportedIsolatedAcceptance,
     #[error("operation {0} has no prepared Tier 2 acceptance review")]
     IsolatedAcceptanceMissing(OperationId),

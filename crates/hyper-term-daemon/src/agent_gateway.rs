@@ -583,6 +583,9 @@ struct AgentTier2PreviewChangeResponse {
     base_digest: Option<String>,
     proposed_digest: String,
     deleted: bool,
+    binary: bool,
+    base_bytes: u64,
+    proposed_bytes: u64,
     hunks: Vec<AgentTier2PreviewHunkResponse>,
     truncated: bool,
 }
@@ -4816,27 +4819,29 @@ fn tier2_preview_response(preview: IsolatedAcceptancePreview) -> AgentTier2Previ
     let mut response_truncated = preview.changes.len() > MAX_TIER2_PREVIEW_CHANGES;
     let mut changes = Vec::new();
     for change in preview.changes.into_iter().take(MAX_TIER2_PREVIEW_CHANGES) {
-        let diff = review_workspace_diff(&change.target_path, &change.before, &change.after);
         let mut change_truncated = false;
         let mut hunks = Vec::new();
-        let hunk_count = diff.hunks.len();
-        for (hunk_index, hunk) in diff.hunks.into_iter().enumerate() {
-            let retained_bytes = utf8_prefix_len(&hunk.patch, remaining_patch_bytes);
-            let truncated = retained_bytes < hunk.patch.len();
-            hunks.push(AgentTier2PreviewHunkResponse {
-                id: hunk.id,
-                base_start: hunk.base_start,
-                base_lines: hunk.base_lines,
-                proposed_start: hunk.proposed_start,
-                proposed_lines: hunk.proposed_lines,
-                patch: hunk.patch[..retained_bytes].to_owned(),
-                truncated,
-            });
-            remaining_patch_bytes = remaining_patch_bytes.saturating_sub(retained_bytes);
-            if truncated || (remaining_patch_bytes == 0 && hunk_index + 1 < hunk_count) {
-                change_truncated = true;
-                response_truncated = true;
-                break;
+        if !change.binary {
+            let diff = review_workspace_diff(&change.target_path, &change.before, &change.after);
+            let hunk_count = diff.hunks.len();
+            for (hunk_index, hunk) in diff.hunks.into_iter().enumerate() {
+                let retained_bytes = utf8_prefix_len(&hunk.patch, remaining_patch_bytes);
+                let truncated = retained_bytes < hunk.patch.len();
+                hunks.push(AgentTier2PreviewHunkResponse {
+                    id: hunk.id,
+                    base_start: hunk.base_start,
+                    base_lines: hunk.base_lines,
+                    proposed_start: hunk.proposed_start,
+                    proposed_lines: hunk.proposed_lines,
+                    patch: hunk.patch[..retained_bytes].to_owned(),
+                    truncated,
+                });
+                remaining_patch_bytes = remaining_patch_bytes.saturating_sub(retained_bytes);
+                if truncated || (remaining_patch_bytes == 0 && hunk_index + 1 < hunk_count) {
+                    change_truncated = true;
+                    response_truncated = true;
+                    break;
+                }
             }
         }
         changes.push(AgentTier2PreviewChangeResponse {
@@ -4844,6 +4849,9 @@ fn tier2_preview_response(preview: IsolatedAcceptancePreview) -> AgentTier2Previ
             base_digest: change.base_digest,
             proposed_digest: change.proposed_digest,
             deleted: change.deleted,
+            binary: change.binary,
+            base_bytes: change.base_bytes,
+            proposed_bytes: change.proposed_bytes,
             hunks,
             truncated: change_truncated,
         });
@@ -5623,7 +5631,7 @@ mod tests {
         let executable = root.join("limactl");
         let environment_marker = root.join("limactl-environment");
         let script = format!(
-            "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nlast=''\nfor argument in \"$@\"; do\n  last=\"$argument\"\n  case \"$argument\" in validate|start|shell|stop|delete) [ -n \"$action\" ] || action=\"$argument\";; esac\ndone\nif [ \"$action\" = start ]; then printf '%s\\n' \"${{last%/*}}\" > '{}'; fi\nif [ \"$action\" = shell ]; then environment=$(cat '{}'); printf 'from tier2\\n' > \"$environment/worktree/generated.txt\"; printf 'tier2-output\\n'; fi\n",
+            "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nlast=''\nfor argument in \"$@\"; do\n  last=\"$argument\"\n  case \"$argument\" in validate|start|shell|stop|delete) [ -n \"$action\" ] || action=\"$argument\";; esac\ndone\nif [ \"$action\" = start ]; then printf '%s\\n' \"${{last%/*}}\" > '{}'; fi\nif [ \"$action\" = shell ]; then environment=$(cat '{}'); printf '\\377\\000\\001' > \"$environment/worktree/data.bin\"; printf 'from tier2\\n' > \"$environment/worktree/generated.txt\"; printf 'tier2-output\\n'; fi\n",
             environment_marker.display(),
             environment_marker.display()
         );
@@ -6264,7 +6272,7 @@ mod tests {
         let results: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             results["results"][0]["changed_files"][0]["path"],
-            "generated.txt"
+            "data.bin"
         );
         assert!(results["results"][0].get("acceptance").is_none());
 
@@ -6277,9 +6285,14 @@ mod tests {
             request_path(gateway.address(), &preview_path, "POST", &source_body).await;
         assert_eq!(status, StatusCode::OK.as_u16());
         let preview: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(preview["changes"][0]["target_path"], "generated.txt");
+        assert_eq!(preview["changes"][0]["target_path"], "data.bin");
+        assert_eq!(preview["changes"][0]["binary"], true);
+        assert_eq!(preview["changes"][0]["base_bytes"], 0);
+        assert_eq!(preview["changes"][0]["proposed_bytes"], 3);
+        assert_eq!(preview["changes"][0]["hunks"], serde_json::json!([]));
+        assert_eq!(preview["changes"][1]["target_path"], "generated.txt");
         assert!(
-            preview["changes"][0]["hunks"][0]["patch"]
+            preview["changes"][1]["hunks"][0]["patch"]
                 .as_str()
                 .unwrap()
                 .contains("from tier2")
@@ -6297,7 +6310,7 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED.as_u16());
         let review: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(review["state"], "waiting_human");
-        assert_eq!(review["changed_file_count"], 1);
+        assert_eq!(review["changed_file_count"], 2);
 
         let discard_path = format!("/agent/session/tier2/discard?token={token}&session_id=6");
         assert_eq!(

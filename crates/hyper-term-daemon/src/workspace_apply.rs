@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
@@ -7,6 +8,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use hyper_term_protocol::{OperationId, TaskId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +27,8 @@ const WORKSPACE_TRANSACTION_DIRECTORY: &str = "workspace-transactions";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct WorkspaceFileSnapshot {
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binary_bytes: Option<u64>,
     pub digest: String,
     device: u64,
     inode: u64,
@@ -34,6 +39,8 @@ pub(crate) struct WorkspaceFileSnapshot {
 pub(crate) struct WorkspaceApplyPlan {
     pub target_path: String,
     pub proposed_content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proposed_binary_base64: Option<String>,
     pub proposed_digest: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub delete: bool,
@@ -54,6 +61,39 @@ impl WorkspaceApplyPlan {
         self.base.as_ref().map(|snapshot| snapshot.digest.as_str())
     }
 
+    pub(crate) fn proposed_bytes(&self) -> Result<Cow<'_, [u8]>, WorkspaceApplyError> {
+        match self.proposed_binary_base64.as_deref() {
+            Some(encoded) => BASE64_STANDARD
+                .decode(encoded)
+                .map(Cow::Owned)
+                .map_err(|_| WorkspaceApplyError::InvalidPath),
+            None => Ok(Cow::Borrowed(self.proposed_content.as_bytes())),
+        }
+    }
+
+    pub(crate) fn base_bytes_len(&self) -> u64 {
+        self.base
+            .as_ref()
+            .map(WorkspaceFileSnapshot::bytes_len)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn proposed_bytes_len(&self) -> u64 {
+        self.proposed_binary_base64
+            .as_ref()
+            .and_then(|encoded| decoded_base64_len(encoded).ok())
+            .map(|length| length as u64)
+            .unwrap_or(self.proposed_content.len() as u64)
+    }
+
+    pub(crate) fn is_binary(&self) -> bool {
+        self.proposed_binary_base64.is_some()
+            || self
+                .base
+                .as_ref()
+                .is_some_and(WorkspaceFileSnapshot::is_binary)
+    }
+
     pub(crate) fn deletes_target(&self) -> bool {
         self.delete
     }
@@ -65,9 +105,23 @@ pub(crate) enum WorkspaceApplyRequest {
         target_path: String,
         proposed_content: String,
     },
+    WriteBytes {
+        target_path: String,
+        proposed_bytes: Vec<u8>,
+    },
     Delete {
         target_path: String,
     },
+}
+
+impl WorkspaceFileSnapshot {
+    fn bytes_len(&self) -> u64 {
+        self.binary_bytes.unwrap_or(self.content.len() as u64)
+    }
+
+    fn is_binary(&self) -> bool {
+        self.binary_bytes.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -254,6 +308,7 @@ pub(crate) fn prepare_workspace_apply_requests(
                 WorkspaceApplyRequest::Write {
                     proposed_content, ..
                 } => proposed_content.len(),
+                WorkspaceApplyRequest::WriteBytes { proposed_bytes, .. } => proposed_bytes.len(),
                 WorkspaceApplyRequest::Delete { .. } => 0,
             };
             total.checked_add(bytes)
@@ -267,6 +322,7 @@ pub(crate) fn prepare_workspace_apply_requests(
     for request in requests {
         let target_path = match &request {
             WorkspaceApplyRequest::Write { target_path, .. }
+            | WorkspaceApplyRequest::WriteBytes { target_path, .. }
             | WorkspaceApplyRequest::Delete { target_path } => target_path,
         };
         if !targets.insert(target_path.clone()) {
@@ -277,6 +333,10 @@ pub(crate) fn prepare_workspace_apply_requests(
                 target_path,
                 proposed_content,
             } => prepare_workspace_file(workspace, &target_path, proposed_content),
+            WorkspaceApplyRequest::WriteBytes {
+                target_path,
+                proposed_bytes,
+            } => prepare_workspace_bytes(workspace, &target_path, proposed_bytes),
             WorkspaceApplyRequest::Delete { target_path } => {
                 prepare_workspace_deletion(workspace, &target_path)
             }
@@ -291,7 +351,7 @@ pub(crate) fn prepare_workspace_apply_requests(
         return Err(WorkspaceApplyError::NoChanges);
     }
     let base_bytes = plans.iter().try_fold(0_usize, |total, plan| {
-        total.checked_add(plan.base_content().len())
+        total.checked_add(plan.base_bytes_len() as usize)
     });
     if base_bytes.is_none_or(|bytes| bytes > MAX_WORKSPACE_APPLY_BYTES) {
         return Err(WorkspaceApplyError::TooLarge);
@@ -308,7 +368,15 @@ fn prepare_workspace_file(
     target_path: &str,
     proposed_content: String,
 ) -> Result<WorkspaceApplyPlan, WorkspaceApplyError> {
-    if proposed_content.len() > MAX_WORKSPACE_FILE_BYTES {
+    prepare_workspace_bytes(workspace, target_path, proposed_content.into_bytes())
+}
+
+fn prepare_workspace_bytes(
+    workspace: &Path,
+    target_path: &str,
+    proposed_bytes: Vec<u8>,
+) -> Result<WorkspaceApplyPlan, WorkspaceApplyError> {
+    if proposed_bytes.len() > MAX_WORKSPACE_FILE_BYTES {
         return Err(WorkspaceApplyError::TooLarge);
     }
     let relative = validate_target_path(target_path)?;
@@ -316,14 +384,16 @@ fn prepare_workspace_file(
     let base = read_target_at(parent.directory.as_raw_fd(), &parent.file_name)?;
     if base
         .as_ref()
-        .is_some_and(|snapshot| snapshot.content == proposed_content)
+        .is_some_and(|snapshot| snapshot.digest == sha256_bytes(&proposed_bytes))
     {
         return Err(WorkspaceApplyError::NoChanges);
     }
+    let (proposed_content, proposed_binary_base64) = encode_workspace_content(&proposed_bytes);
     Ok(WorkspaceApplyPlan {
         target_path: target_path.to_owned(),
-        proposed_digest: sha256_bytes(proposed_content.as_bytes()),
+        proposed_digest: sha256_bytes(&proposed_bytes),
         proposed_content,
+        proposed_binary_base64,
         delete: false,
         base,
         parent_device: parent.device,
@@ -342,6 +412,7 @@ fn prepare_workspace_deletion(
     Ok(WorkspaceApplyPlan {
         target_path: target_path.to_owned(),
         proposed_content: String::new(),
+        proposed_binary_base64: None,
         proposed_digest: workspace_deletion_digest(),
         delete: true,
         base: Some(base),
@@ -397,7 +468,7 @@ pub(crate) fn select_workspace_apply_set(
         let Some(content) = selections.get(&reviewed_plan.target_path) else {
             continue;
         };
-        if reviewed_plan.delete {
+        if reviewed_plan.delete || reviewed_plan.is_binary() {
             return Err(WorkspaceApplyError::InvalidPath);
         }
         total_bytes = total_bytes
@@ -412,6 +483,7 @@ pub(crate) fn select_workspace_apply_set(
         let mut plan = reviewed_plan.clone();
         plan.proposed_digest = sha256_bytes(content.as_bytes());
         plan.proposed_content = content.clone();
+        plan.proposed_binary_base64 = None;
         plans.push(plan);
     }
     if plans.is_empty() {
@@ -663,29 +735,41 @@ pub(crate) fn validate_workspace_apply_set(
     let mut base_bytes = 0_usize;
     for plan in &set.plans {
         validate_target_path(&plan.target_path)?;
+        let proposed = plan.proposed_bytes()?;
         let invalid_proposal = if plan.delete {
             plan.base.is_none()
                 || !plan.proposed_content.is_empty()
+                || plan.proposed_binary_base64.is_some()
                 || plan.proposed_digest != workspace_deletion_digest()
         } else {
-            plan.proposed_content.len() > MAX_WORKSPACE_FILE_BYTES
-                || sha256_bytes(plan.proposed_content.as_bytes()) != plan.proposed_digest
+            proposed.len() > MAX_WORKSPACE_FILE_BYTES
+                || sha256_bytes(proposed.as_ref()) != plan.proposed_digest
+                || plan.proposed_binary_base64.is_some()
+                    && (proposed.is_empty()
+                        || !plan.proposed_content.is_empty()
+                        || std::str::from_utf8(proposed.as_ref()).is_ok()
+                        || plan.proposed_binary_base64.as_deref()
+                            != Some(BASE64_STANDARD.encode(proposed.as_ref()).as_str()))
         };
         if !targets.insert(&plan.target_path)
             || invalid_proposal
             || plan.base.as_ref().is_some_and(|base| {
-                base.content.len() > MAX_WORKSPACE_FILE_BYTES
-                    || sha256_bytes(base.content.as_bytes()) != base.digest
-                    || (!plan.delete && base.content == plan.proposed_content)
+                base.bytes_len() > MAX_WORKSPACE_FILE_BYTES as u64
+                    || !is_sha256(&base.digest)
+                    || base.binary_bytes.is_some()
+                        && (base.binary_bytes == Some(0) || !base.content.is_empty())
+                    || base.binary_bytes.is_none()
+                        && sha256_bytes(base.content.as_bytes()) != base.digest
+                    || (!plan.delete && base.digest == plan.proposed_digest)
             })
         {
             return Err(WorkspaceApplyError::InvalidPath);
         }
         proposed_bytes = proposed_bytes
-            .checked_add(plan.proposed_content.len())
+            .checked_add(proposed.len())
             .ok_or(WorkspaceApplyError::TooLarge)?;
         base_bytes = base_bytes
-            .checked_add(plan.base_content().len())
+            .checked_add(plan.base_bytes_len() as usize)
             .ok_or(WorkspaceApplyError::TooLarge)?;
     }
     if proposed_bytes > MAX_WORKSPACE_APPLY_BYTES
@@ -920,7 +1004,7 @@ fn stage_durable_workspace_plan(
     let result = (|| {
         if !plan.delete {
             let mut stage = create_stage(parent_fd, &stage_name)?;
-            stage.write_all(plan.proposed_content.as_bytes())?;
+            stage.write_all(plan.proposed_bytes()?.as_ref())?;
             stage.set_permissions(fs::Permissions::from_mode(member.proposed_mode))?;
             stage.sync_all()?;
             drop(stage);
@@ -1250,7 +1334,7 @@ fn apply_single_workspace_plan(
     let mut stage = create_stage(parent_fd, &stage_name)?;
     let mut installed = false;
     let install_result = (|| {
-        stage.write_all(plan.proposed_content.as_bytes())?;
+        stage.write_all(plan.proposed_bytes()?.as_ref())?;
         let mode = plan
             .base
             .as_ref()
@@ -1378,7 +1462,7 @@ fn stage_workspace_plan(
     let result = (|| {
         if !plan.delete {
             let mut stage = create_stage(parent_fd, &stage_name)?;
-            stage.write_all(plan.proposed_content.as_bytes())?;
+            stage.write_all(plan.proposed_bytes()?.as_ref())?;
             let mode = plan
                 .base
                 .as_ref()
@@ -1650,10 +1734,15 @@ fn read_target_at(
     if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
         return Err(WorkspaceApplyError::TooLarge);
     }
-    let content = String::from_utf8(bytes).map_err(|_| WorkspaceApplyError::UnsupportedTarget)?;
+    let digest = sha256_bytes(&bytes);
+    let (content, binary_bytes) = match String::from_utf8(bytes) {
+        Ok(content) => (content, None),
+        Err(error) => (String::new(), Some(error.as_bytes().len() as u64)),
+    };
     Ok(Some(WorkspaceFileSnapshot {
-        digest: sha256_bytes(content.as_bytes()),
+        digest,
         content,
+        binary_bytes,
         device: metadata.dev(),
         inode: metadata.ino(),
         mode: metadata.mode(),
@@ -1956,6 +2045,20 @@ fn unlink_at_if_exists(parent_fd: RawFd, name: &CStr) -> Result<(), WorkspaceApp
     }
 }
 
+fn encode_workspace_content(bytes: &[u8]) -> (String, Option<String>) {
+    match std::str::from_utf8(bytes) {
+        Ok(content) => (content.to_owned(), None),
+        Err(_) => (String::new(), Some(BASE64_STANDARD.encode(bytes))),
+    }
+}
+
+fn decoded_base64_len(encoded: &str) -> Result<usize, WorkspaceApplyError> {
+    BASE64_STANDARD
+        .decode(encoded)
+        .map(|bytes| bytes.len())
+        .map_err(|_| WorkspaceApplyError::InvalidPath)
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     sha256_digest(Sha256::digest(bytes))
 }
@@ -2075,8 +2178,126 @@ mod tests {
 
         let json = serde_json::to_string(&plan).unwrap();
         assert!(!json.contains("\"delete\""));
+        assert!(!json.contains("proposed_binary_base64"));
+        assert!(!json.contains("binary_bytes"));
         let recovered: WorkspaceApplyPlan = serde_json::from_str(&json).unwrap();
         assert!(!recovered.deletes_target());
+    }
+
+    #[test]
+    fn non_utf8_file_is_encoded_canonically_and_applied_as_exact_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        let proposed = vec![0, 159, 146, 150, 255];
+        let set = prepare_workspace_apply_requests(
+            &workspace,
+            vec![WorkspaceApplyRequest::WriteBytes {
+                target_path: "image.bin".into(),
+                proposed_bytes: proposed.clone(),
+            }],
+        )
+        .unwrap();
+        let plan = &set.plans[0];
+
+        assert!(plan.is_binary());
+        assert_eq!(plan.base_bytes_len(), 0);
+        assert_eq!(plan.proposed_bytes_len(), proposed.len() as u64);
+        assert!(plan.proposed_content.is_empty());
+        let json = serde_json::to_string(plan).unwrap();
+        assert!(json.contains(&format!(
+            "\"proposed_binary_base64\":\"{}\"",
+            BASE64_STANDARD.encode(&proposed)
+        )));
+        let mut ambiguous = set.clone();
+        ambiguous.plans[0].proposed_content = "shadow text".into();
+        assert!(matches!(
+            validate_workspace_apply_set(&ambiguous),
+            Err(WorkspaceApplyError::InvalidPath)
+        ));
+
+        apply_workspace_plan(&workspace, plan).unwrap();
+        assert_eq!(fs::read(workspace.join("image.bin")).unwrap(), proposed);
+    }
+
+    #[test]
+    fn reviewed_binary_deletion_preserves_only_identity_until_unlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        let target = workspace.join("obsolete.bin");
+        fs::write(&target, [255, 0, 1]).unwrap();
+        let set = prepare_workspace_apply_requests(
+            &workspace,
+            vec![WorkspaceApplyRequest::Delete {
+                target_path: "obsolete.bin".into(),
+            }],
+        )
+        .unwrap();
+        let plan = &set.plans[0];
+
+        assert!(plan.deletes_target());
+        assert!(plan.is_binary());
+        assert_eq!(plan.base_bytes_len(), 3);
+        assert!(!serde_json::to_string(plan).unwrap().contains("/wAB"));
+        apply_workspace_plan(&workspace, plan).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn binary_base_keeps_only_bounded_identity_metadata_in_the_review_plan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        let target = workspace.join("image.bin");
+        let base = vec![255, 0, 1, 2, 3];
+        let proposed = vec![254, 4, 5, 6];
+        fs::write(&target, &base).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let set = prepare_workspace_apply_requests(
+            &workspace,
+            vec![WorkspaceApplyRequest::WriteBytes {
+                target_path: "image.bin".into(),
+                proposed_bytes: proposed.clone(),
+            }],
+        )
+        .unwrap();
+        let plan = &set.plans[0];
+
+        assert!(plan.is_binary());
+        assert_eq!(plan.base_bytes_len(), base.len() as u64);
+        let json = serde_json::to_string(plan).unwrap();
+        assert!(json.contains(&format!("\"binary_bytes\":{}", base.len())));
+        assert!(!json.contains(&BASE64_STANDARD.encode(&base)));
+
+        apply_workspace_plan(&workspace, plan).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), proposed);
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn stale_binary_identity_blocks_the_apply() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        let target = workspace.join("image.bin");
+        fs::write(&target, [255, 0, 1]).unwrap();
+        let set = prepare_workspace_apply_requests(
+            &workspace,
+            vec![WorkspaceApplyRequest::WriteBytes {
+                target_path: "image.bin".into(),
+                proposed_bytes: vec![254, 2, 3],
+            }],
+        )
+        .unwrap();
+        let replacement = workspace.join("replacement.bin");
+        fs::write(&replacement, [255, 0, 1]).unwrap();
+        fs::rename(&replacement, &target).unwrap();
+
+        assert!(matches!(
+            apply_workspace_plan(&workspace, &set.plans[0]),
+            Err(WorkspaceApplyError::StaleBase)
+        ));
+        assert_eq!(fs::read(target).unwrap(), [255, 0, 1]);
     }
 
     #[test]
@@ -2452,6 +2673,52 @@ mod tests {
     }
 
     #[test]
+    fn recovery_rolls_back_an_installed_binary_before_a_pending_text_write() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_binary_roots(&temporary);
+        let (_root, _manifest, mut staged) = stage_prepared_transaction(&workspace, &state, &set);
+        install_transaction_plan(&mut staged[0]).unwrap();
+        drop(staged);
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(
+            report.receipts[0].outcome,
+            WorkspaceTransactionOutcome::RolledBack
+        );
+        assert_eq!(fs::read(workspace.join("image.bin")).unwrap(), [255, 0, 1]);
+        assert_eq!(
+            fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+            "before\n"
+        );
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn recovery_commits_a_fully_installed_binary_and_text_transaction() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_binary_roots(&temporary);
+        let (_root, _manifest, mut staged) = stage_prepared_transaction(&workspace, &state, &set);
+        for candidate in &mut staged {
+            install_transaction_plan(candidate).unwrap();
+        }
+        drop(staged);
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(
+            report.receipts[0].outcome,
+            WorkspaceTransactionOutcome::Committed
+        );
+        assert_eq!(fs::read(workspace.join("image.bin")).unwrap(), [254, 2, 3]);
+        assert_eq!(
+            fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+            "after\n"
+        );
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
     fn recovery_continues_an_interrupted_rollback() {
         let temporary = tempfile::tempdir().unwrap();
         let (workspace, state, set) = durable_test_roots(&temporary);
@@ -2580,6 +2847,33 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn durable_binary_roots(
+        temporary: &tempfile::TempDir,
+    ) -> (PathBuf, PathBuf, WorkspaceApplySetPlan) {
+        let workspace = temporary.path().join("workspace");
+        let state = temporary.path().join("state");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        fs::write(workspace.join("image.bin"), [255, 0, 1]).unwrap();
+        fs::write(workspace.join("notes.txt"), "before\n").unwrap();
+        let set = prepare_workspace_apply_requests(
+            &workspace,
+            vec![
+                WorkspaceApplyRequest::WriteBytes {
+                    target_path: "image.bin".into(),
+                    proposed_bytes: vec![254, 2, 3],
+                },
+                WorkspaceApplyRequest::Write {
+                    target_path: "notes.txt".into(),
+                    proposed_content: "after\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+        (workspace, state, set)
     }
 
     fn transaction_context() -> WorkspaceTransactionContext {

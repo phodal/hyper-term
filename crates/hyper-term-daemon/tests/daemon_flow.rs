@@ -77,7 +77,7 @@ fn fake_lima_runner(root: &Path) -> (LimaTaskRunner, std::path::PathBuf) {
     let log = root.join("limactl.log");
     let environment_marker = root.join("limactl-environment");
     let script = format!(
-        "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nlast=''\nfor argument in \"$@\"; do\n  last=\"$argument\"\n  case \"$argument\" in validate|start|shell|stop|delete) [ -n \"$action\" ] || action=\"$argument\";; esac\ndone\nprintf '%s\\n' \"$action\" >> '{}'\nif [ \"$action\" = start ]; then\n  printf '%s\\n' \"${{last%/*}}\" > '{}'\nfi\nif [ \"$action\" = shell ]; then\n  environment=$(cat '{}')\n  printf 'isolated only\\n' > \"$environment/worktree/generated.txt\"\n  rm \"$environment/worktree/README.md\"\n  printf 'tier2 stream\\n'\nfi\n",
+        "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nlast=''\nfor argument in \"$@\"; do\n  last=\"$argument\"\n  case \"$argument\" in validate|start|shell|stop|delete) [ -n \"$action\" ] || action=\"$argument\";; esac\ndone\nprintf '%s\\n' \"$action\" >> '{}'\nif [ \"$action\" = start ]; then\n  printf '%s\\n' \"${{last%/*}}\" > '{}'\nfi\nif [ \"$action\" = shell ]; then\n  environment=$(cat '{}')\n  printf '\\377\\000\\001' > \"$environment/worktree/data.bin\"\n  printf 'isolated only\\n' > \"$environment/worktree/generated.txt\"\n  rm \"$environment/worktree/README.md\"\n  printf 'tier2 stream\\n'\nfi\n",
         log.display(),
         environment_marker.display(),
         environment_marker.display()
@@ -167,7 +167,7 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         )
         .unwrap();
     assert_eq!(receipt.stdout, "tier2 stream\n");
-    assert_eq!(receipt.changes.changed_files.len(), 2);
+    assert_eq!(receipt.changes.changed_files.len(), 3);
     assert_eq!(
         receipt.changes.changed_files[0].path,
         Path::new("README.md")
@@ -177,11 +177,22 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         hyper_term_sandbox::IsolatedChangeKind::Deleted
     );
     assert!(receipt.changes.changed_files[0].content_sha256.is_none());
+    assert_eq!(receipt.changes.changed_files[1].path, Path::new("data.bin"));
+    let binary_digest = receipt.changes.changed_files[1]
+        .content_sha256
+        .as_deref()
+        .unwrap();
     assert_eq!(
-        receipt.changes.changed_files[1].path,
+        state
+            .read_isolated_result_file(operation.operation_id, Path::new("data.bin"), binary_digest)
+            .unwrap(),
+        [255, 0, 1]
+    );
+    assert_eq!(
+        receipt.changes.changed_files[2].path,
         Path::new("generated.txt")
     );
-    let generated_digest = receipt.changes.changed_files[1]
+    let generated_digest = receipt.changes.changed_files[2]
         .content_sha256
         .as_deref()
         .unwrap();
@@ -199,6 +210,7 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         std::fs::read_to_string(workspace.join("README.md")).unwrap(),
         "source\n"
     );
+    assert!(!workspace.join("data.bin").exists());
     assert!(!workspace.join("generated.txt").exists());
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
@@ -223,15 +235,25 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
     let preview = state
         .preview_isolated_result_acceptance(task_id, operation.operation_id)
         .unwrap();
-    assert_eq!(preview.target_paths, vec!["README.md", "generated.txt"]);
+    assert_eq!(
+        preview.target_paths,
+        vec!["README.md", "data.bin", "generated.txt"]
+    );
     assert_eq!(preview.changes[0].target_path, "README.md");
     assert_eq!(preview.changes[0].before, "source\n");
     assert_eq!(preview.changes[0].after, "");
     assert!(preview.changes[0].deleted);
-    assert_eq!(preview.changes[1].target_path, "generated.txt");
-    assert_eq!(preview.changes[1].before, "");
-    assert_eq!(preview.changes[1].after, "isolated only\n");
-    assert!(!preview.changes[1].deleted);
+    assert_eq!(preview.changes[1].target_path, "data.bin");
+    assert!(preview.changes[1].binary);
+    assert_eq!(preview.changes[1].base_bytes, 0);
+    assert_eq!(preview.changes[1].proposed_bytes, 3);
+    assert!(preview.changes[1].before.is_empty());
+    assert!(preview.changes[1].after.is_empty());
+    assert_eq!(preview.changes[2].target_path, "generated.txt");
+    assert_eq!(preview.changes[2].before, "");
+    assert_eq!(preview.changes[2].after, "isolated only\n");
+    assert!(!preview.changes[2].deleted);
+    assert!(!preview.changes[2].binary);
     assert!(
         state
             .isolated_acceptance_reviews(task_id)
@@ -247,8 +269,12 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
     let acceptance = state
         .propose_isolated_result_acceptance(task_id, operation.operation_id)
         .unwrap();
-    assert_eq!(acceptance.target_paths, vec!["README.md", "generated.txt"]);
+    assert_eq!(
+        acceptance.target_paths,
+        vec!["README.md", "data.bin", "generated.txt"]
+    );
     assert!(acceptance.operation.summary.contains("README.md"));
+    assert!(acceptance.operation.summary.contains("data.bin"));
     assert!(acceptance.operation.summary.contains("generated.txt"));
     let acceptance_path = state_path
         .join("isolated-acceptances")
@@ -261,6 +287,7 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
             & 0o777,
         0o600
     );
+    assert!(!workspace.join("data.bin").exists());
     assert!(!workspace.join("generated.txt").exists());
     drop(state);
     let stored_acceptance = std::fs::read_to_string(&acceptance_path).unwrap();
@@ -306,6 +333,10 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
     assert_eq!(
         std::fs::read_to_string(workspace.join("generated.txt")).unwrap(),
         "isolated only\n"
+    );
+    assert_eq!(
+        std::fs::read(workspace.join("data.bin")).unwrap(),
+        [255, 0, 1]
     );
     assert!(!workspace.join("README.md").exists());
     assert!(matches!(
