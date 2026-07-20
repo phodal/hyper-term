@@ -85,6 +85,7 @@ async fn acp_agent_discovers_the_real_brokered_deno_tool_catalog() {
             ]),
             implementation_version: "fixture-1".into(),
         }],
+        local_mcp_servers: Vec::new(),
         mcp_executable: Some(mcp),
         genui_runtime: Some(AgentGenUiRuntimeConfig {
             deno_executable: deno,

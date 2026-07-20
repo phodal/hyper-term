@@ -19,20 +19,22 @@ use axum::http::header::{
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
+use hyper_term_core::OperationRecord;
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentContainmentConfig, AgentDriverEvent,
     AgentEffectAuthorization, AgentEffectKind, AgentHostOperation, AgentHostRequest,
     AgentHostResponse, AgentSessionCapabilities, AgentSessionConfigValue, CodexAppServerClient,
     CodexAppServerConfig, CodexMcpServerConfig, DenoGenUiCompiler, DenoGenUiConfig, DriverState,
-    ExternalRequestId, GenUiCompileRequest, StructuredAgentClient, StructuredAgentProtocol,
-    sha256_file, stage_codex_auth_file,
+    ExternalRequestId, GenUiCompileRequest, LocalMcpServerConfig, StructuredAgentClient,
+    StructuredAgentProtocol, sha256_file, stage_codex_auth_file,
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, EventEnvelope,
     GenUiArtifactCandidate, GenUiBugCapsule, GenUiBugCapsuleEnvironment,
-    GenUiRuntimeTraceAppendRequest, GenUiRuntimeTraceProjection, MessageRole, OperationAction,
-    OperationCompletion, OperationId, OperationKind, OperationOutcome, OperationState,
-    PermissionDecision, RiskClass, TaskId, TerminalCommand,
+    GenUiRuntimeTraceAppendRequest, GenUiRuntimeTraceProjection, LocalMcpServerRuntimeReceipt,
+    LocalMcpToolCallReceipt, MessageRole, OperationAction, OperationCompletion, OperationId,
+    OperationKind, OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
+    TerminalCommand,
 };
 use hyper_term_sandbox::{IsolatedChange, IsolatedTaskTermination, LimaTaskRunner};
 use serde::{Deserialize, Serialize};
@@ -62,7 +64,10 @@ use crate::workspace_diff::{
     select_workspace_hunks,
 };
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
-use crate::{DaemonError, DaemonState, IsolatedAcceptancePreview, IsolatedAcceptanceReview};
+use crate::{
+    DaemonError, DaemonState, IsolatedAcceptancePreview, IsolatedAcceptanceReview,
+    LocalMcpRuntimeError, LocalMcpRuntimeManager, RegisteredLocalMcpServer,
+};
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
@@ -116,6 +121,7 @@ pub struct AgentGatewayConfig {
     pub codex_executable: Option<PathBuf>,
     pub codex_auth_file: Option<PathBuf>,
     pub acp_providers: Vec<AcpAgentProviderConfig>,
+    pub local_mcp_servers: Vec<LocalMcpServerConfig>,
     pub mcp_executable: Option<PathBuf>,
     pub genui_runtime: Option<AgentGenUiRuntimeConfig>,
     pub workbench_assets: Option<PathBuf>,
@@ -204,6 +210,7 @@ impl AgentGatewayHandle {
     }
 
     pub async fn shutdown(mut self) -> Result<(), AgentGatewayError> {
+        self.runtime.local_mcp.close_all().await;
         self.runtime.close_all();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -244,6 +251,8 @@ pub enum AgentGatewayError {
     WorkspaceRecovery(String),
     #[error("agent gateway ACP provider is invalid: {0}")]
     InvalidAcpProvider(String),
+    #[error("agent gateway local MCP runtime is invalid: {0}")]
+    InvalidLocalMcpRuntime(String),
     #[error("agent gateway I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("agent gateway task failed: {0}")]
@@ -253,6 +262,7 @@ pub enum AgentGatewayError {
 #[derive(Clone)]
 struct AgentGatewayRuntime {
     config: Arc<AgentGatewayConfig>,
+    local_mcp: Arc<LocalMcpRuntimeManager>,
     sessions: Arc<Mutex<HashMap<u16, Arc<AgentSession>>>>,
     preview_shell: Option<Arc<str>>,
     workbench_assets: Option<Arc<PathBuf>>,
@@ -592,6 +602,38 @@ struct AgentPermissionRequest {
     operation_id: OperationId,
     expected_revision: u64,
     decision: PermissionDecision,
+}
+
+#[derive(Deserialize)]
+struct AgentLocalMcpLaunchRequest {
+    server_id: String,
+}
+
+#[derive(Deserialize)]
+struct AgentLocalMcpCallRequest {
+    server_id: String,
+    tool_name: String,
+    #[serde(default)]
+    arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct AgentLocalMcpStatusResponse {
+    registered: Vec<RegisteredLocalMcpServer>,
+    active: Vec<LocalMcpServerRuntimeReceipt>,
+}
+
+#[derive(Serialize)]
+struct AgentLocalMcpOperationResponse {
+    operation_id: OperationId,
+    operation_revision: u64,
+    state: OperationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<LocalMcpServerRuntimeReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<LocalMcpToolCallReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -995,11 +1037,19 @@ pub async fn spawn_agent_gateway(
         .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?;
     let workspace_recovery_block =
         reconcile_workspace_recovery(&config.daemon, &config.state_directory, recovery);
+    let local_mcp = Arc::new(
+        LocalMcpRuntimeManager::new(
+            config.daemon.clone(),
+            std::mem::take(&mut config.local_mcp_servers),
+        )
+        .map_err(|error| AgentGatewayError::InvalidLocalMcpRuntime(error.to_string()))?,
+    );
 
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
     let runtime = AgentGatewayRuntime {
         config: Arc::new(config),
+        local_mcp,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         preview_shell,
         workbench_assets,
@@ -1029,6 +1079,11 @@ pub async fn spawn_agent_gateway(
         .route("/agent/session/stream", get(stream_session))
         .route("/agent/session/config", post(set_session_config))
         .route("/agent/session/permission", post(decide_permission))
+        .route(
+            "/agent/session/mcp",
+            get(local_mcp_status).post(propose_local_mcp_launch),
+        )
+        .route("/agent/session/mcp/call", post(propose_local_mcp_call))
         .route("/agent/session/tier2", get(tier2_results))
         .route("/agent/session/tier2/preview", post(preview_tier2_result))
         .route("/agent/session/tier2/review", post(propose_tier2_review))
@@ -1238,12 +1293,109 @@ async fn close_session(
         Ok(session_id) => session_id,
         Err(response) => return *response,
     };
+    let task_id = runtime
+        .session(session_id)
+        .ok()
+        .map(|session| session.task_id);
     runtime.close_session(session_id);
+    if let Some(task_id) = task_id {
+        runtime.local_mcp.close_task(task_id).await;
+    }
     secure_response(
         StatusCode::NO_CONTENT,
         "text/plain; charset=utf-8",
         Body::empty(),
     )
+}
+
+async fn local_mcp_status(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let session = match runtime.session(session_id) {
+        Ok(session) => session,
+        Err(_) => return status_response(StatusCode::NOT_FOUND, "Agent session does not exist"),
+    };
+    let registered = match runtime.local_mcp.registered_servers() {
+        Ok(registered) => registered,
+        Err(error) => return local_mcp_error_response(error),
+    };
+    let active = match runtime
+        .local_mcp
+        .active_server_receipts(session.task_id)
+        .await
+    {
+        Ok(active) => active,
+        Err(error) => return local_mcp_error_response(error),
+    };
+    json_response(
+        StatusCode::OK,
+        &AgentLocalMcpStatusResponse { registered, active },
+    )
+}
+
+async fn propose_local_mcp_launch(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let session = match runtime.session(session_id) {
+        Ok(session) => session,
+        Err(_) => return status_response(StatusCode::NOT_FOUND, "Agent session does not exist"),
+    };
+    let request = match serde_json::from_slice::<AgentLocalMcpLaunchRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return status_response(StatusCode::BAD_REQUEST, "Local MCP launch is invalid"),
+    };
+    match runtime
+        .local_mcp
+        .propose_launch(session.task_id, &request.server_id)
+    {
+        Ok(operation) => json_response(
+            StatusCode::ACCEPTED,
+            &local_mcp_operation_response(operation, None, None, None),
+        ),
+        Err(error) => local_mcp_error_response(error),
+    }
+}
+
+async fn propose_local_mcp_call(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let session = match runtime.session(session_id) {
+        Ok(session) => session,
+        Err(_) => return status_response(StatusCode::NOT_FOUND, "Agent session does not exist"),
+    };
+    let request = match serde_json::from_slice::<AgentLocalMcpCallRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return status_response(StatusCode::BAD_REQUEST, "Local MCP call is invalid"),
+    };
+    match runtime.local_mcp.propose_tool_call(
+        session.task_id,
+        &request.server_id,
+        request.tool_name,
+        request.arguments,
+    ) {
+        Ok(operation) => json_response(
+            StatusCode::ACCEPTED,
+            &local_mcp_operation_response(operation, None, None, None),
+        ),
+        Err(error) => local_mcp_error_response(error),
+    }
 }
 
 async fn snapshot_session(
@@ -2203,6 +2355,78 @@ async fn decide_permission(
             return status_response(StatusCode::BAD_REQUEST, "Permission decision is invalid");
         }
     };
+    let session = match runtime.session(session_id) {
+        Ok(session) => session,
+        Err(_) => return status_response(StatusCode::NOT_FOUND, "Agent session does not exist"),
+    };
+    match runtime.local_mcp.has_pending_launch(request.operation_id) {
+        Ok(true) => {
+            let receipt = match runtime
+                .local_mcp
+                .resolve_launch(
+                    session.task_id,
+                    request.operation_id,
+                    request.expected_revision,
+                    request.decision,
+                )
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => return local_mcp_error_response(error),
+            };
+            let operation = match runtime.config.daemon.operation(request.operation_id) {
+                Ok(operation) => operation,
+                Err(_) => {
+                    return status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Local MCP launch state is unavailable",
+                    );
+                }
+            };
+            return json_response(
+                StatusCode::ACCEPTED,
+                &local_mcp_operation_response(operation, receipt, None, None),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => return local_mcp_error_response(error),
+    }
+    match runtime.local_mcp.has_pending_call(request.operation_id) {
+        Ok(true) => {
+            let execution = match runtime
+                .local_mcp
+                .resolve_tool_call(
+                    session.task_id,
+                    request.operation_id,
+                    request.expected_revision,
+                    request.decision,
+                )
+                .await
+            {
+                Ok(execution) => execution,
+                Err(error) => return local_mcp_error_response(error),
+            };
+            let operation = match runtime.config.daemon.operation(request.operation_id) {
+                Ok(operation) => operation,
+                Err(_) => {
+                    return status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Local MCP call state is unavailable",
+                    );
+                }
+            };
+            let (receipt, result) = execution.map_or((None, None), |execution| {
+                let result = serde_json::to_value(execution.result).ok();
+                (Some(execution.receipt), result)
+            });
+            return json_response(
+                StatusCode::ACCEPTED,
+                &local_mcp_operation_response(operation, None, receipt, result),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => return local_mcp_error_response(error),
+    }
     let result =
         tokio::task::spawn_blocking(move || runtime.decide_effect(session_id, request)).await;
     match result {
@@ -6098,6 +6322,53 @@ fn valid_provider_id(provider_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn local_mcp_operation_response(
+    operation: OperationRecord,
+    runtime: Option<LocalMcpServerRuntimeReceipt>,
+    receipt: Option<LocalMcpToolCallReceipt>,
+    result: Option<serde_json::Value>,
+) -> AgentLocalMcpOperationResponse {
+    AgentLocalMcpOperationResponse {
+        operation_id: operation.operation_id,
+        operation_revision: operation.revision,
+        state: operation.state,
+        runtime,
+        receipt,
+        result,
+    }
+}
+
+fn local_mcp_error_response(error: LocalMcpRuntimeError) -> Response {
+    match error {
+        LocalMcpRuntimeError::UnknownServer | LocalMcpRuntimeError::ServerNotActive => {
+            status_response(StatusCode::NOT_FOUND, "Local MCP server is unavailable")
+        }
+        LocalMcpRuntimeError::ServerAlreadyActive
+        | LocalMcpRuntimeError::ServerBusy
+        | LocalMcpRuntimeError::PendingLaunchMissing
+        | LocalMcpRuntimeError::PendingCallMissing => status_response(
+            StatusCode::CONFLICT,
+            "Local MCP operation no longer matches the live runtime",
+        ),
+        LocalMcpRuntimeError::UnsupportedDecision => status_response(
+            StatusCode::FORBIDDEN,
+            "Local MCP supports only one-time permission decisions",
+        ),
+        LocalMcpRuntimeError::Tool(_) => status_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Local MCP tool request is invalid or failed",
+        ),
+        LocalMcpRuntimeError::DuplicateServer(_)
+        | LocalMcpRuntimeError::Plan(_)
+        | LocalMcpRuntimeError::Client(_)
+        | LocalMcpRuntimeError::Daemon(_)
+        | LocalMcpRuntimeError::Lock => status_response(
+            StatusCode::BAD_GATEWAY,
+            "Local MCP runtime could not complete the operation safely",
+        ),
+    }
+}
+
 fn json_response(status: StatusCode, value: &impl Serialize) -> Response {
     match serde_json::to_vec(value) {
         Ok(bytes) => secure_response(status, "application/json; charset=utf-8", Body::from(bytes)),
@@ -6148,13 +6419,96 @@ fn constant_time_eq(candidate: &[u8], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
 
     use futures_util::StreamExt;
+    use hyper_term_core::{ExecutionContextInputs, compile_execution_context};
+    use hyper_term_protocol::{
+        CollisionPolicy, EnvironmentPlan, ExecutionContextSpec, ExecutionMode,
+        LocalMcpCredentialScope, LocalMcpServerLifecycle, RuntimeEnvironmentSpec,
+        SandboxEnforcement, SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLifetime,
+        SandboxNetworkPolicy, SandboxProcessPolicy, SandboxProfile, SandboxResourceLimits,
+        WorkspaceContextSpec,
+    };
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    fn gateway_local_mcp_config(
+        temporary: &tempfile::TempDir,
+        workspace: &Path,
+    ) -> LocalMcpServerConfig {
+        let runtime_home = temporary.path().join("mcp-home");
+        let runtime_temp = temporary.path().join("mcp-tmp");
+        std::fs::create_dir_all(&runtime_home).unwrap();
+        std::fs::create_dir_all(&runtime_temp).unwrap();
+        let mut profile = SandboxProfile {
+            enforcement: SandboxEnforcement::Native,
+            filesystem: SandboxFileSystemPolicy::default(),
+            network: SandboxNetworkPolicy::Offline,
+            environment: SandboxEnvironmentPolicy::default(),
+            process: SandboxProcessPolicy::default(),
+            resources: SandboxResourceLimits::default(),
+            lifetime: SandboxLifetime::OneTask,
+        };
+        profile
+            .process
+            .allowed_executables
+            .push(PathBuf::from("/bin/bash").canonicalize().unwrap());
+        let context = ExecutionContextSpec {
+            schema_version: hyper_term_protocol::EXECUTION_CONTEXT_SCHEMA_VERSION,
+            context_id: "gateway:mcp:fixture:1".into(),
+            context_revision: 1,
+            mode: ExecutionMode::Hermetic,
+            workspace: WorkspaceContextSpec {
+                root: workspace.to_owned(),
+                working_directory: workspace.to_owned(),
+                runtime_home: runtime_home.canonicalize().unwrap(),
+                runtime_temp: runtime_temp.canonicalize().unwrap(),
+            },
+            runtime: RuntimeEnvironmentSpec {
+                path: vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+                locale: "C.UTF-8".into(),
+                timezone: "UTC".into(),
+                terminal: "dumb".into(),
+            },
+            shell: None,
+            environment: EnvironmentPlan {
+                bindings: Vec::new(),
+                collision_policy: CollisionPolicy::Deny,
+            },
+            credentials: Vec::new(),
+            sandbox: Some(profile),
+        };
+        let (execution_context, _) =
+            compile_execution_context(&context, &ExecutionContextInputs::default()).unwrap();
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"gateway-fixture","version":"1.0.0"}}}' ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"fixture.read","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]}}' ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"gateway manager result"}],"structuredContent":{"text":"gateway manager result"},"isError":false}}' ;;
+  esac
+done
+"#;
+        let executable = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        LocalMcpServerConfig {
+            server_id: "gateway_fixture".into(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            executable,
+            arguments: [OsString::from("-c"), OsString::from(script)].into(),
+            working_directory: workspace.to_owned(),
+            execution_context,
+            roots_snapshot_sha256: Some("a".repeat(64)),
+            lifecycle: LocalMcpServerLifecycle::OneTask,
+            credential_scope: LocalMcpCredentialScope::ServerLifetime,
+        }
+    }
 
     #[test]
     fn provider_model_version_errors_become_actionable_status_text() {
@@ -6168,6 +6522,138 @@ mod tests {
             agent_error_summary("Agent exited before the turn completed"),
             "Agent exited before the turn completed"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticated_session_drives_reviewed_local_mcp_over_real_stdio() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let codex = temporary.path().join("codex");
+        std::fs::write(
+            &codex,
+            r#"#!/bin/sh
+if [ "${1:-} ${2:-}" = "login status" ]; then exit 0; fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"mcp-gateway-fixture"}}' ;;
+    *'"method":"model/list"'*) printf '%s\n' '{"id":2,"result":{"data":[{"model":"gpt-test","displayName":"GPT Test","description":"Fixture","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"Medium"}],"defaultReasoningEffort":"medium","isDefault":true}]}}' ;;
+    *'"method":"skills/list"'*) printf '%s\n' '{"id":3,"result":{"data":[]}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":4,"result":{"thread":{"id":"mcp-gateway-thread"}}}' ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace: workspace.clone(),
+            state_directory: temporary.path().join("gateway-state"),
+            daemon,
+            provider_home: temporary.path().to_owned(),
+            codex_executable: Some(codex),
+            codex_auth_file: None,
+            acp_providers: Vec::new(),
+            local_mcp_servers: vec![gateway_local_mcp_config(&temporary, &workspace)],
+            mcp_executable: None,
+            genui_runtime: None,
+            workbench_assets: None,
+            debug_capsule: None,
+            tier2_runner: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .unwrap();
+        let session_path = format!("/agent/session?token={token}&session_id=14&provider=codex");
+        let (status, body) = request_path(gateway.address(), &session_path, "POST", b"{}").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id: TaskId = serde_json::from_value(session["task_id"].clone()).unwrap();
+        let mcp_path = format!("/agent/session/mcp?token={token}&session_id=14");
+        let (status, body) = request_path(gateway.address(), &mcp_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let inventory: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(inventory["registered"][0]["server_id"], "gateway_fixture");
+        assert_eq!(inventory["active"].as_array().unwrap().len(), 0);
+
+        let (status, body) = request_path(
+            gateway.address(),
+            &mcp_path,
+            "POST",
+            br#"{"server_id":"gateway_fixture"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16());
+        let launch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(launch["state"], "waiting_human");
+        let permission_path = format!("/agent/session/permission?token={token}&session_id=14");
+        let approval = serde_json::json!({
+            "operation_id": launch["operation_id"],
+            "expected_revision": launch["operation_revision"],
+            "decision": "allow_once"
+        });
+        let (status, body) = request_path(
+            gateway.address(),
+            &permission_path,
+            "POST",
+            &serde_json::to_vec(&approval).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16());
+        let launched: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(launched["state"], "succeeded");
+        assert_eq!(launched["runtime"]["server_name"], "gateway-fixture");
+        assert_eq!(launched["runtime"]["tools"][0]["name"], "fixture.read");
+
+        let call_path = format!("/agent/session/mcp/call?token={token}&session_id=14");
+        let (status, body) = request_path(
+            gateway.address(),
+            &call_path,
+            "POST",
+            br#"{"server_id":"gateway_fixture","tool_name":"fixture.read","arguments":{"path":"README.md"}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16());
+        let call: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let approval = serde_json::json!({
+            "operation_id": call["operation_id"],
+            "expected_revision": call["operation_revision"],
+            "decision": "allow_once"
+        });
+        let (status, body) = request_path(
+            gateway.address(),
+            &permission_path,
+            "POST",
+            &serde_json::to_vec(&approval).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16());
+        let completed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(completed["state"], "succeeded");
+        assert_eq!(completed["receipt"]["succeeded"], true);
+        assert_eq!(
+            completed["result"]["structuredContent"]["text"],
+            "gateway manager result"
+        );
+
+        let (status, _) = request_path(gateway.address(), &session_path, "DELETE", b"").await;
+        assert_eq!(status, StatusCode::NO_CONTENT.as_u16());
+        assert!(
+            gateway
+                .runtime
+                .local_mcp
+                .active_server_receipts(task_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        gateway.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6206,6 +6692,7 @@ done
             codex_executable: Some(codex),
             codex_auth_file: Some(temporary.path().join(".codex/auth.json")),
             acp_providers: Vec::new(),
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -6797,6 +7284,7 @@ done
             codex_executable: None,
             codex_auth_file: None,
             acp_providers: Vec::new(),
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -6859,6 +7347,7 @@ done
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -7018,6 +7507,7 @@ done
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -7184,6 +7674,7 @@ done
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -7280,6 +7771,7 @@ done
                 environment: BTreeMap::new(),
                 implementation_version: "fixture-1".into(),
             }],
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -7472,6 +7964,7 @@ done
                 environment: BTreeMap::new(),
                 implementation_version: "fixture-1".into(),
             }],
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -7950,6 +8443,7 @@ done
                 environment: BTreeMap::new(),
                 implementation_version: "fixture-1".into(),
             }],
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: Some(AgentGenUiRuntimeConfig {
                 deno_executable: deno,
@@ -8144,6 +8638,7 @@ done
                 environment: BTreeMap::new(),
                 implementation_version: "fixture-1".into(),
             }],
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: Some(AgentGenUiRuntimeConfig {
                 deno_executable: deno,
@@ -8400,6 +8895,7 @@ done
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: Some(AgentGenUiRuntimeConfig {
                 deno_executable: deno,
@@ -8749,6 +9245,7 @@ done
                 environment: BTreeMap::new(),
                 implementation_version: "fixture-1".into(),
             }],
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -8904,6 +9401,7 @@ done
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -9053,6 +9551,7 @@ done
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
             acp_providers: Vec::new(),
+            local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
             workbench_assets: None,
@@ -9166,17 +9665,19 @@ done
             "<!-- HYPER_TERM_ARTIFACT_BOOTSTRAP -->hyper_term_preview_boot",
         )
         .expect("preview");
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
         let runtime = AgentGatewayRuntime {
             config: Arc::new(AgentGatewayConfig {
                 bind: "127.0.0.1:0".parse().expect("bind"),
                 token: "0123456789abcdef0123456789abcdef".into(),
                 workspace: workspace.canonicalize().unwrap(),
                 state_directory: state_directory.canonicalize().unwrap(),
-                daemon: DaemonState::open(temporary.path().join("daemon-state")).unwrap(),
+                daemon: daemon.clone(),
                 provider_home: temporary.path().to_owned(),
                 codex_executable: None,
                 codex_auth_file: None,
                 acp_providers: Vec::new(),
+                local_mcp_servers: Vec::new(),
                 mcp_executable: Some(mcp),
                 genui_runtime: Some(AgentGenUiRuntimeConfig {
                     deno_executable: deno,
@@ -9191,6 +9692,7 @@ done
                 tier2_runner: None,
                 control_socket: temporary.path().join("hyperd.sock"),
             }),
+            local_mcp: Arc::new(LocalMcpRuntimeManager::new(daemon, Vec::new()).unwrap()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             preview_shell: None,
             workbench_assets: None,

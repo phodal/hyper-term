@@ -150,6 +150,7 @@ fn run() -> Result<i32, String> {
             codex_executable: resolved.codex.clone(),
             codex_auth_file: resolved.codex_auth.clone(),
             acp_providers,
+            local_mcp_servers: Vec::new(),
             mcp_executable: resolved.mcp.clone(),
             genui_runtime: resolved
                 .genui_runtime
