@@ -5,6 +5,8 @@ smoke_repo_root=$(cd "$(dirname "$0")/.." && pwd)
 smoke_supervisor=${1:-"$smoke_repo_root/target/debug/hyper-term-desktop"}
 smoke_renderer=${2:-"$smoke_repo_root/apps/desktop/zig-out/bin/hyper-term"}
 smoke_acp_fixture="$smoke_repo_root/scripts/fixtures/acp_diff_agent.sh"
+smoke_terminal_acp_fixture="$smoke_repo_root/scripts/fixtures/acp_terminal_agent.sh"
+smoke_lima_fixture="$smoke_repo_root/scripts/fixtures/fake_limactl.sh"
 smoke_artifact_dir=${HYPER_TERM_SMOKE_ARTIFACT_DIR:-}
 
 if [[ "$smoke_supervisor" != /* ]]; then
@@ -21,7 +23,7 @@ if [[ $(uname -s) != Darwin ]]; then
   echo "macOS desktop smoke requires a macOS host" >&2
   exit 1
 fi
-for smoke_command in native python3 stat; do
+for smoke_command in git native python3 shasum stat; do
   if ! command -v "$smoke_command" >/dev/null 2>&1; then
     echo "required command is unavailable: $smoke_command" >&2
     exit 1
@@ -39,6 +41,14 @@ if [[ ! -x "$smoke_acp_fixture" ]]; then
   echo "desktop ACP fixture is unavailable: $smoke_acp_fixture" >&2
   exit 1
 fi
+if [[ ! -x "$smoke_terminal_acp_fixture" ]]; then
+  echo "desktop terminal ACP fixture is unavailable: $smoke_terminal_acp_fixture" >&2
+  exit 1
+fi
+if [[ ! -x "$smoke_lima_fixture" ]]; then
+  echo "desktop Lima fixture is unavailable: $smoke_lima_fixture" >&2
+  exit 1
+fi
 for smoke_asset in \
   "$smoke_repo_root/dist/terminal/index.html" \
   "$smoke_repo_root/dist/workbench/index.html"; do
@@ -51,6 +61,25 @@ done
 smoke_root=$(mktemp -d)
 smoke_log="$smoke_root/hyper-term-smoke.log"
 smoke_pid=""
+
+smoke_workspace="$smoke_root/workspace"
+mkdir -p "$smoke_workspace"
+git -C "$smoke_workspace" init -q
+git -C "$smoke_workspace" config user.name "Hyper Term Smoke"
+git -C "$smoke_workspace" config user.email "hyper-term@example.invalid"
+printf 'Hyper Term\n' > "$smoke_workspace/README.md"
+git -C "$smoke_workspace" add README.md
+git -C "$smoke_workspace" commit -qm fixture
+
+smoke_lima="$smoke_root/limactl"
+smoke_lima_image="$smoke_root/tier2.qcow2"
+smoke_acp="$smoke_root/acp-diff-agent"
+cp "$smoke_acp_fixture" "$smoke_acp"
+chmod 700 "$smoke_acp"
+cp "$smoke_lima_fixture" "$smoke_lima"
+chmod 700 "$smoke_lima"
+printf 'local pinned smoke image' > "$smoke_lima_image"
+smoke_lima_image_sha256=$(shasum -a 256 "$smoke_lima_image" | awk '{print $1}')
 
 smoke_cleanup() {
   smoke_status=$?
@@ -74,10 +103,16 @@ trap 'exit 143' TERM
   cd "$smoke_root"
   exec "$smoke_supervisor" \
     --ui "$smoke_renderer" \
+    --state-dir "$smoke_root/state" \
     --terminal-assets "$smoke_repo_root/dist/terminal" \
     --workbench-assets "$smoke_repo_root/dist/workbench" \
-    --codex "$smoke_acp_fixture" \
-    --codex-acp "$smoke_acp_fixture"
+    --shell-cwd "$smoke_workspace" \
+    --codex "$smoke_acp" \
+    --codex-acp "$smoke_acp" \
+    --claude-agent-acp "$smoke_terminal_acp_fixture" \
+    --lima "$smoke_lima" \
+    --lima-image "$smoke_lima_image" \
+    --lima-image-sha256 "$smoke_lima_image_sha256"
 ) >"$smoke_log" 2>&1 &
 smoke_pid=$!
 
@@ -189,6 +224,29 @@ PY
     'name="Changed files"' \
     'name="Changed file README.md, plus 1, minus 0"' \
     'AI Terminal'
+  native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
+
+  native automate shortcut hyper-term.new-claude-acp-agent
+  native automate assert \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Send prompt".*enabled=true'
+  smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text 'Run the bounded terminal'
+  native automate assert \
+    'role=textbox name="Agent prompt".*text="Run the bounded terminal"' \
+    'role=button name="Send prompt".*enabled=true'
+  smoke_send_id=$(smoke_widget_id 'role=button name="Send prompt".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_send_id"
+  native automate assert \
+    'Approval required' \
+    'Shell command · external effect' \
+    'Isolated Tier 2 command · no ordinary PTY access' \
+    'role=button name="Allow once".*enabled=true'
+  smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_allow_id"
+  native automate assert \
+    'Tier 2 terminal completed.' \
+    'Decision: allowed once'
   native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
   native automate screenshot hyper-term-canvas
   smoke_agent_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png
