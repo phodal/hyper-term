@@ -986,6 +986,23 @@ test "Agent timeline mounts only a tail window at the full retained block bound"
     try testing.expect(widgetCount(tree.root) < 220);
 }
 
+test "Agent conversation uses compact reading and composer rails" {
+    var model = main.initialModel();
+    model.session_slots[0].mode = .agent;
+    model.session_slots[0].title = "Agent";
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+
+    const reading_rail = findByLabel(tree.root, "Agent reading rail").?;
+    const composer_rail = findByLabel(tree.root, "Agent composer rail").?;
+    try testing.expectEqual(main.agent_reading_width, reading_rail.layout.min_size.width);
+    try testing.expectEqual(main.agent_reading_width, reading_rail.layout.max_size.width);
+    try testing.expectEqual(main.agent_reading_width, composer_rail.layout.min_size.width);
+    try testing.expectEqual(main.agent_reading_width, composer_rail.layout.max_size.width);
+}
+
 test "read-only MCP approvals expose an exact Allow once action" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";

@@ -2607,6 +2607,7 @@ const agent_timeline_id = "agent-blocks";
 const agent_timeline_estimated_width: usize = 84;
 const agent_timeline_line_height: f32 = 19;
 const agent_timeline_viewport_fallback: f32 = 480;
+pub const agent_reading_width: f32 = 760;
 
 fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 {
     const pointer = context orelse return 36;
@@ -2663,15 +2664,27 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
             ui.text(.{ .padding = 6, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Older activity is compacted · showing the latest {d} blocks", .{max_agent_blocks})),
             timeline,
         });
-    if (!model.agent_plan_visible) return transcript;
-    const goal_width: f32 = if (model.hasAgentEditor()) 360 else 620;
-    return ui.column(.{ .grow = 1 }, .{
-        transcript,
-        ui.row(.{ .gap = 5, .padding = 5, .cross = .center }, .{
-            ui.spacer(1),
-            agentActivityNodeWithWidth(ui, &model.agent_plan, goal_width),
-            ui.spacer(1),
-        }),
+    const content = if (!model.agent_plan_visible)
+        transcript
+    else blk: {
+        const goal_width: f32 = if (model.hasAgentEditor()) 360 else 620;
+        break :blk ui.column(.{ .grow = 1 }, .{
+            transcript,
+            ui.row(.{ .gap = 5, .padding = 5, .cross = .center }, .{
+                ui.spacer(1),
+                agentActivityNodeWithWidth(ui, &model.agent_plan, goal_width),
+                ui.spacer(1),
+            }),
+        });
+    };
+    if (model.hasAgentEditor()) return content;
+    return ui.row(.{ .grow = 1, .cross = .stretch }, .{
+        ui.spacer(1),
+        ui.column(.{
+            .width = agent_reading_width,
+            .semantics = .{ .label = "Agent reading rail" },
+        }, .{content}),
+        ui.spacer(1),
     });
 }
 
@@ -2708,7 +2721,6 @@ fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBl
         return ui.column(.{ .grow = 1 }, .{
             ui.row(.{ .gap = 4, .padding = 2, .cross = .center }, .{
                 ui.button(.{
-                    .grow = 1,
                     .size = .sm,
                     .variant = .ghost,
                     .icon = if (block.expanded) "chevron-down" else "chevron-right",
@@ -2741,21 +2753,21 @@ fn agentActivityNodeWithWidth(ui: *HyperTermUi, block: *const AgentBlockView, wi
     }, .{
         ui.row(.{ .gap = 5, .padding = 2, .cross = .center }, .{
             ui.button(.{
-                .grow = 1,
                 .size = .sm,
                 .variant = .ghost,
                 .icon = if (block.expanded) "chevron-down" else "chevron-right",
                 .on_press = Msg{ .toggle_agent_block = block.id },
             }, block.activityTitle()),
+            ui.spacer(1),
             ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.activityMeta()),
         }),
         if (block.expanded)
             ui.column(.{ .gap = 5, .padding = 7 }, .{
-            if (block.hasActivityDetails()) AgentMarkdown.view(ui, block.content(), .{}) else ui.el(.stack, .{}, .{}),
-            if (block.truncated)
-                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Tool details clipped to 8 KiB in this view.")
-            else
-                ui.el(.stack, .{}, .{}),
+                if (block.hasActivityDetails()) AgentMarkdown.view(ui, block.content(), .{}) else ui.el(.stack, .{}, .{}),
+                if (block.truncated)
+                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Tool details clipped to 8 KiB in this view.")
+                else
+                    ui.el(.stack, .{}, .{}),
             })
         else
             ui.el(.stack, .{}, .{}),

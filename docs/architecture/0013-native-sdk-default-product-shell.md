@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-18
-- Amended: 2026-07-20 (hybrid fragment hot reload)
+- Amended: 2026-07-20 (hybrid reload and compact Agent workspace)
 - Supersedes the product-shell decision in:
   [ADR 0012](0012-native-sdk-renderer-spike.md)
 - Depends on: [ADR 0002](0002-runtime-authority-boundaries.md),
@@ -135,6 +135,18 @@ builds retain only the ahead-of-time compiled document and no source watcher.
 
 ## Compact Agent interaction evidence (2026-07-20)
 
+The compact hierarchy is based on two local reference implementations, not on
+a screenshot-only imitation. The installed Codex desktop bundle is
+`/Applications/ChatGPT.app` (signed and presented as Codex); its visible task
+surface uses a bounded reading column, collapsed activity summaries, and a
+bottom composer with adjacent goal state. The local Codex checkout's
+`codex-rs/tui` sources make the interaction rules explicit:
+`bottom_pane/chat_composer.rs` owns command, file, Skill, history, paste, and
+popup routing; `goal_display.rs`, `chatwidget/goal_status.rs`, and
+`bottom_pane/footer.rs` reduce goal status to compact elapsed or budget usage.
+Hyper Term adopts those information-density rules while retaining its own
+Native SDK widget system and Rust-owned ACP/Block model.
+
 The Native Agent transcript now follows the Codex-style disclosure hierarchy
 without copying its application structure. Consecutive reasoning and tool-call
 Blocks project into one collapsed `Processed` activity row; final Agent prose
@@ -153,10 +165,23 @@ remain anchored selectors in that row. Direct Codex selections are sent through
 the Rust adapter on the next `turn/start`; Native state is only the projection.
 An active turn disables dispatch and configuration changes but leaves the text
 area editable, so the next prompt can be prepared while streaming continues.
+
+Outside ACP artifact editing, transcript, Goal, and composer share one centered
+760-point reading rail. Activity labels take only their intrinsic width; their
+duration, file-count, and diff metadata stay right-aligned, and details remain
+unmounted until disclosure. Opening the artifact editor intentionally removes
+that fixed rail so the Agent/editor split can consume the available width. The
+composer is one reusable Native template in both states, preventing Skills,
+commands, model, reasoning, send, and multiline behavior from drifting.
+
 Native automation exercised both disclosures, opened the Skills and model
 menus, entered a four-line Chinese prompt through the real text-input path, and
 captured a nonblank Metal/reference-renderer screenshot without dispatch or
-widget-budget errors.
+widget-budget errors. A second minimum-window automation run measured both
+rails at exactly 760 points inside an 840-point window, with 40-point symmetric
+gutters, an unchanged 68-point one-line composer, and no frame-budget or
+dispatch errors. A structural layout test locks those widths for both the Zig
+transcript projection and compiled Native composer.
 
 ## Rejected alternatives
 
