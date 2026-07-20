@@ -5315,7 +5315,7 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
     {
         Ok(turn_id) => turn_id,
         Err(error) => {
-            set_progress_failed(&session, &bounded_error(&error.to_string()));
+            set_progress_failed(&session, &agent_error_summary(&error.to_string()));
             return;
         }
     };
@@ -5357,7 +5357,7 @@ fn continue_turn(
         let event = match session.client.next_event(remaining) {
             Ok(event) => event,
             Err(error) => {
-                set_progress_failed(&session, &bounded_error(&error.to_string()));
+                set_progress_failed(&session, &agent_error_summary(&error.to_string()));
                 return;
             }
         };
@@ -5857,6 +5857,35 @@ fn bounded_error(message: &str) -> String {
     message[..end].to_owned()
 }
 
+fn agent_error_summary(message: &str) -> String {
+    const CODEX_UPGRADE_MARKER: &str = "requires a newer version of Codex";
+    if message.contains(CODEX_UPGRADE_MARKER) {
+        let model = message
+            .find("The '")
+            .and_then(|start| {
+                let value = &message[start + "The '".len()..];
+                value.find("' model").map(|end| &value[..end])
+            })
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 96
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    })
+            });
+        return match model {
+            Some(model) => format!(
+                "Model {model} requires a newer Codex CLI · choose another model or update Codex"
+            ),
+            None => {
+                "Selected model requires a newer Codex CLI · choose another model or update Codex"
+                    .to_owned()
+            }
+        };
+    }
+    bounded_error(message)
+}
+
 fn ready_response(session_id: u16, session: &AgentSession) -> AgentSessionResponse {
     AgentSessionResponse {
         session_id,
@@ -5942,6 +5971,20 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    #[test]
+    fn provider_model_version_errors_become_actionable_status_text() {
+        let nested = r#"ACP request 3 failed: {"code":-32603,"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\"}}"}"#;
+        assert_eq!(
+            agent_error_summary(nested),
+            "Model gpt-5.6-sol requires a newer Codex CLI · choose another model or update Codex"
+        );
+        assert!(!agent_error_summary(nested).contains("jsonrpc"));
+        assert_eq!(
+            agent_error_summary("Agent exited before the turn completed"),
+            "Agent exited before the turn completed"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn provider_endpoint_observes_login_without_gateway_restart() {
