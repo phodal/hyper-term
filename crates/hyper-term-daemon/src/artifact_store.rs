@@ -455,8 +455,9 @@ mod tests {
     fn new_acceptance_requires_source_but_legacy_artifacts_remain_readable() {
         let temporary = tempfile::tempdir().unwrap();
         let store = ArtifactStore::open(temporary.path()).unwrap();
-        let mut legacy = candidate("legacy");
-        legacy.source_files.clear();
+        let legacy: GenUiArtifactCandidate =
+            serde_json::from_slice(include_bytes!("../testdata/artifact_candidate_v1.json"))
+                .unwrap();
         assert!(matches!(
             store.persist(legacy.clone()),
             Err(ArtifactStoreError::InvalidSourceSnapshot)
@@ -471,7 +472,7 @@ mod tests {
         };
         fs::write(
             store.path(accepted.artifact_id),
-            serde_json::to_vec(&legacy).unwrap(),
+            include_bytes!("../testdata/artifact_candidate_v1.json"),
         )
         .unwrap();
         let stored = store.read(&accepted).unwrap();

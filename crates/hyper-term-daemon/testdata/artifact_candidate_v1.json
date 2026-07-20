@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source_revision": 7,
+  "entrypoint": "/App.tsx",
+  "bundle": "legacy",
+  "css": "",
+  "source_map": "{}",
+  "content_digest": "c49fea7425fa7f8699897a97c159c6690267d9003bb78c53fafa8fc15c325d84",
+  "compiler": {
+    "name": "esbuild-wasm",
+    "version": "0.28.1"
+  }
+}
