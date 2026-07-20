@@ -295,8 +295,8 @@ Useful design documents:
 ## Roadmap
 
 - Harden terminal performance, accessibility, reconnect, and recovery gates.
-- Add interrupted-VM cleanup, pending-review recovery, and a user-facing diff
-  surface to the Tier 2 Lima runner; extend its exact text-file acceptance to
+- Add pending-review recovery and a user-facing diff surface to the Tier 2 Lima
+  runner; extend its exact text-file acceptance to
   reviewed deletions and bounded binary patches without giving the renderer
   write authority, and run a pinned production image through the release
   conformance gate.

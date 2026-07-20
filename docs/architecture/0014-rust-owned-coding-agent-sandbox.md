@@ -634,9 +634,14 @@ generated worktree file, and verifies that stop/delete leaves no hostagent or
 VM process. The test remains opt-in because the 225 MiB image must be supplied
 locally and is never downloaded by the product or normal test suite.
 
-This remains an experimental Tier 2 baseline. Cleanup/reconciliation for a VM
-interrupted before its receipt, recovery of a pending pre-apply review, a
-user-facing bounded patch/diff API, deletion and binary acceptance semantics,
+If the daemon restarts before a receipt is durable, it derives the same short
+private Lima home and instance name from the environment identity, forces the
+instance through stop/delete, removes the incomplete worktree registration,
+and only then discards the operation directory. A missing Lima executable or a
+failed delete blocks that recovery instead of silently abandoning a live VM.
+
+This remains an experimental Tier 2 baseline. Recovery of a pending pre-apply
+review, a user-facing bounded patch/diff API, deletion and binary acceptance semantics,
 and a release-gated boot test using the production pinned image are still open.
 Opaque ACP provider workloads also remain on the Tier 1 control-process path
 until their credentials, dependencies, and broker channels can be staged into
