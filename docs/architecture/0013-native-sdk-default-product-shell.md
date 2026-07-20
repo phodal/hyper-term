@@ -118,14 +118,29 @@ same `hyper-term.close-session` command. Native automation created a real Agent
 tab, observed the terminal-plus-Agent workspace, invoked that shortcut, and
 proved the Agent tab and workspace were removed while `zsh 1` became selected.
 
-Agent mode also owns a second system WebView for the current accepted Agentic UI
-artifact. The compositor derives its URL from a validated isolated Artifact
-Block, uses the artifact source revision as a reload token, and collapses it to
-1-by-1 when inactive or absent. Native strict checks, 33 renderer tests,
-minimum-window and text-expansion layout sweeps, semantic snapshots, and a Metal
-canvas screenshot pass. Native automation cannot capture a child system
-WebView, so authenticated HTTP tests and browser verification separately prove
-the compiled React preview capsule.
+Agent mode may own a second system WebView for the current accepted Agentic UI
+artifact. The startup scene itself contains only the Metal canvas. After its
+first present, a one-shot Native timer mounts the Terminal WebView on the next
+run-loop turn; the GenUI/Workbench WebView is not created until the user opens
+an ACP artifact editor or a verified Bug Capsule. Once mounted, the compositor
+derives its URL from a validated isolated Artifact Block, uses the artifact
+source revision as a reload token, and collapses it to 1-by-1 when inactive.
+This keeps ordinary Terminal and Agent launches free of an unused WKWebView
+without moving navigation or process authority into the renderer. Native strict
+checks, renderer lifecycle tests, minimum-window and text-expansion layout
+sweeps, semantic snapshots, and a Metal canvas screenshot pass cover the
+boundary. Native automation cannot capture a child system WebView, so
+authenticated HTTP tests and browser verification separately prove the compiled
+React preview capsule.
+
+The 2026-07-21 macOS launch timeline measured the prior eager two-WebView scene
+at about 367 ms from GPU-surface creation to its first frame and about 417 ms
+from window creation to visible presentation. Reading the 22 MiB UI font was
+disabled in an A/B run and left the first-frame result at about 370 ms, ruling
+it out as the dominant cost. With the canvas-first deferred mounts, the same
+ReleaseFast smokes measured 0.2-0.3 ms for the SDK first-frame metric and
+11-12 ms from window creation to first presentation; the complete Terminal, Agent,
+Goal, and ACP smoke plus the lazy-pane lifecycle tests remained green.
 
 Debug authoring uses Native SDK's hybrid fragment watcher rather than its
 whole-document runtime root. `src/app.native` remains a compiled fragment

@@ -75,6 +75,8 @@ pub const agent_tier2_review_effect_key_base: u64 = 0x4854_4c00;
 pub const agent_tier2_discard_effect_key_base: u64 = 0x4854_4d00;
 pub const agent_provider_refresh_effect_key: u64 = 0x4854_4e00;
 pub const agent_goal_effect_key_base: u64 = 0x4854_5000;
+pub const deferred_webview_timer_id: u64 = 0x4854_5100;
+const deferred_webview_delay_ns: u64 = 1_000_000;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
@@ -99,28 +101,6 @@ const shell_views = [_]native_sdk.ShellView{
         .gpu_alpha_mode = .@"opaque",
         .gpu_color_space = .srgb,
         .gpu_vsync = true,
-    },
-    .{
-        .label = terminal_view_label,
-        .kind = .webview,
-        .parent = canvas_label,
-        .url = "zero://inline",
-        .x = 0,
-        .y = 0,
-        .width = 1,
-        .height = 1,
-        .layer = 20,
-    },
-    .{
-        .label = genui_view_label,
-        .kind = .webview,
-        .parent = canvas_label,
-        .url = "zero://inline",
-        .x = 0,
-        .y = 0,
-        .width = 1,
-        .height = 1,
-        .layer = 21,
     },
 };
 const shell_windows = [_]native_sdk.ShellWindow{.{
@@ -673,6 +653,8 @@ pub const Model = struct {
     genui_artifact_id_len: usize = 0,
     genui_source_revision: u64 = 0,
     agent_editor_open_session_id: u8 = 0,
+    terminal_webview_mounted: bool = false,
+    genui_webview_mounted: bool = false,
     agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
     agent_pending_prompts: [max_sessions]PendingAgentPrompt = [_]PendingAgentPrompt{.{}} ** max_sessions,
     ui_font_registered: bool = false,
@@ -752,6 +734,8 @@ pub const Model = struct {
         "agent_editor_open_session_id",
         "agent_composer_buffer",
         "agent_pending_prompts",
+        "terminal_webview_mounted",
+        "genui_webview_mounted",
         "ui_font_registered",
         "agent_blocks",
         "agent_block_count",
@@ -4640,28 +4624,33 @@ pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize
 }
 
 pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize {
-    if (out.len == 0) return 0;
-    out[0] = if (model.isTerminal() and model.terminalReady()) .{
-        .label = terminal_view_label,
-        .anchor = terminal_view_anchor,
-        .url = model.terminalUrl(),
-    } else .{
-        .label = terminal_view_label,
-        .frame = geometry.RectF.init(0, 0, 1, 1),
-        .url = "zero://inline",
-    };
-    if (out.len == 1) return 1;
-    out[1] = if (model.isCapsule() or model.hasAgentEditor()) .{
-        .label = genui_view_label,
-        .anchor = genui_view_anchor,
-        .url = model.genUiWorkbenchUrl(),
-        .reload_token = model.genui_source_revision,
-    } else .{
-        .label = genui_view_label,
-        .frame = geometry.RectF.init(0, 0, 1, 1),
-        .url = "zero://inline",
-    };
-    return 2;
+    var count: usize = 0;
+    if (model.terminal_webview_mounted and count < out.len) {
+        out[count] = if (model.isTerminal() and model.terminalReady()) .{
+            .label = terminal_view_label,
+            .anchor = terminal_view_anchor,
+            .url = model.terminalUrl(),
+        } else .{
+            .label = terminal_view_label,
+            .frame = geometry.RectF.init(0, 0, 1, 1),
+            .url = "zero://inline",
+        };
+        count += 1;
+    }
+    if (model.genui_webview_mounted and count < out.len) {
+        out[count] = if (model.isCapsule() or model.hasAgentEditor()) .{
+            .label = genui_view_label,
+            .anchor = genui_view_anchor,
+            .url = model.genUiWorkbenchUrl(),
+            .reload_token = model.genui_source_revision,
+        } else .{
+            .label = genui_view_label,
+            .frame = geometry.RectF.init(0, 0, 1, 1),
+            .url = "zero://inline",
+        };
+        count += 1;
+    }
+    return count;
 }
 
 fn refreshGenUiWorkbenchUrl(model: *Model) void {
@@ -4738,6 +4727,117 @@ fn trustedGatewayToken(token: []const u8) bool {
     return true;
 }
 
+/// Keeps launch-to-glass native-first. The scene installs only the Metal
+/// canvas; the ordinary Terminal WebView joins on the next run-loop turn, and
+/// the Artifact Workbench does not exist until an editor or Capsule needs it.
+/// Both views remain presentation-only children of the trusted canvas.
+pub const DeferredWebViewApp = struct {
+    inner: native_sdk.App,
+    model: *Model,
+    primary_window_id: native_sdk.WindowId = 0,
+    mount_timer_armed: bool = false,
+    mounting_enabled: bool = false,
+
+    pub fn init(app_state: *HyperTermApp) DeferredWebViewApp {
+        return .{
+            .inner = app_state.app(),
+            .model = &app_state.model,
+        };
+    }
+
+    pub fn app(self: *DeferredWebViewApp) native_sdk.App {
+        return .{
+            .context = self,
+            .name = self.inner.name,
+            .source = self.inner.source,
+            .scene_fn = scene,
+            .start_fn = start,
+            .event_fn = event,
+            .stop_fn = stop,
+            .replay_fn = replay,
+        };
+    }
+
+    fn scene(context: *anyopaque) anyerror!native_sdk.ShellConfig {
+        const self: *DeferredWebViewApp = @ptrCast(@alignCast(context));
+        return (try self.inner.scene()) orelse error.MissingScene;
+    }
+
+    fn start(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const self: *DeferredWebViewApp = @ptrCast(@alignCast(context));
+        try self.inner.start(runtime);
+    }
+
+    fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
+        const self: *DeferredWebViewApp = @ptrCast(@alignCast(context));
+        try self.inner.event(runtime, event_value);
+
+        switch (event_value) {
+            .gpu_surface_frame => |frame| {
+                if (!std.mem.eql(u8, frame.label, canvas_label)) return;
+                self.primary_window_id = frame.window_id;
+                if (!self.mount_timer_armed and !self.mounting_enabled) {
+                    try runtime.startTimer(deferred_webview_timer_id, deferred_webview_delay_ns, false);
+                    self.mount_timer_armed = true;
+                }
+            },
+            .timer => |timer| {
+                if (timer.id == deferred_webview_timer_id) {
+                    self.mount_timer_armed = false;
+                    self.mounting_enabled = true;
+                }
+            },
+            else => {},
+        }
+
+        if (!self.mounting_enabled or self.primary_window_id == 0) return;
+        try self.mountTerminal(runtime);
+        if (self.model.isCapsule() or self.model.hasAgentEditor()) {
+            try self.mountGenUi(runtime);
+        }
+    }
+
+    fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const self: *DeferredWebViewApp = @ptrCast(@alignCast(context));
+        try self.inner.stop(runtime);
+    }
+
+    fn replay(context: *anyopaque, control: native_sdk.runtime.ReplayControl) anyerror!void {
+        const self: *DeferredWebViewApp = @ptrCast(@alignCast(context));
+        try self.inner.replayControl(control);
+    }
+
+    fn mountTerminal(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) !void {
+        if (self.model.terminal_webview_mounted) return;
+        const url = if (self.model.terminalReady()) self.model.terminalUrl() else "zero://inline";
+        _ = try runtime.createView(.{
+            .window_id = self.primary_window_id,
+            .label = terminal_view_label,
+            .kind = .webview,
+            .parent = canvas_label,
+            .frame = geometry.RectF.init(0, 0, 1, 1),
+            .layer = 20,
+            .url = url,
+        });
+        self.model.terminal_webview_mounted = true;
+    }
+
+    fn mountGenUi(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) !void {
+        if (self.model.genui_webview_mounted) return;
+        const url = if (self.model.genUiWorkbenchUrl().len > 0) self.model.genUiWorkbenchUrl() else "zero://inline";
+        _ = try runtime.createView(.{
+            .window_id = self.primary_window_id,
+            .label = genui_view_label,
+            .kind = .webview,
+            .parent = canvas_label,
+            .frame = geometry.RectF.init(0, 0, 1, 1),
+            .layer = 21,
+            .url = url,
+        });
+        self.model.genui_webview_mounted = true;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const terminal_url = init.environ_map.get("HYPER_TERM_TERMINAL_URL") orelse "";
     const agent_url = init.environ_map.get("HYPER_TERM_AGENT_URL") orelse "";
@@ -4804,7 +4904,8 @@ pub fn main(init: std.process.Init) !void {
     );
     app_state.model.ui_font_registered = app_fonts.len > 0;
 
-    try runner.runWithOptions(app_state.app(), .{
+    var deferred_webview_app = DeferredWebViewApp.init(app_state);
+    try runner.runWithOptions(deferred_webview_app.app(), .{
         .app_name = "hyper-term",
         .window_title = "Hyper Term",
         .bundle_id = "dev.hyperterm.desktop",

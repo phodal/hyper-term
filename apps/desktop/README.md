@@ -39,7 +39,11 @@ The native chrome, design tokens, mode selection, responsive layout, and Agent
 Block composition remain native. The terminal cell renderer is currently a child
 system WebView anchored into that layout. It connects directly to the
 authenticated loopback terminal plane; terminal bytes never cross the Native SDK
-JSON bridge, and Zig never spawns a shell.
+JSON bridge, and Zig never spawns a shell. Startup installs and presents the
+Metal canvas first, then mounts this Terminal WebView on the next run-loop turn.
+The separate GenUI/Workbench WebView is created only when the user opens an ACP
+artifact editor or a verified Bug Capsule; ordinary Terminal and Agent tabs do
+not pay its WebKit startup or resident-process cost.
 
 For an integrated development launch, build the terminal and native renderer,
 then let the Rust desktop supervisor own daemon and renderer lifetime:

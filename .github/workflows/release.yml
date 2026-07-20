@@ -157,7 +157,7 @@ jobs:
         env:
           HYPER_TERM_SMOKE_ARTIFACT_DIR: ${{ github.workspace }}/dist/smoke/macos
           # GitHub's virtualized macOS display can spend over one second
-          # before the first Metal frame. Local smoke keeps the 750 ms default.
+          # before the first Metal frame. Local smoke keeps the 150 ms SDK budget.
           HYPER_TERM_SMOKE_FIRST_FRAME_BUDGET_MS: "1500"
         run: |
           cargo build \

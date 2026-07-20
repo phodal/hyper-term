@@ -9,7 +9,7 @@ smoke_terminal_acp_fixture="$smoke_repo_root/scripts/fixtures/acp_terminal_agent
 smoke_codex_goal_fixture="$smoke_repo_root/scripts/fixtures/codex_goal_agent.sh"
 smoke_lima_fixture="$smoke_repo_root/scripts/fixtures/fake_limactl.sh"
 smoke_artifact_dir=${HYPER_TERM_SMOKE_ARTIFACT_DIR:-}
-smoke_first_frame_budget_ms=${HYPER_TERM_SMOKE_FIRST_FRAME_BUDGET_MS:-750}
+smoke_first_frame_budget_ms=${HYPER_TERM_SMOKE_FIRST_FRAME_BUDGET_MS:-150}
 
 if [[ ! "$smoke_first_frame_budget_ms" =~ ^[0-9]+$ ]] || (( smoke_first_frame_budget_ms == 0 )); then
   echo "desktop first-frame budget must be a positive integer in milliseconds" >&2
@@ -145,7 +145,10 @@ smoke_pid=$!
     'role=button name="New Agent tab"' \
     'role=button name="Close zsh 1"' \
     'hyper-term-terminal-view.*url="http://127.0.0.1:47437/.*tab=1"'
-  native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
+  native automate assert --absent \
+    'view @w1/hyper-term-genui-view' \
+    'error event=' \
+    'dispatch_errors=[1-9]'
   python3 - .zig-cache/native-sdk-automation/snapshot.txt "$smoke_first_frame_budget_ms" <<'PY'
 import pathlib
 import re
@@ -272,6 +275,7 @@ PY
   native automate assert --absent \
     'name="ACP artifact editor"' \
     'name="Agent execution context details"' \
+    'view @w1/hyper-term-genui-view' \
     'error event=' \
     'dispatch_errors=[1-9]'
 

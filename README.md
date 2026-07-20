@@ -291,12 +291,15 @@ cargo build -p hyper-term-daemon --bin hyper-term-desktop
 ```
 
 The smoke starts the complete Rust supervisor and Native application in an
-isolated temporary directory. It enforces a 750 ms cold-start first-frame cap
-for shared release runners plus Native's canvas frame budget, then verifies the
-real terminal WebView attachment, default Terminal mode, `Command-T`,
-`Command-W`, accessibility labels, and a non-empty retained-canvas screenshot.
-The release workflow uploads the snapshot, screenshot, and supervisor log as
-evidence instead of treating a successful compile as desktop-runtime proof.
+isolated temporary directory. It enforces a 150 ms cold-start first-frame cap
+locally (matching Native SDK's first-frame budget; shared release runners set an
+explicit virtualization allowance) plus Native's canvas frame budget, then
+verifies the canvas-first launch, deferred real Terminal WebView attachment,
+default Terminal mode, `Command-T`, `Command-W`, accessibility labels,
+Agent/Goal interactions, and a non-empty retained-canvas screenshot. The separate GenUI WebView stays
+unmounted until an ACP artifact editor or verified Capsule needs it. The release
+workflow uploads the snapshot, screenshot, and supervisor log as evidence
+instead of treating a successful compile as desktop-runtime proof.
 
 Regenerate and test the README's vector UI preview:
 

@@ -77,6 +77,70 @@ test "default session is an ordinary terminal" {
     try testing.expect(!containsText(tree.root, "Native Block surface"));
 }
 
+test "desktop defers WebViews until native glass and mounts GenUI on demand" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const capsule_url = "http://127.0.0.1:55321/agent/workbench/?surface=capsule&token=abcdef0123456789abcdef0123456789";
+    const allowed_origins = [_][]const u8{
+        "zero://inline",
+        "http://127.0.0.1:47437",
+        "http://127.0.0.1:55321",
+    };
+
+    const app_state = try main.HyperTermApp.create(std.heap.page_allocator, .{
+        .name = "hyper-term-deferred-webview-test",
+        .scene = main.shell_scene,
+        .canvas_label = main.canvas_label,
+        .update_fx = main.update,
+        .tokens_fn = main.hyperTermTokens,
+        .view = main.rootView,
+        .web_panes = main.desktopPanes,
+    });
+    defer app_state.destroy();
+    app_state.model = main.initialModelWithTerminalUrl(terminal_url);
+
+    var deferred = main.DeferredWebViewApp.init(app_state);
+    const app = deferred.app();
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{
+        .size = geometry.SizeF.init(main.window_width, main.window_height),
+    });
+    defer harness.destroy(testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &allowed_origins;
+
+    try harness.start(app);
+    var views_buffer: [4]native_sdk.ViewInfo = undefined;
+    try testing.expectEqual(@as(usize, 1), harness.runtime.listViews(1, &views_buffer).len);
+
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .window_id = 1,
+        .label = main.canvas_label,
+        .size = geometry.SizeF.init(main.window_width, main.window_height),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try testing.expect(!app_state.model.terminal_webview_mounted);
+    try testing.expect(!app_state.model.genui_webview_mounted);
+    try testing.expectEqual(@as(usize, 1), harness.runtime.listViews(1, &views_buffer).len);
+
+    const timer_event = harness.null_platform.fireTimer(main.deferred_webview_timer_id, 2_000_000).?;
+    try harness.runtime.dispatchPlatformEvent(app, timer_event);
+    try testing.expect(app_state.model.terminal_webview_mounted);
+    try testing.expect(!app_state.model.genui_webview_mounted);
+    try testing.expectEqual(@as(usize, 2), harness.runtime.listViews(1, &views_buffer).len);
+
+    app_state.model.session_slots[0].mode = .capsule;
+    @memcpy(app_state.model.genui_workbench_url_storage[0..capsule_url.len], capsule_url);
+    app_state.model.genui_workbench_url_len = capsule_url.len;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try testing.expect(app_state.model.genui_webview_mounted);
+    const mounted_views = harness.runtime.listViews(1, &views_buffer);
+    try testing.expectEqual(@as(usize, 3), mounted_views.len);
+    try testing.expectEqualStrings(main.terminal_view_label, mounted_views[1].label);
+    try testing.expectEqualStrings(main.genui_view_label, mounted_views[2].label);
+}
+
 test "Native typography uses the registered broad-coverage face when available" {
     try testing.expectEqualStrings(
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
@@ -789,11 +853,11 @@ test "direct Codex artifacts never expose the ACP editor panel" {
     try testing.expect(findByLabel(tree.root, "Open ACP artifact editor") == null);
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
+    try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &panes));
+    model.terminal_webview_mounted = true;
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
     try testing.expectEqualStrings("zero://inline", panes[0].url);
     try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
-    try testing.expectEqualStrings("zero://inline", panes[1].url);
-    try testing.expectEqualStrings(main.genui_view_label, panes[1].label);
 }
 
 test "accepted ACP artifact stays single-pane until the user enters editing" {
@@ -814,11 +878,11 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
     try testing.expect(!model.hasAgentEditor());
 
     var initial_panes: [2]main.HyperTermApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &initial_panes));
+    try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &initial_panes));
+    model.terminal_webview_mounted = true;
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &initial_panes));
     try testing.expectEqualStrings("zero://inline", initial_panes[0].url);
     try testing.expectEqualStrings(main.terminal_view_label, initial_panes[0].label);
-    try testing.expectEqualStrings("zero://inline", initial_panes[1].url);
-    try testing.expectEqualStrings(main.genui_view_label, initial_panes[1].label);
 
     var initial_arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer initial_arena_state.deinit();
@@ -850,11 +914,9 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
     try testing.expectEqual(@as(usize, 0), model.agentBlocks().len);
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
     try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
     try testing.expectEqualStrings("zero://inline", panes[0].url);
-    try testing.expectEqualStrings(main.genui_view_label, panes[1].label);
-    try testing.expectEqualStrings("zero://inline", panes[1].url);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -867,6 +929,7 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
 
     try testing.expect(!model.canOpenAgentEditor());
     try testing.expect(model.hasAgentEditor());
+    model.genui_webview_mounted = true;
     try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
     try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
     try testing.expectEqualStrings(model.genUiWorkbenchUrl(), panes[1].url);
@@ -1865,11 +1928,11 @@ test "terminal web pane accepts only the authenticated fixed loopback shape" {
     try testing.expectEqualStrings(url ++ "&tab=1", panes[0].url);
 
     var desktop_panes: [2]main.HyperTermApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &desktop_panes));
+    try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &desktop_panes));
+    model.terminal_webview_mounted = true;
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &desktop_panes));
     try testing.expectEqualStrings(main.terminal_view_label, desktop_panes[0].label);
     try testing.expectEqualStrings(url ++ "&tab=1", desktop_panes[0].url);
-    try testing.expectEqualStrings(main.genui_view_label, desktop_panes[1].label);
-    try testing.expectEqualStrings("zero://inline", desktop_panes[1].url);
 
     model = main.initialModel();
     try testing.expectEqual(@as(usize, 0), main.terminalPanes(&model, &panes));
@@ -1901,6 +1964,9 @@ test "Rust-verified Bug Capsule opens as a dedicated read-only Native tab" {
     try testing.expect(containsText(tree.root, "Rust verified"));
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
+    try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &panes));
+    model.terminal_webview_mounted = true;
+    model.genui_webview_mounted = true;
     try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
     try testing.expectEqualStrings("zero://inline", panes[0].url);
     try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);

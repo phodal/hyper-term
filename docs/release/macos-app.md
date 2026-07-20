@@ -9,12 +9,14 @@ framework checkout is also pinned to the audited commit recorded by ADR 0013;
 the workflow refuses to build when the release tag resolves elsewhere.
 
 Before packaging either architecture, the validation job launches the complete
-Rust supervisor with an automation-enabled Native renderer. The macOS smoke
-enforces a 750 ms cold-start first-frame cap for shared release runners and
-Native's canvas frame budget, attaches the Terminal WebView, exposes accessible
-Terminal and Agent creation controls, and handles `Command-T` plus `Command-W`.
-Its Native snapshot, deterministic canvas screenshot, and supervisor log are
-retained as the `macos-desktop-smoke` workflow artifact.
+Rust supervisor with an automation-enabled Native renderer. The macOS smoke's
+local default enforces Native SDK's 150 ms cold-start first-frame budget; the
+shared release runner explicitly allows 1500 ms for virtualized-display startup.
+The same run enforces Native's canvas frame budget, attaches the Terminal
+WebView, exposes accessible Terminal and Agent creation controls, and handles
+`Command-T` plus `Command-W`. Its Native snapshot, deterministic canvas
+screenshot, and supervisor log are retained as the `macos-desktop-smoke`
+workflow artifact.
 
 The final bundle contains:
 
