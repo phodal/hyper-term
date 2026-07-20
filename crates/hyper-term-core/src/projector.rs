@@ -290,7 +290,8 @@ impl BlockProjector {
             | DomainEvent::SandboxReceiptRecorded { .. }
             | DomainEvent::SandboxViolationObserved { .. }
             | DomainEvent::AgentExecutionContextRecorded { .. }
-            | DomainEvent::LocalMcpServerRuntimeRecorded { .. } => Vec::new(),
+            | DomainEvent::LocalMcpServerRuntimeRecorded { .. }
+            | DomainEvent::LocalMcpToolCallRecorded { .. } => Vec::new(),
             DomainEvent::TerminalOpened {
                 terminal_id,
                 command,

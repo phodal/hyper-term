@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AcceptedGenUiArtifact, ActionDigest, AgentExecutionContextReceiptSet, AgentPlanEntry,
     AgentToolCall, BlockId, CompiledSandboxProfile, EVENT_SCHEMA_VERSION, EventId,
-    LocalMcpServerRuntimeReceipt, OperationId, RunId, SandboxLeaseId, SandboxProfileDigest,
-    SandboxReceipt, SandboxViolation, TaskId, TerminalId,
+    LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt, OperationId, RunId,
+    SandboxLeaseId, SandboxProfileDigest, SandboxReceipt, SandboxViolation, TaskId, TerminalId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,6 +58,9 @@ pub enum OperationAction {
     },
     McpServerLaunch {
         launch: crate::LocalMcpServerLaunch,
+    },
+    McpToolCall {
+        call: LocalMcpToolCall,
     },
     Opaque {
         kind: String,
@@ -281,6 +284,9 @@ pub enum DomainEvent {
     LocalMcpServerRuntimeRecorded {
         receipt: LocalMcpServerRuntimeReceipt,
     },
+    LocalMcpToolCallRecorded {
+        receipt: LocalMcpToolCallReceipt,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -327,9 +333,9 @@ mod tests {
     use crate::{
         ContextDigest, ContextReceipt, EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest,
         ExecutionMode, LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle,
-        LocalMcpServerRuntimeReceipt, LocalMcpToolContractReceipt, McpArgumentsDigest,
-        McpCapabilitiesDigest, McpCatalogDigest, McpRuntimeIdentityDigest, McpToolContractDigest,
-        SandboxProfileDigest,
+        LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt,
+        LocalMcpToolContractReceipt, McpArgumentsDigest, McpCapabilitiesDigest, McpCatalogDigest,
+        McpRuntimeIdentityDigest, McpToolContractDigest, McpToolResultDigest, SandboxProfileDigest,
     };
 
     #[test]
@@ -439,5 +445,35 @@ mod tests {
         assert!(!encoded.contains("secret-token"));
         assert!(!encoded.contains("environment"));
         assert!(!encoded.contains("arguments\""));
+    }
+
+    #[test]
+    fn local_mcp_tool_receipts_bind_identity_without_persisting_arguments() {
+        let call = LocalMcpToolCall {
+            schema_version: crate::LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION,
+            server_id: "reviewed-files".into(),
+            runtime_identity_digest: McpRuntimeIdentityDigest::parse("1".repeat(64)).unwrap(),
+            catalog_digest: McpCatalogDigest::parse("2".repeat(64)).unwrap(),
+            tool_name: "read_file".into(),
+            tool_contract_digest: McpToolContractDigest::parse("3".repeat(64)).unwrap(),
+            arguments_digest: McpArgumentsDigest::parse("4".repeat(64)).unwrap(),
+        };
+        let event = DomainEvent::LocalMcpToolCallRecorded {
+            receipt: LocalMcpToolCallReceipt {
+                schema_version: crate::LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION,
+                call,
+                succeeded: true,
+                result_digest: McpToolResultDigest::parse("5".repeat(64)).unwrap(),
+                content_count: 1,
+                has_structured_content: true,
+            },
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "local_mcp_tool_call_recorded");
+        assert_eq!(value["receipt"]["call"]["tool_name"], "read_file");
+        let encoded = value.to_string();
+        assert!(!encoded.contains("argument_values"));
+        assert!(!encoded.contains("secret-path"));
     }
 }

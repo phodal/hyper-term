@@ -10,18 +10,21 @@ use hyper_term_core::{
 };
 use hyper_term_protocol::{
     Actor, EXECUTION_CONTEXT_SCHEMA_VERSION, ExecutionMode, LOCAL_MCP_LAUNCH_SCHEMA_VERSION,
-    LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle,
-    LocalMcpServerRuntimeReceipt, LocalMcpToolContractReceipt, McpArgumentsDigest,
+    LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION, LocalMcpCredentialScope, LocalMcpServerLaunch,
+    LocalMcpServerLifecycle, LocalMcpServerRuntimeReceipt, LocalMcpToolCall,
+    LocalMcpToolCallReceipt, LocalMcpToolContractReceipt, McpArgumentsDigest,
     McpCapabilitiesDigest, McpCatalogDigest, McpRuntimeIdentityDigest, McpToolContractDigest,
-    OperationAction, OperationKind, OperationState, ResolvedExecutionContext, SandboxLifetime,
-    SandboxProfile, TerminalCommand,
+    McpToolResultDigest, OperationAction, OperationKind, OperationState, ResolvedExecutionContext,
+    SandboxLifetime, SandboxProfile, TerminalCommand,
 };
 use hyper_term_sandbox::MacOsSeatbeltLauncher;
 use process_wrap::tokio::{CommandWrap, KillOnDrop, ProcessGroup};
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
 use serde::Serialize;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -37,6 +40,8 @@ const MAX_ARGUMENT_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_DISCOVERED_TOOLS: usize = 256;
 const MAX_TOOL_NAME_BYTES: usize = 256;
 const MAX_TOOL_SCHEMA_BYTES: usize = 1024 * 1024;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
@@ -64,6 +69,21 @@ pub struct PreparedLocalMcpServer {
 pub struct AuthorizedLocalMcpServer {
     prepared: PreparedLocalMcpServer,
     sandbox_launch: hyper_term_core::SandboxLaunchPlan,
+}
+
+#[derive(Clone)]
+pub struct PreparedLocalMcpToolCall {
+    pub call: LocalMcpToolCall,
+    arguments: Map<String, Value>,
+}
+
+pub struct AuthorizedLocalMcpToolCall {
+    prepared: PreparedLocalMcpToolCall,
+}
+
+pub struct LocalMcpToolExecution {
+    pub result: CallToolResult,
+    pub receipt: LocalMcpToolCallReceipt,
 }
 
 pub struct ManagedLocalMcpClient {
@@ -122,6 +142,59 @@ pub fn authorize_local_mcp_server(
         prepared,
         sandbox_launch,
     })
+}
+
+pub fn prepare_local_mcp_tool_call(
+    runtime: &LocalMcpServerRuntimeReceipt,
+    tool_name: String,
+    arguments: Map<String, Value>,
+) -> Result<PreparedLocalMcpToolCall, LocalMcpToolCallError> {
+    if runtime.schema_version != LOCAL_MCP_LAUNCH_SCHEMA_VERSION
+        || runtime.launch.server_id.is_empty()
+        || runtime.runtime_identity_digest.as_str().is_empty()
+    {
+        return Err(LocalMcpToolCallError::InvalidRuntimeReceipt);
+    }
+    let contract = runtime
+        .tools
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .ok_or(LocalMcpToolCallError::UnknownTool)?;
+    let encoded = serde_json::to_vec(&arguments)?;
+    if encoded.len() > MAX_TOOL_ARGUMENT_BYTES {
+        return Err(LocalMcpToolCallError::ArgumentsTooLarge);
+    }
+    let arguments_digest = McpArgumentsDigest::parse(hex_sha256(&encoded))
+        .map_err(|error| LocalMcpToolCallError::Digest(error.to_string()))?;
+    Ok(PreparedLocalMcpToolCall {
+        call: LocalMcpToolCall {
+            schema_version: LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION,
+            server_id: runtime.launch.server_id.clone(),
+            runtime_identity_digest: runtime.runtime_identity_digest.clone(),
+            catalog_digest: runtime.catalog_digest.clone(),
+            tool_name,
+            tool_contract_digest: contract.contract_digest.clone(),
+            arguments_digest,
+        },
+        arguments,
+    })
+}
+
+pub fn authorize_local_mcp_tool_call(
+    prepared: PreparedLocalMcpToolCall,
+    operation: &OperationRecord,
+) -> Result<AuthorizedLocalMcpToolCall, LocalMcpToolCallError> {
+    if operation.kind != OperationKind::McpTool
+        || operation.state != OperationState::Dispatching
+        || operation.revision == 0
+        || !matches!(
+            &operation.action,
+            OperationAction::McpToolCall { call } if call == &prepared.call
+        )
+    {
+        return Err(LocalMcpToolCallError::CallNotAuthorized);
+    }
+    Ok(AuthorizedLocalMcpToolCall { prepared })
 }
 
 impl ManagedLocalMcpClient {
@@ -201,6 +274,48 @@ impl ManagedLocalMcpClient {
 
     pub fn receipt(&self) -> &LocalMcpServerRuntimeReceipt {
         &self.receipt
+    }
+
+    pub async fn call_tool(
+        &self,
+        authorized: AuthorizedLocalMcpToolCall,
+        timeout: Duration,
+    ) -> Result<LocalMcpToolExecution, LocalMcpToolCallError> {
+        let call = &authorized.prepared.call;
+        if timeout.is_zero()
+            || call.server_id != self.receipt.launch.server_id
+            || call.runtime_identity_digest != self.receipt.runtime_identity_digest
+            || call.catalog_digest != self.receipt.catalog_digest
+            || !self.receipt.tools.iter().any(|tool| {
+                tool.name == call.tool_name && tool.contract_digest == call.tool_contract_digest
+            })
+        {
+            return Err(LocalMcpToolCallError::RuntimeIdentityMismatch);
+        }
+        let request = CallToolRequestParams::new(call.tool_name.clone())
+            .with_arguments(authorized.prepared.arguments);
+        let result = match tokio::time::timeout(timeout, self.service.call_tool(request)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => return Err(LocalMcpToolCallError::Call(error.to_string())),
+            Err(_) => return Err(LocalMcpToolCallError::CallTimeout),
+        };
+        let encoded = serde_json::to_vec(&result)?;
+        if encoded.len() > MAX_TOOL_RESULT_BYTES {
+            return Err(LocalMcpToolCallError::ResultTooLarge);
+        }
+        let content_count = u16::try_from(result.content.len())
+            .map_err(|_| LocalMcpToolCallError::ResultTooLarge)?;
+        let result_digest = McpToolResultDigest::parse(hex_sha256(&encoded))
+            .map_err(|error| LocalMcpToolCallError::Digest(error.to_string()))?;
+        let receipt = LocalMcpToolCallReceipt {
+            schema_version: LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION,
+            call: call.clone(),
+            succeeded: result.is_error != Some(true),
+            result_digest,
+            content_count,
+            has_structured_content: result.structured_content.is_some(),
+        };
+        Ok(LocalMcpToolExecution { result, receipt })
     }
 
     pub async fn stderr_tail(&self) -> String {
@@ -392,10 +507,14 @@ fn bounded_json_sha256(
 
 fn client_sha256_json(value: &impl Serialize) -> Result<String, LocalMcpClientError> {
     let bytes = serde_json::to_vec(value)?;
-    Ok(Sha256::digest(bytes)
+    Ok(hex_sha256(&bytes))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect()
 }
 
 pub fn prepare_local_mcp_server(
@@ -693,6 +812,30 @@ pub enum LocalMcpClientError {
     CloseTimeout,
 }
 
+#[derive(Debug, Error)]
+pub enum LocalMcpToolCallError {
+    #[error("local MCP runtime receipt is invalid")]
+    InvalidRuntimeReceipt,
+    #[error("local MCP tool is not present in the negotiated catalog")]
+    UnknownTool,
+    #[error("local MCP tool arguments exceed their byte bound")]
+    ArgumentsTooLarge,
+    #[error("local MCP tool call has not entered its exact dispatching operation")]
+    CallNotAuthorized,
+    #[error("local MCP tool call does not match the live negotiated runtime")]
+    RuntimeIdentityMismatch,
+    #[error("local MCP tool call timed out")]
+    CallTimeout,
+    #[error("local MCP tool call failed: {0}")]
+    Call(String),
+    #[error("local MCP tool result exceeds its byte bound")]
+    ResultTooLarge,
+    #[error("local MCP tool digest is invalid: {0}")]
+    Digest(String),
+    #[error("local MCP tool JSON encoding failed: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -791,6 +934,21 @@ mod tests {
             summary: "Start reviewed fixture MCP".into(),
             risk: RiskClass::ExternalEffect,
             required_capabilities: vec!["mcp.server.launch".into()],
+            state,
+            permission_decision: Some(hyper_term_protocol::PermissionDecision::AllowOnce),
+        }
+    }
+
+    fn tool_operation(call: LocalMcpToolCall, state: OperationState) -> OperationRecord {
+        OperationRecord {
+            task_id: TaskId::new(),
+            operation_id: OperationId::new(),
+            revision: 7,
+            kind: OperationKind::McpTool,
+            action: OperationAction::McpToolCall { call },
+            summary: "Read reviewed fixture metadata".into(),
+            risk: RiskClass::ReadOnly,
+            required_capabilities: vec!["mcp.tool.call".into()],
             state,
             permission_decision: Some(hyper_term_protocol::PermissionDecision::AllowOnce),
         }
@@ -910,6 +1068,9 @@ while IFS= read -r line; do
     *'"method":"tools/list"'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"fixture.read","description":"Read fixture metadata","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},"outputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]}}'
       ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"reviewed fixture"}],"structuredContent":{"text":"reviewed fixture"},"isError":false}}'
+      ;;
   esac
 done
 "#;
@@ -971,6 +1132,48 @@ done
         let receipt = serde_json::to_string(client.receipt()).unwrap();
         assert!(!receipt.contains("Read fixture metadata"));
         assert!(!receipt.contains("while IFS="));
+
+        let arguments = serde_json::json!({"path":"README.md"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let prepared_call =
+            prepare_local_mcp_tool_call(client.receipt(), "fixture.read".into(), arguments)
+                .unwrap();
+        let waiting = tool_operation(prepared_call.call.clone(), OperationState::WaitingHuman);
+        assert!(matches!(
+            authorize_local_mcp_tool_call(prepared_call.clone(), &waiting),
+            Err(LocalMcpToolCallError::CallNotAuthorized)
+        ));
+        let mut substituted =
+            tool_operation(prepared_call.call.clone(), OperationState::Dispatching);
+        if let OperationAction::McpToolCall { call } = &mut substituted.action {
+            call.arguments_digest = McpArgumentsDigest::parse("0".repeat(64)).unwrap();
+        }
+        assert!(matches!(
+            authorize_local_mcp_tool_call(prepared_call.clone(), &substituted),
+            Err(LocalMcpToolCallError::CallNotAuthorized)
+        ));
+        let dispatching = tool_operation(prepared_call.call.clone(), OperationState::Dispatching);
+        let authorized_call = authorize_local_mcp_tool_call(prepared_call, &dispatching).unwrap();
+        let execution = client
+            .call_tool(authorized_call, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(execution.receipt.succeeded);
+        assert_eq!(execution.receipt.content_count, 1);
+        assert!(execution.receipt.has_structured_content);
+        assert_eq!(
+            execution.receipt.call.runtime_identity_digest,
+            client.receipt().runtime_identity_digest
+        );
+        let durable = serde_json::to_string(&execution.receipt).unwrap();
+        assert!(!durable.contains("README.md"));
+        assert!(
+            serde_json::to_string(&execution.result)
+                .unwrap()
+                .contains("reviewed fixture")
+        );
         client.close(Duration::from_secs(2)).await.unwrap();
     }
 

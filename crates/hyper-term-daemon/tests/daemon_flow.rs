@@ -14,12 +14,13 @@ use hyper_term_protocol::{
     BlockPayload, ClientId, ContextDigest, ContextReceipt, ControlRequest, ControlRequestEnvelope,
     ControlResponse, DomainEvent, EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest,
     ExecutionMode, GenUiArtifactCandidate, GenUiCompilerIdentity, LocalMcpCredentialScope,
-    LocalMcpServerLaunch, LocalMcpServerLifecycle, LocalMcpServerRuntimeReceipt,
-    LocalMcpToolContractReceipt, McpArgumentsDigest, McpCapabilitiesDigest, McpCatalogDigest,
-    McpRuntimeIdentityDigest, McpToolContractDigest, OperationAction, OperationCompletion,
-    OperationKind, OperationOutcome, OperationState, PermissionDecision, RequestId, RiskClass,
-    SandboxProfileDigest, TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize,
-    WireFrame, read_frame, write_frame,
+    LocalMcpServerLaunch, LocalMcpServerLifecycle, LocalMcpServerRuntimeReceipt, LocalMcpToolCall,
+    LocalMcpToolCallReceipt, LocalMcpToolContractReceipt, McpArgumentsDigest,
+    McpCapabilitiesDigest, McpCatalogDigest, McpRuntimeIdentityDigest, McpToolContractDigest,
+    McpToolResultDigest, OperationAction, OperationCompletion, OperationKind, OperationOutcome,
+    OperationState, PermissionDecision, RequestId, RiskClass, SandboxProfileDigest,
+    TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame, read_frame,
+    write_frame,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -999,11 +1000,161 @@ fn local_mcp_server_launch_is_separately_authorized_and_redacted() {
         )
         .unwrap();
 
+    let tool_call = LocalMcpToolCall {
+        schema_version: hyper_term_protocol::LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION,
+        server_id: receipt.launch.server_id.clone(),
+        runtime_identity_digest: receipt.runtime_identity_digest.clone(),
+        catalog_digest: receipt.catalog_digest.clone(),
+        tool_name: receipt.tools[0].name.clone(),
+        tool_contract_digest: receipt.tools[0].contract_digest.clone(),
+        arguments_digest: McpArgumentsDigest::parse("8".repeat(64)).unwrap(),
+    };
+    let missing_runtime_call = LocalMcpToolCall {
+        runtime_identity_digest: McpRuntimeIdentityDigest::parse("9".repeat(64)).unwrap(),
+        ..tool_call.clone()
+    };
+    let missing_runtime = reopened
+        .propose_operation(
+            task_id,
+            OperationKind::McpTool,
+            OperationAction::McpToolCall {
+                call: missing_runtime_call.clone(),
+            },
+            "Invoke a tool on an unrecorded MCP runtime".into(),
+            RiskClass::ReadOnly,
+            vec!["mcp.tool.call".into()],
+        )
+        .unwrap();
+    let missing_runtime = reopened
+        .decide_permission(
+            task_id,
+            missing_runtime.operation_id,
+            missing_runtime.revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let missing_runtime = reopened
+        .begin_operation(
+            task_id,
+            missing_runtime.operation_id,
+            missing_runtime.revision,
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.record_local_mcp_tool_call(
+            task_id,
+            missing_runtime.operation_id,
+            missing_runtime.revision,
+            LocalMcpToolCallReceipt {
+                schema_version: hyper_term_protocol::LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION,
+                call: missing_runtime_call,
+                succeeded: true,
+                result_digest: McpToolResultDigest::parse("a".repeat(64)).unwrap(),
+                content_count: 1,
+                has_structured_content: false,
+            },
+        ),
+        Err(DaemonError::LocalMcpRuntimeNotRecorded)
+    ));
+
+    let proposed_call = reopened
+        .propose_operation(
+            task_id,
+            OperationKind::McpTool,
+            OperationAction::McpToolCall {
+                call: tool_call.clone(),
+            },
+            "Invoke the reviewed read_file tool".into(),
+            RiskClass::ReadOnly,
+            vec!["mcp.tool.call".into()],
+        )
+        .unwrap();
+    let authorized_call = reopened
+        .decide_permission(
+            task_id,
+            proposed_call.operation_id,
+            proposed_call.revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let dispatching_call = reopened
+        .begin_operation(
+            task_id,
+            proposed_call.operation_id,
+            authorized_call.revision,
+        )
+        .unwrap();
+    let tool_receipt = LocalMcpToolCallReceipt {
+        schema_version: hyper_term_protocol::LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION,
+        call: tool_call,
+        succeeded: true,
+        result_digest: McpToolResultDigest::parse("f".repeat(64)).unwrap(),
+        content_count: 1,
+        has_structured_content: true,
+    };
+    let mut substituted_receipt = tool_receipt.clone();
+    substituted_receipt.call.arguments_digest = McpArgumentsDigest::parse("0".repeat(64)).unwrap();
+    assert!(matches!(
+        reopened.record_local_mcp_tool_call(
+            task_id,
+            proposed_call.operation_id,
+            dispatching_call.revision,
+            substituted_receipt,
+        ),
+        Err(DaemonError::InvalidLocalMcpToolCallReceipt)
+    ));
+    reopened
+        .record_local_mcp_tool_call(
+            task_id,
+            proposed_call.operation_id,
+            dispatching_call.revision,
+            tool_receipt.clone(),
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.record_local_mcp_tool_call(
+            task_id,
+            proposed_call.operation_id,
+            dispatching_call.revision,
+            tool_receipt.clone(),
+        ),
+        Err(DaemonError::InvalidLocalMcpToolCallReceipt)
+    ));
+    let tool_event = reopened
+        .local_mcp_tool_call_event(task_id, proposed_call.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tool_event.operation_id, Some(proposed_call.operation_id));
+    assert_eq!(tool_event.correlation_id, Some(runtime_event.event_id));
+    assert!(tool_event.causation_id.is_some());
+    assert_ne!(tool_event.causation_id, tool_event.correlation_id);
+    assert!(matches!(
+        &tool_event.payload,
+        DomainEvent::LocalMcpToolCallRecorded { receipt: recorded }
+            if recorded == &tool_receipt
+    ));
+    reopened
+        .complete_operation(
+            task_id,
+            proposed_call.operation_id,
+            dispatching_call.revision,
+            OperationCompletion {
+                executor: "hyper-term-mcp-client".into(),
+                succeeded: true,
+                outcome: Some(OperationOutcome::Succeeded),
+                summary: "Reviewed read_file call completed".into(),
+                result_digest: Some(tool_receipt.result_digest.to_string()),
+            },
+        )
+        .unwrap();
+
     let events = std::fs::read_to_string(state_path.join("events.jsonl")).unwrap();
     assert!(events.contains("mcp_server_launch"));
     assert!(events.contains("local_mcp_server_runtime_recorded"));
     assert!(events.contains("2025-11-25"));
     assert!(events.contains("fixture_read"));
+    assert!(events.contains("local_mcp_tool_call_recorded"));
+    assert!(events.contains("read_file"));
     assert!(!events.contains("secret-token"));
     assert!(matches!(
         reopened.propose_operation(
