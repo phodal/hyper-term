@@ -105,6 +105,8 @@ fn installed_acp_agent_creates_a_real_session_with_brokered_mcp_without_prompt()
         executable_sha256: sha256_file(&mcp_executable).expect("digest MCP connector"),
         executable: mcp_executable,
         arguments,
+        runtime_home: PathBuf::from("/tmp/hyper-term-mcp-home"),
+        runtime_temp: PathBuf::from("/tmp/hyper-term-mcp-tmp"),
     };
     let (client, _workspace) = launch_installed_acp_agent_with_mcp(Some(mcp));
     client

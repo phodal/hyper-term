@@ -9,7 +9,8 @@ use agent_client_protocol::JsonRpcMessage;
 use agent_client_protocol::schema::{ProtocolVersion, v1};
 use hyper_term_protocol::{
     AgentMediaKind, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentToolCall,
-    AgentToolContent, AgentToolKind, AgentToolLocation, AgentToolStatus, PermissionDecision,
+    AgentToolContent, AgentToolKind, AgentToolLocation, AgentToolStatus, ContextReceipt,
+    PermissionDecision,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -19,7 +20,13 @@ use similar::{ChangeTag, TextDiff};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::codex_containment::{apply_managed_proxy_environment, compile_agent_task_sandbox};
+use crate::codex_containment::{
+    agent_task_sandbox_profile, apply_managed_proxy_environment,
+    compile_agent_task_sandbox_from_profile,
+};
+use crate::execution_context::{
+    compile_agent_execution_context, compile_mcp_execution_context, os_environment,
+};
 use crate::{
     AgentAvailableCommand, AgentClientError, AgentContainmentConfig, AgentDriverEvent,
     AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal, AgentHostOperation,
@@ -60,6 +67,8 @@ pub struct AcpMcpServerConfig {
     pub executable: PathBuf,
     pub executable_sha256: String,
     pub arguments: Vec<OsString>,
+    pub runtime_home: PathBuf,
+    pub runtime_temp: PathBuf,
 }
 
 impl StructuredAgentClient for AcpAgentClient {
@@ -172,6 +181,8 @@ pub struct AcpAgentClient {
     workspace: PathBuf,
     mcp_servers: Vec<v1::McpServer>,
     terminal_client: bool,
+    context_receipt: Option<ContextReceipt>,
+    mcp_context_receipt: Option<ContextReceipt>,
 }
 
 #[derive(Clone)]
@@ -202,42 +213,77 @@ impl AcpAgentClient {
             ));
         }
         let workspace = config.workspace.canonicalize()?;
-        let mcp_servers = config
-            .brokered_mcp_server
-            .as_ref()
-            .map(acp_mcp_server)
-            .transpose()?
-            .into_iter()
-            .collect();
         let driver_id = Uuid::new_v4();
-        let authority_environment = config.environment.clone();
         let mut environment = config.environment;
+        let mut context_receipt = None;
+        let mut mcp_context_receipt = None;
+        let mut mcp_environment = BTreeMap::new();
         let sandbox = match config.containment.as_ref() {
             Some(containment) => {
-                apply_managed_proxy_environment(
-                    &mut environment,
-                    &containment.credentialed_proxy_url,
-                );
                 let mut read_paths = containment.read_paths.clone();
                 if let Some(mcp) = &config.brokered_mcp_server {
                     read_paths.push(mcp.executable.clone());
                 }
-                Some(compile_agent_task_sandbox(
-                    driver_id,
+                let profile = agent_task_sandbox_profile(
                     &config.executable,
-                    &config.arguments,
                     &workspace,
                     &environment,
-                    &authority_environment,
                     &containment.proxy_url,
                     &containment.allowed_hosts,
                     &containment.allowed_unix_sockets,
                     read_paths,
                     containment.write_paths.clone(),
-                )?)
+                )?;
+                let (context, receipt) = compile_agent_execution_context(
+                    driver_id,
+                    &config.provider_id,
+                    &workspace,
+                    &environment,
+                    profile,
+                    &containment.proxy_url,
+                )?;
+                let profile = context.requested_sandbox.clone().ok_or_else(|| {
+                    AcpAdapterError::InvalidConfig(
+                        "ACP execution context did not compile a sandbox".into(),
+                    )
+                })?;
+                if let Some(mcp) = &config.brokered_mcp_server {
+                    let (mcp_context, receipt) = compile_mcp_execution_context(
+                        driver_id,
+                        &workspace,
+                        mcp.runtime_home.clone(),
+                        mcp.runtime_temp.clone(),
+                        &context,
+                        profile.clone(),
+                    )?;
+                    mcp_environment = mcp_context.environment.variables;
+                    mcp_context_receipt = Some(receipt);
+                }
+                environment = os_environment(&context);
+                apply_managed_proxy_environment(
+                    &mut environment,
+                    &containment.credentialed_proxy_url,
+                );
+                let sandbox = compile_agent_task_sandbox_from_profile(
+                    driver_id,
+                    &config.executable,
+                    &config.arguments,
+                    &workspace,
+                    &environment,
+                    profile,
+                )?;
+                context_receipt = Some(receipt);
+                Some(sandbox)
             }
             None => None,
         };
+        let mcp_servers = config
+            .brokered_mcp_server
+            .as_ref()
+            .map(|config| acp_mcp_server(config, &mcp_environment))
+            .transpose()?
+            .into_iter()
+            .collect();
         let permission_profile = sandbox
             .as_ref()
             .map(crate::sandbox_permission_profile)
@@ -286,11 +332,21 @@ impl AcpAgentClient {
             workspace,
             mcp_servers,
             terminal_client: config.terminal_client,
+            context_receipt,
+            mcp_context_receipt,
         })
     }
 
     pub fn provider_id(&self) -> &str {
         &self.provider_id
+    }
+
+    pub fn context_receipt(&self) -> Option<&ContextReceipt> {
+        self.context_receipt.as_ref()
+    }
+
+    pub fn mcp_context_receipt(&self) -> Option<&ContextReceipt> {
+        self.mcp_context_receipt.as_ref()
     }
 
     pub fn initialize(&self, timeout: Duration) -> Result<v1::InitializeResponse, AcpAdapterError> {
@@ -968,7 +1024,10 @@ impl AcpAgentClient {
     }
 }
 
-fn acp_mcp_server(config: &AcpMcpServerConfig) -> Result<v1::McpServer, AcpAdapterError> {
+fn acp_mcp_server(
+    config: &AcpMcpServerConfig,
+    environment: &BTreeMap<String, String>,
+) -> Result<v1::McpServer, AcpAdapterError> {
     if !config.executable.is_absolute() || config.arguments.len() > 32 {
         return Err(AcpAdapterError::InvalidConfig(
             "brokered MCP executable or arguments are invalid".into(),
@@ -992,8 +1051,14 @@ fn acp_mcp_server(config: &AcpMcpServerConfig) -> Result<v1::McpServer, AcpAdapt
             bounded(value.to_owned(), 16 * 1024)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let environment = environment
+        .iter()
+        .map(|(name, value)| v1::EnvVariable::new(name, value))
+        .collect();
     Ok(v1::McpServer::Stdio(
-        v1::McpServerStdio::new("hyper_term", executable).args(arguments),
+        v1::McpServerStdio::new("hyper_term", executable)
+            .args(arguments)
+            .env(environment),
     ))
 }
 
@@ -2317,6 +2382,8 @@ done
                     "--socket".into(),
                     "/tmp/hyperd.sock".into(),
                 ],
+                runtime_home: temporary.path().join("mcp-home"),
+                runtime_temp: temporary.path().join("mcp-tmp"),
             }),
             containment: None,
             terminal_client: false,
@@ -2365,6 +2432,8 @@ done
                 executable: mcp.clone(),
                 executable_sha256: sha256_file(&mcp).unwrap(),
                 arguments: vec!["--agent-mode".into()],
+                runtime_home: temporary.path().join("mcp-home"),
+                runtime_temp: temporary.path().join("mcp-tmp"),
             }),
             containment: None,
             terminal_client: false,
@@ -2419,6 +2488,8 @@ done
                 executable: mcp.clone(),
                 executable_sha256: sha256_file(&mcp).unwrap(),
                 arguments: vec!["--agent-mode".into()],
+                runtime_home: temporary.path().join("mcp-home"),
+                runtime_temp: temporary.path().join("mcp-tmp"),
             }),
             containment: None,
             terminal_client: false,
@@ -2553,6 +2624,10 @@ done
             std::fs::read_to_string(marker).unwrap().trim(),
             "denied,denied"
         );
+        let receipt = serde_json::to_string(client.context_receipt().unwrap()).unwrap();
+        assert!(receipt.contains("managed-connect-proxy-session"));
+        assert!(!receipt.contains("contained-test-token"));
+        assert!(client.mcp_context_receipt().is_none());
         assert!(!forbidden.exists());
         assert_eq!(client.close().unwrap(), DriverState::Closed);
     }

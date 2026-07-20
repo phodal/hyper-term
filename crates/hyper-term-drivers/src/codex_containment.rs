@@ -42,15 +42,37 @@ pub(crate) fn compile_agent_task_sandbox(
     read_paths: impl IntoIterator<Item = PathBuf>,
     write_paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<SandboxLaunchPlan, DriverError> {
-    let command = TerminalCommand {
-        program: utf8_path(executable, "Agent executable")?,
-        args: arguments
-            .iter()
-            .map(|argument| utf8_os(argument, "Agent argument"))
-            .collect::<Result<Vec<_>, _>>()?,
-        cwd: Some(working_directory.to_path_buf()),
-        env: utf8_environment(command_environment)?,
-    };
+    let profile = agent_task_sandbox_profile(
+        executable,
+        working_directory,
+        authority_environment,
+        proxy_url,
+        allowed_hosts,
+        allowed_unix_sockets,
+        read_paths,
+        write_paths,
+    )?;
+    compile_agent_task_sandbox_from_profile(
+        driver_id,
+        executable,
+        arguments,
+        working_directory,
+        command_environment,
+        profile,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agent_task_sandbox_profile(
+    executable: &Path,
+    working_directory: &Path,
+    authority_environment: &BTreeMap<String, OsString>,
+    proxy_url: &str,
+    allowed_hosts: &[String],
+    allowed_unix_sockets: &[PathBuf],
+    read_paths: impl IntoIterator<Item = PathBuf>,
+    write_paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<SandboxProfile, DriverError> {
     let mut rules = ["/System", "/usr", "/bin", "/sbin", "/Library"]
         .into_iter()
         .map(|path| SandboxPathRule {
@@ -74,7 +96,7 @@ pub(crate) fn compile_agent_task_sandbox(
         path,
         access: SandboxPathAccess::Write,
     }));
-    let profile = SandboxProfile {
+    Ok(SandboxProfile {
         enforcement: SandboxEnforcement::Native,
         filesystem: SandboxFileSystemPolicy { rules },
         network: SandboxNetworkPolicy::ProxyOnly {
@@ -93,6 +115,25 @@ pub(crate) fn compile_agent_task_sandbox(
         },
         resources: SandboxResourceLimits::default(),
         lifetime: SandboxLifetime::OneTask,
+    })
+}
+
+pub(crate) fn compile_agent_task_sandbox_from_profile(
+    driver_id: Uuid,
+    executable: &Path,
+    arguments: &[OsString],
+    working_directory: &Path,
+    command_environment: &BTreeMap<String, OsString>,
+    profile: SandboxProfile,
+) -> Result<SandboxLaunchPlan, DriverError> {
+    let command = TerminalCommand {
+        program: utf8_path(executable, "Agent executable")?,
+        args: arguments
+            .iter()
+            .map(|argument| utf8_os(argument, "Agent argument"))
+            .collect::<Result<Vec<_>, _>>()?,
+        cwd: Some(working_directory.to_path_buf()),
+        env: utf8_environment(command_environment)?,
     };
     MacOsSeatbeltLauncher
         .compile(&SandboxCompileRequest {

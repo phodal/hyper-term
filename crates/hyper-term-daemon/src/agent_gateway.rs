@@ -378,6 +378,8 @@ struct BrokeredMcpLaunch {
     executable: PathBuf,
     executable_sha256: String,
     arguments: Vec<OsString>,
+    runtime_home: PathBuf,
+    runtime_temp: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -3006,6 +3008,8 @@ impl AgentGatewayRuntime {
                 executable: mcp.executable,
                 executable_sha256: mcp.executable_sha256,
                 arguments: mcp.arguments,
+                runtime_home: mcp.runtime_home,
+                runtime_temp: mcp.runtime_temp,
             }),
             containment: Some(AgentContainmentConfig {
                 proxy_url: endpoint.proxy_url.clone(),
@@ -4773,6 +4777,13 @@ impl AgentGatewayRuntime {
             Ok(digest) => digest,
             Err(_) => return Some(Err(StartError::Driver)),
         };
+        let runtime_home = session_root.join("mcp-home");
+        let runtime_temp = session_root.join("mcp-tmp");
+        for directory in [&runtime_home, &runtime_temp] {
+            if create_private_runtime_root(directory).is_err() {
+                return Some(Err(StartError::Driver));
+            }
+        }
         let mut arguments = vec![
             "--agent-mode".into(),
             "--socket".into(),
@@ -4832,6 +4843,8 @@ impl AgentGatewayRuntime {
             executable,
             executable_sha256: digest,
             arguments,
+            runtime_home,
+            runtime_temp,
         }))
     }
 

@@ -8,6 +8,7 @@ mod codex_containment;
 mod deno_containment;
 mod deno_genui;
 mod deno_lsp;
+mod execution_context;
 mod mcp;
 mod process;
 mod structured_agent;
