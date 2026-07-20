@@ -3073,8 +3073,6 @@ const agent_timeline_id = "agent-blocks";
 const agent_timeline_estimated_width: usize = 84;
 const agent_timeline_line_height: f32 = 19;
 const agent_timeline_viewport_fallback: f32 = 480;
-pub const agent_reading_width: f32 = 760;
-
 fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 {
     const pointer = context orelse return 36;
     const model: *const Model = @ptrCast(@alignCast(pointer));
@@ -3138,7 +3136,6 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
     const content = if (model.agent_tier2_result_count == 0 and !model.agent_plan_visible)
         transcript
     else blk: {
-        const goal_width: f32 = if (model.hasAgentEditor()) 360 else 560;
         break :blk ui.column(.{ .grow = 1 }, .{
             transcript,
             if (model.agent_tier2_result_count > 0)
@@ -3147,23 +3144,18 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
                 ui.el(.stack, .{}, .{}),
             if (model.agent_plan_visible)
                 ui.row(.{ .gap = 4, .padding = 4, .cross = .center }, .{
-                    ui.spacer(1),
-                    agentGoalNode(ui, &model.agent_plan, goal_width),
-                    ui.spacer(1),
+                    agentGoalNode(ui, &model.agent_plan),
                 })
             else
                 ui.el(.stack, .{}, .{}),
         });
     };
     if (model.hasAgentEditor()) return content;
-    return ui.row(.{ .grow = 1, .cross = .stretch }, .{
-        ui.spacer(1),
-        ui.column(.{
-            .width = agent_reading_width,
-            .semantics = .{ .label = "Agent reading rail" },
-        }, .{content}),
-        ui.spacer(1),
-    });
+    return ui.column(.{
+        .grow = 1,
+        .padding = 10,
+        .semantics = .{ .label = "Agent reading rail" },
+    }, .{content});
 }
 
 fn agentTier2ResultsNode(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
@@ -3342,8 +3334,8 @@ fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBl
     });
 }
 
-fn agentGoalNode(ui: *HyperTermUi, block: *const AgentBlockView, width: f32) HyperTermUi.Node {
-    return ui.column(.{ .width = width }, .{
+fn agentGoalNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
+    return ui.column(.{ .grow = 1, .semantics = .{ .label = "Active Agent goal" } }, .{
         ui.el(.bubble, .{}, .{
             ui.row(.{ .gap = 5, .padding = 3, .cross = .center }, .{
                 ui.icon(.{ .width = 12, .height = 12, .style_tokens = .{ .foreground = .accent } }, "circle-dot"),

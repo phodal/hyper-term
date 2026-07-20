@@ -17,11 +17,12 @@
             </if>
           </stack>
         </if>
+        <spacer grow="1" />
         <for each="agentConfigOptions" key="id" as="option">
           <stack>
             <select size="sm" on-press="toggle_agent_config_picker:{option.index}" disabled="{agentCapabilityBusy}" label="{option.name}">{option.currentLabel}</select>
             <if test="{option.picker_open}">
-              <dropdown-menu anchor="above" anchor-alignment="start" width="280" on-dismiss="dismiss_agent_config_picker" label="{option.name}">
+              <dropdown-menu anchor="above" anchor-alignment="end" width="280" on-dismiss="dismiss_agent_config_picker" label="{option.name}">
                 <for each="openAgentConfigChoices" key="action_id" as="choice">
                   <menu-item selected="{choice.selected}" on-press="choose_agent_config:{choice.action_id}">{choice.name}</menu-item>
                 </for>
@@ -29,7 +30,6 @@
             </if>
           </stack>
         </for>
-        <spacer grow="1" />
         <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentSubmitDisabled}" label="Send prompt"></button>
       </input-group-actions>
     </input-group>
@@ -158,13 +158,9 @@
       <use template="agent-composer" />
     </if>
     <else>
-      <row>
-        <spacer grow="1" />
-        <column width="760" label="Agent composer rail">
-          <use template="agent-composer" />
-        </column>
-        <spacer grow="1" />
-      </row>
+      <column padding="8" label="Agent composer rail">
+        <use template="agent-composer" />
+      </column>
     </else>
     <if test="{hasAgentStatusNotice}">
       <status-bar>{agentStatus}</status-bar>

@@ -846,6 +846,7 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
     try testing.expect(containsText(tree.root, "Processed"));
     try testing.expect(containsText(tree.root, "Goal · Verify the edit · 1 / 3"));
+    try testing.expectEqual(@as(f32, 1), findByLabel(tree.root, "Active Agent goal").?.layout.grow);
     try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Processed").?.icon);
     try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Goal · Verify the edit · 1 / 3").?.icon);
 
@@ -1027,7 +1028,7 @@ test "Agent timeline mounts only a tail window at the full retained block bound"
     try testing.expect(widgetCount(tree.root) < 220);
 }
 
-test "Agent conversation uses compact reading and composer rails" {
+test "Agent conversation uses responsive reading and composer rails" {
     var model = main.initialModel();
     model.session_slots[0].mode = .agent;
     model.session_slots[0].title = "Agent";
@@ -1038,10 +1039,10 @@ test "Agent conversation uses compact reading and composer rails" {
 
     const reading_rail = findByLabel(tree.root, "Agent reading rail").?;
     const composer_rail = findByLabel(tree.root, "Agent composer rail").?;
-    try testing.expectEqual(main.agent_reading_width, reading_rail.layout.min_size.width);
-    try testing.expectEqual(main.agent_reading_width, reading_rail.layout.max_size.width);
-    try testing.expectEqual(main.agent_reading_width, composer_rail.layout.min_size.width);
-    try testing.expectEqual(main.agent_reading_width, composer_rail.layout.max_size.width);
+    try testing.expectEqual(@as(f32, 1), reading_rail.layout.grow);
+    try testing.expectEqual(@as(f32, 0), composer_rail.layout.grow);
+    try testing.expectEqual(@as(f32, 0), reading_rail.layout.min_size.width);
+    try testing.expectEqual(@as(f32, 0), composer_rail.layout.min_size.width);
 }
 
 test "read-only MCP approvals expose an exact Allow once action" {
