@@ -2,6 +2,7 @@ import { assertEquals, assertRejects } from "@std/assert";
 import {
   type BugCapsule,
   BugCapsuleClient,
+  digestAcceptedSource,
   digestUnsignedBugCapsule,
   OfflineBugCapsuleClient,
 } from "./debug-capsule-client.ts";
@@ -14,9 +15,9 @@ const context = {
   token: "0123456789abcdef0123456789abcdef",
 };
 
-async function fixture(): Promise<BugCapsule> {
-  const capsule = {
-    schema_version: 1,
+async function fixture(schemaVersion: 1 | 2 = 2): Promise<BugCapsule> {
+  const capsule: BugCapsule = {
+    schema_version: schemaVersion,
     mode: "replay_only",
     artifact: {
       artifact_id: artifactId,
@@ -25,7 +26,12 @@ async function fixture(): Promise<BugCapsule> {
       content_digest: "a".repeat(64),
       compiler: { name: "esbuild-wasm", version: "0.28.1" },
     },
-    accepted_source: [],
+    accepted_source: [{
+      path: "/App.tsx",
+      byte_count: 24,
+      content_digest: "9".repeat(64),
+      modified: false,
+    }],
     outputs: {
       bundle_bytes: 0,
       bundle_digest: "d".repeat(64),
@@ -40,7 +46,12 @@ async function fixture(): Promise<BugCapsule> {
       state_digest: "c".repeat(64),
       active_path: "/App.tsx",
       view: "trace",
-      files: [],
+      files: [{
+        path: "/App.tsx",
+        byte_count: 24,
+        content_digest: "9".repeat(64),
+        modified: false,
+      }],
     },
     runtime: {
       artifact_id: artifactId,
@@ -64,7 +75,10 @@ async function fixture(): Promise<BugCapsule> {
     }],
     reproduction: ["Verify capsule_digest before replay."],
     capsule_digest: "0".repeat(64),
-  } satisfies BugCapsule;
+  };
+  if (schemaVersion === 2) {
+    capsule.accepted_source_digest = await digestAcceptedSource(capsule);
+  }
   capsule.capsule_digest = await digestUnsignedBugCapsule(capsule);
   return capsule;
 }
@@ -100,6 +114,32 @@ Deno.test("Bug Capsule client rejects tampering before UI export", async () => {
     Error,
     "failed offline integrity verification",
   );
+});
+
+Deno.test("Bug Capsule client verifies the accepted source identity", async () => {
+  const capsule = await fixture();
+  capsule.accepted_source[0].content_digest = "8".repeat(64);
+  capsule.capsule_digest = await digestUnsignedBugCapsule(capsule);
+  const client = new BugCapsuleClient(
+    context,
+    () => Promise.resolve(Response.json(capsule)),
+  );
+
+  await assertRejects(
+    () => client.prepare(),
+    Error,
+    "failed accepted source verification",
+  );
+});
+
+Deno.test("Bug Capsule client accepts a verified schema v1 response during upgrade", async () => {
+  const capsule = await fixture(1);
+  const client = new BugCapsuleClient(
+    context,
+    () => Promise.resolve(Response.json(capsule)),
+  );
+
+  assertEquals(await client.prepare(), capsule);
 });
 
 Deno.test("offline Bug Capsule client opens without an Agent session context", async () => {

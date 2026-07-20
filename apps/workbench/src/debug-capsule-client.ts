@@ -18,7 +18,7 @@ export interface BugCapsuleFile {
 }
 
 export interface BugCapsule {
-  schema_version: 1;
+  schema_version: 1 | 2;
   mode: "replay_only";
   artifact: {
     artifact_id: string;
@@ -28,6 +28,7 @@ export interface BugCapsule {
     compiler: { name: string; version: string };
   };
   accepted_source: BugCapsuleFile[];
+  accepted_source_digest?: string;
   outputs: {
     bundle_bytes: number;
     bundle_digest: string;
@@ -152,6 +153,12 @@ async function decodeAndVerifyBugCapsule(
   if (digest !== capsule.capsule_digest) {
     throw new Error("Rust Bug Capsule failed offline integrity verification.");
   }
+  if (
+    capsule.schema_version === 2 &&
+    await digestAcceptedSource(capsule) !== capsule.accepted_source_digest
+  ) {
+    throw new Error("Rust Bug Capsule failed accepted source verification.");
+  }
   return capsule;
 }
 
@@ -163,6 +170,24 @@ export async function digestUnsignedBugCapsule(
   const digest = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode(JSON.stringify(unsigned)),
+  );
+  return [...new Uint8Array(digest)].map((byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+}
+
+export async function digestAcceptedSource(
+  capsule: BugCapsule,
+): Promise<string> {
+  const identity = {
+    schema_version: 1,
+    source_revision: capsule.artifact.source_revision,
+    entrypoint: capsule.artifact.entrypoint,
+    files: capsule.accepted_source,
+  };
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(identity)),
   );
   return [...new Uint8Array(digest)].map((byte) =>
     byte.toString(16).padStart(2, "0")
@@ -190,7 +215,14 @@ function validCapsule(
   const capsule = value as Partial<BugCapsule>;
   const artifact = capsule.artifact;
   const runtime = capsule.runtime;
-  return capsule.schema_version === 1 && capsule.mode === "replay_only" &&
+  const supportedSchema = capsule.schema_version === 1 ||
+    capsule.schema_version === 2;
+  const validSourceDigest = capsule.schema_version === 1
+    ? capsule.accepted_source_digest === undefined
+    : typeof capsule.accepted_source_digest === "string" &&
+      SHA256_PATTERN.test(capsule.accepted_source_digest);
+  return supportedSchema && validSourceDigest &&
+    capsule.mode === "replay_only" &&
     Boolean(artifact) && typeof artifact?.artifact_id === "string" &&
     (!context || artifact.artifact_id === context.artifactId) &&
     Number.isSafeInteger(artifact.source_revision) &&

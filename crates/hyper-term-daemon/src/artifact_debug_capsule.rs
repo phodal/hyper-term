@@ -8,6 +8,7 @@ use hyper_term_protocol::{
     GenUiBugCapsuleInclusion, GenUiBugCapsuleInventoryEntry, GenUiBugCapsuleOutputs,
     GenUiRuntimeTraceEvent, GenUiRuntimeTraceKind, GenUiRuntimeTraceProjection,
 };
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -18,7 +19,8 @@ use crate::artifact_editor_store::{ArtifactEditorCheckpoint, ArtifactEditorView}
 use crate::artifact_runtime_trace_store::{RuntimeTraceStoreError, replay_projection_digest};
 use crate::artifact_store::StoredGenUiArtifact;
 
-const BUG_CAPSULE_SCHEMA_VERSION: u16 = 1;
+const LEGACY_BUG_CAPSULE_SCHEMA_VERSION: u16 = 1;
+const BUG_CAPSULE_SCHEMA_VERSION: u16 = 2;
 const MAX_RUNTIME_EVENT_BYTES: usize = 384 * 1024;
 const MAX_BUG_CAPSULE_BYTES: usize = 512 * 1024;
 const EXCLUDED_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -68,8 +70,19 @@ pub fn load_bug_capsule(path: &Path) -> Result<GenUiBugCapsule, BugCapsuleError>
     if encoded.len() > MAX_BUG_CAPSULE_BYTES {
         return Err(BugCapsuleError::TooLarge);
     }
-    let capsule: GenUiBugCapsule = serde_json::from_slice(&encoded)?;
-    validate_bug_capsule(&capsule)?;
+    let mut capsule: GenUiBugCapsule = serde_json::from_slice(&encoded)?;
+    match capsule.schema_version {
+        LEGACY_BUG_CAPSULE_SCHEMA_VERSION => {
+            validate_bug_capsule_version(&capsule, LEGACY_BUG_CAPSULE_SCHEMA_VERSION)?;
+            capsule.schema_version = BUG_CAPSULE_SCHEMA_VERSION;
+            capsule.accepted_source_digest = accepted_source_digest(&capsule)?;
+            capsule.capsule_digest = None;
+            capsule.capsule_digest = Some(unsigned_digest(&capsule)?);
+            validate_bug_capsule(&capsule)?;
+        }
+        BUG_CAPSULE_SCHEMA_VERSION => validate_bug_capsule(&capsule)?,
+        _ => return Err(BugCapsuleError::Invalid),
+    }
     Ok(capsule)
 }
 
@@ -195,6 +208,7 @@ pub(crate) fn build_bug_capsule(
         mode: "replay_only".into(),
         artifact: artifact.metadata.clone(),
         accepted_source,
+        accepted_source_digest: String::new(),
         outputs,
         editor: GenUiBugCapsuleEditorState {
             base_source_revision: editor.base_source_revision,
@@ -224,6 +238,7 @@ pub(crate) fn build_bug_capsule(
         ],
         capsule_digest: None,
     };
+    capsule.accepted_source_digest = accepted_source_digest(&capsule)?;
     capsule.capsule_digest = Some(unsigned_digest(&capsule)?);
     if serde_json::to_vec(&capsule)?.len() > MAX_BUG_CAPSULE_BYTES {
         return Err(BugCapsuleError::TooLarge);
@@ -236,7 +251,22 @@ pub(crate) fn verify_bug_capsule(capsule: &GenUiBugCapsule) -> Result<bool, BugC
 }
 
 fn validate_bug_capsule(capsule: &GenUiBugCapsule) -> Result<(), BugCapsuleError> {
-    if capsule.schema_version != BUG_CAPSULE_SCHEMA_VERSION
+    validate_bug_capsule_version(capsule, BUG_CAPSULE_SCHEMA_VERSION)
+}
+
+fn validate_bug_capsule_version(
+    capsule: &GenUiBugCapsule,
+    expected_schema_version: u16,
+) -> Result<(), BugCapsuleError> {
+    let valid_source_identity = match expected_schema_version {
+        LEGACY_BUG_CAPSULE_SCHEMA_VERSION => capsule.accepted_source_digest.is_empty(),
+        BUG_CAPSULE_SCHEMA_VERSION => {
+            is_sha256(&capsule.accepted_source_digest)
+                && accepted_source_digest(capsule)? == capsule.accepted_source_digest
+        }
+        _ => false,
+    };
+    if capsule.schema_version != expected_schema_version
         || capsule.mode != "replay_only"
         || capsule.artifact.source_revision == 0
         || capsule.runtime.artifact_id != capsule.artifact.artifact_id
@@ -249,6 +279,7 @@ fn validate_bug_capsule(capsule: &GenUiBugCapsule) -> Result<(), BugCapsuleError
         || !is_sha256(&capsule.outputs.css_digest)
         || !is_sha256(&capsule.outputs.source_map_digest)
         || !capsule.capsule_digest.as_deref().is_some_and(is_sha256)
+        || !valid_source_identity
         || capsule.accepted_source.is_empty()
         || capsule.accepted_source.len() > 100
         || capsule.editor.files.is_empty()
@@ -396,6 +427,24 @@ fn unsigned_digest(capsule: &GenUiBugCapsule) -> Result<String, serde_json::Erro
     Ok(sha256_bytes(&serde_json::to_vec(&unsigned)?))
 }
 
+#[derive(Serialize)]
+struct AcceptedSourceIdentity<'a> {
+    schema_version: u16,
+    source_revision: u64,
+    entrypoint: &'a str,
+    files: &'a [GenUiBugCapsuleFile],
+}
+
+fn accepted_source_digest(capsule: &GenUiBugCapsule) -> Result<String, serde_json::Error> {
+    let identity = AcceptedSourceIdentity {
+        schema_version: 1,
+        source_revision: capsule.artifact.source_revision,
+        entrypoint: &capsule.artifact.entrypoint,
+        files: &capsule.accepted_source,
+    };
+    Ok(sha256_bytes(&serde_json::to_vec(&identity)?))
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(64);
@@ -503,6 +552,12 @@ mod tests {
         assert!(!encoded.contains("console secret"));
         assert_eq!(capsule.runtime.events[0].name, "observation.excluded");
         assert!(capsule.editor.files[0].modified);
+        assert_eq!(capsule.schema_version, BUG_CAPSULE_SCHEMA_VERSION);
+        assert_eq!(capsule.accepted_source_digest.len(), 64);
+        assert_eq!(
+            capsule.accepted_source_digest,
+            accepted_source_digest(&capsule).unwrap()
+        );
         assert!(verify_bug_capsule(&capsule).unwrap());
 
         let mut tampered = capsule;
@@ -597,6 +652,94 @@ mod tests {
         let mut tampered = capsule;
         tampered.environment.os = "tampered".into();
         std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        assert!(matches!(
+            load_bug_capsule(&path),
+            Err(BugCapsuleError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn schema_v1_capsule_migrates_in_memory_after_legacy_digest_verification() {
+        let (artifact, editor, runtime) = fixture();
+        let mut legacy = build_bug_capsule(
+            &artifact,
+            &editor,
+            &runtime,
+            GenUiBugCapsuleEnvironment {
+                hyper_term_version: "0.1.0".into(),
+                os: "macos".into(),
+                architecture: "aarch64".into(),
+                deno_runtime_version: None,
+                deno_executable_digest: None,
+                compiler_script_digest: None,
+                compiler_wasm_digest: None,
+            },
+        )
+        .unwrap();
+        legacy.schema_version = LEGACY_BUG_CAPSULE_SCHEMA_VERSION;
+        legacy.accepted_source_digest.clear();
+        legacy.capsule_digest = None;
+        legacy.capsule_digest = Some(unsigned_digest(&legacy).unwrap());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("legacy.bug-capsule.json");
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let migrated = load_bug_capsule(&path).unwrap();
+        assert_eq!(migrated.schema_version, BUG_CAPSULE_SCHEMA_VERSION);
+        assert_eq!(
+            migrated.accepted_source_digest,
+            accepted_source_digest(&migrated).unwrap()
+        );
+        assert!(verify_bug_capsule(&migrated).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let mut tampered_legacy = legacy;
+        tampered_legacy.environment.os = "tampered".into();
+        std::fs::write(&path, serde_json::to_vec_pretty(&tampered_legacy).unwrap()).unwrap();
+        assert!(matches!(
+            load_bug_capsule(&path),
+            Err(BugCapsuleError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn schema_v2_rejects_source_substitution_and_future_versions() {
+        let (artifact, editor, runtime) = fixture();
+        let capsule = build_bug_capsule(
+            &artifact,
+            &editor,
+            &runtime,
+            GenUiBugCapsuleEnvironment {
+                hyper_term_version: "0.1.0".into(),
+                os: "macos".into(),
+                architecture: "aarch64".into(),
+                deno_runtime_version: None,
+                deno_executable_digest: None,
+                compiler_script_digest: None,
+                compiler_wasm_digest: None,
+            },
+        )
+        .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("fixture.bug-capsule.json");
+
+        let mut substituted = capsule.clone();
+        substituted.accepted_source[0].content_digest = "e".repeat(64);
+        substituted.capsule_digest = None;
+        substituted.capsule_digest = Some(unsigned_digest(&substituted).unwrap());
+        std::fs::write(&path, serde_json::to_vec_pretty(&substituted).unwrap()).unwrap();
+        assert!(matches!(
+            load_bug_capsule(&path),
+            Err(BugCapsuleError::Invalid)
+        ));
+
+        let mut future = capsule;
+        future.schema_version = BUG_CAPSULE_SCHEMA_VERSION + 1;
+        future.capsule_digest = None;
+        future.capsule_digest = Some(unsigned_digest(&future).unwrap());
+        std::fs::write(&path, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
         assert!(matches!(
             load_bug_capsule(&path),
             Err(BugCapsuleError::Invalid)

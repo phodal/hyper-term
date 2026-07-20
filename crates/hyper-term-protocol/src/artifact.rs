@@ -194,6 +194,13 @@ pub struct GenUiBugCapsule {
     pub mode: String,
     pub artifact: AcceptedGenUiArtifact,
     pub accepted_source: Vec<GenUiBugCapsuleFile>,
+    /// Digest of the accepted source identity: source revision, entrypoint,
+    /// and the ordered digest-only file inventory.
+    ///
+    /// Schema v1 capsules did not include this field. Rust verifies the v1
+    /// capsule before deriving it during an in-memory import migration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub accepted_source_digest: String,
     pub outputs: GenUiBugCapsuleOutputs,
     pub editor: GenUiBugCapsuleEditorState,
     pub runtime: GenUiRuntimeTraceProjection,
