@@ -8,6 +8,12 @@ smoke_acp_fixture="$smoke_repo_root/scripts/fixtures/acp_diff_agent.sh"
 smoke_terminal_acp_fixture="$smoke_repo_root/scripts/fixtures/acp_terminal_agent.sh"
 smoke_lima_fixture="$smoke_repo_root/scripts/fixtures/fake_limactl.sh"
 smoke_artifact_dir=${HYPER_TERM_SMOKE_ARTIFACT_DIR:-}
+smoke_first_frame_budget_ms=${HYPER_TERM_SMOKE_FIRST_FRAME_BUDGET_MS:-750}
+
+if [[ ! "$smoke_first_frame_budget_ms" =~ ^[0-9]+$ ]] || (( smoke_first_frame_budget_ms == 0 )); then
+  echo "desktop first-frame budget must be a positive integer in milliseconds" >&2
+  exit 1
+fi
 
 if [[ "$smoke_supervisor" != /* ]]; then
   smoke_supervisor="$PWD/$smoke_supervisor"
@@ -132,17 +138,18 @@ smoke_pid=$!
     'role=button name="Close zsh 1"' \
     'hyper-term-terminal-view.*url="http://127.0.0.1:47437/.*tab=1"'
   native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
-  python3 - .zig-cache/native-sdk-automation/snapshot.txt <<'PY'
+  python3 - .zig-cache/native-sdk-automation/snapshot.txt "$smoke_first_frame_budget_ms" <<'PY'
 import pathlib
 import re
 import sys
 
 snapshot = pathlib.Path(sys.argv[1]).read_text()
+budget_ms = int(sys.argv[2])
 match = re.search(r"\bgpu_first_frame_latency_ns=(\d+)\b", snapshot)
 if match is None:
     raise SystemExit("Native snapshot is missing first-frame latency")
 latency_ns = int(match.group(1))
-cold_start_budget_ns = 750_000_000
+cold_start_budget_ns = budget_ms * 1_000_000
 if latency_ns > cold_start_budget_ns:
     raise SystemExit(
         f"Native cold first frame took {latency_ns / 1_000_000:.1f} ms; "
