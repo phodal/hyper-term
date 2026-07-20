@@ -514,7 +514,12 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     defer arena_state.deinit();
     const running_tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(!findByLabel(running_tree.root, "Agent prompt").?.state.disabled);
-    try testing.expect(findByLabel(running_tree.root, "Send prompt").?.state.disabled);
+    try testing.expect(findByLabel(running_tree.root, "Send prompt") == null);
+    try testing.expect(!findByLabel(running_tree.root, "Stop Agent turn").?.state.disabled);
+    try testing.expect(findAnyByText(
+        findByLabel(running_tree.root, "Agent turn status").?,
+        "Working",
+    ) != null);
     model.agent_turn_status = .ready;
     model.agent_composer_buffer.set("Explain the PTY boundary");
     main.update(&model, .send_agent_prompt, &fx);
@@ -528,6 +533,44 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expectEqualStrings("Explain the PTY boundary", request.body);
     try testing.expectEqualStrings("", model.agentComposerText());
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+}
+
+test "Agent stop control posts cancellation and enters compact stopping state" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_turn_status = .running;
+    main.update(&model, .cancel_agent_turn, &fx);
+
+    const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_cancel_effect_key_base + 2).?).?;
+    try testing.expectEqual(std.http.Method.POST, request.method);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session/cancel?token=abcdef0123456789abcdef0123456789&session_id=2",
+        request.url,
+    );
+    try testing.expectEqualStrings("{}", request.body);
+    try testing.expectEqual(main.AgentTurnStatus.cancelling, model.agent_turn_status);
+    try testing.expectEqualStrings("Stopping…", model.agentComposerStatus());
+    try testing.expect(model.agentCancelDisabled());
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(tree.root, "Stop Agent turn").?.state.disabled);
+    try testing.expect(findByLabel(tree.root, "Send prompt") == null);
+
+    main.update(&model, .{ .agent_turn_cancelled = .{
+        .key = main.agent_cancel_effect_key_base + 2,
+        .status = 202,
+        .body = "{\"session_id\":2,\"status\":\"cancelling\"}",
+    } }, &fx);
+    try testing.expectEqual(main.AgentTurnStatus.cancelling, model.agent_turn_status);
 }
 
 test "failed Agent turns restore the submitted prompt without replacing a newer draft" {

@@ -30,7 +30,18 @@
             </if>
           </stack>
         </for>
-        <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentSubmitDisabled}" label="Send prompt"></button>
+        <if test="{hasAgentComposerStatus}">
+          <row gap="5" cross="center" label="Agent turn status">
+            <icon name="circle-dot" width="11" height="11" foreground="accent" />
+            <text foreground="text_muted">{agentComposerStatus}</text>
+          </row>
+        </if>
+        <if test="{hasAgentStopControl}">
+          <button icon="pause" size="icon" variant="outline" on-press="cancel_agent_turn" disabled="{agentCancelDisabled}" label="Stop Agent turn"></button>
+        </if>
+        <else>
+          <button icon="send" size="icon" on-press="send_agent_prompt" disabled="{agentSubmitDisabled}" label="Send prompt"></button>
+        </else>
       </input-group-actions>
     </input-group>
   </column>

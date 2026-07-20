@@ -55,6 +55,7 @@ const terminal_close_effect_key_base: u64 = 0x4854_4300;
 pub const agent_start_effect_key_base: u64 = 0x4854_4100;
 const agent_close_effect_key_base: u64 = 0x4854_4200;
 pub const agent_turn_effect_key_base: u64 = 0x4854_4400;
+pub const agent_cancel_effect_key_base: u64 = 0x4854_4f00;
 pub const agent_snapshot_effect_key_base: u64 = 0x4854_4500;
 pub const agent_poll_timer_key_base: u64 = 0x4854_4600;
 pub const agent_permission_effect_key_base: u64 = 0x4854_4700;
@@ -177,6 +178,7 @@ pub const AgentTurnStatus = enum {
     idle,
     ready,
     running,
+    cancelling,
     completed,
     waiting_approval,
     failed,
@@ -796,6 +798,7 @@ pub const Model = struct {
         if (model.activeSession().agent_connection == .ready) {
             return switch (model.agent_turn_status) {
                 .running => "Agent working",
+                .cancelling => "Stopping Agent",
                 .waiting_approval => "Needs approval",
                 .failed => if (model.agent_error_len > 0) model.agentError() else "Agent turn failed",
                 .completed => "Turn complete",
@@ -839,7 +842,37 @@ pub const Model = struct {
     pub fn agentSubmitDisabled(model: *const Model) bool {
         return model.agentComposerInputDisabled() or
             model.agent_turn_status == .running or
+            model.agent_turn_status == .cancelling or
             model.agent_turn_status == .waiting_approval;
+    }
+
+    pub fn hasAgentComposerStatus(model: *const Model) bool {
+        return model.activeSession().agent_connection == .connecting or switch (model.agent_turn_status) {
+            .running, .cancelling, .waiting_approval => true,
+            else => false,
+        };
+    }
+
+    pub fn agentComposerStatus(model: *const Model) []const u8 {
+        if (model.activeSession().agent_connection == .connecting) return "Connecting…";
+        return switch (model.agent_turn_status) {
+            .running => "Working",
+            .cancelling => "Stopping…",
+            .waiting_approval => "Needs approval",
+            else => "",
+        };
+    }
+
+    pub fn hasAgentStopControl(model: *const Model) bool {
+        return switch (model.agent_turn_status) {
+            .running, .cancelling, .waiting_approval => true,
+            else => false,
+        };
+    }
+
+    pub fn agentCancelDisabled(model: *const Model) bool {
+        return model.agent_turn_status == .cancelling or
+            model.activeSession().agent_connection != .ready;
     }
 
     pub fn agentBlocks(model: *const Model) []const AgentBlockView {
@@ -939,6 +972,8 @@ pub const Msg = union(enum) {
     agent_composer_changed: canvas.TextInputEvent,
     send_agent_prompt,
     agent_turn_started: native_sdk.EffectResponse,
+    cancel_agent_turn,
+    agent_turn_cancelled: native_sdk.EffectResponse,
     agent_snapshot_received: native_sdk.EffectResponse,
     agent_stream_line: native_sdk.EffectLine,
     agent_stream_closed: native_sdk.EffectResponse,
@@ -973,7 +1008,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -1014,6 +1049,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .agent_composer_changed => |edit| model.agent_composer_buffer.apply(edit),
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
+        .cancel_agent_turn => requestAgentCancel(model, fx),
+        .agent_turn_cancelled => |response| applyAgentCancelResponse(model, response),
         .agent_snapshot_received => |response| applyAgentSnapshotResponse(model, response, fx),
         .agent_stream_line => |line| applyAgentStreamLine(model, line, fx),
         .agent_stream_closed => |response| applyAgentStreamClosed(model, response, fx),
@@ -1125,6 +1162,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         fx.cancelTimer(agent_poll_timer_key_base + session_id);
         cancelAgentStream(model, session_id, fx);
         fx.cancel(agent_permission_effect_key_base + session_id);
+        fx.cancel(agent_cancel_effect_key_base + session_id);
         fx.cancel(agent_config_effect_key_base + session_id);
         fx.cancel(agent_tier2_results_effect_key_base + session_id);
         fx.cancel(agent_tier2_preview_effect_key_base + session_id);
@@ -1275,6 +1313,19 @@ fn writeAgentTurnUrl(model: *const Model, session_id: u8, storage: []u8) ?[]cons
     return std.fmt.bufPrint(
         storage,
         "{s}/agent/session/turn?token={s}&session_id={d}",
+        .{ origin, token, session_id },
+    ) catch null;
+}
+
+fn writeAgentCancelUrl(model: *const Model, session_id: u8, storage: []u8) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(
+        storage,
+        "{s}/agent/session/cancel?token={s}&session_id={d}",
         .{ origin, token, session_id },
     ) catch null;
 }
@@ -1474,6 +1525,35 @@ fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, _:
         setAgentError(model, "Agent turn could not be started");
         restorePendingAgentPrompt(model, session_id);
         return;
+    }
+}
+
+fn requestAgentCancel(model: *Model, fx: *Effects) void {
+    if (!model.hasAgentStopControl() or model.agentCancelDisabled()) return;
+    const session_id = model.active_session_id;
+    var storage: [agent_effect_url_capacity + 8]u8 = undefined;
+    const request_url = writeAgentCancelUrl(model, session_id, storage[0..]) orelse return;
+    fx.fetch(.{
+        .key = agent_cancel_effect_key_base + session_id,
+        .method = .POST,
+        .url = request_url,
+        .body = "{}",
+        .timeout_ms = 12_000,
+        .on_response = Effects.responseMsg(.agent_turn_cancelled),
+    });
+    model.agent_turn_status = .cancelling;
+    model.agent_error_len = 0;
+    closeAgentConfigPickers(model);
+    model.agent_command_picker_open = false;
+}
+
+fn applyAgentCancelResponse(model: *Model, response: native_sdk.EffectResponse) void {
+    const session_id = effectSessionId(response.key, agent_cancel_effect_key_base) orelse return;
+    if (session_id != model.active_session_id) return;
+    const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
+    if (!accepted) {
+        model.agent_turn_status = .failed;
+        setAgentError(model, "Agent turn could not be stopped safely");
     }
 }
 
@@ -2919,6 +2999,7 @@ fn parseAgentMessageRole(value: []const u8) AgentMessageRole {
 fn parseAgentTurnStatus(value: []const u8) AgentTurnStatus {
     if (std.mem.eql(u8, value, "ready")) return .ready;
     if (std.mem.eql(u8, value, "running")) return .running;
+    if (std.mem.eql(u8, value, "cancelling")) return .cancelling;
     if (std.mem.eql(u8, value, "completed")) return .completed;
     if (std.mem.eql(u8, value, "waiting_approval")) return .waiting_approval;
     if (std.mem.eql(u8, value, "failed")) return .failed;
