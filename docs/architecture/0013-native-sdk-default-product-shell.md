@@ -152,13 +152,18 @@ without copying its application structure. Consecutive reasoning and tool-call
 Blocks project into one collapsed `Processed` activity row; final Agent prose
 remains first-class transcript content. Activity and reasoning disclosures use
 single-line, chrome-free chevron rows; detail content is not mounted until the
-row opens. The active `PlanBlock` renders as a bounded, centered Goal disclosure
-directly above the composer instead of a full-width panel or permanent side
-pane. The Agent header likewise reduces provider and connection state to one
-compact line rather than repeating them as badges.
+row opens. Provider/system notices also project into a one-line `Session notice`
+disclosure so protocol diagnostics remain inspectable without competing with
+the conversation. The active `PlanBlock` renders as a bounded, centered Goal
+capsule directly above the composer instead of a full-width panel or permanent
+side pane. The session tab is the provider identity, so a healthy Agent thread
+does not repeat provider and connection state in a second header; only an
+available ACP artifact adds a compact editor action, while failures remain in
+the trusted status notice.
 
-The composer stays at 68 points for a one-line prompt and grows to 144 points
-for four lines while retaining its bottom action row. Provider capabilities
+The composer stays at 66 points for a one-line prompt and grows with four
+bounded additional visual lines while retaining its bottom action row. Provider
+capabilities
 remain behind compact controls: Direct Codex Skills insert real `$skill`
 mentions, ACP commands insert their slash form, and model/reasoning choices
 remain anchored selectors in that row. Direct Codex selections are sent through
@@ -179,7 +184,7 @@ menus, entered a four-line Chinese prompt through the real text-input path, and
 captured a nonblank Metal/reference-renderer screenshot without dispatch or
 widget-budget errors. A second minimum-window automation run measured both
 rails at exactly 760 points inside an 840-point window, with 40-point symmetric
-gutters, an unchanged 68-point one-line composer, and no frame-budget or
+gutters, an accessible 66-point one-line composer, and no frame-budget or
 dispatch errors. A structural layout test locks those widths for both the Zig
 transcript projection and compiled Native composer.
 

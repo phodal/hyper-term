@@ -59,7 +59,7 @@ pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
 pub const window_min_width: f32 = 840;
 pub const window_min_height: f32 = 520;
-pub const titlebar_natural_height: f32 = 48;
+pub const titlebar_natural_height: f32 = 44;
 
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
@@ -255,6 +255,10 @@ pub const AgentBlockView = struct {
 
     pub fn isThoughtMessage(block: *const AgentBlockView) bool {
         return block.kind == .message and block.role == .thought;
+    }
+
+    pub fn isSystemMessage(block: *const AgentBlockView) bool {
+        return block.kind == .message and block.role == .system;
     }
 
     pub fn isOperation(block: *const AgentBlockView) bool {
@@ -656,28 +660,6 @@ pub const Model = struct {
         return providerMenuLabel(model, .copilot_acp);
     }
 
-    pub fn activeAgentProviderLabel(model: *const Model) []const u8 {
-        const session = model.activeSession();
-        return if (session.mode == .agent) session.agent_provider.label() else model.selected_agent_provider.label();
-    }
-
-    pub fn agentConnectionLabel(model: *const Model) []const u8 {
-        if (model.activeSession().agent_connection == .ready) {
-            return switch (model.agent_turn_status) {
-                .running => "working",
-                .waiting_approval => "approval",
-                .failed => "failed",
-                else => "ready",
-            };
-        }
-        return switch (model.activeSession().agent_connection) {
-            .unavailable => "unavailable",
-            .connecting => "connecting",
-            .ready => "ready",
-            .failed => "failed",
-        };
-    }
-
     pub fn agentStatus(model: *const Model) []const u8 {
         const session = model.activeSession();
         if (session.mode == .agent and !model.agentProviderReady(session.agent_provider)) {
@@ -721,7 +703,7 @@ pub const Model = struct {
         for (text) |byte| visual_lines += @intFromBool(byte == '\n');
         visual_lines += text.len / 96;
         const extra_lines = @min(visual_lines - 1, 4);
-        return 68 + @as(f32, @floatFromInt(extra_lines)) * 19;
+        return 66 + @as(f32, @floatFromInt(extra_lines)) * 18;
     }
 
     pub fn agentComposerText(model: *const Model) []const u8 {
@@ -907,7 +889,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.agent_plan.expanded = !model.agent_plan.expanded;
             }
             for (model.agent_blocks[0..model.agent_block_count]) |*block| {
-                if (block.id == block_id and (block.isActivity() or block.isThoughtMessage())) {
+                if (block.id == block_id and
+                    (block.isActivity() or block.isThoughtMessage() or block.isSystemMessage()))
+                {
                     block.expanded = !block.expanded;
                     break;
                 }
@@ -2619,7 +2603,12 @@ fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 
     const lines = @max(@as(usize, 1), (block.content_len + agent_timeline_estimated_width - 1) / agent_timeline_estimated_width);
     const text_extent = @as(f32, @floatFromInt(@min(lines, 96))) * agent_timeline_line_height;
     return switch (block.kind) {
-        .message => if (block.role == .user) 28 + text_extent else 14 + text_extent,
+        .message => if (block.role == .system and !block.expanded)
+            28
+        else if (block.role == .user)
+            24 + text_extent
+        else
+            10 + text_extent,
         .tool_call, .plan => if (block.expanded) 42 + text_extent else 30,
         .operation => 36 + @min(text_extent, agent_timeline_line_height),
         .approval => 118 + @min(text_extent, agent_timeline_line_height * 5),
@@ -2634,7 +2623,7 @@ pub fn agentTimelineOptions(model: *const Model) HyperTermUi.VirtualListOptions 
         .item_extent = 36,
         .extent_estimate = agentBlockExtentEstimate,
         .extent_context = model,
-        .gap = 3,
+        .gap = 2,
         .overscan = 4,
         .grow = 1,
         .viewport_fallback = agent_timeline_viewport_fallback,
@@ -2667,12 +2656,12 @@ fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
     const content = if (!model.agent_plan_visible)
         transcript
     else blk: {
-        const goal_width: f32 = if (model.hasAgentEditor()) 360 else 620;
+        const goal_width: f32 = if (model.hasAgentEditor()) 360 else 560;
         break :blk ui.column(.{ .grow = 1 }, .{
             transcript,
-            ui.row(.{ .gap = 5, .padding = 5, .cross = .center }, .{
+            ui.row(.{ .gap = 4, .padding = 4, .cross = .center }, .{
                 ui.spacer(1),
-                agentActivityNodeWithWidth(ui, &model.agent_plan, goal_width),
+                agentGoalNode(ui, &model.agent_plan, goal_width),
                 ui.spacer(1),
             }),
         });
@@ -2703,14 +2692,33 @@ fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBl
     else
         ui.el(.stack, .{}, .{});
     if (block.isUserMessage()) {
-        return ui.row(.{ .padding = 2 }, .{
+        return ui.row(.{ .padding = 1 }, .{
             ui.spacer(1),
             ui.el(.bubble, .{}, .{
-                ui.column(.{ .gap = 3, .padding = 7 }, .{
+                ui.column(.{ .gap = 3, .padding = 6 }, .{
                     ui.text(.{ .wrap = true }, block.content()),
                     clipped,
                 }),
             }),
+        });
+    }
+    if (block.isSystemMessage()) {
+        return ui.column(.{ .grow = 1 }, .{
+            ui.row(.{ .gap = 4, .padding = 1, .cross = .center }, .{
+                ui.button(.{
+                    .size = .sm,
+                    .variant = .ghost,
+                    .icon = if (block.expanded) "chevron-down" else "chevron-right",
+                    .on_press = Msg{ .toggle_agent_block = block.id },
+                }, "Session notice"),
+            }),
+            if (block.expanded)
+                ui.column(.{ .gap = 4, .padding = 6 }, .{
+                    AgentMarkdown.view(ui, block.content(), .{}),
+                    clipped,
+                })
+            else
+                ui.el(.stack, .{}, .{}),
         });
     }
     if (block.isThoughtMessage()) {
@@ -2736,9 +2744,33 @@ fn agentMessageNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBl
                 ui.el(.stack, .{}, .{}),
         });
     }
-    return ui.column(.{ .gap = 4, .padding = 2 }, .{
-        ui.column(.{ .padding = 2 }, .{AgentMarkdown.view(ui, block.content(), .{})}),
+    return ui.column(.{ .gap = 3, .padding = 1 }, .{
+        ui.column(.{ .padding = 1 }, .{AgentMarkdown.view(ui, block.content(), .{})}),
         clipped,
+    });
+}
+
+fn agentGoalNode(ui: *HyperTermUi, block: *const AgentBlockView, width: f32) HyperTermUi.Node {
+    return ui.column(.{ .width = width }, .{
+        ui.el(.bubble, .{}, .{
+            ui.row(.{ .gap = 5, .padding = 3, .cross = .center }, .{
+                ui.icon(.{ .width = 12, .height = 12, .style_tokens = .{ .foreground = .accent } }, "circle-dot"),
+                ui.button(.{
+                    .size = .sm,
+                    .variant = .ghost,
+                    .icon = if (block.expanded) "chevron-down" else "chevron-right",
+                    .on_press = Msg{ .toggle_agent_block = block.id },
+                }, block.activityTitle()),
+                ui.spacer(1),
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.activityMeta()),
+            }),
+        }),
+        if (block.expanded)
+            ui.column(.{ .gap = 4, .padding = 6 }, .{
+                AgentMarkdown.view(ui, block.content(), .{}),
+            })
+        else
+            ui.el(.stack, .{}, .{}),
     });
 }
 

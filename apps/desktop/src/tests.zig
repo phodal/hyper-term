@@ -441,9 +441,9 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     model.agent_turn_status = .ready;
     try testing.expect(!model.agentComposerInputDisabled());
     try testing.expect(!model.agentSubmitDisabled());
-    try testing.expectEqual(@as(f32, 68), model.agentComposerHeight());
+    try testing.expectEqual(@as(f32, 66), model.agentComposerHeight());
     model.agent_composer_buffer.set("One\nTwo\nThree");
-    try testing.expect(model.agentComposerHeight() > 68);
+    try testing.expect(model.agentComposerHeight() > 66);
     model.agent_turn_status = .running;
     try testing.expect(!model.agentComposerInputDisabled());
     try testing.expect(model.agentSubmitDisabled());
@@ -860,6 +860,41 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(containsText(tree.root, "/workspace/src/lib.rs"));
     try testing.expect(containsText(tree.root, "+new"));
     try testing.expect(containsText(tree.root, "terminal-7"));
+}
+
+test "Agent system notices remain one line until explicitly expanded" {
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices("", agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"completed","error":null,"document":{"blocks":[
+        \\  {"block_id":"00000000-0000-4000-8000-000000000039","kind":"message","payload":{"type":"message","role":"system","text":"Provider restored a bounded session notice."}}
+        \\]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqual(@as(usize, 1), model.agentBlocks().len);
+    try testing.expect(model.agentBlocks()[0].isSystemMessage());
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "Session notice"));
+    try testing.expect(!containsText(tree.root, "Provider restored"));
+
+    main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[0].id }, &fx);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "Provider restored a bounded session notice."));
 }
 
 test "empty ACP plans remain hidden as low-signal activity" {

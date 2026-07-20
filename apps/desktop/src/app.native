@@ -1,15 +1,15 @@
 <!-- Hyper Term product shell. This native view is trusted application code.
      Agent-authored content enters later as versioned Block data, never markup. -->
 <template name="agent-composer">
-  <column padding="6">
+  <column padding="4">
     <input-group label="Agent prompt composer" height="{agentComposerHeight}">
-      <textarea size="sm" text="{agentComposerText}" placeholder="Ask this Agent about the workspace" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerInputDisabled}" label="Agent prompt" />
+      <textarea size="sm" text="{agentComposerText}" placeholder="Ask, use /commands, or mention a $skill" on-input="agent_composer_changed" on-submit="send_agent_prompt" disabled="{agentComposerInputDisabled}" label="Agent prompt" />
       <input-group-actions>
         <if test="{agent_command_count > 0}">
           <stack>
             <button size="sm" variant="ghost" icon="plus" on-press="toggle_agent_command_picker" disabled="{agentCapabilityBusy}" label="Agent commands"></button>
             <if test="{agent_command_picker_open}">
-              <dropdown-menu anchor="above" anchor-alignment="start" on-dismiss="dismiss_agent_command_picker" label="Agent commands">
+              <dropdown-menu anchor="above" anchor-alignment="start" width="420" on-dismiss="dismiss_agent_command_picker" label="Agent commands">
                 <for each="agentCommands" key="index" as="command">
                   <menu-item on-press="insert_agent_command:{command.index}">{command.menuLabel}</menu-item>
                 </for>
@@ -21,7 +21,7 @@
           <stack>
             <select size="sm" on-press="toggle_agent_config_picker:{option.index}" disabled="{agentCapabilityBusy}" label="{option.name}">{option.currentLabel}</select>
             <if test="{option.picker_open}">
-              <dropdown-menu anchor="above" anchor-alignment="start" on-dismiss="dismiss_agent_config_picker" label="{option.name}">
+              <dropdown-menu anchor="above" anchor-alignment="start" width="280" on-dismiss="dismiss_agent_config_picker" label="{option.name}">
                 <for each="openAgentConfigChoices" key="action_id" as="choice">
                   <menu-item selected="{choice.selected}" on-press="choose_agent_config:{choice.action_id}">{choice.name}</menu-item>
                 </for>
@@ -38,15 +38,13 @@
 
 <template name="agent-thread">
   <column min-width="400" grow="1" background="surface" label="Agent conversation">
-    <row gap="5" padding="4" cross="center">
-      <icon name="circle-dot" width="12" height="12" foreground="accent" />
-      <text><span weight="medium">{activeAgentProviderLabel}</span></text>
-      <text grow="1" foreground="text_muted">{agentConnectionLabel}</text>
-      <if test="{canOpenAgentEditor}">
+    <if test="{canOpenAgentEditor}">
+      <row gap="5" padding="3" cross="center">
+        <text grow="1" foreground="text_muted">Agent artifact available</text>
         <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open ACP artifact editor">Edit</button>
-      </if>
-    </row>
-    <separator />
+      </row>
+      <separator />
+    </if>
     <!-- The Zig root replaces this labelled slot with a variable-height,
          tail-anchored virtual list. The unreachable branch keeps the Native
          model contract checking the builder-owned block vocabulary. -->
@@ -189,7 +187,7 @@
 </template>
 
 <column background="background">
-  <row gap="8" padding="8" height="{titlebar_height}" cross="center" background="surface" window-drag="true" label="Session bar">
+  <row gap="7" padding="6" height="{titlebar_height}" cross="center" background="surface" window-drag="true" label="Session bar">
     <spacer width="{chrome_leading}" />
     <row gap="7" cross="center" grow="1">
       <icon name="terminal" width="15" height="15" foreground="accent" />
@@ -217,7 +215,7 @@
           <button size="sm" variant="outline" icon="chevron-down" on-press="toggle_agent_provider_picker" disabled="{agentProviderUnavailable}" label="Choose provider for a new Agent tab"></button>
         </button-group>
         <if test="{agent_provider_picker_open}">
-          <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="12" on-dismiss="dismiss_agent_provider_picker">
+          <dropdown-menu anchor="below" anchor-alignment="end" anchor-offset="8" width="360" on-dismiss="dismiss_agent_provider_picker">
             <if test="{codexProviderAvailable}">
               <menu-item selected="{selected_agent_provider == 'codex'}" disabled="{codexProviderDisabled}" on-press="choose_codex_agent">{codexProviderMenuLabel}</menu-item>
             </if>
