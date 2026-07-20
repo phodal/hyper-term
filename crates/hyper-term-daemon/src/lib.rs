@@ -53,6 +53,7 @@ mod artifact_store;
 #[cfg(unix)]
 mod client;
 mod editor_lsp;
+mod local_mcp_runtime;
 #[cfg(unix)]
 mod mcp_gateway;
 mod network_proxy;
@@ -78,6 +79,9 @@ pub use agent_gateway::{
 };
 #[cfg(unix)]
 pub use client::{ControlClient, ControlClientError};
+pub use local_mcp_runtime::{
+    LocalMcpRuntimeError, LocalMcpRuntimeManager, RegisteredLocalMcpServer,
+};
 #[cfg(unix)]
 pub use mcp_gateway::{
     DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig, McpGatewayError, McpStdioConfig,
