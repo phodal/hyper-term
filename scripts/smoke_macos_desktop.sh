@@ -131,6 +131,24 @@ PY
     echo "Native renderer screenshot is unexpectedly small: $smoke_screenshot_bytes bytes" >&2
     exit 1
   fi
+  smoke_terminal_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-terminal.png
+  cp "$smoke_screenshot" "$smoke_terminal_screenshot"
+
+  native automate shortcut hyper-term.new-agent
+  native automate assert \
+    'role=group name="Agent conversation"' \
+    'role=group name="Agent reading rail"' \
+    'role=group name="Agent composer rail"' \
+    'role=group name="Agent prompt composer"' \
+    'role=textbox name="Agent prompt"'
+  native automate assert --absent \
+    'name="ACP artifact editor"' \
+    'error event=' \
+    'dispatch_errors=[1-9]'
+  native automate screenshot hyper-term-canvas
+  smoke_agent_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png
+  cp "$smoke_screenshot" "$smoke_agent_screenshot"
+  cp "$smoke_terminal_screenshot" "$smoke_screenshot"
 )
 
 if [[ -n "$smoke_artifact_dir" ]]; then
@@ -141,6 +159,12 @@ if [[ -n "$smoke_artifact_dir" ]]; then
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png" \
     "$smoke_artifact_dir/screenshot-hyper-term-canvas.png"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-terminal.png" \
+    "$smoke_artifact_dir/screenshot-hyper-term-terminal.png"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png" \
+    "$smoke_artifact_dir/screenshot-hyper-term-agent.png"
   cp "$smoke_log" "$smoke_artifact_dir/hyper-term-smoke.log"
 fi
 
