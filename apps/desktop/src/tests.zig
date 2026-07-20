@@ -1149,7 +1149,7 @@ test "Tier 2 results show a bounded Diff before creating workspace approval" {
         .key = main.agent_tier2_results_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"results":[{"source_operation_id":"66666666-6666-4666-8666-666666666666","changed_bytes":17,"changed_files":[{"kind":"deleted","path":"README.md","bytes":0,"content_sha256":null},{"kind":"modified","path":"src/main.rs","bytes":17,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}
+        \\{"results":[{"source_operation_id":"66666666-6666-4666-8666-666666666666","changed_bytes":20,"changed_files":[{"kind":"deleted","path":"README.md","bytes":0,"content_sha256":null},{"kind":"untracked","path":"data.bin","bytes":3,"content_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"kind":"modified","path":"src/main.rs","bytes":17,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}
         ,
     } }, &fx);
 
@@ -1159,7 +1159,7 @@ test "Tier 2 results show a bounded Diff before creating workspace approval" {
     defer arena_state.deinit();
     var tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(containsText(tree.root, "Tier 2 changes retained for review"));
-    try testing.expect(containsText(tree.root, "2 files · 1 deleted · 17 bytes"));
+    try testing.expect(containsText(tree.root, "3 files · 1 deleted · 20 bytes"));
     try testing.expect(containsText(tree.root, "README.md"));
     try testing.expect(containsText(tree.root, "delete"));
     const review_diff = findByText(tree.root, .button, "Review Diff").?;
@@ -1176,7 +1176,7 @@ test "Tier 2 results show a bounded Diff before creating workspace approval" {
         .key = main.agent_tier2_preview_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"source_operation_id":"66666666-6666-4666-8666-666666666666","result_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","changes":[{"target_path":"README.md","deleted":true,"hunks":[{"id":"h0","base_start":1,"base_lines":1,"proposed_start":1,"proposed_lines":0,"patch":"@@ -1 +0,0 @@\n-remove me\n","truncated":false}],"truncated":false},{"target_path":"src/main.rs","deleted":false,"hunks":[{"id":"h1","base_start":1,"base_lines":1,"proposed_start":1,"proposed_lines":1,"patch":"@@ -1 +1 @@\n-old\n+generated\n","truncated":false}],"truncated":false}],"truncated":false}
+        \\{"source_operation_id":"66666666-6666-4666-8666-666666666666","result_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","changes":[{"target_path":"README.md","deleted":true,"binary":false,"base_bytes":10,"proposed_bytes":0,"proposed_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","hunks":[{"id":"h0","base_start":1,"base_lines":1,"proposed_start":1,"proposed_lines":0,"patch":"@@ -1 +0,0 @@\n-remove me\n","truncated":false}],"truncated":false},{"target_path":"data.bin","deleted":false,"binary":true,"base_bytes":0,"proposed_bytes":3,"proposed_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","hunks":[],"truncated":false},{"target_path":"src/main.rs","deleted":false,"binary":false,"base_bytes":4,"proposed_bytes":10,"proposed_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","hunks":[{"id":"h1","base_start":1,"base_lines":1,"proposed_start":1,"proposed_lines":1,"patch":"@@ -1 +1 @@\n-old\n+generated\n","truncated":false}],"truncated":false}],"truncated":false}
         ,
     } }, &fx);
 
@@ -1184,6 +1184,7 @@ test "Tier 2 results show a bounded Diff before creating workspace approval" {
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(containsText(tree.root, "-remove me"));
+    try testing.expect(containsText(tree.root, "Binary file · 0 → 3 bytes · SHA-256 cccccccccccc… · no textual Diff"));
     try testing.expect(containsText(tree.root, "+generated"));
     try testing.expect(containsText(tree.root, "Preview only · no workspace permission created"));
     const request_approval = findByText(tree.root, .button, "Request apply approval").?;

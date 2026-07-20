@@ -1692,6 +1692,10 @@ const AgentTier2PreviewHunkWire = struct {
 const AgentTier2PreviewChangeWire = struct {
     target_path: []const u8,
     deleted: bool = false,
+    binary: bool = false,
+    base_bytes: u64 = 0,
+    proposed_bytes: u64 = 0,
+    proposed_digest: []const u8 = "",
     hunks: []const AgentTier2PreviewHunkWire,
     truncated: bool = false,
 };
@@ -1812,6 +1816,17 @@ fn applyAgentTier2PreviewResponse(model: *Model, response: native_sdk.EffectResp
         if (change_index > 0) appendAgentTier2Diff(model, "\n");
         appendAgentTier2Diff(model, change.target_path);
         appendAgentTier2Diff(model, "\n");
+        if (change.binary) {
+            var metadata: [192]u8 = undefined;
+            const digest = if (change.proposed_digest.len >= 12) change.proposed_digest[0..12] else change.proposed_digest;
+            const label = if (change.deleted)
+                std.fmt.bufPrint(&metadata, "Binary file · {d} bytes → delete · no textual Diff\n", .{change.base_bytes}) catch "Binary file · delete · no textual Diff\n"
+            else if (digest.len > 0)
+                std.fmt.bufPrint(&metadata, "Binary file · {d} → {d} bytes · SHA-256 {s}… · no textual Diff\n", .{ change.base_bytes, change.proposed_bytes, digest }) catch "Binary file · no textual Diff\n"
+            else
+                std.fmt.bufPrint(&metadata, "Binary file · {d} → {d} bytes · no textual Diff\n", .{ change.base_bytes, change.proposed_bytes }) catch "Binary file · no textual Diff\n";
+            appendAgentTier2Diff(model, label);
+        }
         for (change.hunks) |hunk| {
             appendAgentTier2Diff(model, hunk.patch);
             if (hunk.patch.len > 0 and hunk.patch[hunk.patch.len - 1] != '\n') {
