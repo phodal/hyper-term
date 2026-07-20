@@ -121,6 +121,19 @@ jobs:
           deno task build:terminal
           deno task build:workbench
           deno task build:runtime
+          deno_path="$(command -v deno)"
+          deno_sha256="$(shasum -a 256 "$deno_path" | awk '{print $1}')"
+          HYPER_TERM_ACP_RUNTIME_ROOT="$GITHUB_WORKSPACE/dist/runtime/acp" \
+          HYPER_TERM_DENO_PATH="$deno_path" \
+          HYPER_TERM_DENO_SHA256="$deno_sha256" \
+            cargo test \
+              --locked \
+              --package hyper-term-drivers \
+              --test acp_agent \
+              bundled_codex_acp_completes_the_release_initialize_handshake \
+              -- \
+              --ignored \
+              --exact
 
       - name: Run Native SDK release gates
         working-directory: apps/desktop

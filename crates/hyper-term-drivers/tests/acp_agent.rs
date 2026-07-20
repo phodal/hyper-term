@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentDriverEvent, AgentEffectAuthorization,
@@ -9,6 +13,28 @@ use hyper_term_drivers::{
 };
 use hyper_term_protocol::{OperationId, PermissionDecision};
 use tempfile::TempDir;
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires HYPER_TERM_ACP_RUNTIME_ROOT, HYPER_TERM_DENO_PATH, and HYPER_TERM_DENO_SHA256"]
+fn bundled_codex_acp_completes_the_release_initialize_handshake() {
+    let (client, runtime) = launch_bundled_codex_acp();
+    if let Err(error) = client.initialize(Duration::from_secs(20)) {
+        let provider_log = fs::read_to_string(runtime.path().join("provider.log"))
+            .unwrap_or_else(|log_error| format!("provider log unavailable: {log_error}"));
+        panic!(
+            "bundled Codex ACP initialize failed: {error}; provider={provider_log}; stderr={}",
+            client.stderr_tail().unwrap_or_default()
+        );
+    }
+    assert_eq!(client.state().unwrap(), DriverState::Ready);
+    let provider_log = fs::read_to_string(runtime.path().join("provider.log"))
+        .expect("bundled adapter must launch the configured provider path");
+    assert!(provider_log.contains("started: app-server"));
+    assert!(provider_log.contains("\"method\":\"initialize\""));
+    assert!(provider_log.contains("\"name\":\"hyper-term\""));
+    assert_eq!(client.close().unwrap(), DriverState::Closed);
+}
 
 #[test]
 #[ignore = "requires HYPER_TERM_ACP_PATH, HYPER_TERM_ACP_SHA256, and an installed ACP adapter"]
@@ -153,6 +179,67 @@ fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
 
 fn launch_installed_acp_agent() -> (AcpAgentClient, TempDir) {
     launch_installed_acp_agent_with_mcp(None)
+}
+
+#[cfg(unix)]
+fn launch_bundled_codex_acp() -> (AcpAgentClient, TempDir) {
+    let runtime_root = required_path("HYPER_TERM_ACP_RUNTIME_ROOT")
+        .canonicalize()
+        .expect("HYPER_TERM_ACP_RUNTIME_ROOT must resolve to the built ACP runtime");
+    let entrypoint = runtime_root
+        .join("node_modules/@agentclientprotocol/codex-acp/dist/index.js")
+        .canonicalize()
+        .expect("built Codex ACP entrypoint");
+    assert!(
+        entrypoint.starts_with(&runtime_root),
+        "Codex ACP entrypoint escaped the built runtime"
+    );
+    let executable = required_path("HYPER_TERM_DENO_PATH")
+        .canonicalize()
+        .expect("HYPER_TERM_DENO_PATH must resolve to the inspected Deno runtime");
+    let executable_sha256 = std::env::var("HYPER_TERM_DENO_SHA256")
+        .expect("HYPER_TERM_DENO_SHA256 must identify that exact Deno runtime");
+
+    let root = TempDir::new().expect("temporary bundled ACP release gate");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("temporary ACP workspace");
+    let provider = root.path().join("codex");
+    fs::write(
+        &provider,
+        "#!/bin/sh\nset -eu\nprintf 'started: %s\\n' \"$*\" > \"$HOME/provider.log\"\nIFS= read -r line\nprintf 'request: %s\\n' \"$line\" >> \"$HOME/provider.log\"\nprintf '%s\\n' '{\"id\":0,\"result\":{\"userAgent\":\"hyper-term-release-gate\"}}'\nwhile IFS= read -r line; do :; done\n",
+    )
+    .expect("deterministic Codex app-server fixture");
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700))
+        .expect("executable Codex app-server fixture");
+
+    let arguments = [
+        "run",
+        "--cached-only",
+        "--no-config",
+        "--node-modules-dir=manual",
+        "-A",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain(std::iter::once(entrypoint.into_os_string()))
+    .collect();
+    let mut environment = adapter_environment(&executable);
+    environment.insert("HOME".into(), root.path().as_os_str().to_owned());
+    environment.insert("CODEX_PATH".into(), provider.into_os_string());
+    let client = AcpAgentClient::launch(AcpAgentConfig {
+        executable,
+        executable_sha256,
+        arguments,
+        environment,
+        implementation_version: "bundled-release-gate".into(),
+        provider_id: "codex-acp".into(),
+        workspace,
+        brokered_mcp_server: None,
+        containment: None,
+        terminal_client: false,
+    })
+    .expect("launch bundled Codex ACP adapter");
+    (client, root)
 }
 
 fn launch_installed_acp_agent_with_mcp(
