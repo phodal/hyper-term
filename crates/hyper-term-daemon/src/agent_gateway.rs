@@ -30,6 +30,7 @@ use hyper_term_protocol::{
     GenUiRuntimeTraceProjection, MessageRole, OperationAction, OperationCompletion, OperationId,
     OperationKind, OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
 };
+use hyper_term_sandbox::{IsolatedChange, IsolatedTaskTermination};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -37,7 +38,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::DaemonState;
 use crate::artifact_debug_capsule::build_bug_capsule;
 use crate::artifact_editor_store::{
     ArtifactEditorCheckpoint, ArtifactEditorCheckpointRequest, ArtifactEditorStore,
@@ -58,6 +58,7 @@ use crate::workspace_diff::{
     select_workspace_hunks,
 };
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
+use crate::{DaemonError, DaemonState, IsolatedAcceptanceReview};
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
@@ -517,6 +518,50 @@ struct AgentPermissionRequest {
     decision: PermissionDecision,
 }
 
+#[derive(Deserialize)]
+struct AgentTier2SourceRequest {
+    source_operation_id: OperationId,
+}
+
+#[derive(Serialize)]
+struct AgentTier2ResultsResponse {
+    results: Vec<AgentTier2ResultResponse>,
+}
+
+#[derive(Serialize)]
+struct AgentTier2ResultResponse {
+    source_operation_id: OperationId,
+    source_revision: String,
+    finished_at_ms: u64,
+    termination: IsolatedTaskTermination,
+    exit_code: Option<i32>,
+    changed_bytes: u64,
+    inventory_sha256: String,
+    changed_files: Vec<IsolatedChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance: Option<AgentTier2ReviewResponse>,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentTier2ReviewResponse {
+    source_operation_id: OperationId,
+    operation_id: OperationId,
+    operation_revision: u64,
+    state: OperationState,
+    result_digest: String,
+    changes: Vec<AgentTier2ReviewChangeResponse>,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentTier2ReviewChangeResponse {
+    target_path: String,
+    base_digest: Option<String>,
+    proposed_digest: String,
+    before: String,
+    after: String,
+    hunks: Vec<WorkspaceDiffHunk>,
+}
+
 pub async fn spawn_agent_gateway(
     mut config: AgentGatewayConfig,
 ) -> Result<AgentGatewayHandle, AgentGatewayError> {
@@ -649,6 +694,9 @@ pub async fn spawn_agent_gateway(
         .route("/agent/session/stream", get(stream_session))
         .route("/agent/session/config", post(set_session_config))
         .route("/agent/session/permission", post(decide_permission))
+        .route("/agent/session/tier2", get(tier2_results))
+        .route("/agent/session/tier2/review", post(propose_tier2_review))
+        .route("/agent/session/tier2/discard", post(discard_tier2_result))
         .route(
             "/agent/artifact/{artifact_id}/preview",
             get(preview_artifact),
@@ -1795,6 +1843,96 @@ async fn decide_permission(
         Ok(Err(_)) | Err(_) => status_response(
             StatusCode::BAD_GATEWAY,
             "Permission decision could not be delivered safely",
+        ),
+    }
+}
+
+async fn tier2_results(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    match runtime.tier2_results(session_id) {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(SessionError::NotFound) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Tier 2 review results could not be read",
+        ),
+    }
+}
+
+async fn propose_tier2_review(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let request = match serde_json::from_slice::<AgentTier2SourceRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return status_response(StatusCode::BAD_REQUEST, "Tier 2 result is invalid"),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.propose_tier2_review(session_id, request.source_operation_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::ACCEPTED, &response),
+        Ok(Err(SessionError::NotFound)) => {
+            status_response(StatusCode::NOT_FOUND, "Tier 2 result is unavailable")
+        }
+        Ok(Err(SessionError::Busy)) => status_response(
+            StatusCode::CONFLICT,
+            "Tier 2 result already has a pending review",
+        ),
+        Ok(Err(_)) | Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Tier 2 review could not enter the permission broker",
+        ),
+    }
+}
+
+async fn discard_tier2_result(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+    body: Bytes,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let request = match serde_json::from_slice::<AgentTier2SourceRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return status_response(StatusCode::BAD_REQUEST, "Tier 2 result is invalid"),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.discard_tier2_result(session_id, request.source_operation_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => secure_response(
+            StatusCode::NO_CONTENT,
+            "text/plain; charset=utf-8",
+            Body::empty(),
+        ),
+        Ok(Err(SessionError::NotFound)) => {
+            status_response(StatusCode::NOT_FOUND, "Tier 2 result is unavailable")
+        }
+        Ok(Err(SessionError::Busy)) => status_response(
+            StatusCode::CONFLICT,
+            "Reject the pending Tier 2 review before discarding its result",
+        ),
+        Ok(Err(_)) | Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Tier 2 result could not be discarded",
         ),
     }
 }
@@ -3602,6 +3740,91 @@ impl AgentGatewayRuntime {
         })
     }
 
+    fn tier2_results(&self, session_id: u16) -> Result<AgentTier2ResultsResponse, SessionError> {
+        let session = self.session(session_id)?;
+        let acceptances = self
+            .config
+            .daemon
+            .isolated_acceptance_reviews(session.task_id)
+            .map_err(|_| SessionError::Daemon)?
+            .into_iter()
+            .map(|review| (review.source_operation_id, tier2_review_response(review)))
+            .collect::<HashMap<_, _>>();
+        let results = self
+            .config
+            .daemon
+            .isolated_result_reviews(session.task_id)
+            .map_err(|_| SessionError::Daemon)?
+            .into_iter()
+            .map(|review| AgentTier2ResultResponse {
+                source_operation_id: review.operation_id,
+                source_revision: review.receipt.source_revision,
+                finished_at_ms: review.receipt.finished_at_ms,
+                termination: review.receipt.termination,
+                exit_code: review.receipt.exit_code,
+                changed_bytes: review.receipt.changes.changed_bytes,
+                inventory_sha256: review.receipt.changes.inventory_sha256,
+                changed_files: review.receipt.changes.changed_files,
+                acceptance: acceptances.get(&review.operation_id).cloned(),
+            })
+            .collect();
+        Ok(AgentTier2ResultsResponse { results })
+    }
+
+    fn propose_tier2_review(
+        &self,
+        session_id: u16,
+        source_operation_id: OperationId,
+    ) -> Result<AgentTier2ReviewResponse, SessionError> {
+        let session = self.session(session_id)?;
+        if !self
+            .config
+            .daemon
+            .isolated_result_reviews(session.task_id)
+            .map_err(|_| SessionError::Daemon)?
+            .iter()
+            .any(|result| result.operation_id == source_operation_id)
+        {
+            return Err(SessionError::NotFound);
+        }
+        let review = self
+            .config
+            .daemon
+            .propose_isolated_result_acceptance(session.task_id, source_operation_id)
+            .map_err(|error| match error {
+                DaemonError::IsolatedAcceptanceAlreadyExists(_) => SessionError::Busy,
+                DaemonError::IsolatedResultMissing(_) => SessionError::NotFound,
+                _ => SessionError::Daemon,
+            })?;
+        Ok(tier2_review_response(review))
+    }
+
+    fn discard_tier2_result(
+        &self,
+        session_id: u16,
+        source_operation_id: OperationId,
+    ) -> Result<(), SessionError> {
+        let session = self.session(session_id)?;
+        if !self
+            .config
+            .daemon
+            .isolated_result_reviews(session.task_id)
+            .map_err(|_| SessionError::Daemon)?
+            .iter()
+            .any(|result| result.operation_id == source_operation_id)
+        {
+            return Err(SessionError::NotFound);
+        }
+        self.config
+            .daemon
+            .discard_isolated_result(source_operation_id)
+            .map_err(|error| match error {
+                DaemonError::IsolatedResultHasPendingAcceptance(_) => SessionError::Busy,
+                DaemonError::IsolatedResultMissing(_) => SessionError::NotFound,
+                _ => SessionError::Daemon,
+            })
+    }
+
     fn decide_effect(
         &self,
         session_id: u16,
@@ -3652,8 +3875,18 @@ impl AgentGatewayRuntime {
                 .map_err(|_| SessionError::Lock)?
                 .get(&request.operation_id)
                 .cloned();
+            let tier2_review = match self
+                .config
+                .daemon
+                .isolated_acceptance_review(request.operation_id)
+            {
+                Ok(review) => Some(review),
+                Err(DaemonError::IsolatedAcceptanceMissing(_)) => None,
+                Err(_) => return Err(SessionError::Daemon),
+            };
             if request.decision == PermissionDecision::AllowOnce
                 && workspace_apply.is_none()
+                && tier2_review.is_none()
                 && !allowable_brokered_mcp_operation(&operation)
             {
                 return Err(SessionError::UnsafeApproval);
@@ -3765,6 +3998,47 @@ impl AgentGatewayRuntime {
                             );
                             SessionError::Thread
                         })?;
+                }
+                let status = session
+                    .progress
+                    .lock()
+                    .map_err(|_| SessionError::Lock)?
+                    .status;
+                return Ok(AgentTurnResponse { session_id, status });
+            }
+            if let Some(review) = tier2_review {
+                if review.operation.task_id != session.task_id
+                    || review.operation.revision != request.expected_revision
+                    || review.operation.state != OperationState::WaitingHuman
+                    || review.operation.kind != OperationKind::FileEdit
+                    || review.operation.risk != RiskClass::WorkspaceWrite
+                    || !matches!(
+                        &review.operation.action,
+                        OperationAction::Opaque { kind, .. }
+                            if kind == "hyper_term.tier2.accept"
+                    )
+                {
+                    return Err(SessionError::StalePermission);
+                }
+                let decided = self
+                    .config
+                    .daemon
+                    .decide_isolated_acceptance_permission(
+                        session.task_id,
+                        request.operation_id,
+                        request.expected_revision,
+                        request.decision,
+                    )
+                    .map_err(|_| SessionError::StalePermission)?;
+                if request.decision == PermissionDecision::AllowOnce {
+                    self.config
+                        .daemon
+                        .accept_isolated_result(
+                            session.task_id,
+                            request.operation_id,
+                            decided.revision,
+                        )
+                        .map_err(|_| SessionError::Daemon)?;
                 }
                 let status = session
                     .progress
@@ -4369,6 +4643,32 @@ fn workspace_apply_response(
     }
 }
 
+fn tier2_review_response(review: IsolatedAcceptanceReview) -> AgentTier2ReviewResponse {
+    let changes = review
+        .changes
+        .into_iter()
+        .map(|change| {
+            let diff = review_workspace_diff(&change.target_path, &change.before, &change.after);
+            AgentTier2ReviewChangeResponse {
+                target_path: change.target_path,
+                base_digest: change.base_digest,
+                proposed_digest: change.proposed_digest,
+                before: change.before,
+                after: change.after,
+                hunks: diff.hunks,
+            }
+        })
+        .collect();
+    AgentTier2ReviewResponse {
+        source_operation_id: review.source_operation_id,
+        operation_id: review.operation.operation_id,
+        operation_revision: review.operation.revision,
+        state: review.operation.state,
+        result_digest: review.result_digest,
+        changes,
+    }
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -4825,6 +5125,57 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn run_git(cwd: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(cwd)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_lima_runner(root: &Path) -> hyper_term_sandbox::LimaTaskRunner {
+        let executable = root.join("limactl");
+        let environment_marker = root.join("limactl-environment");
+        let script = format!(
+            "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nlast=''\nfor argument in \"$@\"; do\n  last=\"$argument\"\n  case \"$argument\" in validate|start|shell|stop|delete) [ -n \"$action\" ] || action=\"$argument\";; esac\ndone\nif [ \"$action\" = start ]; then printf '%s\\n' \"${{last%/*}}\" > '{}'; fi\nif [ \"$action\" = shell ]; then environment=$(cat '{}'); printf 'from tier2\\n' > \"$environment/worktree/generated.txt\"; fi\n",
+            environment_marker.display(),
+            environment_marker.display()
+        );
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let image = root.join("image.qcow2");
+        std::fs::write(&image, b"local pinned image").unwrap();
+        hyper_term_sandbox::LimaTaskRunner::with_executable(
+            executable,
+            hyper_term_sandbox::LimaRunnerConfig {
+                image: hyper_term_sandbox::LimaImage {
+                    path: image,
+                    sha256: Sha256::digest(b"local pinned image")
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    arch: "aarch64".into(),
+                },
+                vm_type: "vz".into(),
+                cpus: 2,
+                memory_mib: 1_024,
+                disk_gib: 4,
+                start_timeout: Duration::from_secs(2),
+                task_timeout: Duration::from_secs(2),
+                max_output_bytes: 64 * 1024,
+            },
+        )
+        .unwrap()
+    }
 
     fn draft_fixture() -> crate::artifact_store::StoredGenUiArtifact {
         crate::artifact_store::StoredGenUiArtifact {
@@ -5332,6 +5683,150 @@ mod tests {
             .await
             .0,
             StatusCode::UNAUTHORIZED.as_u16()
+        );
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tier2_review_endpoint_requires_diff_approval_before_workspace_apply() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        run_git(&workspace, &["init", "-q"]);
+        run_git(&workspace, &["config", "user.name", "Hyper Term Test"]);
+        run_git(
+            &workspace,
+            &["config", "user.email", "hyper-term@example.invalid"],
+        );
+        std::fs::write(workspace.join("README.md"), "source\n").unwrap();
+        run_git(&workspace, &["add", "."]);
+        run_git(&workspace, &["commit", "-qm", "fixture"]);
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).unwrap();
+        let fake_codex = temporary.path().join("codex");
+        std::fs::write(
+            &fake_codex,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"fake-codex\"}}' ;;\n    *'\"method\":\"thread/start\"'*) printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"tier2-thread\"}}}' ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace: workspace.clone(),
+            state_directory: temporary.path().join("gateway-state"),
+            daemon: daemon.clone(),
+            codex_executable: Some(fake_codex),
+            codex_auth_file: None,
+            acp_providers: Vec::new(),
+            mcp_executable: None,
+            genui_runtime: None,
+            workbench_assets: None,
+            debug_capsule: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .unwrap();
+        let session_path = format!("/agent/session?token={token}&session_id=6");
+        let (status, body) = request_path(gateway.address(), &session_path, "POST", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id: TaskId = serde_json::from_value(session["task_id"].clone()).unwrap();
+        let operation = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::Shell,
+                OperationAction::Shell {
+                    command: hyper_term_protocol::TerminalCommand {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "printf generated > generated.txt".into()],
+                        cwd: Some(workspace.clone()),
+                        env: BTreeMap::new(),
+                    },
+                },
+                "run an isolated code task".into(),
+                RiskClass::WorkspaceWrite,
+                vec!["shell".into(), "sandbox.isolated_task".into()],
+            )
+            .unwrap();
+        let authorized = daemon
+            .decide_permission(
+                task_id,
+                operation.operation_id,
+                operation.revision,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap();
+        daemon
+            .dispatch_isolated_task(
+                task_id,
+                operation.operation_id,
+                authorized.revision,
+                &fake_lima_runner(temporary.path()),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!workspace.join("generated.txt").exists());
+
+        let tier2_path = format!("/agent/session/tier2?token={token}&session_id=6");
+        let (status, body) = request_path(gateway.address(), &tier2_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let results: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            results["results"][0]["changed_files"][0]["path"],
+            "generated.txt"
+        );
+        assert!(results["results"][0].get("acceptance").is_none());
+
+        let source_body = serde_json::to_vec(&serde_json::json!({
+            "source_operation_id": operation.operation_id,
+        }))
+        .unwrap();
+        let review_path = format!("/agent/session/tier2/review?token={token}&session_id=6");
+        let (status, body) =
+            request_path(gateway.address(), &review_path, "POST", &source_body).await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16());
+        let review: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(review["state"], "waiting_human");
+        assert_eq!(review["changes"][0]["target_path"], "generated.txt");
+        assert!(
+            review["changes"][0]["hunks"][0]["patch"]
+                .as_str()
+                .unwrap()
+                .contains("from tier2")
+        );
+
+        let discard_path = format!("/agent/session/tier2/discard?token={token}&session_id=6");
+        assert_eq!(
+            request_path(gateway.address(), &discard_path, "POST", &source_body)
+                .await
+                .0,
+            StatusCode::CONFLICT.as_u16()
+        );
+        let permission = serde_json::to_vec(&serde_json::json!({
+            "operation_id": review["operation_id"],
+            "expected_revision": review["operation_revision"],
+            "decision": "allow_once",
+        }))
+        .unwrap();
+        let permission_path = format!("/agent/session/permission?token={token}&session_id=6");
+        assert_eq!(
+            request_path(gateway.address(), &permission_path, "POST", &permission)
+                .await
+                .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("generated.txt")).unwrap(),
+            "from tier2\n"
+        );
+        let (_, body) = request_path(gateway.address(), &tier2_path, "GET", b"").await;
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
         gateway.shutdown().await.unwrap();
     }

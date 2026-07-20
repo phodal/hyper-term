@@ -209,6 +209,22 @@ pub struct IsolatedAcceptanceReview {
     pub source_operation_id: OperationId,
     pub result_digest: String,
     pub target_paths: Vec<String>,
+    pub changes: Vec<IsolatedAcceptanceChange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IsolatedAcceptanceChange {
+    pub target_path: String,
+    pub base_digest: Option<String>,
+    pub proposed_digest: String,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IsolatedResultReview {
+    pub operation_id: OperationId,
+    pub receipt: IsolatedTaskReceipt,
 }
 
 #[derive(Clone, Copy)]
@@ -1186,6 +1202,14 @@ impl DaemonState {
     }
 
     pub fn discard_isolated_result(&self, operation_id: OperationId) -> Result<(), DaemonError> {
+        if lock(&self.inner.isolated_acceptances)?
+            .values()
+            .any(|acceptance| acceptance.source_operation_id == operation_id)
+        {
+            return Err(DaemonError::IsolatedResultHasPendingAcceptance(
+                operation_id,
+            ));
+        }
         let result = lock(&self.inner.isolated_results)?
             .remove(&operation_id)
             .ok_or(DaemonError::IsolatedResultMissing(operation_id))?;
@@ -1205,6 +1229,28 @@ impl DaemonState {
             .ok_or(DaemonError::IsolatedResultMissing(operation_id))?
             .receipt
             .clone())
+    }
+
+    pub fn isolated_result_reviews(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Vec<IsolatedResultReview>, DaemonError> {
+        self.require_task(task_id)?;
+        let retained = lock(&self.inner.isolated_results)?
+            .iter()
+            .map(|(operation_id, result)| (*operation_id, result.receipt.clone()))
+            .collect::<Vec<_>>();
+        let mut reviews = Vec::new();
+        for (operation_id, receipt) in retained {
+            if self.operation(operation_id)?.task_id == task_id {
+                reviews.push(IsolatedResultReview {
+                    operation_id,
+                    receipt,
+                });
+            }
+        }
+        reviews.sort_by_key(|review| (review.receipt.finished_at_ms, review.operation_id));
+        Ok(reviews)
     }
 
     pub fn read_isolated_result_file(
@@ -1356,12 +1402,7 @@ impl DaemonState {
             },
         );
         debug_assert!(previous.is_none());
-        Ok(IsolatedAcceptanceReview {
-            operation,
-            source_operation_id,
-            result_digest: plan.result_digest,
-            target_paths,
-        })
+        self.isolated_acceptance_review(operation.operation_id)
     }
 
     pub fn isolated_acceptance_review(
@@ -1383,7 +1424,39 @@ impl DaemonState {
                 .iter()
                 .map(|plan| plan.target_path.clone())
                 .collect(),
+            changes: acceptance
+                .plan
+                .plans
+                .iter()
+                .map(|plan| IsolatedAcceptanceChange {
+                    target_path: plan.target_path.clone(),
+                    base_digest: plan.base_digest().map(str::to_owned),
+                    proposed_digest: plan.proposed_digest.clone(),
+                    before: plan.base_content().to_owned(),
+                    after: plan.proposed_content.clone(),
+                })
+                .collect(),
         })
+    }
+
+    pub fn isolated_acceptance_reviews(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Vec<IsolatedAcceptanceReview>, DaemonError> {
+        self.require_task(task_id)?;
+        let operation_ids = lock(&self.inner.isolated_acceptances)?
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut reviews = Vec::new();
+        for operation_id in operation_ids {
+            let review = self.isolated_acceptance_review(operation_id)?;
+            if review.operation.task_id == task_id {
+                reviews.push(review);
+            }
+        }
+        reviews.sort_by_key(|review| review.operation.operation_id);
+        Ok(reviews)
     }
 
     pub fn decide_isolated_acceptance_permission(
@@ -3313,6 +3386,8 @@ pub enum DaemonError {
     IsolatedResultAlreadyExists(OperationId),
     #[error("operation {0} has no retained Tier 2 result")]
     IsolatedResultMissing(OperationId),
+    #[error("operation {0} has a pending Tier 2 acceptance review")]
+    IsolatedResultHasPendingAcceptance(OperationId),
     #[error("Tier 2 result store failed integrity validation")]
     InvalidIsolatedResultStore,
     #[error("Tier 2 result path is not a safe reviewed relative path")]
@@ -3392,6 +3467,7 @@ impl DaemonError {
             | Self::IsolatedTaskRequiresVmDispatch
             | Self::IsolatedResultAlreadyExists(_)
             | Self::IsolatedResultMissing(_)
+            | Self::IsolatedResultHasPendingAcceptance(_)
             | Self::InvalidIsolatedResultStore
             | Self::InvalidIsolatedResultPath
             | Self::IsolatedResultDigestMismatch
