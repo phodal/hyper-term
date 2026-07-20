@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -32,7 +33,9 @@ use hyper_term_sandbox::{
     IsolatedTaskReceipt, IsolatedTaskRequest, IsolatedTaskTermination, IsolatedWorktree,
     IsolatedWorktreeError, IsolatedWorktreeManager, IsolatedWorktreeRequest,
     LimaIsolatedTaskLauncher, LimaRunnerError, LimaTaskRunner, MacOsSeatbeltLauncher,
+    read_isolated_task_receipt,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -110,6 +113,7 @@ struct DaemonInner {
     sandbox_executions: Mutex<HashMap<TerminalId, SandboxExecutionContext>>,
     isolated_worktree_manager: IsolatedWorktreeManager,
     isolated_results: Mutex<HashMap<OperationId, IsolatedResult>>,
+    isolated_results_root: PathBuf,
     state_directory: PathBuf,
     artifacts: ArtifactStore,
     artifact_acceptance: Mutex<()>,
@@ -118,12 +122,6 @@ struct DaemonInner {
 
 impl Drop for DaemonInner {
     fn drop(&mut self) {
-        if let Ok(results) = self.isolated_results.get_mut() {
-            for (_, result) in results.drain() {
-                let _ = self.isolated_worktree_manager.destroy(&result.environment);
-                cleanup_scratch_directory(&result.scratch_directory);
-            }
-        }
         cleanup_scratch_directory(&self.scratch_root);
     }
 }
@@ -168,6 +166,7 @@ struct SandboxExecutionContext {
 struct IsolatedResult {
     environment: IsolatedWorktree,
     scratch_directory: PathBuf,
+    receipt: IsolatedTaskReceipt,
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +189,8 @@ impl DaemonState {
         let state_directory = fs::canonicalize(state_directory.as_ref())?;
         let artifacts = ArtifactStore::open(&state_directory)?;
         let isolated_worktree_manager = IsolatedWorktreeManager::discover()?;
+        let isolated_results_root = state_directory.join("isolated-results");
+        create_private_directory(&isolated_results_root)?;
         let journal = JsonlJournal::open(state_directory.join("events.jsonl"))?;
         let mut operations = OperationReducer::default();
         let mut projectors = HashMap::new();
@@ -219,6 +220,11 @@ impl DaemonState {
             .join(instance_id.to_string());
         create_private_directory(&scratch_root)?;
         let scratch_root = fs::canonicalize(scratch_root)?;
+        let isolated_results = recover_completed_isolated_results(
+            &isolated_worktree_manager,
+            &isolated_results_root,
+            &operations,
+        )?;
         let daemon = Self {
             inner: Arc::new(DaemonInner {
                 instance_id,
@@ -239,7 +245,8 @@ impl DaemonState {
                 authorized_sandboxes: Mutex::new(HashMap::new()),
                 sandbox_executions: Mutex::new(HashMap::new()),
                 isolated_worktree_manager,
-                isolated_results: Mutex::new(HashMap::new()),
+                isolated_results: Mutex::new(isolated_results),
+                isolated_results_root,
                 state_directory,
                 artifacts,
                 artifact_acceptance: Mutex::new(()),
@@ -505,19 +512,24 @@ impl DaemonState {
         if workspace.starts_with(&self.inner.state_directory) {
             return Err(DaemonError::WorkspaceInsideDaemonState);
         }
+        let isolated_task = record
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == ISOLATED_TASK_CAPABILITY);
 
-        let scratch_directory = self
-            .inner
-            .scratch_root
-            .join(record.operation_id.to_string());
+        let scratch_directory = if isolated_task {
+            self.inner
+                .isolated_results_root
+                .join(record.operation_id.to_string())
+        } else {
+            self.inner
+                .scratch_root
+                .join(record.operation_id.to_string())
+        };
         create_private_directory(&scratch_directory)?;
         let scratch_directory = fs::canonicalize(scratch_directory)?;
 
         let result = (|| {
-            let isolated_task = record
-                .required_capabilities
-                .iter()
-                .any(|capability| capability == ISOLATED_TASK_CAPABILITY);
             let mut rules = ["/System", "/usr", "/bin", "/sbin", "/Library"]
                 .into_iter()
                 .map(PathBuf::from)
@@ -1093,6 +1105,7 @@ impl DaemonState {
             IsolatedResult {
                 environment,
                 scratch_directory: authorized.scratch_directory,
+                receipt: receipt.clone(),
             },
         );
         debug_assert!(previous.is_none());
@@ -1130,6 +1143,64 @@ impl DaemonState {
             .destroy(&result.environment)?;
         cleanup_scratch_directory(&result.scratch_directory);
         Ok(())
+    }
+
+    pub fn isolated_result_receipt(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<IsolatedTaskReceipt, DaemonError> {
+        Ok(lock(&self.inner.isolated_results)?
+            .get(&operation_id)
+            .ok_or(DaemonError::IsolatedResultMissing(operation_id))?
+            .receipt
+            .clone())
+    }
+
+    pub fn read_isolated_result_file(
+        &self,
+        operation_id: OperationId,
+        relative_path: &Path,
+        expected_sha256: &str,
+    ) -> Result<Vec<u8>, DaemonError> {
+        if !safe_isolated_result_path(relative_path) || !is_sha256(expected_sha256) {
+            return Err(DaemonError::InvalidIsolatedResultPath);
+        }
+        let results = lock(&self.inner.isolated_results)?;
+        let result = results
+            .get(&operation_id)
+            .ok_or(DaemonError::IsolatedResultMissing(operation_id))?;
+        let reviewed = result
+            .receipt
+            .changes
+            .changed_files
+            .iter()
+            .find(|change| change.path == relative_path)
+            .and_then(|change| {
+                change
+                    .content_sha256
+                    .as_deref()
+                    .filter(|digest| *digest == expected_sha256)
+                    .map(|_| change)
+            })
+            .ok_or(DaemonError::IsolatedResultDigestMismatch)?;
+        let target = result.environment.manifest.worktree.join(relative_path);
+        let metadata = fs::symlink_metadata(&target)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != reviewed.bytes
+            || metadata.len() > 8 * 1024 * 1024
+        {
+            return Err(DaemonError::IsolatedResultDigestMismatch);
+        }
+        let bytes = fs::read(target)?;
+        let digest = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if digest != expected_sha256 {
+            return Err(DaemonError::IsolatedResultDigestMismatch);
+        }
+        Ok(bytes)
     }
 
     pub fn dispatch_terminal(
@@ -2033,6 +2104,81 @@ fn validate_operation_scope(
     Ok(())
 }
 
+fn recover_completed_isolated_results(
+    manager: &IsolatedWorktreeManager,
+    root: &Path,
+    operations: &OperationReducer,
+) -> Result<HashMap<OperationId, IsolatedResult>, DaemonError> {
+    let mut recovered = HashMap::new();
+    for operation_entry in fs::read_dir(root)?.take(1_025) {
+        let operation_entry = operation_entry?;
+        let metadata = operation_entry.file_type()?;
+        if !metadata.is_dir() || metadata.is_symlink() {
+            return Err(DaemonError::InvalidIsolatedResultStore);
+        }
+        if recovered.len() == 1_024 {
+            return Err(DaemonError::InvalidIsolatedResultStore);
+        }
+        let operation_text = operation_entry
+            .file_name()
+            .into_string()
+            .map_err(|_| DaemonError::InvalidIsolatedResultStore)?;
+        let operation_id = OperationId::from(
+            Uuid::parse_str(&operation_text)
+                .map_err(|_| DaemonError::InvalidIsolatedResultStore)?,
+        );
+        let operation = operations
+            .records()
+            .find(|record| record.operation_id == operation_id)
+            .ok_or(DaemonError::InvalidIsolatedResultStore)?;
+        if !operation
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == ISOLATED_TASK_CAPABILITY)
+        {
+            return Err(DaemonError::InvalidIsolatedResultStore);
+        }
+        let mut completed = None;
+        for environment_entry in fs::read_dir(operation_entry.path())?.take(3) {
+            let environment_entry = environment_entry?;
+            if !environment_entry.file_type()?.is_dir() {
+                return Err(DaemonError::InvalidIsolatedResultStore);
+            }
+            if !environment_entry.path().join("task-receipt.json").is_file() {
+                continue;
+            }
+            if completed.is_some() {
+                return Err(DaemonError::InvalidIsolatedResultStore);
+            }
+            let environment = manager.reopen(environment_entry.path())?;
+            if environment.manifest.task_id != operation_id.to_string() {
+                return Err(DaemonError::InvalidIsolatedResultStore);
+            }
+            let receipt = read_isolated_task_receipt(&environment)?;
+            if manager.inspect_changes(&environment)? != receipt.changes {
+                return Err(DaemonError::IsolatedResultDigestMismatch);
+            }
+            completed = Some(IsolatedResult {
+                environment,
+                scratch_directory: operation_entry.path(),
+                receipt,
+            });
+        }
+        if let Some(result) = completed {
+            recovered.insert(operation_id, result);
+        }
+    }
+    Ok(recovered)
+}
+
+fn safe_isolated_result_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(name) if name != ".git"))
+}
+
 fn bounded_nonempty(
     value: String,
     maximum: usize,
@@ -2659,6 +2805,12 @@ pub enum DaemonError {
     IsolatedResultAlreadyExists(OperationId),
     #[error("operation {0} has no retained Tier 2 result")]
     IsolatedResultMissing(OperationId),
+    #[error("Tier 2 result store failed integrity validation")]
+    InvalidIsolatedResultStore,
+    #[error("Tier 2 result path is not a safe reviewed relative path")]
+    InvalidIsolatedResultPath,
+    #[error("Tier 2 result content no longer matches its reviewed digest")]
+    IsolatedResultDigestMismatch,
     #[error("operation {0} has no live one-use sandbox authorization")]
     SandboxAuthorizationMissing(OperationId),
     #[error("operation {0} already has a live sandbox authorization")]
@@ -2720,6 +2872,9 @@ impl DaemonError {
             | Self::IsolatedTaskRequiresVmDispatch
             | Self::IsolatedResultAlreadyExists(_)
             | Self::IsolatedResultMissing(_)
+            | Self::InvalidIsolatedResultStore
+            | Self::InvalidIsolatedResultPath
+            | Self::IsolatedResultDigestMismatch
             | Self::IsolatedWorktree(_)
             | Self::LimaRunner(_)
             | Self::Sandbox(_)

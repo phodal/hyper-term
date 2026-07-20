@@ -121,7 +121,8 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
     run_git(&workspace, &["add", "."]);
     run_git(&workspace, &["commit", "-qm", "fixture"]);
 
-    let state = DaemonState::open(directory.path().join("daemon-state")).unwrap();
+    let state_path = directory.path().join("daemon-state");
+    let state = DaemonState::open(&state_path).unwrap();
     let task_id = state.create_task("isolated task".into()).unwrap();
     let operation = state
         .propose_operation(
@@ -167,10 +168,40 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         receipt.changes.changed_files[0].path,
         Path::new("generated.txt")
     );
+    let generated_digest = receipt.changes.changed_files[0]
+        .content_sha256
+        .as_deref()
+        .unwrap();
+    assert_eq!(
+        state
+            .read_isolated_result_file(
+                operation.operation_id,
+                Path::new("generated.txt"),
+                generated_digest
+            )
+            .unwrap(),
+        b"isolated only\n"
+    );
     assert!(!workspace.join("generated.txt").exists());
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
         "validate\nstart\nshell\nstop\ndelete\n"
+    );
+    drop(state);
+    let state = DaemonState::open(&state_path).unwrap();
+    let recovered = state
+        .isolated_result_receipt(operation.operation_id)
+        .unwrap();
+    assert_eq!(recovered.changes, receipt.changes);
+    assert_eq!(
+        state
+            .read_isolated_result_file(
+                operation.operation_id,
+                Path::new("generated.txt"),
+                generated_digest
+            )
+            .unwrap(),
+        b"isolated only\n"
     );
     state
         .discard_isolated_result(operation.operation_id)

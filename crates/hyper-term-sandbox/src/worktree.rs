@@ -180,6 +180,27 @@ impl IsolatedWorktreeManager {
         create_result
     }
 
+    pub fn reopen(
+        &self,
+        environment_root: impl AsRef<Path>,
+    ) -> Result<IsolatedWorktree, IsolatedWorktreeError> {
+        let environment_root = fs::canonicalize(environment_root.as_ref())?;
+        let manifest_path = environment_root.join("manifest.json");
+        let manifest = read_manifest(&manifest_path)?;
+        let environment = IsolatedWorktree {
+            environment_root,
+            manifest_path,
+            manifest,
+        };
+        verify_live_environment(&environment)?;
+        if environment.environment_root.file_name()
+            != Some(OsStr::new(&environment.manifest.environment_id))
+        {
+            return Err(IsolatedWorktreeError::ManifestMismatch);
+        }
+        Ok(environment)
+    }
+
     pub fn destroy(&self, environment: &IsolatedWorktree) -> Result<(), IsolatedWorktreeError> {
         let state_root = environment.environment_root.parent().ok_or_else(|| {
             IsolatedWorktreeError::UnsafeCleanup(environment.environment_root.clone())

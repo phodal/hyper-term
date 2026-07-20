@@ -397,6 +397,42 @@ impl LimaTaskRunner {
     }
 }
 
+pub fn read_isolated_task_receipt(
+    environment: &IsolatedWorktree,
+) -> Result<IsolatedTaskReceipt, LimaRunnerError> {
+    let path = environment.environment_root.join("task-receipt.json");
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 8 * 1024 * 1024
+    {
+        return Err(LimaRunnerError::InvalidReceipt);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(LimaRunnerError::InvalidReceipt);
+        }
+    }
+    let receipt: IsolatedTaskReceipt = serde_json::from_reader(File::open(path)?)?;
+    if receipt.schema_version != RECEIPT_SCHEMA_VERSION
+        || receipt.environment_id != environment.manifest.environment_id
+        || receipt.source_revision != environment.manifest.source_revision
+        || receipt.backend != "lima"
+        || !receipt.cleanup_complete
+        || !valid_sha256(&receipt.image_sha256)
+        || !valid_sha256(&receipt.command_sha256)
+        || !valid_sha256(&receipt.stdout_sha256)
+        || !valid_sha256(&receipt.stderr_sha256)
+        || receipt.stdout_sha256 != hex_digest(receipt.stdout.as_bytes())
+        || receipt.stderr_sha256 != hex_digest(receipt.stderr.as_bytes())
+        || receipt.changes.environment_id != receipt.environment_id
+        || receipt.changes.source_revision != receipt.source_revision
+    {
+        return Err(LimaRunnerError::InvalidReceipt);
+    }
+    Ok(receipt)
+}
+
 #[derive(Debug)]
 struct Execution {
     status: Option<ExitStatus>,
@@ -427,6 +463,8 @@ pub enum LimaRunnerError {
     ImageTooLarge,
     #[error("local VM image digest does not match its pinned SHA-256")]
     ImageDigestMismatch,
+    #[error("isolated task receipt failed integrity validation")]
+    InvalidReceipt,
     #[error("Lima control command {command} failed with status {status:?}: {stderr}")]
     ControlFailed {
         command: String,
