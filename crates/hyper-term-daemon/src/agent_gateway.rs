@@ -582,6 +582,7 @@ struct AgentTier2PreviewChangeResponse {
     target_path: String,
     base_digest: Option<String>,
     proposed_digest: String,
+    deleted: bool,
     hunks: Vec<AgentTier2PreviewHunkResponse>,
     truncated: bool,
 }
@@ -4842,6 +4843,7 @@ fn tier2_preview_response(preview: IsolatedAcceptancePreview) -> AgentTier2Previ
             target_path: change.target_path,
             base_digest: change.base_digest,
             proposed_digest: change.proposed_digest,
+            deleted: change.deleted,
             hunks,
             truncated: change_truncated,
         });

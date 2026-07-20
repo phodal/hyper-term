@@ -35,6 +35,8 @@ pub(crate) struct WorkspaceApplyPlan {
     pub target_path: String,
     pub proposed_content: String,
     pub proposed_digest: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete: bool,
     pub base: Option<WorkspaceFileSnapshot>,
     parent_device: u64,
     parent_inode: u64,
@@ -51,6 +53,21 @@ impl WorkspaceApplyPlan {
     pub(crate) fn base_digest(&self) -> Option<&str> {
         self.base.as_ref().map(|snapshot| snapshot.digest.as_str())
     }
+
+    pub(crate) fn deletes_target(&self) -> bool {
+        self.delete
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceApplyRequest {
+    Write {
+        target_path: String,
+        proposed_content: String,
+    },
+    Delete {
+        target_path: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -141,6 +158,8 @@ struct WorkspaceTransactionMember {
     base: Option<WorkspaceRecoveryIdentity>,
     proposed_digest: String,
     proposed_mode: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    delete: bool,
     staged: Option<WorkspaceRecoveryIdentity>,
     backup: Option<WorkspaceRecoveryIdentity>,
 }
@@ -207,13 +226,37 @@ pub(crate) fn prepare_workspace_apply_set(
     workspace: &Path,
     requests: Vec<(String, String)>,
 ) -> Result<WorkspaceApplySetPlan, WorkspaceApplyError> {
+    prepare_workspace_apply_requests(
+        workspace,
+        requests
+            .into_iter()
+            .map(
+                |(target_path, proposed_content)| WorkspaceApplyRequest::Write {
+                    target_path,
+                    proposed_content,
+                },
+            )
+            .collect(),
+    )
+}
+
+pub(crate) fn prepare_workspace_apply_requests(
+    workspace: &Path,
+    requests: Vec<WorkspaceApplyRequest>,
+) -> Result<WorkspaceApplySetPlan, WorkspaceApplyError> {
     if requests.is_empty() || requests.len() > MAX_WORKSPACE_APPLY_FILES {
         return Err(WorkspaceApplyError::InvalidPath);
     }
     let total_bytes = requests
         .iter()
-        .try_fold(0_usize, |total, (_, content)| {
-            total.checked_add(content.len())
+        .try_fold(0_usize, |total, request| {
+            let bytes = match request {
+                WorkspaceApplyRequest::Write {
+                    proposed_content, ..
+                } => proposed_content.len(),
+                WorkspaceApplyRequest::Delete { .. } => 0,
+            };
+            total.checked_add(bytes)
         })
         .ok_or(WorkspaceApplyError::TooLarge)?;
     if total_bytes > MAX_WORKSPACE_APPLY_BYTES {
@@ -221,11 +264,24 @@ pub(crate) fn prepare_workspace_apply_set(
     }
     let mut targets = BTreeSet::new();
     let mut plans = Vec::with_capacity(requests.len());
-    for (target_path, proposed_content) in requests {
+    for request in requests {
+        let target_path = match &request {
+            WorkspaceApplyRequest::Write { target_path, .. }
+            | WorkspaceApplyRequest::Delete { target_path } => target_path,
+        };
         if !targets.insert(target_path.clone()) {
             return Err(WorkspaceApplyError::InvalidPath);
         }
-        match prepare_workspace_file(workspace, &target_path, proposed_content) {
+        let prepared = match request {
+            WorkspaceApplyRequest::Write {
+                target_path,
+                proposed_content,
+            } => prepare_workspace_file(workspace, &target_path, proposed_content),
+            WorkspaceApplyRequest::Delete { target_path } => {
+                prepare_workspace_deletion(workspace, &target_path)
+            }
+        };
+        match prepared {
             Ok(plan) => plans.push(plan),
             Err(WorkspaceApplyError::NoChanges) => {}
             Err(error) => return Err(error),
@@ -268,7 +324,27 @@ fn prepare_workspace_file(
         target_path: target_path.to_owned(),
         proposed_digest: sha256_bytes(proposed_content.as_bytes()),
         proposed_content,
+        delete: false,
         base,
+        parent_device: parent.device,
+        parent_inode: parent.inode,
+    })
+}
+
+fn prepare_workspace_deletion(
+    workspace: &Path,
+    target_path: &str,
+) -> Result<WorkspaceApplyPlan, WorkspaceApplyError> {
+    let relative = validate_target_path(target_path)?;
+    let parent = open_parent(workspace, &relative)?;
+    let base = read_target_at(parent.directory.as_raw_fd(), &parent.file_name)?
+        .ok_or(WorkspaceApplyError::NoChanges)?;
+    Ok(WorkspaceApplyPlan {
+        target_path: target_path.to_owned(),
+        proposed_content: String::new(),
+        proposed_digest: workspace_deletion_digest(),
+        delete: true,
+        base: Some(base),
         parent_device: parent.device,
         parent_inode: parent.inode,
     })
@@ -281,7 +357,7 @@ pub(crate) fn apply_workspace_plan(
 ) -> Result<String, WorkspaceApplyError> {
     let set = WorkspaceApplySetPlan {
         plans: vec![plan.clone()],
-        result_digest: plan.proposed_digest.clone(),
+        result_digest: workspace_set_digest(std::slice::from_ref(plan)),
     };
     apply_workspace_set_plan(workspace, &set)
 }
@@ -321,6 +397,9 @@ pub(crate) fn select_workspace_apply_set(
         let Some(content) = selections.get(&reviewed_plan.target_path) else {
             continue;
         };
+        if reviewed_plan.delete {
+            return Err(WorkspaceApplyError::InvalidPath);
+        }
         total_bytes = total_bytes
             .checked_add(content.len())
             .ok_or(WorkspaceApplyError::TooLarge)?;
@@ -377,21 +456,23 @@ pub(crate) fn apply_workspace_set_plan_durable(
     manifest.phase = WorkspaceTransactionPhase::Prepared;
     write_workspace_transaction_manifest(&transaction_root, &manifest)?;
     for (index, staged_plan) in staged.iter_mut().enumerate() {
-        let staged_snapshot = read_target_at(
-            staged_plan.parent.directory.as_raw_fd(),
-            &staged_plan.stage_name,
-        )?
-        .ok_or_else(|| {
-            WorkspaceApplyError::RecoveryRequired("prepared stage disappeared".into())
-        })?;
-        if !manifest.members[index]
-            .staged
-            .as_ref()
-            .is_some_and(|identity| identity.matches(&staged_snapshot))
-        {
-            return Err(WorkspaceApplyError::RecoveryRequired(
-                "prepared stage identity changed".into(),
-            ));
+        if !staged_plan.plan.delete {
+            let staged_snapshot = read_target_at(
+                staged_plan.parent.directory.as_raw_fd(),
+                &staged_plan.stage_name,
+            )?
+            .ok_or_else(|| {
+                WorkspaceApplyError::RecoveryRequired("prepared stage disappeared".into())
+            })?;
+            if !manifest.members[index]
+                .staged
+                .as_ref()
+                .is_some_and(|identity| identity.matches(&staged_snapshot))
+            {
+                return Err(WorkspaceApplyError::RecoveryRequired(
+                    "prepared stage identity changed".into(),
+                ));
+            }
         }
         if let Err(error) = install_transaction_plan(staged_plan) {
             manifest.phase = WorkspaceTransactionPhase::RollingBack;
@@ -535,6 +616,7 @@ impl WorkspaceTransactionManifest {
                     .as_ref()
                     .map(|base| base.mode & 0o7777)
                     .unwrap_or(0o644),
+                delete: plan.delete,
                 staged: None,
                 backup: None,
             })
@@ -581,13 +663,20 @@ pub(crate) fn validate_workspace_apply_set(
     let mut base_bytes = 0_usize;
     for plan in &set.plans {
         validate_target_path(&plan.target_path)?;
+        let invalid_proposal = if plan.delete {
+            plan.base.is_none()
+                || !plan.proposed_content.is_empty()
+                || plan.proposed_digest != workspace_deletion_digest()
+        } else {
+            plan.proposed_content.len() > MAX_WORKSPACE_FILE_BYTES
+                || sha256_bytes(plan.proposed_content.as_bytes()) != plan.proposed_digest
+        };
         if !targets.insert(&plan.target_path)
-            || plan.proposed_content.len() > MAX_WORKSPACE_FILE_BYTES
-            || sha256_bytes(plan.proposed_content.as_bytes()) != plan.proposed_digest
+            || invalid_proposal
             || plan.base.as_ref().is_some_and(|base| {
                 base.content.len() > MAX_WORKSPACE_FILE_BYTES
                     || sha256_bytes(base.content.as_bytes()) != base.digest
-                    || base.content == plan.proposed_content
+                    || (!plan.delete && base.content == plan.proposed_content)
             })
         {
             return Err(WorkspaceApplyError::InvalidPath);
@@ -751,8 +840,11 @@ fn validate_workspace_transaction_manifest(
                     .map(|_| workspace_backup_name(manifest.transaction_id, index))
             || !is_sha256(&member.proposed_digest)
             || member.proposed_mode > 0o7777
-            || requires_staged_identity != member.staged.is_some()
+            || (member.delete && member.base.is_none())
+            || (requires_staged_identity && member.delete && member.staged.is_some())
+            || (requires_staged_identity && !member.delete && member.staged.is_none())
             || (member.staged.is_some() && member.base.is_some() != member.backup.is_some())
+            || (requires_staged_identity && member.base.is_some() != member.backup.is_some())
             || member
                 .base
                 .as_ref()
@@ -826,20 +918,26 @@ fn stage_durable_workspace_plan(
         .transpose()
         .map_err(|_| WorkspaceApplyError::InvalidPath)?;
     let result = (|| {
-        let mut stage = create_stage(parent_fd, &stage_name)?;
-        stage.write_all(plan.proposed_content.as_bytes())?;
-        stage.set_permissions(fs::Permissions::from_mode(member.proposed_mode))?;
-        stage.sync_all()?;
-        drop(stage);
-        let staged = read_target_at(parent_fd, &stage_name)?.ok_or(
-            WorkspaceApplyError::RecoveryRequired("staged transaction member disappeared".into()),
-        )?;
-        if staged.digest != member.proposed_digest || staged.mode & 0o7777 != member.proposed_mode {
-            return Err(WorkspaceApplyError::RecoveryRequired(
-                "staged transaction member could not be verified".into(),
-            ));
+        if !plan.delete {
+            let mut stage = create_stage(parent_fd, &stage_name)?;
+            stage.write_all(plan.proposed_content.as_bytes())?;
+            stage.set_permissions(fs::Permissions::from_mode(member.proposed_mode))?;
+            stage.sync_all()?;
+            drop(stage);
+            let staged = read_target_at(parent_fd, &stage_name)?.ok_or(
+                WorkspaceApplyError::RecoveryRequired(
+                    "staged transaction member disappeared".into(),
+                ),
+            )?;
+            if staged.digest != member.proposed_digest
+                || staged.mode & 0o7777 != member.proposed_mode
+            {
+                return Err(WorkspaceApplyError::RecoveryRequired(
+                    "staged transaction member could not be verified".into(),
+                ));
+            }
+            member.staged = Some(WorkspaceRecoveryIdentity::from_snapshot(&staged));
         }
-        member.staged = Some(WorkspaceRecoveryIdentity::from_snapshot(&staged));
         if let Some(backup_name) = backup_name.as_ref() {
             link_target_at(parent_fd, &parent.file_name, backup_name)?;
             let backup = read_target_at(parent_fd, backup_name)?.ok_or(
@@ -868,7 +966,9 @@ fn stage_durable_workspace_plan(
         Ok(())
     })();
     if let Err(error) = result {
-        unlink_at(parent_fd, &stage_name);
+        if !plan.delete {
+            unlink_at(parent_fd, &stage_name);
+        }
         if let Some(backup_name) = backup_name.as_ref() {
             unlink_at(parent_fd, backup_name);
         }
@@ -980,6 +1080,9 @@ fn classify_manifest_target(
     if is_base {
         return Ok(ManifestTargetState::Base);
     }
+    if member.delete && current.is_none() {
+        return Ok(ManifestTargetState::Proposed);
+    }
     if let (Some(current), Some(staged)) = (current.as_ref(), member.staged.as_ref())
         && staged.matches(current)
     {
@@ -1072,12 +1175,14 @@ fn cleanup_manifest_files(
         let parent_fd = parent.directory.as_raw_fd();
         let stage_name = CString::new(member.stage_name.as_str())
             .map_err(|_| WorkspaceApplyError::InvalidPath)?;
-        unlink_manifest_file_if_matches(
-            parent_fd,
-            &stage_name,
-            member.staged.as_ref(),
-            Some((&member.proposed_digest, member.proposed_mode)),
-        )?;
+        if !member.delete {
+            unlink_manifest_file_if_matches(
+                parent_fd,
+                &stage_name,
+                member.staged.as_ref(),
+                Some((&member.proposed_digest, member.proposed_mode)),
+            )?;
+        }
         if let Some(backup_name) = member.backup_name.as_deref() {
             let backup_name =
                 CString::new(backup_name).map_err(|_| WorkspaceApplyError::InvalidPath)?;
@@ -1127,6 +1232,17 @@ fn apply_single_workspace_plan(
     let current = read_target_at(parent_fd, &parent.file_name)?;
     if !same_file_state(current.as_ref(), plan.base.as_ref()) {
         return Err(WorkspaceApplyError::StaleBase);
+    }
+
+    if plan.delete {
+        unlink_at_checked(parent_fd, &parent.file_name)?;
+        parent.directory.sync_all()?;
+        if read_target_at(parent_fd, &parent.file_name)?.is_some() {
+            return Err(WorkspaceApplyError::UnknownExecution(
+                "deleted workspace target is still present".into(),
+            ));
+        }
+        return Ok(());
     }
 
     let stage_name = CString::new(format!(".hyper-term-apply-{}.tmp", Uuid::new_v4()))
@@ -1260,16 +1376,18 @@ fn stage_workspace_plan(
             .expect("generated workspace backup names do not contain NUL")
     });
     let result = (|| {
-        let mut stage = create_stage(parent_fd, &stage_name)?;
-        stage.write_all(plan.proposed_content.as_bytes())?;
-        let mode = plan
-            .base
-            .as_ref()
-            .map(|snapshot| snapshot.mode & 0o7777)
-            .unwrap_or(0o644);
-        stage.set_permissions(fs::Permissions::from_mode(mode))?;
-        stage.sync_all()?;
-        drop(stage);
+        if !plan.delete {
+            let mut stage = create_stage(parent_fd, &stage_name)?;
+            stage.write_all(plan.proposed_content.as_bytes())?;
+            let mode = plan
+                .base
+                .as_ref()
+                .map(|snapshot| snapshot.mode & 0o7777)
+                .unwrap_or(0o644);
+            stage.set_permissions(fs::Permissions::from_mode(mode))?;
+            stage.sync_all()?;
+            drop(stage);
+        }
         if let Some(backup_name) = backup_name.as_ref() {
             link_target_at(parent_fd, &parent.file_name, backup_name)?;
         }
@@ -1280,7 +1398,9 @@ fn stage_workspace_plan(
         Ok(())
     })();
     if let Err(error) = result {
-        unlink_at(parent_fd, &stage_name);
+        if !plan.delete {
+            unlink_at(parent_fd, &stage_name);
+        }
         if let Some(backup_name) = backup_name.as_ref() {
             unlink_at(parent_fd, backup_name);
         }
@@ -1301,26 +1421,36 @@ fn install_transaction_plan(staged: &mut StagedWorkspacePlan) -> Result<(), Work
     if !same_file_state(latest.as_ref(), staged.plan.base.as_ref()) {
         return Err(WorkspaceApplyError::StaleBase);
     }
-    install_transaction_stage(
-        parent_fd,
-        &staged.stage_name,
-        &staged.parent.file_name,
-        staged.plan.base.is_some(),
-    )?;
+    if staged.plan.delete {
+        unlink_at_checked(parent_fd, &staged.parent.file_name)?;
+    } else {
+        install_transaction_stage(
+            parent_fd,
+            &staged.stage_name,
+            &staged.parent.file_name,
+            staged.plan.base.is_some(),
+        )?;
+    }
     staged.installed = true;
     staged.parent.directory.sync_all()?;
-    let installed = read_target_at(parent_fd, &staged.parent.file_name)?
-        .ok_or(WorkspaceApplyError::StaleBase)?;
-    if installed.digest != staged.plan.proposed_digest
-        || installed.mode & 0o7777
-            != staged
-                .plan
-                .base
-                .as_ref()
-                .map(|base| base.mode & 0o7777)
-                .unwrap_or(0o644)
-    {
-        return Err(WorkspaceApplyError::StaleBase);
+    let installed = read_target_at(parent_fd, &staged.parent.file_name)?;
+    if staged.plan.delete {
+        if installed.is_some() {
+            return Err(WorkspaceApplyError::StaleBase);
+        }
+    } else {
+        let installed = installed.ok_or(WorkspaceApplyError::StaleBase)?;
+        if installed.digest != staged.plan.proposed_digest
+            || installed.mode & 0o7777
+                != staged
+                    .plan
+                    .base
+                    .as_ref()
+                    .map(|base| base.mode & 0o7777)
+                    .unwrap_or(0o644)
+        {
+            return Err(WorkspaceApplyError::StaleBase);
+        }
     }
     Ok(())
 }
@@ -1332,9 +1462,12 @@ fn rollback_workspace_transaction(
     for staged_plan in staged.iter_mut().rev().filter(|plan| plan.installed) {
         let parent_fd = staged_plan.parent.directory.as_raw_fd();
         let current = read_target_at(parent_fd, &staged_plan.parent.file_name)?;
-        if current.as_ref().map(|snapshot| snapshot.digest.as_str())
-            != Some(staged_plan.plan.proposed_digest.as_str())
-        {
+        let expected_digest = if staged_plan.plan.delete {
+            None
+        } else {
+            Some(staged_plan.plan.proposed_digest.as_str())
+        };
+        if current.as_ref().map(|snapshot| snapshot.digest.as_str()) != expected_digest {
             return Err(WorkspaceApplyError::StaleBase);
         }
         match (
@@ -1370,7 +1503,7 @@ fn rollback_workspace_transaction(
 fn cleanup_staged_workspace_plans(staged: &[StagedWorkspacePlan]) {
     for staged_plan in staged {
         let parent_fd = staged_plan.parent.directory.as_raw_fd();
-        if !staged_plan.installed {
+        if !staged_plan.installed && !staged_plan.plan.delete {
             unlink_at(parent_fd, &staged_plan.stage_name);
         }
         if let Some(backup_name) = staged_plan.backup_name.as_ref() {
@@ -1380,17 +1513,32 @@ fn cleanup_staged_workspace_plans(staged: &[StagedWorkspacePlan]) {
 }
 
 fn workspace_set_digest(plans: &[WorkspaceApplyPlan]) -> String {
-    if let [plan] = plans {
-        return plan.proposed_digest.clone();
+    if plans.iter().all(|plan| !plan.delete) {
+        if let [plan] = plans {
+            return plan.proposed_digest.clone();
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"hyper-term.workspace.apply-set.v1\0");
+        for plan in plans {
+            digest.update((plan.target_path.len() as u64).to_be_bytes());
+            digest.update(plan.target_path.as_bytes());
+            digest.update(plan.proposed_digest.as_bytes());
+        }
+        return sha256_digest(digest.finalize());
     }
     let mut digest = Sha256::new();
-    digest.update(b"hyper-term.workspace.apply-set.v1\0");
+    digest.update(b"hyper-term.workspace.apply-set.v2\0");
     for plan in plans {
         digest.update((plan.target_path.len() as u64).to_be_bytes());
         digest.update(plan.target_path.as_bytes());
+        digest.update([u8::from(plan.delete)]);
         digest.update(plan.proposed_digest.as_bytes());
     }
     sha256_digest(digest.finalize())
+}
+
+fn workspace_deletion_digest() -> String {
+    sha256_bytes(b"hyper-term.workspace.delete.v1\0")
 }
 
 fn validate_target_path(value: &str) -> Result<PathBuf, WorkspaceApplyError> {
@@ -1784,7 +1932,6 @@ fn unlink_at(parent_fd: RawFd, name: &CStr) {
     let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
 }
 
-#[cfg(test)]
 fn unlink_at_checked(parent_fd: RawFd, name: &CStr) -> Result<(), WorkspaceApplyError> {
     // SAFETY: name is bounded and relative to an open directory descriptor.
     let result = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
@@ -1828,6 +1975,10 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1865,6 +2016,67 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".hyper-term-apply-")
         }));
+    }
+
+    #[test]
+    fn reviewed_deletion_unlinks_only_the_exact_file_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        let target = workspace.join("obsolete.txt");
+        fs::write(&target, "reviewed content\n").unwrap();
+
+        let set = prepare_workspace_apply_requests(
+            &workspace,
+            vec![WorkspaceApplyRequest::Delete {
+                target_path: "obsolete.txt".into(),
+            }],
+        )
+        .unwrap();
+        let plan = &set.plans[0];
+        assert!(plan.deletes_target());
+        assert_eq!(plan.base_content(), "reviewed content\n");
+        assert!(plan.proposed_content.is_empty());
+
+        let digest = apply_workspace_plan(&workspace, plan).unwrap();
+        assert_eq!(digest, set.result_digest);
+        assert!(!target.exists());
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn stale_file_identity_blocks_deletion_even_when_the_text_is_equal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        let target = workspace.join("obsolete.txt");
+        fs::write(&target, "reviewed content\n").unwrap();
+        let set = prepare_workspace_apply_requests(
+            &workspace,
+            vec![WorkspaceApplyRequest::Delete {
+                target_path: "obsolete.txt".into(),
+            }],
+        )
+        .unwrap();
+        let replacement = workspace.join("replacement.txt");
+        fs::write(&replacement, "reviewed content\n").unwrap();
+        fs::rename(&replacement, &target).unwrap();
+
+        assert!(matches!(
+            apply_workspace_plan(&workspace, &set.plans[0]),
+            Err(WorkspaceApplyError::StaleBase)
+        ));
+        assert_eq!(fs::read_to_string(target).unwrap(), "reviewed content\n");
+    }
+
+    #[test]
+    fn ordinary_write_plan_serialization_keeps_the_v1_acceptance_shape() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().canonicalize().unwrap();
+        let plan = prepare_workspace_apply(&workspace, "new.txt", "new\n".into()).unwrap();
+
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("\"delete\""));
+        let recovered: WorkspaceApplyPlan = serde_json::from_str(&json).unwrap();
+        assert!(!recovered.deletes_target());
     }
 
     #[test]
@@ -2112,6 +2324,30 @@ mod tests {
     }
 
     #[test]
+    fn durable_apply_atomically_commits_a_write_and_a_deletion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let state = temporary.path().join("state");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        fs::write(workspace.join("keep.ts"), "before\n").unwrap();
+        fs::write(workspace.join("delete.ts"), "remove me\n").unwrap();
+        let set = prepared_write_delete_set(&workspace);
+
+        let result =
+            apply_workspace_set_plan_durable(&workspace, &state, transaction_context(), &set)
+                .unwrap();
+        assert!(matches!(result, DurableWorkspaceApplyResult::Committed(_)));
+        assert_eq!(
+            fs::read_to_string(workspace.join("keep.ts")).unwrap(),
+            "after\n"
+        );
+        assert!(!workspace.join("delete.ts").exists());
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
     fn recovery_rolls_back_a_partially_installed_prepared_transaction() {
         let temporary = tempfile::tempdir().unwrap();
         let (workspace, state, set) = durable_test_roots(&temporary);
@@ -2163,6 +2399,55 @@ mod tests {
             fs::read_to_string(workspace.join("two.ts")).unwrap(),
             "two after\n"
         );
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn recovery_restores_a_deleted_file_when_the_write_is_not_installed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_write_delete_roots(&temporary);
+        let (_root, _manifest, mut staged) = stage_prepared_transaction(&workspace, &state, &set);
+        install_transaction_plan(&mut staged[1]).unwrap();
+        drop(staged);
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(
+            report.receipts[0].outcome,
+            WorkspaceTransactionOutcome::RolledBack
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("keep.ts")).unwrap(),
+            "before\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("delete.ts")).unwrap(),
+            "remove me\n"
+        );
+        assert!(!contains_transaction_file(&workspace));
+    }
+
+    #[test]
+    fn recovery_commits_when_the_write_and_deletion_were_both_installed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (workspace, state, set) = durable_write_delete_roots(&temporary);
+        let (_root, _manifest, mut staged) = stage_prepared_transaction(&workspace, &state, &set);
+        for candidate in &mut staged {
+            install_transaction_plan(candidate).unwrap();
+        }
+        drop(staged);
+
+        let report = recover_workspace_transactions(&workspace, &state).unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(
+            report.receipts[0].outcome,
+            WorkspaceTransactionOutcome::Committed
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("keep.ts")).unwrap(),
+            "after\n"
+        );
+        assert!(!workspace.join("delete.ts").exists());
         assert!(!contains_transaction_file(&workspace));
     }
 
@@ -2262,6 +2547,36 @@ mod tests {
             vec![
                 ("one.ts".into(), "one after\n".into()),
                 ("two.ts".into(), "two after\n".into()),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn durable_write_delete_roots(
+        temporary: &tempfile::TempDir,
+    ) -> (PathBuf, PathBuf, WorkspaceApplySetPlan) {
+        let workspace = temporary.path().join("workspace");
+        let state = temporary.path().join("state");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        fs::write(workspace.join("keep.ts"), "before\n").unwrap();
+        fs::write(workspace.join("delete.ts"), "remove me\n").unwrap();
+        let set = prepared_write_delete_set(&workspace);
+        (workspace, state, set)
+    }
+
+    fn prepared_write_delete_set(workspace: &Path) -> WorkspaceApplySetPlan {
+        prepare_workspace_apply_requests(
+            workspace,
+            vec![
+                WorkspaceApplyRequest::Write {
+                    target_path: "keep.ts".into(),
+                    proposed_content: "after\n".into(),
+                },
+                WorkspaceApplyRequest::Delete {
+                    target_path: "delete.ts".into(),
+                },
             ],
         )
         .unwrap()

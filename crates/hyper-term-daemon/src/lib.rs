@@ -61,9 +61,10 @@ mod workspace_snapshot;
 
 use artifact_store::{ArtifactStore, ArtifactStoreError, StoredGenUiArtifact};
 use workspace_apply::{
-    DurableWorkspaceApplyResult, WorkspaceApplySetPlan, WorkspaceTransactionContext,
-    WorkspaceTransactionOutcome, acknowledge_workspace_transaction,
-    apply_workspace_set_plan_durable, prepare_workspace_apply_set, validate_workspace_apply_set,
+    DurableWorkspaceApplyResult, WorkspaceApplyRequest, WorkspaceApplySetPlan,
+    WorkspaceTransactionContext, WorkspaceTransactionOutcome, acknowledge_workspace_transaction,
+    apply_workspace_set_plan_durable, prepare_workspace_apply_requests,
+    validate_workspace_apply_set,
 };
 
 pub use artifact_debug_capsule::{BugCapsuleError, load_bug_capsule};
@@ -231,6 +232,7 @@ pub struct IsolatedAcceptanceChange {
     pub target_path: String,
     pub base_digest: Option<String>,
     pub proposed_digest: String,
+    pub deleted: bool,
     pub before: String,
     pub after: String,
 }
@@ -1425,6 +1427,12 @@ impl DaemonState {
             .ok_or(DaemonError::IsolatedResultMissing(source_operation_id))?;
         let mut requests = Vec::new();
         for change in &result.receipt.changes.changed_files {
+            if change.kind == hyper_term_sandbox::IsolatedChangeKind::Deleted {
+                requests.push(WorkspaceApplyRequest::Delete {
+                    target_path: change.path.to_string_lossy().into_owned(),
+                });
+                continue;
+            }
             if !matches!(
                 change.kind,
                 hyper_term_sandbox::IsolatedChangeKind::Added
@@ -1441,10 +1449,13 @@ impl DaemonState {
                 self.read_isolated_result_file(source_operation_id, &change.path, digest)?;
             let content =
                 String::from_utf8(bytes).map_err(|_| DaemonError::UnsupportedIsolatedAcceptance)?;
-            requests.push((change.path.to_string_lossy().into_owned(), content));
+            requests.push(WorkspaceApplyRequest::Write {
+                target_path: change.path.to_string_lossy().into_owned(),
+                proposed_content: content,
+            });
         }
         let workspace = result.environment.manifest.source_workspace.clone();
-        let plan = prepare_workspace_apply_set(&workspace, requests)
+        let plan = prepare_workspace_apply_requests(&workspace, requests)
             .map_err(|error| DaemonError::WorkspaceApply(error.to_string()))?;
         let binding_digest = isolated_acceptance_digest(
             source_operation_id,
@@ -2684,7 +2695,12 @@ fn recover_isolated_acceptances(
             || stored.plan.plans.iter().any(|plan| {
                 !result.receipt.changes.changed_files.iter().any(|change| {
                     change.path == Path::new(&plan.target_path)
-                        && change.content_sha256.as_deref() == Some(&plan.proposed_digest)
+                        && if plan.deletes_target() {
+                            change.kind == hyper_term_sandbox::IsolatedChangeKind::Deleted
+                                && change.content_sha256.is_none()
+                        } else {
+                            change.content_sha256.as_deref() == Some(&plan.proposed_digest)
+                        }
                 })
             })
         {
@@ -2787,6 +2803,7 @@ fn isolated_acceptance_changes(plan: &WorkspaceApplySetPlan) -> Vec<IsolatedAcce
             target_path: plan.target_path.clone(),
             base_digest: plan.base_digest().map(str::to_owned),
             proposed_digest: plan.proposed_digest.clone(),
+            deleted: plan.deletes_target(),
             before: plan.base_content().to_owned(),
             after: plan.proposed_content.clone(),
         })
@@ -3476,7 +3493,7 @@ pub enum DaemonError {
     InvalidIsolatedResultPath,
     #[error("Tier 2 result content no longer matches its reviewed digest")]
     IsolatedResultDigestMismatch,
-    #[error("Tier 2 result contains deletions, type changes, binary data, or unsupported bounds")]
+    #[error("Tier 2 result contains type changes, binary data, or unsupported bounds")]
     UnsupportedIsolatedAcceptance,
     #[error("operation {0} has no prepared Tier 2 acceptance review")]
     IsolatedAcceptanceMissing(OperationId),
