@@ -203,9 +203,39 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
             .unwrap(),
         b"isolated only\n"
     );
-    state
-        .discard_isolated_result(operation.operation_id)
+    let acceptance = state
+        .propose_isolated_result_acceptance(task_id, operation.operation_id)
         .unwrap();
+    assert_eq!(acceptance.target_paths, vec!["generated.txt"]);
+    assert!(!workspace.join("generated.txt").exists());
+    assert!(matches!(
+        state.accept_isolated_result(
+            task_id,
+            acceptance.operation.operation_id,
+            acceptance.operation.revision
+        ),
+        Err(DaemonError::OperationNotAuthorized(_))
+    ));
+    let authorized_acceptance = state
+        .decide_permission(
+            task_id,
+            acceptance.operation.operation_id,
+            acceptance.operation.revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let completed = state
+        .accept_isolated_result(
+            task_id,
+            acceptance.operation.operation_id,
+            authorized_acceptance.revision,
+        )
+        .unwrap();
+    assert_eq!(completed.state, OperationState::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("generated.txt")).unwrap(),
+        "isolated only\n"
+    );
     assert!(matches!(
         state.discard_isolated_result(operation.operation_id),
         Err(DaemonError::IsolatedResultMissing(id)) if id == operation.operation_id
