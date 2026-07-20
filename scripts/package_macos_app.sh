@@ -74,6 +74,9 @@ native package \
   "$hyper_deno" \
   "$hyper_repo_root/dist/runtime"
 
+"$hyper_staging_app/Contents/MacOS/hyper-term" --help \
+  | grep -F -- "--lima-image-sha256" >/dev/null
+
 codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term-ui"
 codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term-mcp"
 codesign --force --sign - "$hyper_staging_app/Contents/MacOS/hyper-term"

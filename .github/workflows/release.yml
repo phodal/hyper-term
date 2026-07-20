@@ -287,6 +287,8 @@ jobs:
             dist/runtime
           "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term" --help \
             | grep -F "Hyper Term desktop host"
+          "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term" --help \
+            | grep -F -- "--lima-image-sha256"
           "$RUNNER_TEMP/Hyper Term.app/Contents/MacOS/hyper-term-mcp" --help \
             | grep -F "Hyper Term brokered MCP connector"
           test -x "$RUNNER_TEMP/Hyper Term.app/Contents/Resources/runtime/deno"

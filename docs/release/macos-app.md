@@ -45,6 +45,12 @@ read-only workspace and a private writable session home. Opaque
 provider-internal execution and hermetic acceptance still require Tier 2 under
 ADR 0014.
 
+The application can opt into that Tier 2 backend at launch with an explicit
+`limactl` executable, local VZ-compatible image, and pinned SHA-256. The image
+is not bundled or downloaded. ACP Terminal client capability is advertised
+only after the desktop supervisor constructs the verified Lima runner; an
+absent or partial configuration never degrades to host execution.
+
 The application does not bundle Node or the large provider CLI binaries. It
 only offers a bundled ACP provider when the matching `codex` or `claude`
 executable is available locally, and may register an installed GitHub Copilot

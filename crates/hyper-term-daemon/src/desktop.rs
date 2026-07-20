@@ -25,6 +25,7 @@ use hyper_term_daemon::{
 use uuid::Uuid;
 
 use hyper_term_drivers::sha256_file;
+use hyper_term_sandbox::{LimaImage, LimaRunnerConfig, LimaTaskRunner};
 use serde::{Deserialize, Serialize};
 
 const DESKTOP_TERMINAL_ADDRESS: &str = "127.0.0.1:47437";
@@ -56,6 +57,9 @@ Options:\n  --ui PATH                 Native renderer executable\n  \
 --genui-script PATH       Bundled GenUI compiler service\n  \
 --genui-wasm PATH         Pinned esbuild-wasm compiler binary\n  \
 --genui-preview PATH      Bundled isolated GenUI preview capsule\n  \
+--lima PATH               Explicit limactl executable for Tier 2 tasks\n  \
+--lima-image PATH         Local VZ-compatible image for Tier 2 tasks\n  \
+--lima-image-sha256 HEX   Pinned SHA-256 for the Tier 2 image\n  \
 -h, --help                Show this help";
 
 fn main() {
@@ -83,6 +87,7 @@ fn run() -> Result<i32, String> {
         .ok_or_else(|| "HOME is not available for desktop state and shell cwd".to_owned())?;
     let resolved = options.resolve(&executable, &home)?;
     resolved.validate()?;
+    let tier2_runner = resolved.tier2_runner()?;
     let debug_capsule = resolved
         .bug_capsule
         .as_deref()
@@ -163,7 +168,7 @@ fn run() -> Result<i32, String> {
                 }),
             workbench_assets: resolved.workbench_assets.clone(),
             debug_capsule: debug_capsule.clone(),
-            tier2_runner: None,
+            tier2_runner,
             control_socket,
         })
         .await
@@ -272,6 +277,9 @@ struct Options {
     genui_script: Option<PathBuf>,
     genui_wasm: Option<PathBuf>,
     genui_preview: Option<PathBuf>,
+    lima: Option<PathBuf>,
+    lima_image: Option<PathBuf>,
+    lima_image_sha256: Option<String>,
     help: bool,
 }
 
@@ -327,6 +335,16 @@ impl Options {
                 }
                 Some("--genui-preview") => {
                     options.genui_preview = Some(required_path(&mut arguments, "--genui-preview")?);
+                }
+                Some("--lima") => {
+                    options.lima = Some(required_path(&mut arguments, "--lima")?);
+                }
+                Some("--lima-image") => {
+                    options.lima_image = Some(required_path(&mut arguments, "--lima-image")?);
+                }
+                Some("--lima-image-sha256") => {
+                    options.lima_image_sha256 =
+                        Some(required_value(&mut arguments, "--lima-image-sha256")?);
                 }
                 Some("-h" | "--help") => options.help = true,
                 Some(other) => return Err(format!("unknown argument: {other}")),
@@ -423,6 +441,18 @@ impl Options {
             bundled_claude_acp,
             discovered_claude_acp,
         );
+        let lima = self
+            .lima
+            .or_else(|| std::env::var_os("HYPER_TERM_LIMA_PATH").map(PathBuf::from));
+        let lima_image = self
+            .lima_image
+            .or_else(|| std::env::var_os("HYPER_TERM_LIMA_IMAGE").map(PathBuf::from));
+        let lima_image_sha256 = self.lima_image_sha256.or_else(|| {
+            std::env::var("HYPER_TERM_LIMA_IMAGE_SHA256")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
+        let tier2 = resolve_tier2(lima, lima_image, lima_image_sha256)?;
         Ok(ResolvedOptions {
             ui: self
                 .ui
@@ -450,6 +480,7 @@ impl Options {
                 .is_file()
                 .then(|| executable.with_file_name("hyper-term-mcp")),
             genui_runtime,
+            tier2,
         })
     }
 }
@@ -470,6 +501,7 @@ struct ResolvedOptions {
     copilot: Option<PathBuf>,
     mcp: Option<PathBuf>,
     genui_runtime: Option<ResolvedGenUiRuntime>,
+    tier2: Option<ResolvedTier2>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -478,6 +510,44 @@ struct ResolvedGenUiRuntime {
     compiler_script: PathBuf,
     compiler_wasm: PathBuf,
     preview_shell: PathBuf,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ResolvedTier2 {
+    limactl: Option<PathBuf>,
+    image: PathBuf,
+    image_sha256: String,
+}
+
+impl ResolvedTier2 {
+    fn runner(&self) -> Result<LimaTaskRunner, String> {
+        let config = LimaRunnerConfig::macos_vz(LimaImage {
+            path: self.image.clone(),
+            sha256: self.image_sha256.clone(),
+            arch: std::env::consts::ARCH.into(),
+        });
+        match &self.limactl {
+            Some(executable) => LimaTaskRunner::with_executable(executable, config),
+            None => LimaTaskRunner::discover(config),
+        }
+        .map_err(|error| format!("cannot configure Tier 2 Lima runner: {error}"))
+    }
+}
+
+fn resolve_tier2(
+    limactl: Option<PathBuf>,
+    image: Option<PathBuf>,
+    image_sha256: Option<String>,
+) -> Result<Option<ResolvedTier2>, String> {
+    match (limactl, image, image_sha256) {
+        (None, None, None) => Ok(None),
+        (limactl, Some(image), Some(image_sha256)) => Ok(Some(ResolvedTier2 {
+            limactl,
+            image,
+            image_sha256,
+        })),
+        _ => Err("Tier 2 requires both a local Lima image and its pinned SHA-256".into()),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -563,6 +633,10 @@ fn select_acp_adapter(
 }
 
 impl ResolvedOptions {
+    fn tier2_runner(&self) -> Result<Option<LimaTaskRunner>, String> {
+        self.tier2.as_ref().map(ResolvedTier2::runner).transpose()
+    }
+
     fn validate(&self) -> Result<(), String> {
         validate_executable(&self.ui)?;
         if !self.terminal_assets.join("index.html").is_file() {
@@ -627,6 +701,17 @@ impl ResolvedOptions {
                         asset.display()
                     ));
                 }
+            }
+        }
+        if let Some(tier2) = &self.tier2 {
+            if !tier2.image.is_absolute() || !tier2.image.is_file() {
+                return Err(format!(
+                    "Tier 2 Lima image is not an absolute file: {}",
+                    tier2.image.display()
+                ));
+            }
+            if let Some(limactl) = &tier2.limactl {
+                validate_executable(limactl)?;
             }
         }
         Ok(())
@@ -1118,6 +1203,17 @@ fn required_path(
         .ok_or_else(|| format!("{option} requires a path"))
 }
 
+fn required_value(
+    arguments: &mut impl Iterator<Item = OsString>,
+    option: &str,
+) -> Result<String, String> {
+    arguments
+        .next()
+        .ok_or_else(|| format!("{option} requires a value"))?
+        .into_string()
+        .map_err(|_| format!("{option} requires a valid UTF-8 value"))
+}
+
 fn default_state_directory(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/Hyper Term")
@@ -1348,6 +1444,12 @@ mod tests {
             "/tmp/esbuild.wasm".into(),
             "--genui-preview".into(),
             "/tmp/genui-preview.html".into(),
+            "--lima".into(),
+            "/tmp/limactl".into(),
+            "--lima-image".into(),
+            "/tmp/tier2.qcow2".into(),
+            "--lima-image-sha256".into(),
+            "a".repeat(64).into(),
         ])
         .expect("options");
         assert_eq!(options.ui, Some(PathBuf::from("/tmp/hyper-term-ui")));
@@ -1381,6 +1483,9 @@ mod tests {
             options.genui_preview,
             Some(PathBuf::from("/tmp/genui-preview.html"))
         );
+        assert_eq!(options.lima, Some(PathBuf::from("/tmp/limactl")));
+        assert_eq!(options.lima_image, Some(PathBuf::from("/tmp/tier2.qcow2")));
+        assert_eq!(options.lima_image_sha256, Some("a".repeat(64)));
     }
 
     #[test]
@@ -1392,6 +1497,59 @@ mod tests {
         );
         assert!(DESKTOP_HELP.contains("--workbench-assets PATH"));
         assert!(DESKTOP_HELP.contains("--bug-capsule PATH"));
+        assert!(DESKTOP_HELP.contains("--lima-image-sha256 HEX"));
+    }
+
+    #[test]
+    fn tier2_configuration_is_complete_and_digest_pinned() {
+        assert!(resolve_tier2(None, None, None).unwrap().is_none());
+        assert!(
+            resolve_tier2(None, Some("/tmp/image.qcow2".into()), None)
+                .unwrap_err()
+                .contains("both a local Lima image")
+        );
+        assert!(
+            resolve_tier2(None, None, Some("a".repeat(64)))
+                .unwrap_err()
+                .contains("both a local Lima image")
+        );
+        let configured = resolve_tier2(
+            Some("/tmp/limactl".into()),
+            Some("/tmp/image.qcow2".into()),
+            Some("a".repeat(64)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(configured.limactl, Some("/tmp/limactl".into()));
+        assert_eq!(configured.image, PathBuf::from("/tmp/image.qcow2"));
+        assert_eq!(configured.image_sha256, "a".repeat(64));
+    }
+
+    #[test]
+    fn tier2_runner_probes_an_explicit_lima_backend() {
+        let temporary = tempfile::tempdir().expect("temporary Tier 2 runtime");
+        let limactl = temporary.path().join("limactl");
+        std::fs::write(
+            &limactl,
+            "#!/bin/sh\n[ \"${1:-}\" = \"--version\" ] && printf '%s\\n' 'limactl version 2.1.1'\n",
+        )
+        .expect("fake limactl");
+        let mut permissions = std::fs::metadata(&limactl).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&limactl, permissions).unwrap();
+        let image = temporary.path().join("image.qcow2");
+        std::fs::write(&image, b"pinned local image").expect("fake image");
+
+        let runner = ResolvedTier2 {
+            limactl: Some(limactl),
+            image: image.clone(),
+            image_sha256: sha256_file(&image).expect("image digest"),
+        }
+        .runner()
+        .expect("Tier 2 runner");
+
+        assert_eq!(runner.max_output_bytes(), 2 * 1024 * 1024);
+        assert_eq!(runner.task_timeout(), Duration::from_secs(10 * 60));
     }
 
     #[test]
@@ -1473,6 +1631,7 @@ mod tests {
             copilot: Some(copilot.clone()),
             mcp: None,
             genui_runtime: None,
+            tier2: None,
         };
         assert_eq!(
             resolved

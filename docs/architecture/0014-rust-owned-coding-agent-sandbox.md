@@ -640,6 +640,16 @@ instance through stop/delete, removes the incomplete worktree registration,
 and only then discards the operation directory. A missing Lima executable or a
 failed delete blocks that recovery instead of silently abandoning a live VM.
 
+The packaged desktop supervisor exposes this backend through the complete
+`--lima`, `--lima-image`, and `--lima-image-sha256` tuple, with equivalent
+`HYPER_TERM_LIMA_*` environment variables for managed launches. Partial
+configuration fails before the Native renderer starts. Rust validates the
+explicit `limactl` executable and version probe, requires an absolute local
+image, constructs the bounded VZ profile, and passes the runner to the Agent
+gateway. Only then does ACP initialization advertise its Terminal client
+capability. Without that runner, `terminal/create` remains unadvertised rather
+than falling back to the ordinary user-owned PTY or an unenforced host process.
+
 This remains an experimental Tier 2 baseline. Recovery of a pending pre-apply
 review, a user-facing bounded patch/diff API, deletion and binary acceptance semantics,
 and a release-gated boot test using the production pinned image are still open.

@@ -208,6 +208,23 @@ The package contains the Rust supervisor, Native SDK renderer, terminal and
 Workbench assets, and the pinned Deno/ACP runtime. It does not require a global
 Node.js runtime after packaging.
 
+ACP terminal-host requests are available only when the desktop supervisor has
+an explicitly pinned Tier 2 backend. Hyper Term never downloads a VM image and
+never falls back to the user's ordinary PTY. With Lima 2.1.1 or newer and a
+local VZ-compatible image, launch the packaged application with:
+
+```bash
+"dist/macos/Hyper Term.app/Contents/MacOS/hyper-term" \
+  --lima /absolute/path/to/limactl \
+  --lima-image /absolute/path/to/image.qcow2 \
+  --lima-image-sha256 <lowercase-sha256>
+```
+
+The same values can be supplied as `HYPER_TERM_LIMA_PATH`,
+`HYPER_TERM_LIMA_IMAGE`, and `HYPER_TERM_LIMA_IMAGE_SHA256`. If the image or
+digest is absent, ACP does not negotiate the Terminal capability; normal zsh
+tabs and brokered Diff, GenUI, and bounded Deno LSP tools remain available.
+
 ### Run the kernel only
 
 The renderer-independent daemon can also run on its own:
