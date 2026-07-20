@@ -3,9 +3,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::{
-    AcpAdapterError, AgentDriverEvent, AgentEffectAuthorization, AgentSessionCapabilities,
-    AgentSessionConfigValue, CodexAdapterError, DriverState, ExternalRequestId,
-    StructuredAgentProtocol,
+    AcpAdapterError, AgentDriverEvent, AgentEffectAuthorization, AgentHostResponse,
+    AgentSessionCapabilities, AgentSessionConfigValue, CodexAdapterError, DriverState,
+    ExternalRequestId, StructuredAgentProtocol,
 };
 
 /// Renderer-independent port used by the daemon for every structured coding agent.
@@ -34,6 +34,15 @@ pub trait StructuredAgentClient: Send + Sync {
         request_id: &ExternalRequestId,
         authorization: AgentEffectAuthorization,
     ) -> Result<(), AgentClientError>;
+    fn resolve_host_request(
+        &self,
+        _request_id: &ExternalRequestId,
+        _response: AgentHostResponse,
+    ) -> Result<(), AgentClientError> {
+        Err(AgentClientError::Unsupported(
+            "provider does not support Agent-to-Host requests".into(),
+        ))
+    }
     fn state(&self) -> Result<DriverState, AgentClientError>;
     fn stderr_tail(&self) -> Result<String, AgentClientError>;
     fn close(&self) -> Result<DriverState, AgentClientError>;

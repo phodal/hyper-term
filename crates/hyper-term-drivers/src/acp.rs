@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -22,10 +22,11 @@ use uuid::Uuid;
 use crate::codex_containment::{apply_managed_proxy_environment, compile_agent_task_sandbox};
 use crate::{
     AgentAvailableCommand, AgentClientError, AgentContainmentConfig, AgentDriverEvent,
-    AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal, AgentSessionCapabilities,
-    AgentSessionConfigChoice, AgentSessionConfigKind, AgentSessionConfigOption,
-    AgentSessionConfigValue, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent,
-    DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
+    AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal, AgentHostOperation,
+    AgentHostRequest, AgentHostResponse, AgentSessionCapabilities, AgentSessionConfigChoice,
+    AgentSessionConfigKind, AgentSessionConfigOption, AgentSessionConfigValue,
+    AgentTerminalEnvironmentVariable, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError,
+    DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
     ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox,
     sha256_file,
 };
@@ -41,6 +42,13 @@ const MAX_AVAILABLE_COMMANDS: usize = 96;
 const MAX_CAPABILITY_ID_BYTES: usize = 128;
 const MAX_CAPABILITY_LABEL_BYTES: usize = 256;
 const MAX_CAPABILITY_DESCRIPTION_BYTES: usize = 2048;
+const MAX_PENDING_HOST_REQUESTS: usize = 128;
+const MAX_TERMINAL_ARGUMENTS: usize = 256;
+const MAX_TERMINAL_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_TERMINAL_ENVIRONMENT: usize = 64;
+const MAX_TERMINAL_ENVIRONMENT_BYTES: usize = 64 * 1024;
+const DEFAULT_TERMINAL_OUTPUT_BYTES: u64 = 512 * 1024;
+const MAX_TERMINAL_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 const HYPER_TERM_MCP_TOOLS: &[&str] = &[
     "hyper_term.genui.compile",
     "hyper_term.lsp.query",
@@ -109,6 +117,16 @@ impl StructuredAgentClient for AcpAgentClient {
         )?)
     }
 
+    fn resolve_host_request(
+        &self,
+        request_id: &ExternalRequestId,
+        response: AgentHostResponse,
+    ) -> Result<(), AgentClientError> {
+        Ok(AcpAgentClient::resolve_host_request(
+            self, request_id, response,
+        )?)
+    }
+
     fn state(&self) -> Result<DriverState, AgentClientError> {
         Ok(AcpAgentClient::state(self)?)
     }
@@ -132,6 +150,7 @@ pub struct AcpAgentConfig {
     pub workspace: PathBuf,
     pub brokered_mcp_server: Option<AcpMcpServerConfig>,
     pub containment: Option<AgentContainmentConfig>,
+    pub terminal_client: bool,
 }
 
 pub struct AcpAgentClient {
@@ -141,12 +160,14 @@ pub struct AcpAgentClient {
     inbox: Mutex<BoundedDriverInbox>,
     pending_prompt: Mutex<Option<PendingPrompt>>,
     pending_approvals: Mutex<HashMap<ExternalRequestId, PendingApproval>>,
+    pending_host_requests: Mutex<HashMap<ExternalRequestId, AgentHostRequest>>,
     brokered_mcp_calls: Mutex<HashMap<String, BrokeredMcpCall>>,
     tool_calls: Mutex<HashMap<String, v1::ToolCall>>,
     session_capabilities: Mutex<AgentSessionCapabilities>,
     provider_id: String,
     workspace: PathBuf,
     mcp_servers: Vec<v1::McpServer>,
+    terminal_client: bool,
 }
 
 #[derive(Clone)]
@@ -253,12 +274,14 @@ impl AcpAgentClient {
             )),
             pending_prompt: Mutex::new(None),
             pending_approvals: Mutex::new(HashMap::new()),
+            pending_host_requests: Mutex::new(HashMap::new()),
             brokered_mcp_calls: Mutex::new(HashMap::new()),
             tool_calls: Mutex::new(HashMap::new()),
             session_capabilities: Mutex::new(AgentSessionCapabilities::default()),
             provider_id: config.provider_id,
             workspace,
             mcp_servers,
+            terminal_client: config.terminal_client,
         })
     }
 
@@ -267,9 +290,12 @@ impl AcpAgentClient {
     }
 
     pub fn initialize(&self, timeout: Duration) -> Result<v1::InitializeResponse, AcpAdapterError> {
-        let request = v1::InitializeRequest::new(ProtocolVersion::V1).client_info(
-            v1::Implementation::new("hyper-term", env!("CARGO_PKG_VERSION")).title("Hyper Term"),
-        );
+        let request = v1::InitializeRequest::new(ProtocolVersion::V1)
+            .client_capabilities(v1::ClientCapabilities::new().terminal(self.terminal_client))
+            .client_info(
+                v1::Implementation::new("hyper-term", env!("CARGO_PKG_VERSION"))
+                    .title("Hyper Term"),
+            );
         let response = self.request(&request, timeout)?;
         if response.protocol_version != ProtocolVersion::V1 {
             return Err(AcpAdapterError::UnsupportedProtocol);
@@ -425,6 +451,33 @@ impl AcpAgentClient {
         Ok(())
     }
 
+    pub fn resolve_host_request(
+        &self,
+        request_id: &ExternalRequestId,
+        response: AgentHostResponse,
+    ) -> Result<(), AcpAdapterError> {
+        let request = lock(&self.pending_host_requests)?
+            .get(request_id)
+            .cloned()
+            .ok_or(AcpAdapterError::UnknownHostRequest)?;
+        let wire = host_response_value(&request.operation, response)?;
+        let message = match wire {
+            HostResponseValue::Result(result) => json!({
+                "jsonrpc": "2.0",
+                "id": request_id_value(request_id),
+                "result": result,
+            }),
+            HostResponseValue::Error { code, message } => json!({
+                "jsonrpc": "2.0",
+                "id": request_id_value(request_id),
+                "error": {"code": code, "message": message},
+            }),
+        };
+        self.process.send_json(&message)?;
+        lock(&self.pending_host_requests)?.remove(request_id);
+        Ok(())
+    }
+
     pub fn pending_effects(&self) -> Result<Vec<AgentEffectProposal>, AcpAdapterError> {
         Ok(lock(&self.pending_approvals)?
             .values()
@@ -551,12 +604,60 @@ impl AcpAgentClient {
             Some("session/request_permission") => {
                 self.normalize_permission_request(sequence, payload)
             }
+            Some(
+                "terminal/create"
+                | "terminal/output"
+                | "terminal/release"
+                | "terminal/wait_for_exit"
+                | "terminal/kill",
+            ) if self.terminal_client => self.normalize_host_request(sequence, payload),
             Some(_) if payload.get("id").is_some() => {
                 reject_unsupported_request(&self.process, &payload)?;
                 protocol_notice(sequence, method, &payload)
             }
             _ => protocol_notice(sequence, method, &payload),
         }
+    }
+
+    fn normalize_host_request(
+        &self,
+        sequence: u64,
+        payload: Value,
+    ) -> Result<AgentDriverEvent, AcpAdapterError> {
+        let method = payload
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AcpAdapterError::InvalidMessage("ACP host request has no method".into())
+            })?;
+        let request_id = external_request_id(payload.get("id"))?;
+        if lock(&self.pending_approvals)?.contains_key(&request_id) {
+            return Err(AcpAdapterError::DuplicateApproval);
+        }
+        let params = payload.get("params").cloned().unwrap_or(Value::Null);
+        let pending_prompt = lock(&self.pending_prompt)?.clone().ok_or_else(|| {
+            AcpAdapterError::InvalidMessage("ACP host request arrived outside a turn".into())
+        })?;
+        let operation =
+            normalize_host_operation(method, &params, &pending_prompt.session_id, &self.workspace)?;
+        let request = AgentHostRequest {
+            driver_id: self.process.manifest().driver_id,
+            protocol: StructuredAgentProtocol::Acp,
+            request_id: request_id.clone(),
+            method: method.to_owned(),
+            payload_sha256: sha256_value(&params)?,
+            thread_id: pending_prompt.session_id,
+            turn_id: pending_prompt.turn_id,
+            operation,
+        };
+        let mut pending = lock(&self.pending_host_requests)?;
+        if pending.len() == MAX_PENDING_HOST_REQUESTS {
+            return Err(AcpAdapterError::HostRequestOverflow);
+        }
+        if pending.insert(request_id, request.clone()).is_some() {
+            return Err(AcpAdapterError::DuplicateHostRequest);
+        }
+        Ok(AgentDriverEvent::HostRequest { sequence, request })
     }
 
     fn normalize_session_update(
@@ -673,6 +774,9 @@ impl AcpAgentClient {
             &params,
             lock(&self.pending_prompt)?.as_ref(),
         )?;
+        if lock(&self.pending_host_requests)?.contains_key(&request_id) {
+            return Err(AcpAdapterError::DuplicateHostRequest);
+        }
         let mut pending = lock(&self.pending_approvals)?;
         if pending.len() == MAX_PENDING_APPROVALS {
             return Err(AcpAdapterError::ApprovalOverflow);
@@ -869,6 +973,225 @@ fn normalize_permission(
         turn_id: prompt.map(|pending| pending.turn_id.clone()),
         item_id: Some(bounded(request.tool_call.tool_call_id.to_string(), 4096)?),
     })
+}
+
+enum HostResponseValue {
+    Result(Value),
+    Error { code: i32, message: String },
+}
+
+fn normalize_host_operation(
+    method: &str,
+    params: &Value,
+    pending_session_id: &str,
+    workspace: &Path,
+) -> Result<AgentHostOperation, AcpAdapterError> {
+    match method {
+        "terminal/create" => {
+            let request: v1::CreateTerminalRequest = serde_json::from_value(params.clone())?;
+            validate_host_session(&request.session_id.to_string(), pending_session_id)?;
+            if request.args.len() > MAX_TERMINAL_ARGUMENTS {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP terminal argument count exceeded its bound".into(),
+                ));
+            }
+            let command = bounded(request.command, 16 * 1024)?;
+            if command.is_empty() {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP terminal command is empty".into(),
+                ));
+            }
+            let mut argument_bytes = 0usize;
+            let args = request
+                .args
+                .into_iter()
+                .map(|argument| {
+                    let argument = bounded(argument, 16 * 1024)?;
+                    argument_bytes =
+                        argument_bytes.checked_add(argument.len()).ok_or_else(|| {
+                            AcpAdapterError::InvalidMessage(
+                                "ACP terminal argument bytes overflowed".into(),
+                            )
+                        })?;
+                    Ok(argument)
+                })
+                .collect::<Result<Vec<_>, AcpAdapterError>>()?;
+            if argument_bytes > MAX_TERMINAL_ARGUMENT_BYTES {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP terminal arguments exceeded their byte bound".into(),
+                ));
+            }
+            if request.env.len() > MAX_TERMINAL_ENVIRONMENT {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP terminal environment exceeded its entry bound".into(),
+                ));
+            }
+            let mut names = HashSet::new();
+            let mut environment_bytes = 0usize;
+            let env = request
+                .env
+                .into_iter()
+                .map(|variable| {
+                    let name = bounded(variable.name, 128)?;
+                    if !valid_environment_name(&name) || !names.insert(name.clone()) {
+                        return Err(AcpAdapterError::InvalidMessage(
+                            "ACP terminal environment contains an invalid or duplicate name".into(),
+                        ));
+                    }
+                    let value = bounded(variable.value, 16 * 1024)?;
+                    environment_bytes = environment_bytes
+                        .checked_add(name.len())
+                        .and_then(|bytes| bytes.checked_add(value.len()))
+                        .ok_or_else(|| {
+                            AcpAdapterError::InvalidMessage(
+                                "ACP terminal environment bytes overflowed".into(),
+                            )
+                        })?;
+                    Ok(AgentTerminalEnvironmentVariable { name, value })
+                })
+                .collect::<Result<Vec<_>, AcpAdapterError>>()?;
+            if environment_bytes > MAX_TERMINAL_ENVIRONMENT_BYTES {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP terminal environment exceeded its byte bound".into(),
+                ));
+            }
+            let cwd = request.cwd.unwrap_or_else(|| workspace.to_path_buf());
+            if !cwd.is_absolute() {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP terminal cwd must be absolute".into(),
+                ));
+            }
+            let cwd = cwd.canonicalize().map_err(|_| {
+                AcpAdapterError::InvalidMessage("ACP terminal cwd is unavailable".into())
+            })?;
+            if !cwd.starts_with(workspace) {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP terminal cwd escaped the session workspace".into(),
+                ));
+            }
+            let output_byte_limit = request
+                .output_byte_limit
+                .unwrap_or(DEFAULT_TERMINAL_OUTPUT_BYTES);
+            if output_byte_limit == 0 || output_byte_limit > MAX_TERMINAL_OUTPUT_BYTES {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP terminal output limit is outside the supported bound".into(),
+                ));
+            }
+            Ok(AgentHostOperation::TerminalCreate {
+                command,
+                args,
+                env,
+                cwd,
+                output_byte_limit,
+            })
+        }
+        "terminal/output" => {
+            let request: v1::TerminalOutputRequest = serde_json::from_value(params.clone())?;
+            validate_host_session(&request.session_id.to_string(), pending_session_id)?;
+            Ok(AgentHostOperation::TerminalOutput {
+                terminal_id: normalize_terminal_id(request.terminal_id.to_string())?,
+            })
+        }
+        "terminal/release" => {
+            let request: v1::ReleaseTerminalRequest = serde_json::from_value(params.clone())?;
+            validate_host_session(&request.session_id.to_string(), pending_session_id)?;
+            Ok(AgentHostOperation::TerminalRelease {
+                terminal_id: normalize_terminal_id(request.terminal_id.to_string())?,
+            })
+        }
+        "terminal/wait_for_exit" => {
+            let request: v1::WaitForTerminalExitRequest = serde_json::from_value(params.clone())?;
+            validate_host_session(&request.session_id.to_string(), pending_session_id)?;
+            Ok(AgentHostOperation::TerminalWaitForExit {
+                terminal_id: normalize_terminal_id(request.terminal_id.to_string())?,
+            })
+        }
+        "terminal/kill" => {
+            let request: v1::KillTerminalRequest = serde_json::from_value(params.clone())?;
+            validate_host_session(&request.session_id.to_string(), pending_session_id)?;
+            Ok(AgentHostOperation::TerminalKill {
+                terminal_id: normalize_terminal_id(request.terminal_id.to_string())?,
+            })
+        }
+        _ => Err(AcpAdapterError::InvalidMessage(
+            "unsupported ACP host request".into(),
+        )),
+    }
+}
+
+fn validate_host_session(actual: &str, expected: &str) -> Result<(), AcpAdapterError> {
+    if actual != expected {
+        return Err(AcpAdapterError::InvalidMessage(
+            "ACP host request belongs to another session".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn normalize_terminal_id(terminal_id: String) -> Result<String, AcpAdapterError> {
+    let terminal_id = bounded(terminal_id, 4096)?;
+    if terminal_id.is_empty() {
+        return Err(AcpAdapterError::InvalidMessage(
+            "ACP terminal id is empty".into(),
+        ));
+    }
+    Ok(terminal_id)
+}
+
+fn host_response_value(
+    operation: &AgentHostOperation,
+    response: AgentHostResponse,
+) -> Result<HostResponseValue, AcpAdapterError> {
+    if let AgentHostResponse::Error { code, message } = response {
+        return Ok(HostResponseValue::Error {
+            code,
+            message: bounded(message, 512)?,
+        });
+    }
+    let result = match (operation, response) {
+        (
+            AgentHostOperation::TerminalCreate { .. },
+            AgentHostResponse::TerminalCreated { terminal_id },
+        ) => json!({"terminalId": normalize_terminal_id(terminal_id)?}),
+        (
+            AgentHostOperation::TerminalOutput { .. },
+            AgentHostResponse::TerminalOutput {
+                output,
+                truncated,
+                exit_code,
+                signal,
+            },
+        ) => {
+            let output = bounded(output, MAX_TERMINAL_OUTPUT_BYTES as usize)?;
+            let signal = signal.map(|signal| bounded(signal, 128)).transpose()?;
+            json!({
+                "output": output,
+                "truncated": truncated,
+                "exitStatus": {"exitCode": exit_code, "signal": signal},
+            })
+        }
+        (AgentHostOperation::TerminalRelease { .. }, AgentHostResponse::TerminalReleased) => {
+            json!({})
+        }
+        (
+            AgentHostOperation::TerminalWaitForExit { .. },
+            AgentHostResponse::TerminalExited { exit_code, signal },
+        ) => json!({
+            "exitCode": exit_code,
+            "signal": signal.map(|signal| bounded(signal, 128)).transpose()?,
+        }),
+        (AgentHostOperation::TerminalKill { .. }, AgentHostResponse::TerminalKilled) => json!({}),
+        _ => return Err(AcpAdapterError::HostResponseMismatch),
+    };
+    Ok(HostResponseValue::Result(result))
 }
 
 fn brokered_mcp_tool(call: &v1::ToolCall) -> Option<&str> {
@@ -1409,10 +1732,18 @@ pub enum AcpAdapterError {
     InboxOverflow,
     #[error("ACP pending approvals exceeded their bound")]
     ApprovalOverflow,
+    #[error("ACP pending Agent-to-Host requests exceeded their bound")]
+    HostRequestOverflow,
     #[error("ACP repeated a permission request ID")]
     DuplicateApproval,
     #[error("ACP permission request is no longer pending")]
     UnknownApproval,
+    #[error("ACP repeated an Agent-to-Host request ID")]
+    DuplicateHostRequest,
+    #[error("ACP Agent-to-Host request is no longer pending")]
+    UnknownHostRequest,
+    #[error("ACP Agent-to-Host response did not match its request")]
+    HostResponseMismatch,
     #[error("the requested ACP permission decision is unavailable")]
     DecisionUnavailable,
     #[error("an ACP prompt is already running")]
@@ -1454,6 +1785,7 @@ mod tests {
             workspace: workspace.to_owned(),
             brokered_mcp_server: None,
             containment: None,
+            terminal_client: false,
         })
         .unwrap()
     }
@@ -1480,6 +1812,115 @@ mod tests {
             AgentDriverEvent::TurnCompleted { status: Some(status), .. } if status == "end_turn"
         ));
         assert_eq!(client.state().unwrap(), DriverState::Ready);
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[test]
+    fn acp_terminal_requests_cross_the_bounded_host_transport() {
+        let (temporary, executable) = fake_agent(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*'\"terminal\":true'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-terminal\"}}' ;;\n    *'\"method\":\"session/prompt\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-create-1\",\"method\":\"terminal/create\",\"params\":{\"sessionId\":\"session-terminal\",\"command\":\"cargo\",\"args\":[\"test\",\"--workspace\"],\"env\":[{\"name\":\"RUST_LOG\",\"value\":\"warn\"}],\"outputByteLimit\":8192}}' ;;\n    *'\"id\":\"terminal-create-1\"'*'\"terminalId\":\"ht-terminal-1\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-output-1\",\"method\":\"terminal/output\",\"params\":{\"sessionId\":\"session-terminal\",\"terminalId\":\"ht-terminal-1\"}}' ;;\n    *'\"id\":\"terminal-output-1\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-wait-1\",\"method\":\"terminal/wait_for_exit\",\"params\":{\"sessionId\":\"session-terminal\",\"terminalId\":\"ht-terminal-1\"}}' ;;\n    *'\"id\":\"terminal-wait-1\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-kill-1\",\"method\":\"terminal/kill\",\"params\":{\"sessionId\":\"session-terminal\",\"terminalId\":\"ht-terminal-1\"}}' ;;\n    *'\"id\":\"terminal-kill-1\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-release-1\",\"method\":\"terminal/release\",\"params\":{\"sessionId\":\"session-terminal\",\"terminalId\":\"ht-terminal-1\"}}' ;;\n    *'\"id\":\"terminal-release-1\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+        );
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let client = AcpAgentClient::launch(AcpAgentConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            arguments: vec![],
+            environment: BTreeMap::new(),
+            implementation_version: "fixture-1".into(),
+            provider_id: "fixture-acp".into(),
+            workspace: workspace.clone(),
+            brokered_mcp_server: None,
+            containment: None,
+            terminal_client: true,
+        })
+        .unwrap();
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
+        client.start_turn(&session_id, "run the tests").unwrap();
+
+        let create = match client.next_event(Duration::from_secs(2)).unwrap() {
+            AgentDriverEvent::HostRequest { request, .. } => request,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        assert_eq!(create.method, "terminal/create");
+        assert!(matches!(
+            &create.operation,
+            AgentHostOperation::TerminalCreate {
+                command,
+                args,
+                env,
+                cwd,
+                output_byte_limit: 8192,
+            } if command == "cargo"
+                && args == &["test", "--workspace"]
+                && env == &[AgentTerminalEnvironmentVariable {
+                    name: "RUST_LOG".into(),
+                    value: "warn".into(),
+                }]
+                && cwd == &workspace.canonicalize().unwrap()
+        ));
+        client
+            .resolve_host_request(
+                &create.request_id,
+                AgentHostResponse::TerminalCreated {
+                    terminal_id: "ht-terminal-1".into(),
+                },
+            )
+            .unwrap();
+
+        let output = match client.next_event(Duration::from_secs(2)).unwrap() {
+            AgentDriverEvent::HostRequest { request, .. } => request,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        assert!(matches!(
+            output.operation,
+            AgentHostOperation::TerminalOutput { ref terminal_id }
+                if terminal_id == "ht-terminal-1"
+        ));
+        client
+            .resolve_host_request(
+                &output.request_id,
+                AgentHostResponse::TerminalOutput {
+                    output: "done\n".into(),
+                    truncated: false,
+                    exit_code: Some(0),
+                    signal: None,
+                },
+            )
+            .unwrap();
+
+        let wait = match client.next_event(Duration::from_secs(2)).unwrap() {
+            AgentDriverEvent::HostRequest { request, .. } => request,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        client
+            .resolve_host_request(
+                &wait.request_id,
+                AgentHostResponse::TerminalExited {
+                    exit_code: Some(0),
+                    signal: None,
+                },
+            )
+            .unwrap();
+        let kill = match client.next_event(Duration::from_secs(2)).unwrap() {
+            AgentDriverEvent::HostRequest { request, .. } => request,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        client
+            .resolve_host_request(&kill.request_id, AgentHostResponse::TerminalKilled)
+            .unwrap();
+        let release = match client.next_event(Duration::from_secs(2)).unwrap() {
+            AgentDriverEvent::HostRequest { request, .. } => request,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        client
+            .resolve_host_request(&release.request_id, AgentHostResponse::TerminalReleased)
+            .unwrap();
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::TurnCompleted { .. }
+        ));
         assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 
@@ -1611,6 +2052,7 @@ mod tests {
                 ],
             }),
             containment: None,
+            terminal_client: false,
         })
         .unwrap();
 
@@ -1658,6 +2100,7 @@ mod tests {
                 arguments: vec!["--agent-mode".into()],
             }),
             containment: None,
+            terminal_client: false,
         })
         .unwrap();
 
@@ -1711,6 +2154,7 @@ mod tests {
                 arguments: vec!["--agent-mode".into()],
             }),
             containment: None,
+            terminal_client: false,
         })
         .unwrap();
 
@@ -1829,6 +2273,7 @@ mod tests {
                 read_paths: Vec::new(),
                 write_paths: vec![scratch.canonicalize().unwrap()],
             }),
+            terminal_client: false,
         })
         .unwrap();
 

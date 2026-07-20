@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentDriverEvent, AgentEffectAuthorization,
-    DriverState, sha256_file,
+    AgentHostResponse, DriverState, sha256_file,
 };
 use hyper_term_protocol::{OperationId, PermissionDecision};
 use tempfile::TempDir;
@@ -113,6 +113,20 @@ fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
                         panic_with_stderr(&client, "reject unexpected tool", error)
                     });
             }
+            AgentDriverEvent::HostRequest { request, .. } => {
+                client
+                    .resolve_host_request(
+                        &request.request_id,
+                        AgentHostResponse::Error {
+                            code: -32601,
+                            message: "Terminal requests are disabled for this integration gate"
+                                .into(),
+                        },
+                    )
+                    .unwrap_or_else(|error| {
+                        panic_with_stderr(&client, "reject unexpected host request", error)
+                    });
+            }
             AgentDriverEvent::TurnCompleted { status, .. } => break status,
             AgentDriverEvent::Exited { code, state } => {
                 panic!(
@@ -164,6 +178,7 @@ fn launch_installed_acp_agent_with_mcp(
         workspace: workspace.path().canonicalize().unwrap(),
         brokered_mcp_server,
         containment: None,
+        terminal_client: false,
     })
     .expect("launch inspected ACP adapter");
     (client, workspace)

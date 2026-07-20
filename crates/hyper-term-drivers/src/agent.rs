@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use hyper_term_protocol::{AgentPlanEntry, AgentToolCall, OperationId, PermissionDecision};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -99,6 +101,72 @@ pub struct AgentEffectAuthorization {
     pub decision: PermissionDecision,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentTerminalEnvironmentVariable {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentHostOperation {
+    TerminalCreate {
+        command: String,
+        args: Vec<String>,
+        env: Vec<AgentTerminalEnvironmentVariable>,
+        cwd: PathBuf,
+        output_byte_limit: u64,
+    },
+    TerminalOutput {
+        terminal_id: String,
+    },
+    TerminalRelease {
+        terminal_id: String,
+    },
+    TerminalWaitForExit {
+        terminal_id: String,
+    },
+    TerminalKill {
+        terminal_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentHostRequest {
+    pub driver_id: Uuid,
+    pub protocol: StructuredAgentProtocol,
+    pub request_id: ExternalRequestId,
+    pub method: String,
+    pub payload_sha256: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub operation: AgentHostOperation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentHostResponse {
+    TerminalCreated {
+        terminal_id: String,
+    },
+    TerminalOutput {
+        output: String,
+        truncated: bool,
+        exit_code: Option<u32>,
+        signal: Option<String>,
+    },
+    TerminalReleased,
+    TerminalExited {
+        exit_code: Option<u32>,
+        signal: Option<String>,
+    },
+    TerminalKilled,
+    Error {
+        code: i32,
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentDriverEvent {
@@ -139,6 +207,10 @@ pub enum AgentDriverEvent {
     EffectProposed {
         sequence: u64,
         proposal: AgentEffectProposal,
+    },
+    HostRequest {
+        sequence: u64,
+        request: AgentHostRequest,
     },
     TurnCompleted {
         sequence: u64,
