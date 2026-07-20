@@ -74,9 +74,12 @@ fn fake_lima_runner(root: &Path) -> (LimaTaskRunner, std::path::PathBuf) {
 
     let executable = root.join("limactl");
     let log = root.join("limactl.log");
+    let environment_marker = root.join("limactl-environment");
     let script = format!(
-        "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nfor argument in \"$@\"; do\n  case \"$argument\" in validate|start|shell|stop|delete) action=\"$argument\"; break;; esac\ndone\nprintf '%s\\n' \"$action\" >> '{}'\nif [ \"$action\" = shell ]; then\n  printf 'isolated only\\n' > \"$LIMA_HOME/../worktree/generated.txt\"\n  printf 'tier2 stream\\n'\nfi\n",
-        log.display()
+        "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nlast=''\nfor argument in \"$@\"; do\n  last=\"$argument\"\n  case \"$argument\" in validate|start|shell|stop|delete) [ -n \"$action\" ] || action=\"$argument\";; esac\ndone\nprintf '%s\\n' \"$action\" >> '{}'\nif [ \"$action\" = start ]; then\n  printf '%s\\n' \"${{last%/*}}\" > '{}'\nfi\nif [ \"$action\" = shell ]; then\n  environment=$(cat '{}')\n  printf 'isolated only\\n' > \"$environment/worktree/generated.txt\"\n  printf 'tier2 stream\\n'\nfi\n",
+        log.display(),
+        environment_marker.display(),
+        environment_marker.display()
     );
     std::fs::write(&executable, script).unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();

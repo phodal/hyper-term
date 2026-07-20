@@ -42,13 +42,15 @@ if [ "$#" -eq 0 ]; then
 fi
 uid="${SUDO_UID:?missing SUDO_UID}"
 gid="${SUDO_GID:?missing SUDO_GID}"
+user=$(awk -F: -v uid="$uid" '$3 == uid { print $1; exit }' /etc/passwd)
+test -n "$user"
 home="/tmp/hyper-term-$uid"
 mkdir -p "$home"
 chown "$uid:$gid" "$home"
 chmod 0700 "$home"
 ulimit -n 256
 ulimit -u 256
-exec unshare --net -- setpriv --reuid "$uid" --regid "$gid" --init-groups env -i HOME="$home" TMPDIR=/tmp PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@"
+exec unshare --net -- su "$user" -s /bin/sh -c 'home=$1; shift; exec env -i HOME="$home" TMPDIR=/tmp PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@"' hyper-term "$home" "$@"
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,6 +193,8 @@ impl LimaTaskRunner {
         }
         let output = Command::new(&limactl_executable)
             .env_clear()
+            .env("HOME", "/var/empty")
+            .env("LC_ALL", "C")
             .arg("--version")
             .output()?;
         if !output.status.success() || output.stdout.len() > 4_096 || output.stderr.len() > 4_096 {
@@ -224,8 +228,7 @@ impl LimaTaskRunner {
         cancelled: &AtomicBool,
     ) -> Result<IsolatedTaskReceipt, LimaRunnerError> {
         validate_request(request)?;
-        let lima_home = environment.environment_root.join("lima-home");
-        create_private_directory(&lima_home)?;
+        let lima_home = create_private_lima_home(&environment.manifest.environment_id)?;
         let staged_image = environment.environment_root.join("pinned-vm-image");
         stage_image(&self.config.image, &staged_image)?;
         let config_path = environment.environment_root.join("lima.yaml");
@@ -290,6 +293,9 @@ impl LimaTaskRunner {
         })();
 
         let cleanup = self.cleanup(&lima_home, &instance_name, started);
+        if cleanup.is_ok() {
+            fs::remove_dir_all(&lima_home)?;
+        }
         match (task_result, cleanup) {
             (Ok(receipt), Ok(())) => {
                 write_private_json(&receipt_path, &receipt)?;
@@ -392,6 +398,7 @@ impl LimaTaskRunner {
             .env("HOME", lima_home)
             .env("LIMA_HOME", lima_home)
             .env("LC_ALL", "C")
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .stdin(Stdio::null());
         command
     }
@@ -465,6 +472,8 @@ pub enum LimaRunnerError {
     ImageDigestMismatch,
     #[error("isolated task receipt failed integrity validation")]
     InvalidReceipt,
+    #[error("private Lima home is insecure: {0}")]
+    InsecureLimaHome(PathBuf),
     #[error("Lima control command {command} failed with status {status:?}: {stderr}")]
     ControlFailed {
         command: String,
@@ -719,6 +728,29 @@ fn create_private_directory(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
+fn create_private_lima_home(environment_id: &str) -> Result<PathBuf, LimaRunnerError> {
+    let root = PathBuf::from("/tmp/ht-lima");
+    if root.exists() {
+        let metadata = fs::symlink_metadata(&root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(LimaRunnerError::InsecureLimaHome(root));
+            }
+        }
+    } else {
+        create_private_directory(&root)?;
+    }
+    let digest = hex_digest(environment_id.as_bytes());
+    let home = root.join(&digest[..16]);
+    create_private_directory(&home)?;
+    Ok(home)
+}
+
 fn command_digest(argv: &[String]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"hyper-term-isolated-command-v1\0");
@@ -742,7 +774,7 @@ fn valid_sha256(value: &str) -> bool {
 
 fn instance_name(environment_id: &str) -> String {
     let digest = hex_digest(environment_id.as_bytes());
-    format!("ht-{}", &digest[..20])
+    format!("ht-{}", &digest[..12])
 }
 
 fn unix_time_ms() -> Result<u64, LimaRunnerError> {
@@ -1044,6 +1076,56 @@ mod tests {
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        manager.destroy(&environment).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires HYPER_TERM_LIMA_IMAGE and HYPER_TERM_LIMA_IMAGE_SHA256"]
+    fn real_lima_runs_an_offline_unprivileged_exact_commit_task() {
+        let image = PathBuf::from(std::env::var("HYPER_TERM_LIMA_IMAGE").unwrap());
+        let image_sha256 = std::env::var("HYPER_TERM_LIMA_IMAGE_SHA256").unwrap();
+        let (_temporary, manager, environment) = isolated_environment();
+        let runner = LimaTaskRunner::discover(LimaRunnerConfig {
+            image: LimaImage {
+                path: image,
+                sha256: image_sha256,
+                arch: "aarch64".into(),
+            },
+            vm_type: "vz".into(),
+            cpus: 2,
+            memory_mib: 1_024,
+            disk_gib: 4,
+            start_timeout: Duration::from_secs(5 * 60),
+            task_timeout: Duration::from_secs(2 * 60),
+            max_output_bytes: 64 * 1024,
+        })
+        .unwrap();
+        let receipt = runner
+            .run(
+                &manager,
+                &environment,
+                &IsolatedTaskRequest {
+                    argv: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "set -eu; test \"$(id -u)\" != 0; printf 'real lima\\n' > generated.txt; if wget -q -T 3 -O /tmp/network-probe https://example.com; then exit 91; fi; printf 'offline unprivileged\\n'"
+                            .into(),
+                    ],
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(receipt.termination, IsolatedTaskTermination::Exited);
+        assert_eq!(receipt.exit_code, Some(0), "{}", receipt.stderr);
+        assert_eq!(receipt.stdout, "offline unprivileged\n");
+        assert!(
+            receipt
+                .changes
+                .changed_files
+                .iter()
+                .any(|change| change.path == Path::new("generated.txt"))
         );
         manager.destroy(&environment).unwrap();
     }
