@@ -280,10 +280,11 @@ Useful design documents:
 ## Roadmap
 
 - Harden terminal performance, accessibility, reconnect, and recovery gates.
-- Add restart recovery, user-facing diff review, and an exact acceptance
-  operation to the Tier 2 Lima runner; add bounded binary patches without
-  giving the renderer write authority, and run a pinned production image
-  through the release conformance gate.
+- Add interrupted-VM cleanup, pending-review recovery, and a user-facing diff
+  surface to the Tier 2 Lima runner; extend its exact text-file acceptance to
+  reviewed deletions and bounded binary patches without giving the renderer
+  write authority, and run a pinned production image through the release
+  conformance gate.
 - Version and migrate accepted-source, editor, runtime, and Bug Capsule schemas
   while preserving deterministic replay across Hyper Term upgrades.
 - Move opaque provider-internal execution from the read-only macOS Tier 1

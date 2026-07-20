@@ -609,15 +609,29 @@ A cleanup failure suppresses the otherwise valid result and fails closed.
 After execution Rust inventories tracked and untracked changes without
 following symlinks, bounds file count and bytes, and records per-file content
 digests plus an aggregate inventory digest. The daemon retains the isolated
-result for review and exposes explicit discard; it never applies the result to
-the user's workspace. Unit tests exercise success, non-zero exit, cancellation,
-timeout, output flood, cleanup, dirty-worktree separation, and review inventory.
-On macOS the generated configuration is also validated by the installed Lima
-2.1.1 parser without booting a VM.
+result in daemon-private durable state and exposes digest-bound file reads plus
+explicit discard; reopening the daemon revalidates the manifest, receipt, and
+live Git inventory before restoring a completed result.
 
-This remains an experimental Tier 2 baseline. Restart-time recovery, a
-user-facing bounded patch/diff API, permission-gated exact acceptance, and a
-release-gated boot test using the production pinned image are still open.
+Applying a result is a separate `FileEdit` operation. Rust prepares an atomic
+workspace transaction against the current file identities, binds its digest to
+the source operation and Tier 2 inventory, and asks for another human
+permission decision. A successful task therefore never implies acceptance.
+Only the approved transaction can write the workspace; stale targets roll back,
+and the existing durable transaction journal handles crashes after application
+starts. The first acceptance slice supports bounded UTF-8 additions and
+modifications and deliberately rejects deletions, type changes, and binaries.
+
+Unit tests exercise success, non-zero exit, cancellation, timeout, output
+flood, cleanup, dirty-worktree separation, durable result reopen, digest-bound
+reads, review inventory, rejection before acceptance approval, and exact
+transactional apply. On macOS the generated configuration is also validated by
+the installed Lima 2.1.1 parser without booting a VM.
+
+This remains an experimental Tier 2 baseline. Cleanup/reconciliation for a VM
+interrupted before its receipt, recovery of a pending pre-apply review, a
+user-facing bounded patch/diff API, deletion and binary acceptance semantics,
+and a release-gated boot test using the production pinned image are still open.
 Opaque ACP provider workloads also remain on the Tier 1 control-process path
 until their credentials, dependencies, and broker channels can be staged into
 this environment without broadening its mounts.
@@ -869,7 +883,8 @@ Costs and constraints:
 
 ### Phase 4: Tier 2 environments
 
-- complete acceptance operations on top of the implemented isolated worktree;
+- extend the implemented text-file acceptance operation with pending-review
+  recovery, deletion semantics, and bounded binary artifacts;
 - qualify the experimental Lima/VZ backend with a production pinned image,
   restart recovery, bounded patch export, and release conformance tests;
 - evaluate whether a container backend is also useful for faster lower-risk
