@@ -146,14 +146,17 @@ pane. The Agent header likewise reduces provider and connection state to one
 compact line rather than repeating them as badges.
 
 The composer stays at 68 points for a one-line prompt and grows to 144 points
-for four lines while retaining its bottom action row. ACP-provided Skills and
-commands remain behind the plus menu, and model/config choices remain anchored
-selectors in that row. An active turn disables dispatch and configuration
-changes but leaves the text area editable, so the next prompt can be prepared
-while streaming continues. Native automation exercised both disclosures,
-opened the Skills and model menus, entered a four-line Chinese prompt through
-the real text-input path, and captured a nonblank Metal/reference-renderer
-screenshot without dispatch or widget-budget errors.
+for four lines while retaining its bottom action row. Provider capabilities
+remain behind compact controls: Direct Codex Skills insert real `$skill`
+mentions, ACP commands insert their slash form, and model/reasoning choices
+remain anchored selectors in that row. Direct Codex selections are sent through
+the Rust adapter on the next `turn/start`; Native state is only the projection.
+An active turn disables dispatch and configuration changes but leaves the text
+area editable, so the next prompt can be prepared while streaming continues.
+Native automation exercised both disclosures, opened the Skills and model
+menus, entered a four-line Chinese prompt through the real text-input path, and
+captured a nonblank Metal/reference-renderer screenshot without dispatch or
+widget-budget errors.
 
 ## Rejected alternatives
 

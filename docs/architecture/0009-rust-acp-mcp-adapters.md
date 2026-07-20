@@ -133,7 +133,7 @@ official [MCP Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) provid
 client/server roles and multiple transports; only the minimal reviewed feature
 set is enabled per release.
 
-## Implementation status (2026-07-19)
+## Implementation status (2026-07-20)
 
 - `agent-client-protocol` 1.2.0 provides the bounded ACP v1 JSONL types and
   framing used by the Rust driver.
@@ -141,6 +141,19 @@ set is enabled per release.
   Codex app-server and ACP sessions. Provider wire values are projected into
   canonical driver events and operation proposals; they do not become
   `BlockDocument` renderer authority.
+- Direct Codex capability discovery now reads a bounded `model/list` and a
+  workspace-scoped `skills/list` through the supervised Rust app-server
+  adapter. The selected model and supported reasoning effort are validated
+  against that catalog and applied to the next `turn/start`; they are not
+  presentation-only state. Enabled Skills become `$skill` mentions in the
+  composer, while ACP `available_commands_update` entries remain provider
+  commands such as `/skills`. Unsupported discovery remains additive: an older
+  app-server can still start a thread with an empty capability projection.
+- The ignored installed-Codex integration gate now covers the authenticated,
+  isolated `initialize -> model/list -> skills/list -> thread/start` path and
+  requires non-empty model and reasoning choices. Native projection tests prove
+  those choices and `$skill` mentions reach the compact composer without giving
+  the renderer protocol or filesystem authority.
 - Fixtures cover initialization, session creation, prompt streaming, session
   updates, permission proposals, and MCP capability negotiation.
 - The desktop supervisor clears the adapter environment, verifies executable
