@@ -274,7 +274,13 @@ PY
     'Tier 2 terminal completed.' \
     'role=button name="Goal complete"' \
     '2 / 2' \
-    'Decision: allowed once'
+    'role=button name="Allowed once"'
+  native automate assert --absent 'Decision: allowed once'
+  smoke_receipt_id=$(smoke_widget_id 'role=button name="Allowed once"')
+  native automate widget-click hyper-term-canvas "$smoke_receipt_id"
+  native automate assert 'Decision: allowed once'
+  native automate widget-click hyper-term-canvas "$smoke_receipt_id"
+  native automate assert --absent 'Decision: allowed once'
   smoke_goal_id=$(smoke_widget_id 'role=button name="Goal complete"')
   native automate widget-click hyper-term-canvas "$smoke_goal_id"
   native automate assert \

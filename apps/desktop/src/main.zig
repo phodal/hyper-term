@@ -1171,7 +1171,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             for (model.agent_blocks[0..model.agent_block_count]) |*block| {
                 if (block.id == block_id and
-                    (block.isActivity() or block.isThoughtMessage() or block.isSystemMessage()))
+                    (block.isActivity() or
+                        block.isThoughtMessage() or
+                        block.isSystemMessage() or
+                        (block.isApproval() and !block.isApprovalPending())))
                 {
                     block.expanded = !block.expanded;
                     break;
@@ -3635,7 +3638,12 @@ fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 
             10 + text_extent,
         .tool_call, .plan => if (block.expanded) 42 + diff_extent + text_extent else 30,
         .operation => 36 + @min(text_extent, agent_timeline_line_height),
-        .approval => 118 + @min(text_extent, agent_timeline_line_height * 5),
+        .approval => if (block.isApprovalPending())
+            118 + @min(text_extent, agent_timeline_line_height * 5)
+        else if (block.expanded)
+            58 + @min(text_extent, agent_timeline_line_height * 5)
+        else
+            30,
     };
 }
 
@@ -3984,9 +3992,33 @@ fn agentOperationNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermU
 }
 
 fn agentApprovalNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBlockView) HyperTermUi.Node {
-    const decision = if (!block.isApprovalPending())
-        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Decision: {s}", .{block.decisionLabel()}))
-    else if (block.canAllowOnce())
+    if (!block.isApprovalPending()) {
+        return ui.column(.{ .grow = 1 }, .{
+            ui.row(.{ .grow = 1, .gap = 5, .padding = 2, .cross = .center }, .{
+                ui.icon(.{ .width = 12, .height = 12, .style_tokens = .{ .foreground = .warning } }, "circle-dot"),
+                ui.button(.{
+                    .size = .sm,
+                    .variant = .ghost,
+                    .icon = if (block.expanded) "chevron-down" else "chevron-right",
+                    .on_press = Msg{ .toggle_agent_block = block.id },
+                }, block.approvalTitle()),
+                ui.spacer(1),
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
+            }),
+            if (block.expanded)
+                ui.column(.{
+                    .gap = 4,
+                    .padding = 7,
+                    .style_tokens = .{ .background = .surface_subtle, .radius = .md },
+                }, .{
+                    ui.text(.{ .wrap = true }, block.content()),
+                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Decision: {s}", .{block.decisionLabel()})),
+                })
+            else
+                ui.el(.stack, .{}, .{}),
+        });
+    }
+    const decision = if (block.canAllowOnce())
         ui.row(.{ .gap = 6, .cross = .center }, .{
             ui.text(.{ .grow = 1, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.approvalBoundaryLabel()),
             ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel"),

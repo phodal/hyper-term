@@ -1461,12 +1461,27 @@ test "resolved Agent approval names Allow once explicitly" {
     try testing.expectEqualStrings("Allowed once", approval.approvalTitle());
     try testing.expectEqualStrings("allowed once", approval.decisionLabel());
     try testing.expect(!approval.canAllowOnce());
+    const timeline_options = main.agentTimelineOptions(&model);
+    const collapsed_extent = timeline_options.extent_estimate.?(timeline_options.extent_context, 1);
+    try testing.expect(collapsed_extent <= 30);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(containsText(tree.root, "Decision: allowed once"));
+    var tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(!containsText(tree.root, "Decision: allowed once"));
     try testing.expect(findByText(tree.root, .button, "Allow once") == null);
+    const disclosure = findByText(tree.root, .button, "Allowed once").?;
+    try testing.expectEqualStrings("chevron-right", disclosure.icon);
+
+    main.update(&model, tree.msgForPointer(disclosure.id, .up).?, &fx);
+    try testing.expect(model.agentBlocks()[1].expanded);
+    const expanded_extent = timeline_options.extent_estimate.?(timeline_options.extent_context, 1);
+    try testing.expect(expanded_extent > collapsed_extent);
+    arena_state.deinit();
+    arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "Decision: allowed once"));
+    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Allowed once").?.icon);
 }
 
 test "Tier 2 results show a bounded Diff before creating workspace approval" {
