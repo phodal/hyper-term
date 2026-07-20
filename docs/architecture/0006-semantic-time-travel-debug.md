@@ -240,6 +240,24 @@ remain separate projections. The offline capsule joins bounded snapshots of
 those projections for inspection; schema migration and cross-version replay
 compatibility remain future work.
 
+## Runtime journal migration evidence (2026-07-20)
+
+The private runtime trace journal now writes storage schema version 2 without
+changing the preview input schema or the deterministic replay projection. Each
+stored row carries a SHA-256 over its task and Artifact context, ordered event
+identity, sanitized payload, payload digest, redaction flag, and recorded time.
+This closes integrity gaps that the replay-oriented payload digest deliberately
+does not cover, while keeping wall-clock data outside canonical replay state.
+
+On first read, Rust validates every version 1 JSONL event, computes the new
+stored-event digest, and atomically replaces the bounded journal with fsync on
+the file and parent directory. A crash before rename leaves version 1 intact;
+after rename only the complete version 2 journal is visible. Tests prove that
+the projection digest is identical before and after migration, exact retries
+remain idempotent, timestamp-only and payload tampering fail closed, and unknown
+future storage schemas are not guessed. Cross-version Bug Capsule migration is
+still separate because its signed export digest covers a different contract.
+
 ## Validation gates
 
 - Replaying the same checkpoint and event range must produce the same canonical

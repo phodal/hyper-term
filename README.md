@@ -334,8 +334,8 @@ Useful design documents:
   renders bounded Rust-generated text Diffs, and identifies binary changes by
   byte count and SHA-256 before it creates the separate workspace-apply
   approval.
-- Extend schema migration beyond the implemented accepted-source and Artifact
-  editor v1-to-v2 upgrades to runtime trace and Bug Capsule stores while
+- Extend schema migration beyond the implemented accepted-source, Artifact
+  editor, and runtime trace v1-to-v2 upgrades to Bug Capsule imports while
   preserving deterministic replay across Hyper Term upgrades.
 - Move opaque provider-internal execution from the read-only macOS Tier 1
   control-process boundary into the Tier 2 runner once its container/VM and
