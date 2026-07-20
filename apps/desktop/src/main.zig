@@ -36,6 +36,8 @@ const max_agent_operation_id_bytes: usize = 36;
 const max_agent_operation_kind_bytes: usize = 96;
 const max_agent_activity_title_bytes: usize = 512;
 const max_agent_activity_meta_bytes: usize = 512;
+const max_agent_diff_files: usize = 8;
+const max_agent_diff_path_bytes: usize = 256;
 const max_agent_goal_step_columns: usize = 42;
 const max_agent_error_bytes: usize = 512;
 const max_agent_prompt_bytes: usize = 16 * 1024;
@@ -258,6 +260,17 @@ pub const AgentTier2ResultView = struct {
     }
 };
 
+pub const AgentDiffFileView = struct {
+    path_storage: [max_agent_diff_path_bytes]u8 = [_]u8{0} ** max_agent_diff_path_bytes,
+    path_len: usize = 0,
+    added_lines: u64 = 0,
+    removed_lines: u64 = 0,
+
+    pub fn path(file: *const AgentDiffFileView) []const u8 {
+        return file.path_storage[0..file.path_len];
+    }
+};
+
 pub const AgentBlockView = struct {
     id: u64 = 0,
     kind: AgentBlockKind = .message,
@@ -285,6 +298,9 @@ pub const AgentBlockView = struct {
     terminal_count: u16 = 0,
     added_lines: u64 = 0,
     removed_lines: u64 = 0,
+    diff_files: [max_agent_diff_files]AgentDiffFileView = [_]AgentDiffFileView{.{}} ** max_agent_diff_files,
+    diff_file_count: usize = 0,
+    diff_files_truncated: bool = false,
     operation_revision: u64 = 0,
     risk: AgentRisk = .unknown,
     state: AgentOperationState = .proposed,
@@ -341,6 +357,10 @@ pub const AgentBlockView = struct {
 
     pub fn hasActivityDetails(block: *const AgentBlockView) bool {
         return block.content_len > 0;
+    }
+
+    pub fn diffFiles(block: *const AgentBlockView) []const AgentDiffFileView {
+        return block.diff_files[0..block.diff_file_count];
     }
 
     pub fn isApprovalPending(block: *const AgentBlockView) bool {
@@ -2674,6 +2694,27 @@ fn appendActivityFmt(view: *AgentBlockView, comptime format: []const u8, args: a
     view.content_len += rendered.len;
 }
 
+fn recordAgentDiffFile(view: *AgentBlockView, path: []const u8, added_lines: u32, removed_lines: u32) void {
+    for (view.diff_files[0..view.diff_file_count]) |*file| {
+        if (!std.mem.eql(u8, file.path(), path)) continue;
+        file.added_lines +|= added_lines;
+        file.removed_lines +|= removed_lines;
+        return;
+    }
+    if (view.diff_file_count == view.diff_files.len) {
+        view.diff_files_truncated = true;
+        return;
+    }
+    const file = &view.diff_files[view.diff_file_count];
+    const path_len = utf8BoundedLength(path, file.path_storage.len);
+    @memcpy(file.path_storage[0..path_len], path[0..path_len]);
+    file.path_len = path_len;
+    file.added_lines = added_lines;
+    file.removed_lines = removed_lines;
+    view.diff_file_count += 1;
+    view.diff_files_truncated = view.diff_files_truncated or path_len < path.len;
+}
+
 fn appendAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
     const call_status = parseAgentToolStatus(call.status);
     if (view.activity_count == 0) {
@@ -2720,6 +2761,12 @@ fn appendAgentToolCall(view: *AgentBlockView, call: AgentToolCallWire) void {
             view.diff_count +|= 1;
             view.added_lines +|= content.added_lines orelse 0;
             view.removed_lines +|= content.removed_lines orelse 0;
+            recordAgentDiffFile(
+                view,
+                content.path.?,
+                content.added_lines orelse 0,
+                content.removed_lines orelse 0,
+            );
             appendActivityFmt(view, "**{s}**\n\n```diff\n", .{content.path.?});
             appendActivitySlice(view, content.patch.?);
             appendActivitySlice(view, "\n```\n\n");
@@ -3295,6 +3342,11 @@ fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 
     const block = &model.agent_blocks[@intCast(physical_u64)];
     const lines = @max(@as(usize, 1), (block.content_len + agent_timeline_estimated_width - 1) / agent_timeline_estimated_width);
     const text_extent = @as(f32, @floatFromInt(@min(lines, 96))) * agent_timeline_line_height;
+    const diff_extent = if (block.expanded and block.diff_file_count > 0)
+        26 + @as(f32, @floatFromInt(block.diff_file_count)) * 24 +
+            @as(f32, @floatFromInt(@intFromBool(block.diff_files_truncated))) * 20
+    else
+        0;
     return switch (block.kind) {
         .message => if (block.role == .system and !block.expanded)
             28
@@ -3302,7 +3354,7 @@ fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 
             24 + text_extent
         else
             10 + text_extent,
-        .tool_call, .plan => if (block.expanded) 42 + text_extent else 30,
+        .tool_call, .plan => if (block.expanded) 42 + diff_extent + text_extent else 30,
         .operation => 36 + @min(text_extent, agent_timeline_line_height),
         .approval => 118 + @min(text_extent, agent_timeline_line_height * 5),
     };
@@ -3575,6 +3627,41 @@ fn agentActivityNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi
     return agentActivityNodeWithWidth(ui, block, 0);
 }
 
+fn agentDiffFilesNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermUi.Node {
+    const files = block.diffFiles();
+    if (files.len == 0) return ui.el(.stack, .{}, .{});
+    const rows = ui.arena.alloc(HyperTermUi.Node, files.len) catch {
+        ui.failed = true;
+        return ui.column(.{}, .{});
+    };
+    for (files, rows) |*file, *row| {
+        row.* = ui.row(.{
+            .gap = 6,
+            .padding = 4,
+            .cross = .center,
+            .style_tokens = .{ .background = .surface_subtle, .radius = .sm },
+            .semantics = .{ .label = ui.fmt("Changed file {s}, plus {d}, minus {d}", .{ file.path(), file.added_lines, file.removed_lines }) },
+        }, .{
+            ui.icon(.{ .width = 12, .height = 12, .style_tokens = .{ .foreground = .info } }, "file-text"),
+            ui.paragraph(.{ .grow = 1 }, &.{.{ .text = file.path(), .monospace = true }}),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .success } }, ui.fmt("+{d}", .{file.added_lines})),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .destructive } }, ui.fmt("-{d}", .{file.removed_lines})),
+        });
+        row.key = .{ .str = file.path() };
+    }
+    return ui.column(.{ .gap = 3, .semantics = .{ .label = "Changed files" } }, .{
+        ui.row(.{ .gap = 5, .cross = .center }, .{
+            ui.text(.{ .grow = 1, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "Changed files"),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{d} shown", .{files.len})),
+        }),
+        ui.column(.{ .gap = 3 }, .{rows}),
+        if (block.diff_files_truncated)
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Additional changed files are hidden by the bounded Native view.")
+        else
+            ui.el(.stack, .{}, .{}),
+    });
+}
+
 fn agentActivityNodeWithWidth(ui: *HyperTermUi, block: *const AgentBlockView, width: f32) HyperTermUi.Node {
     return ui.column(.{
         .width = width,
@@ -3592,6 +3679,7 @@ fn agentActivityNodeWithWidth(ui: *HyperTermUi, block: *const AgentBlockView, wi
         }),
         if (block.expanded)
             ui.column(.{ .gap = 5, .padding = 7 }, .{
+                agentDiffFilesNode(ui, block),
                 if (block.hasActivityDetails()) AgentMarkdown.view(ui, block.content(), .{}) else ui.el(.stack, .{}, .{}),
                 if (block.truncated)
                     ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Tool details clipped to 8 KiB in this view.")

@@ -968,6 +968,10 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(model.agentBlocks()[1].isActivity());
     try testing.expectEqualStrings("Processed", model.agentBlocks()[1].activityTitle());
     try testing.expectEqualStrings("completed · 2 tools · 1 file · +1 −1", model.agentBlocks()[1].activityMeta());
+    try testing.expectEqual(@as(usize, 1), model.agentBlocks()[1].diffFiles().len);
+    try testing.expectEqualStrings("/workspace/src/lib.rs", model.agentBlocks()[1].diffFiles()[0].path());
+    try testing.expectEqual(@as(u64, 1), model.agentBlocks()[1].diffFiles()[0].added_lines);
+    try testing.expectEqual(@as(u64, 1), model.agentBlocks()[1].diffFiles()[0].removed_lines);
     try testing.expect(!model.agentBlocks()[1].expanded);
     const plan = model.agentPlan().?;
     try testing.expect(!plan.expanded);
@@ -1008,6 +1012,20 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(containsText(tree.root, "/workspace/src/lib.rs"));
     try testing.expect(containsText(tree.root, "+new"));
     try testing.expect(containsText(tree.root, "terminal-7"));
+    try testing.expect(findByLabel(tree.root, "Changed files") != null);
+    try testing.expect(findByLabel(tree.root, "Changed file /workspace/src/lib.rs, plus 1, minus 1") != null);
+    const tokens = main.hyperTermTokens(&model);
+    const sweep = canvas.LayoutAuditSweepOptions{
+        .tokens = tokens,
+        .min_size = geometry.SizeF.init(main.window_min_width, main.window_min_height),
+        .default_size = geometry.SizeF.init(main.window_width, main.window_height),
+    };
+    try canvas.expectLayoutAuditSweepClean(testing.allocator, tree.root, sweep);
+    try canvas.expectA11yAuditSweepClean(testing.allocator, tree.root, .{
+        .tokens = tokens,
+        .min_size = sweep.min_size,
+        .default_size = sweep.default_size,
+    });
 }
 
 test "Agent system notices remain one line until explicitly expanded" {

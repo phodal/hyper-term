@@ -4,6 +4,7 @@ set -euo pipefail
 smoke_repo_root=$(cd "$(dirname "$0")/.." && pwd)
 smoke_supervisor=${1:-"$smoke_repo_root/target/debug/hyper-term-desktop"}
 smoke_renderer=${2:-"$smoke_repo_root/apps/desktop/zig-out/bin/hyper-term"}
+smoke_acp_fixture="$smoke_repo_root/scripts/fixtures/acp_diff_agent.sh"
 smoke_artifact_dir=${HYPER_TERM_SMOKE_ARTIFACT_DIR:-}
 
 if [[ "$smoke_supervisor" != /* ]]; then
@@ -32,6 +33,10 @@ if [[ ! -x "$smoke_supervisor" ]]; then
 fi
 if [[ ! -x "$smoke_renderer" ]]; then
   echo "automation-enabled Native renderer is unavailable: $smoke_renderer" >&2
+  exit 1
+fi
+if [[ ! -x "$smoke_acp_fixture" ]]; then
+  echo "desktop ACP fixture is unavailable: $smoke_acp_fixture" >&2
   exit 1
 fi
 for smoke_asset in \
@@ -70,7 +75,9 @@ trap 'exit 143' TERM
   exec "$smoke_supervisor" \
     --ui "$smoke_renderer" \
     --terminal-assets "$smoke_repo_root/dist/terminal" \
-    --workbench-assets "$smoke_repo_root/dist/workbench"
+    --workbench-assets "$smoke_repo_root/dist/workbench" \
+    --codex "$smoke_acp_fixture" \
+    --codex-acp "$smoke_acp_fixture"
 ) >"$smoke_log" 2>&1 &
 smoke_pid=$!
 
@@ -134,17 +141,55 @@ PY
   smoke_terminal_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-terminal.png
   cp "$smoke_screenshot" "$smoke_terminal_screenshot"
 
-  native automate shortcut hyper-term.new-agent
+  native automate shortcut hyper-term.new-codex-acp-agent
   native automate assert \
     'role=group name="Agent conversation"' \
     'role=group name="Agent reading rail"' \
     'role=group name="Agent composer rail"' \
     'role=group name="Agent prompt composer"' \
-    'role=textbox name="Agent prompt"'
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Send prompt".*enabled=true'
   native automate assert --absent \
     'name="ACP artifact editor"' \
     'error event=' \
     'dispatch_errors=[1-9]'
+
+  smoke_widget_id() {
+    python3 - .zig-cache/native-sdk-automation/snapshot.txt "$1" <<'PY'
+import pathlib
+import re
+import sys
+
+snapshot = pathlib.Path(sys.argv[1]).read_text()
+pattern = re.compile(sys.argv[2])
+for line in snapshot.splitlines():
+    if pattern.search(line) is None:
+        continue
+    match = re.search(r"#(\d+)", line)
+    if match is not None:
+        print(match.group(1))
+        raise SystemExit(0)
+raise SystemExit(f"widget not found: {pattern.pattern}")
+PY
+  }
+
+  smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text 'Show the file change.'
+  native automate assert \
+    'role=textbox name="Agent prompt".*text="Show the file change\."' \
+    'role=button name="Send prompt".*enabled=true'
+  smoke_send_id=$(smoke_widget_id 'role=button name="Send prompt".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_send_id"
+  native automate assert \
+    'role=button name="Processed"' \
+    'The proposed file change is ready to review.'
+  smoke_activity_id=$(smoke_widget_id 'role=button name="Processed"')
+  native automate widget-click hyper-term-canvas "$smoke_activity_id"
+  native automate assert \
+    'name="Changed files"' \
+    'name="Changed file README.md, plus 1, minus 0"' \
+    'AI Terminal'
+  native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
   native automate screenshot hyper-term-canvas
   smoke_agent_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png
   cp "$smoke_screenshot" "$smoke_agent_screenshot"
