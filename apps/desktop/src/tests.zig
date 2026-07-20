@@ -530,6 +530,48 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
 }
 
+test "failed Agent turns restore the submitted prompt without replacing a newer draft" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_turn_status = .ready;
+    model.agent_composer_buffer.set("Keep my failed prompt");
+    main.update(&model, .send_agent_prompt, &fx);
+    try testing.expectEqualStrings("", model.agentComposerText());
+
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"failed","error":"Model gpt-test requires a newer Codex CLI · choose another model or update Codex","document":{"revision":1,"blocks":[]}}
+        ,
+    } }, &fx);
+    try testing.expectEqualStrings("Keep my failed prompt", model.agentComposerText());
+    try testing.expectEqualStrings(
+        "Model gpt-test requires a newer Codex CLI · choose another model or update Codex",
+        model.agentStatus(),
+    );
+
+    model.agent_turn_status = .ready;
+    model.agent_composer_buffer.set("Submitted prompt");
+    main.update(&model, .send_agent_prompt, &fx);
+    model.agent_composer_buffer.set("Newer draft wins");
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"failed","error":"Agent failed","document":{"revision":2,"blocks":[]}}
+        ,
+    } }, &fx);
+    try testing.expectEqualStrings("Newer draft wins", model.agentComposerText());
+}
+
 test "ACP composer renders provider capabilities and routes configuration through Rust" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";

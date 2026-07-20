@@ -489,6 +489,25 @@ pub const Session = struct {
     }
 };
 
+const PendingAgentPrompt = struct {
+    storage: [max_agent_prompt_bytes]u8 = [_]u8{0} ** max_agent_prompt_bytes,
+    len: usize = 0,
+
+    fn set(pending: *PendingAgentPrompt, value: []const u8) void {
+        const length = utf8BoundedLength(value, pending.storage.len);
+        @memcpy(pending.storage[0..length], value[0..length]);
+        pending.len = length;
+    }
+
+    fn text(pending: *const PendingAgentPrompt) []const u8 {
+        return pending.storage[0..pending.len];
+    }
+
+    fn clear(pending: *PendingAgentPrompt) void {
+        pending.len = 0;
+    }
+};
+
 pub const Model = struct {
     system_scheme: canvas.ColorScheme = .dark,
     high_contrast: bool = false,
@@ -526,6 +545,7 @@ pub const Model = struct {
     genui_source_revision: u64 = 0,
     agent_editor_open_session_id: u8 = 0,
     agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
+    agent_pending_prompts: [max_sessions]PendingAgentPrompt = [_]PendingAgentPrompt{.{}} ** max_sessions,
     ui_font_registered: bool = false,
     agent_blocks: [max_agent_blocks]AgentBlockView = [_]AgentBlockView{.{}} ** max_agent_blocks,
     agent_block_count: usize = 0,
@@ -591,6 +611,7 @@ pub const Model = struct {
         "genui_source_revision",
         "agent_editor_open_session_id",
         "agent_composer_buffer",
+        "agent_pending_prompts",
         "ui_font_registered",
         "agent_blocks",
         "agent_block_count",
@@ -1056,6 +1077,7 @@ fn appendSession(model: *Model, mode: SessionMode) ?u8 {
         .icon = if (mode == .terminal) "terminal" else "circle-dot",
         .agent_provider = model.selected_agent_provider,
     };
+    model.agent_pending_prompts[model.session_count] = .{};
     model.session_count += 1;
     model.active_session_id = session_id;
     model.next_session_id +%= 1;
@@ -1129,9 +1151,11 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     var cursor = index;
     while (cursor + 1 < model.session_count) : (cursor += 1) {
         model.session_slots[cursor] = model.session_slots[cursor + 1];
+        model.agent_pending_prompts[cursor] = model.agent_pending_prompts[cursor + 1];
     }
     model.session_count -= 1;
     model.session_slots[model.session_count] = .{};
+    model.agent_pending_prompts[model.session_count] = .{};
     refreshTerminalUrl(model);
     if (was_active) {
         resetAgentProjection(model, model.active_session_id);
@@ -1418,6 +1442,8 @@ fn requestAgentTurn(model: *Model, fx: *Effects) void {
     const session_id = model.active_session_id;
     var storage: [agent_effect_url_capacity + 8]u8 = undefined;
     const request_url = writeAgentTurnUrl(model, session_id, storage[0..]) orelse return;
+    const pending = pendingAgentPrompt(model, session_id) orelse return;
+    pending.set(prompt);
     fx.fetch(.{
         .key = agent_turn_effect_key_base + session_id,
         .method = .POST,
@@ -1438,6 +1464,7 @@ fn applyAgentTurnResponse(model: *Model, response: native_sdk.EffectResponse, _:
     if (!accepted) {
         model.agent_turn_status = .failed;
         setAgentError(model, "Agent turn could not be started");
+        restorePendingAgentPrompt(model, session_id);
         return;
     }
 }
@@ -2096,6 +2123,7 @@ fn applyAgentStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects
         projectAgentCapabilities(model, frame.capabilities);
         if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
         if (frame.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
+        reconcilePendingAgentPrompt(model, session_id);
         if (model.agent_turn_status == .completed or model.agent_turn_status == .failed or
             model.agent_turn_status == .ready)
         {
@@ -2214,6 +2242,7 @@ fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8) bo
     model.agent_stream_sequence = parsed.value.document.revision;
     model.agent_turn_status = parseAgentTurnStatus(parsed.value.status);
     if (parsed.value.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
+    reconcilePendingAgentPrompt(model, session_id);
     return true;
 }
 
@@ -2931,6 +2960,30 @@ fn setAgentError(model: *Model, message: []const u8) void {
     const length = utf8BoundedLength(message, model.agent_error_storage.len);
     @memcpy(model.agent_error_storage[0..length], message[0..length]);
     model.agent_error_len = length;
+}
+
+fn pendingAgentPrompt(model: *Model, session_id: u8) ?*PendingAgentPrompt {
+    for (model.session_slots[0..model.session_count], 0..) |session, index| {
+        if (session.id == session_id) return &model.agent_pending_prompts[index];
+    }
+    return null;
+}
+
+fn reconcilePendingAgentPrompt(model: *Model, session_id: u8) void {
+    switch (model.agent_turn_status) {
+        .failed => restorePendingAgentPrompt(model, session_id),
+        .completed => if (pendingAgentPrompt(model, session_id)) |pending| pending.clear(),
+        else => {},
+    }
+}
+
+fn restorePendingAgentPrompt(model: *Model, session_id: u8) void {
+    const pending = pendingAgentPrompt(model, session_id) orelse return;
+    defer pending.clear();
+    if (session_id != model.active_session_id or pending.len == 0) return;
+    if (model.agent_composer_buffer.text().len == 0) {
+        model.agent_composer_buffer.set(pending.text());
+    }
 }
 
 fn utf8BoundedLength(value: []const u8, maximum: usize) usize {
