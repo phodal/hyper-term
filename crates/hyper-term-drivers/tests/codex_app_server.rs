@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use hyper_term_drivers::{CodexAppServerClient, CodexAppServerConfig, DriverState};
+use hyper_term_drivers::{
+    CodexAppServerClient, CodexAppServerConfig, DriverState, StructuredAgentClient,
+};
 use tempfile::TempDir;
 
 #[test]
@@ -34,16 +36,21 @@ fn installed_codex_app_server_starts_an_authenticated_isolated_thread() {
         containment: None,
     })
     .unwrap();
-    let response = client.initialize(Duration::from_secs(10)).unwrap();
-    assert!(
-        response["result"]["userAgent"]
-            .as_str()
-            .is_some_and(|value| value.contains("0.144.5")),
-        "unexpected initialize response: {response}"
-    );
-    assert_eq!(response["result"]["platformFamily"], "unix");
-    assert_eq!(client.state().unwrap(), DriverState::Ready);
-    let thread_id = client.start_thread(Duration::from_secs(10)).unwrap();
+    let thread_id = client.initialize_session(Duration::from_secs(10)).unwrap();
     assert!(!thread_id.is_empty());
+    assert_eq!(client.state().unwrap(), DriverState::Ready);
+    let capabilities = client.session_capabilities().unwrap();
+    assert!(
+        capabilities
+            .config_options
+            .iter()
+            .any(|option| option.id == "model" && !option.choices.is_empty())
+    );
+    assert!(
+        capabilities
+            .config_options
+            .iter()
+            .any(|option| option.id == "reasoning_effort" && !option.choices.is_empty())
+    );
     assert_eq!(client.close().unwrap(), DriverState::Closed);
 }

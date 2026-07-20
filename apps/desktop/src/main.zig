@@ -1336,10 +1336,12 @@ fn insertAgentCommand(model: *Model, index: u8) void {
     const entry = &model.agent_commands[index];
     var storage: [max_agent_prompt_bytes]u8 = undefined;
     const current = model.agent_composer_buffer.text();
+    const command_name = entry.name();
+    const prefix: []const u8 = if (std.mem.startsWith(u8, command_name, "$")) "" else "/";
     const next = if (current.len == 0)
-        std.fmt.bufPrint(&storage, "/{s} ", .{entry.name()}) catch return
+        std.fmt.bufPrint(&storage, "{s}{s} ", .{ prefix, command_name }) catch return
     else
-        std.fmt.bufPrint(&storage, "{s}\n/{s} ", .{ current, entry.name() }) catch return;
+        std.fmt.bufPrint(&storage, "{s}\n{s}{s} ", .{ current, prefix, command_name }) catch return;
     model.agent_composer_buffer = canvas.TextBuffer(max_agent_prompt_bytes).init(next);
 }
 
@@ -1775,7 +1777,10 @@ fn projectAgentCapabilities(model: *Model, capabilities: AgentCapabilitiesWire) 
         const entry = &model.agent_commands[model.agent_command_count];
         entry.index = @intCast(model.agent_command_count);
         copyCapabilityText(&entry.name_storage, &entry.name_len, wire.name);
-        if (std.mem.eql(u8, wire.name, "skills")) {
+        if (std.mem.startsWith(u8, wire.name, "$")) {
+            copyCapabilityText(&entry.label_storage, &entry.label_len, "Skill · ");
+            appendCapabilityText(&entry.label_storage, &entry.label_len, wire.name[1..]);
+        } else if (std.mem.eql(u8, wire.name, "skills")) {
             copyCapabilityText(&entry.label_storage, &entry.label_len, "Skills");
         } else {
             copyCapabilityText(&entry.label_storage, &entry.label_len, "/");

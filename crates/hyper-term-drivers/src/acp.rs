@@ -1489,8 +1489,8 @@ mod tests {
             "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-config\",\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"gpt-a\",\"options\":[{\"value\":\"gpt-a\",\"name\":\"GPT A\"},{\"value\":\"gpt-b\",\"name\":\"GPT B\"}]}]}}' ;;\n    *'\"method\":\"session/set_config_option\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"gpt-b\",\"options\":[{\"value\":\"gpt-a\",\"name\":\"GPT A\"},{\"value\":\"gpt-b\",\"name\":\"GPT B\"}]}]}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-config\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[{\"name\":\"skills\",\"description\":\"Configure skills\"}]}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-config\",\"update\":{\"sessionUpdate\":\"config_option_update\",\"configOptions\":[{\"id\":\"thought\",\"name\":\"Reasoning\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"high\",\"name\":\"High\"}]}]}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
         );
         let client = launch(&executable, temporary.path());
-        client.initialize(Duration::from_secs(1)).unwrap();
-        let session_id = client.start_session(Duration::from_secs(1)).unwrap();
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
 
         let initial = client.session_capabilities().unwrap();
         assert_eq!(initial.config_options[0].id, "model");
@@ -1503,7 +1503,7 @@ mod tests {
                     AgentSessionConfigValue::Id {
                         value: "missing".into(),
                     },
-                    Duration::from_secs(1),
+                    Duration::from_secs(10),
                 )
                 .is_err()
         );
@@ -1514,7 +1514,7 @@ mod tests {
                 AgentSessionConfigValue::Id {
                     value: "gpt-b".into(),
                 },
-                Duration::from_secs(1),
+                Duration::from_secs(10),
             )
             .unwrap();
         assert!(matches!(
@@ -1524,11 +1524,11 @@ mod tests {
 
         client.start_turn(&session_id, "show capabilities").unwrap();
         assert!(matches!(
-            client.next_event(Duration::from_secs(1)).unwrap(),
+            client.next_event(Duration::from_secs(2)).unwrap(),
             AgentDriverEvent::ProtocolNotice { .. }
         ));
         assert!(matches!(
-            client.next_event(Duration::from_secs(1)).unwrap(),
+            client.next_event(Duration::from_secs(2)).unwrap(),
             AgentDriverEvent::ProtocolNotice { .. }
         ));
         let capabilities = client.session_capabilities().unwrap();

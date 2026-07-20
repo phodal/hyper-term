@@ -533,6 +533,39 @@ test "ACP composer renders provider capabilities and routes configuration throug
     try testing.expectEqualStrings("/skills ", model.agentComposerText());
 }
 
+test "direct Codex capabilities insert skill mentions instead of fake slash commands" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_turn_status = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"ready","error":null,"capabilities":{"config_options":[{"id":"model","name":"Model","description":"Next turn model","category":"model","kind":{"type":"select","current_value":"gpt-5.6-sol"},"choices":[{"value":"gpt-5.6-sol","name":"GPT-5.6 Sol","description":null,"group":null}]},{"id":"reasoning_effort","name":"Reasoning","description":"Next turn effort","category":"thought_level","kind":{"type":"select","current_value":"high"},"choices":[{"value":"high","name":"high","description":null,"group":null}]}],"available_commands":[{"name":"$native-sdk","description":"Build Native UI","input_hint":"Describe how this skill should help"}]},"document":{"blocks":[]}}
+        ,
+    } }, &fx);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findAnyByText(tree.root, "GPT-5.6 Sol") != null);
+    try testing.expect(findAnyByText(tree.root, "high") != null);
+    const command_trigger = findByLabel(tree.root, "Agent commands").?;
+    main.update(&model, tree.msgForPointer(command_trigger.id, .up).?, &fx);
+    tree = try buildTree(arena_state.allocator(), &model);
+    const skill = findAnyByText(tree.root, "Skill · native-sdk · Build Native UI").?;
+    main.update(&model, tree.msgForPointer(skill.id, .up).?, &fx);
+    try testing.expectEqualStrings("$native-sdk ", model.agentComposerText());
+}
+
 test "direct Codex artifacts never expose the ACP editor panel" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";

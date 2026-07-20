@@ -7,6 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use hyper_term_protocol::PermissionDecision;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -16,8 +17,9 @@ use crate::codex_containment::{
     AgentContainmentConfig, apply_managed_proxy_environment, compile_agent_task_sandbox,
 };
 use crate::{
-    AgentClientError, AgentDriverEvent, AgentEffectAuthorization, AgentEffectKind,
-    AgentEffectProposal, AgentSessionCapabilities, AgentSessionConfigValue,
+    AgentAvailableCommand, AgentClientError, AgentDriverEvent, AgentEffectAuthorization,
+    AgentEffectKind, AgentEffectProposal, AgentSessionCapabilities, AgentSessionConfigChoice,
+    AgentSessionConfigKind, AgentSessionConfigOption, AgentSessionConfigValue,
     DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
     DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
     StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
@@ -27,6 +29,9 @@ const MAX_PENDING_APPROVALS: usize = 128;
 const MAX_BUFFERED_MESSAGES: usize = 512;
 const MAX_BUFFERED_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CODEX_MODELS: usize = 24;
+const MAX_CODEX_REASONING_EFFORTS: usize = 16;
+const MAX_CODEX_SKILLS: usize = 24;
 const HYPER_TERM_MCP_TOOLS: &[&str] = &[
     "hyper_term.genui.compile",
     "hyper_term.lsp.query",
@@ -59,8 +64,68 @@ pub struct CodexAppServerClient {
     request_gate: Mutex<()>,
     inbox: Mutex<BoundedDriverInbox>,
     pending: Mutex<HashMap<ExternalRequestId, AgentEffectProposal>>,
+    model_catalog: Mutex<Vec<CodexModelCapability>>,
+    session_capabilities: Mutex<AgentSessionCapabilities>,
+    turn_config: Mutex<CodexTurnConfig>,
     workspace: String,
     staged_auth_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CodexTurnConfig {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexModelCapability {
+    model: String,
+    display_name: String,
+    description: String,
+    default_reasoning_effort: String,
+    reasoning_efforts: Vec<CodexReasoningEffortWire>,
+    is_default: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexModelWire {
+    model: String,
+    display_name: String,
+    description: String,
+    hidden: bool,
+    supported_reasoning_efforts: Vec<CodexReasoningEffortWire>,
+    default_reasoning_effort: String,
+    is_default: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexReasoningEffortWire {
+    reasoning_effort: String,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModelListWire {
+    data: Vec<CodexModelWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexSkillsListWire {
+    data: Vec<CodexSkillGroupWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexSkillGroupWire {
+    skills: Vec<CodexSkillWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexSkillWire {
+    name: String,
+    description: String,
+    enabled: bool,
 }
 
 impl CodexAppServerClient {
@@ -179,6 +244,9 @@ impl CodexAppServerClient {
                 MAX_BUFFERED_MESSAGE_BYTES,
             )),
             pending: Mutex::new(HashMap::new()),
+            model_catalog: Mutex::new(Vec::new()),
+            session_capabilities: Mutex::new(AgentSessionCapabilities::default()),
+            turn_config: Mutex::new(CodexTurnConfig::default()),
             workspace: workspace_text,
             staged_auth_file,
         })
@@ -248,19 +316,23 @@ impl CodexAppServerClient {
             ));
         }
         let prompt = bounded(prompt.to_owned(), 16 * 1024)?;
+        let turn_config = lock(&self.turn_config)?.clone();
         self.process.begin_effect()?;
-        let response = self.request_raw(
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [{
-                    "type": "text",
-                    "text": prompt,
-                    "text_elements": []
-                }]
-            }),
-            timeout,
-        );
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{
+                "type": "text",
+                "text": prompt,
+                "text_elements": []
+            }]
+        });
+        if let Some(model) = turn_config.model {
+            params["model"] = Value::String(model);
+        }
+        if let Some(reasoning_effort) = turn_config.reasoning_effort {
+            params["effort"] = Value::String(reasoning_effort);
+        }
+        let response = self.request_raw("turn/start", params, timeout);
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -339,6 +411,99 @@ impl CodexAppServerClient {
         let state = self.process.stop(Duration::from_millis(250))?;
         remove_staged_auth_file(self.staged_auth_file.as_ref());
         Ok(state)
+    }
+
+    fn refresh_session_capabilities(
+        &self,
+        timeout: Duration,
+    ) -> Result<AgentSessionCapabilities, CodexAdapterError> {
+        let models_response = self.request_raw(
+            "model/list",
+            json!({"cursor": null, "limit": MAX_CODEX_MODELS, "includeHidden": false}),
+            timeout,
+        )?;
+        let models: CodexModelListWire =
+            serde_json::from_value(models_response.get("result").cloned().ok_or_else(|| {
+                CodexAdapterError::InvalidMessage("model/list returned no result".into())
+            })?)?;
+        let catalog = normalize_codex_models(models.data)?;
+        let selected = catalog
+            .iter()
+            .find(|model| model.is_default)
+            .or_else(|| catalog.first())
+            .ok_or_else(|| {
+                CodexAdapterError::InvalidMessage("model/list returned no usable models".into())
+            })?;
+        let turn_config = CodexTurnConfig {
+            model: Some(selected.model.clone()),
+            reasoning_effort: Some(selected.default_reasoning_effort.clone()),
+        };
+        let available_commands = self
+            .request_raw(
+                "skills/list",
+                json!({"cwds": [self.workspace], "forceReload": false}),
+                timeout,
+            )
+            .and_then(normalize_codex_skills)
+            .unwrap_or_default();
+        let capabilities = AgentSessionCapabilities {
+            config_options: codex_config_options(&catalog, &turn_config)?,
+            available_commands,
+        };
+        *lock(&self.model_catalog)? = catalog;
+        *lock(&self.turn_config)? = turn_config;
+        *lock(&self.session_capabilities)? = capabilities.clone();
+        Ok(capabilities)
+    }
+
+    fn update_session_config(
+        &self,
+        config_id: &str,
+        value: AgentSessionConfigValue,
+    ) -> Result<AgentSessionCapabilities, CodexAdapterError> {
+        let value = match value {
+            AgentSessionConfigValue::Id { value } => bounded(value, 128)?,
+            AgentSessionConfigValue::Boolean { .. } => {
+                return Err(CodexAdapterError::InvalidConfig(
+                    "Codex model settings require an id value".into(),
+                ));
+            }
+        };
+        let catalog = lock(&self.model_catalog)?;
+        let mut turn_config = lock(&self.turn_config)?;
+        match config_id {
+            "model" => {
+                let selected = catalog
+                    .iter()
+                    .find(|model| model.model == value)
+                    .ok_or_else(|| {
+                        CodexAdapterError::InvalidConfig("unknown Codex model".into())
+                    })?;
+                turn_config.model = Some(selected.model.clone());
+                turn_config.reasoning_effort = Some(selected.default_reasoning_effort.clone());
+            }
+            "reasoning_effort" => {
+                let selected = selected_codex_model(&catalog, &turn_config)?;
+                if !selected
+                    .reasoning_efforts
+                    .iter()
+                    .any(|effort| effort.reasoning_effort == value)
+                {
+                    return Err(CodexAdapterError::InvalidConfig(
+                        "unsupported Codex reasoning effort".into(),
+                    ));
+                }
+                turn_config.reasoning_effort = Some(value);
+            }
+            _ => {
+                return Err(CodexAdapterError::InvalidConfig(
+                    "unknown Codex session configuration".into(),
+                ));
+            }
+        }
+        let mut capabilities = lock(&self.session_capabilities)?;
+        capabilities.config_options = codex_config_options(&catalog, &turn_config)?;
+        Ok(capabilities.clone())
     }
 
     fn request_raw(
@@ -475,6 +640,9 @@ impl StructuredAgentClient for CodexAppServerClient {
 
     fn initialize_session(&self, timeout: Duration) -> Result<String, AgentClientError> {
         CodexAppServerClient::initialize(self, timeout)?;
+        // Capability discovery is additive: older app-server builds can still
+        // run a thread even when they do not expose the richer Codex catalogs.
+        let _ = self.refresh_session_capabilities(timeout);
         Ok(CodexAppServerClient::start_thread(self, timeout)?)
     }
 
@@ -494,19 +662,23 @@ impl StructuredAgentClient for CodexAppServerClient {
     }
 
     fn session_capabilities(&self) -> Result<AgentSessionCapabilities, AgentClientError> {
-        Ok(AgentSessionCapabilities::default())
+        Ok(lock(&self.session_capabilities)?.clone())
     }
 
     fn set_session_config_option(
         &self,
-        _session_id: &str,
-        _config_id: &str,
-        _value: AgentSessionConfigValue,
+        session_id: &str,
+        config_id: &str,
+        value: AgentSessionConfigValue,
         _timeout: Duration,
     ) -> Result<AgentSessionCapabilities, AgentClientError> {
-        Err(AgentClientError::Unsupported(
-            "Codex app-server configuration is not exposed through ACP".into(),
-        ))
+        if session_id.is_empty() {
+            return Err(CodexAdapterError::InvalidConfig(
+                "Codex thread id must not be empty".into(),
+            )
+            .into());
+        }
+        Ok(self.update_session_config(config_id, value)?)
     }
 
     fn resolve_effect(
@@ -722,6 +894,146 @@ fn request_id_value(id: &ExternalRequestId) -> Value {
     }
 }
 
+fn normalize_codex_models(
+    models: Vec<CodexModelWire>,
+) -> Result<Vec<CodexModelCapability>, CodexAdapterError> {
+    models
+        .into_iter()
+        .filter(|model| !model.hidden)
+        .take(MAX_CODEX_MODELS)
+        .map(|model| {
+            let reasoning_efforts = model
+                .supported_reasoning_efforts
+                .into_iter()
+                .take(MAX_CODEX_REASONING_EFFORTS)
+                .map(|effort| {
+                    Ok(CodexReasoningEffortWire {
+                        reasoning_effort: bounded(effort.reasoning_effort, 128)?,
+                        description: bounded(effort.description, 512)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, CodexAdapterError>>()?;
+            let default_reasoning_effort = bounded(model.default_reasoning_effort, 128)?;
+            if !reasoning_efforts
+                .iter()
+                .any(|effort| effort.reasoning_effort == default_reasoning_effort)
+            {
+                return Err(CodexAdapterError::InvalidMessage(
+                    "Codex model default effort is absent from its catalog".into(),
+                ));
+            }
+            Ok(CodexModelCapability {
+                model: bounded(model.model, 128)?,
+                display_name: bounded(model.display_name, 192)?,
+                description: bounded(model.description, 1024)?,
+                default_reasoning_effort,
+                reasoning_efforts,
+                is_default: model.is_default,
+            })
+        })
+        .collect()
+}
+
+fn normalize_codex_skills(
+    response: Value,
+) -> Result<Vec<AgentAvailableCommand>, CodexAdapterError> {
+    let skills: CodexSkillsListWire =
+        serde_json::from_value(response.get("result").cloned().ok_or_else(|| {
+            CodexAdapterError::InvalidMessage("skills/list returned no result".into())
+        })?)?;
+    skills
+        .data
+        .into_iter()
+        .flat_map(|group| group.skills)
+        .filter(|skill| skill.enabled)
+        .take(MAX_CODEX_SKILLS)
+        .map(|skill| {
+            let name = bounded(skill.name, 127)?;
+            if name.is_empty()
+                || name
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'$'))
+            {
+                return Err(CodexAdapterError::InvalidMessage(
+                    "Codex skill name cannot be represented as a mention".into(),
+                ));
+            }
+            Ok(AgentAvailableCommand {
+                name: format!("${name}"),
+                description: bounded(skill.description, 1024)?,
+                input_hint: Some("Describe how this skill should help".into()),
+            })
+        })
+        .collect()
+}
+
+fn codex_config_options(
+    catalog: &[CodexModelCapability],
+    turn_config: &CodexTurnConfig,
+) -> Result<Vec<AgentSessionConfigOption>, CodexAdapterError> {
+    let selected = selected_codex_model(catalog, turn_config)?;
+    let model_choices = catalog
+        .iter()
+        .map(|model| AgentSessionConfigChoice {
+            value: model.model.clone(),
+            name: model.display_name.clone(),
+            description: Some(model.description.clone()),
+            group: None,
+        })
+        .collect();
+    let effort_choices = selected
+        .reasoning_efforts
+        .iter()
+        .map(|effort| AgentSessionConfigChoice {
+            value: effort.reasoning_effort.clone(),
+            name: effort.reasoning_effort.clone(),
+            description: Some(effort.description.clone()),
+            group: None,
+        })
+        .collect();
+    Ok(vec![
+        AgentSessionConfigOption {
+            id: "model".into(),
+            name: "Model".into(),
+            description: Some("Model used for the next Codex turn".into()),
+            category: Some("model".into()),
+            kind: AgentSessionConfigKind::Select {
+                current_value: selected.model.clone(),
+            },
+            choices: model_choices,
+        },
+        AgentSessionConfigOption {
+            id: "reasoning_effort".into(),
+            name: "Reasoning".into(),
+            description: Some("Reasoning effort used for the next Codex turn".into()),
+            category: Some("thought_level".into()),
+            kind: AgentSessionConfigKind::Select {
+                current_value: turn_config
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| selected.default_reasoning_effort.clone()),
+            },
+            choices: effort_choices,
+        },
+    ])
+}
+
+fn selected_codex_model<'a>(
+    catalog: &'a [CodexModelCapability],
+    turn_config: &CodexTurnConfig,
+) -> Result<&'a CodexModelCapability, CodexAdapterError> {
+    let selected = turn_config
+        .model
+        .as_deref()
+        .ok_or_else(|| CodexAdapterError::InvalidConfig("Codex model is not selected".into()))?;
+    catalog
+        .iter()
+        .find(|model| model.model == selected)
+        .ok_or_else(|| {
+            CodexAdapterError::InvalidConfig("selected Codex model is unavailable".into())
+        })
+}
+
 fn required_string(params: &Value, key: &str) -> Result<String, CodexAdapterError> {
     let value = params
         .get(key)
@@ -885,6 +1197,132 @@ mod tests {
         });
         assert_eq!(required_string(&params, "threadId").unwrap(), "thread-1");
         assert_eq!(required_string(&params, "delta").unwrap(), "working");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_codex_exposes_models_reasoning_and_skill_mentions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let runtime = temporary.path().join("runtime");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        let executable = temporary.path().join("codex");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"fake"}}' ;;
+    *'"method":"model/list"'*) printf '%s\n' '{"id":2,"result":{"data":[{"model":"gpt-a","displayName":"GPT A","description":"Fast model","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Low"},{"reasoningEffort":"medium","description":"Medium"}],"defaultReasoningEffort":"medium","isDefault":true},{"model":"gpt-b","displayName":"GPT B","description":"Deep model","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"high","description":"High"}],"defaultReasoningEffort":"high","isDefault":false}]}}' ;;
+    *'"method":"skills/list"'*) printf '%s\n' '{"id":3,"result":{"data":[{"cwd":"workspace","skills":[{"name":"native-sdk","description":"Build Native UI","enabled":true},{"name":"disabled","description":"Hidden","enabled":false}],"errors":[]}]}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":4,"result":{"thread":{"id":"thread-1"}}}' ;;
+    *'"method":"turn/start"'*'"model":"gpt-b"'*'"effort":"high"'*)
+      printf '%s\n' '{"id":5,"result":{"turn":{"id":"turn-1"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let client = CodexAppServerClient::launch(CodexAppServerConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            implementation_version: "test".into(),
+            workspace,
+            codex_home: runtime.join("codex-home"),
+            scratch_directory: runtime.join("scratch"),
+            auth_file: None,
+            brokered_mcp_server: None,
+            containment: None,
+        })
+        .unwrap();
+
+        let thread_id = client.initialize_session(Duration::from_secs(2)).unwrap();
+        assert_eq!(thread_id, "thread-1");
+        let initial = client.session_capabilities().unwrap();
+        assert_eq!(initial.config_options.len(), 2);
+        assert_eq!(
+            initial.available_commands,
+            vec![AgentAvailableCommand {
+                name: "$native-sdk".into(),
+                description: "Build Native UI".into(),
+                input_hint: Some("Describe how this skill should help".into()),
+            }]
+        );
+        let updated = client
+            .set_session_config_option(
+                &thread_id,
+                "model",
+                AgentSessionConfigValue::Id {
+                    value: "gpt-b".into(),
+                },
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(
+            updated.config_options,
+            vec![
+                AgentSessionConfigOption {
+                    id: "model".into(),
+                    name: "Model".into(),
+                    description: Some("Model used for the next Codex turn".into()),
+                    category: Some("model".into()),
+                    kind: AgentSessionConfigKind::Select {
+                        current_value: "gpt-b".into(),
+                    },
+                    choices: vec![
+                        AgentSessionConfigChoice {
+                            value: "gpt-a".into(),
+                            name: "GPT A".into(),
+                            description: Some("Fast model".into()),
+                            group: None,
+                        },
+                        AgentSessionConfigChoice {
+                            value: "gpt-b".into(),
+                            name: "GPT B".into(),
+                            description: Some("Deep model".into()),
+                            group: None,
+                        },
+                    ],
+                },
+                AgentSessionConfigOption {
+                    id: "reasoning_effort".into(),
+                    name: "Reasoning".into(),
+                    description: Some("Reasoning effort used for the next Codex turn".into()),
+                    category: Some("thought_level".into()),
+                    kind: AgentSessionConfigKind::Select {
+                        current_value: "high".into(),
+                    },
+                    choices: vec![AgentSessionConfigChoice {
+                        value: "high".into(),
+                        name: "high".into(),
+                        description: Some("High".into()),
+                        group: None,
+                    }],
+                },
+            ]
+        );
+        assert_eq!(
+            client
+                .start_turn(&thread_id, "Build it", Duration::from_secs(2))
+                .unwrap(),
+            "turn-1"
+        );
+        assert_eq!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::TurnCompleted {
+                sequence: 6,
+                thread_id: "thread-1".into(),
+                turn_id: Some("turn-1".into()),
+                status: Some("completed".into()),
+            }
+        );
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 
     #[test]
