@@ -19,18 +19,20 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentContainmentConfig, AgentDriverEvent,
-    AgentEffectAuthorization, AgentEffectKind, AgentSessionCapabilities, AgentSessionConfigValue,
-    CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig, DenoGenUiCompiler,
-    DenoGenUiConfig, DriverState, ExternalRequestId, GenUiCompileRequest, StructuredAgentClient,
-    StructuredAgentProtocol, sha256_file, stage_codex_auth_file,
+    AgentEffectAuthorization, AgentEffectKind, AgentHostOperation, AgentHostRequest,
+    AgentHostResponse, AgentSessionCapabilities, AgentSessionConfigValue, CodexAppServerClient,
+    CodexAppServerConfig, CodexMcpServerConfig, DenoGenUiCompiler, DenoGenUiConfig, DriverState,
+    ExternalRequestId, GenUiCompileRequest, StructuredAgentClient, StructuredAgentProtocol,
+    sha256_file, stage_codex_auth_file,
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, GenUiArtifactCandidate,
     GenUiBugCapsule, GenUiBugCapsuleEnvironment, GenUiRuntimeTraceAppendRequest,
     GenUiRuntimeTraceProjection, MessageRole, OperationAction, OperationCompletion, OperationId,
     OperationKind, OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
+    TerminalCommand,
 };
-use hyper_term_sandbox::{IsolatedChange, IsolatedTaskTermination};
+use hyper_term_sandbox::{IsolatedChange, IsolatedTaskTermination, LimaTaskRunner};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -62,6 +64,7 @@ use crate::{DaemonError, DaemonState, IsolatedAcceptanceReview};
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
+const MAX_AGENT_TERMINALS: usize = 64;
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const START_TURN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPLETE_TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -110,6 +113,7 @@ pub struct AgentGatewayConfig {
     pub genui_runtime: Option<AgentGenUiRuntimeConfig>,
     pub workbench_assets: Option<PathBuf>,
     pub debug_capsule: Option<GenUiBugCapsule>,
+    pub tier2_runner: Option<LimaTaskRunner>,
     pub control_socket: PathBuf,
 }
 
@@ -273,6 +277,7 @@ struct AgentSession {
     runtime_root: PathBuf,
     progress: Mutex<AgentProgress>,
     pending_effect: Mutex<Option<PendingAgentEffect>>,
+    terminals: Mutex<HashMap<String, AgentTerminalRecord>>,
     _managed_proxy: Option<ManagedConnectProxy>,
 }
 
@@ -299,6 +304,16 @@ struct PendingAgentEffect {
     operation_id: OperationId,
     operation_revision: u64,
     projection: AgentTurnProjection,
+    host_request: Option<AgentHostRequest>,
+}
+
+#[derive(Clone)]
+struct AgentTerminalRecord {
+    _source_operation_id: OperationId,
+    output: String,
+    truncated: bool,
+    exit_code: Option<u32>,
+    signal: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2456,6 +2471,7 @@ impl AgentGatewayRuntime {
                 error: None,
             }),
             pending_effect: Mutex::new(None),
+            terminals: Mutex::new(HashMap::new()),
             _managed_proxy: launched.managed_proxy,
         });
         let response = ready_response(session_id, &session);
@@ -2587,6 +2603,7 @@ impl AgentGatewayRuntime {
                 read_paths,
                 write_paths: vec![session_root.to_path_buf()],
             }),
+            terminal_client: self.config.tier2_runner.is_some(),
         })
         .map_err(|_| StartError::Driver)?;
         Ok(LaunchedAgentProvider {
@@ -4064,6 +4081,89 @@ impl AgentGatewayRuntime {
             return Ok(AgentTurnResponse { session_id, status });
         }
         let effect = effect.expect("checked pending effect");
+        if let Some(host_request) = effect.host_request.clone() {
+            let AgentHostOperation::TerminalCreate { .. } = host_request.operation else {
+                return Err(SessionError::Driver);
+            };
+            let runner = if request.decision == PermissionDecision::AllowOnce {
+                Some(
+                    self.config
+                        .tier2_runner
+                        .clone()
+                        .ok_or(SessionError::UnsafeApproval)?,
+                )
+            } else {
+                None
+            };
+            let decided = self
+                .config
+                .daemon
+                .decide_permission(
+                    session.task_id,
+                    effect.operation_id,
+                    effect.operation_revision,
+                    request.decision,
+                )
+                .map_err(|_| SessionError::StalePermission)?;
+            pending.take();
+            drop(pending);
+            if let Ok(mut progress) = session.progress.lock() {
+                progress.status = AgentStatus::Running;
+                progress.error = None;
+            } else {
+                let _ = session.client.close();
+                return Err(SessionError::Lock);
+            }
+            let projection = effect.projection;
+            let daemon = self.config.daemon.clone();
+            let worker_session = Arc::clone(&session);
+            if let Some(runner) = runner {
+                std::thread::Builder::new()
+                    .name(format!("hyper-term-agent-{session_id}-terminal"))
+                    .spawn(move || {
+                        execute_agent_terminal_create(
+                            worker_session,
+                            daemon,
+                            runner,
+                            host_request,
+                            effect.operation_id,
+                            decided.revision,
+                            projection,
+                        )
+                    })
+                    .map_err(|_| {
+                        set_progress_failed(&session, "ACP terminal worker could not start");
+                        SessionError::Thread
+                    })?;
+            } else {
+                if session
+                    .client
+                    .resolve_host_request(
+                        &host_request.request_id,
+                        AgentHostResponse::Error {
+                            code: -32000,
+                            message: "ACP terminal request was not approved".into(),
+                        },
+                    )
+                    .is_err()
+                {
+                    set_progress_failed(&session, "ACP terminal decision could not be returned");
+                    let _ = session.client.close();
+                    return Err(SessionError::Driver);
+                }
+                std::thread::Builder::new()
+                    .name(format!("hyper-term-agent-{session_id}-resume"))
+                    .spawn(move || continue_turn(worker_session, daemon, projection))
+                    .map_err(|_| {
+                        set_progress_failed(&session, "Agent turn resume worker could not start");
+                        SessionError::Thread
+                    })?;
+            }
+            return Ok(AgentTurnResponse {
+                session_id,
+                status: AgentStatus::Running,
+            });
+        }
         if request.decision == PermissionDecision::AllowOnce {
             return Err(SessionError::UnsafeApproval);
         }
@@ -4975,6 +5075,114 @@ fn continue_turn(
                     operation_id: operation.operation_id,
                     operation_revision: operation.revision,
                     projection,
+                    host_request: None,
+                });
+                drop(pending);
+                if let Ok(mut progress) = session.progress.lock() {
+                    progress.status = AgentStatus::WaitingApproval;
+                }
+                return;
+            }
+            AgentDriverEvent::HostRequest { request, .. }
+                if request.thread_id == session.thread_id
+                    && request.turn_id == projection.turn_id =>
+            {
+                projection.agent_message_interrupted |= projection.agent_message_bytes > 0;
+                let AgentHostOperation::TerminalCreate {
+                    command,
+                    args,
+                    env,
+                    cwd,
+                    ..
+                } = &request.operation
+                else {
+                    if !resolve_terminal_host_request(&session, request) {
+                        return;
+                    }
+                    continue;
+                };
+                let terminal_count = match session.terminals.lock() {
+                    Ok(terminals) => terminals.len(),
+                    Err(_) => {
+                        set_progress_failed(&session, "ACP terminal state could not be read");
+                        return;
+                    }
+                };
+                if terminal_count >= MAX_AGENT_TERMINALS {
+                    if session
+                        .client
+                        .resolve_host_request(
+                            &request.request_id,
+                            AgentHostResponse::Error {
+                                code: -32000,
+                                message: "ACP terminal retention limit reached".into(),
+                            },
+                        )
+                        .is_err()
+                    {
+                        set_progress_failed(
+                            &session,
+                            "ACP terminal rejection could not be returned",
+                        );
+                        let _ = session.client.close();
+                        return;
+                    }
+                    continue;
+                }
+                let summary = std::iter::once(command.as_str())
+                    .chain(args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let terminal_command = TerminalCommand {
+                    program: "/usr/bin/env".into(),
+                    args: std::iter::once(command.clone())
+                        .chain(args.iter().cloned())
+                        .collect(),
+                    cwd: Some(cwd.clone()),
+                    env: env
+                        .iter()
+                        .map(|variable| (variable.name.clone(), variable.value.clone()))
+                        .collect(),
+                };
+                let summary = format!("Agent terminal in Tier 2: {summary}");
+                let operation = match daemon.propose_operation(
+                    session.task_id,
+                    OperationKind::Shell,
+                    OperationAction::Shell {
+                        command: terminal_command,
+                    },
+                    summary,
+                    RiskClass::ExternalEffect,
+                    vec!["shell".into(), "sandbox.isolated_task".into()],
+                ) {
+                    Ok(operation) => operation,
+                    Err(_) => {
+                        set_progress_failed(
+                            &session,
+                            "ACP terminal request could not be journaled",
+                        );
+                        return;
+                    }
+                };
+                let mut pending = match session.pending_effect.lock() {
+                    Ok(pending) => pending,
+                    Err(_) => {
+                        set_progress_failed(&session, "ACP terminal request could not be retained");
+                        return;
+                    }
+                };
+                if pending.is_some() {
+                    set_progress_failed(&session, "Agent emitted overlapping host requests");
+                    let _ = session.client.close();
+                    return;
+                }
+                *pending = Some(PendingAgentEffect {
+                    request_id: request.request_id.clone(),
+                    payload_sha256: request.payload_sha256.clone(),
+                    operation_id: operation.operation_id,
+                    operation_revision: operation.revision,
+                    projection,
+                    host_request: Some(request),
                 });
                 drop(pending);
                 if let Ok(mut progress) = session.progress.lock() {
@@ -5007,6 +5215,164 @@ fn continue_turn(
             _ => {}
         }
     }
+}
+
+fn resolve_terminal_host_request(session: &AgentSession, request: AgentHostRequest) -> bool {
+    let terminal_id = match &request.operation {
+        AgentHostOperation::TerminalOutput { terminal_id }
+        | AgentHostOperation::TerminalRelease { terminal_id }
+        | AgentHostOperation::TerminalWaitForExit { terminal_id }
+        | AgentHostOperation::TerminalKill { terminal_id } => terminal_id,
+        AgentHostOperation::TerminalCreate { .. } => return false,
+    };
+    let response = match session.terminals.lock() {
+        Ok(mut terminals) => match &request.operation {
+            AgentHostOperation::TerminalOutput { .. } => terminals
+                .get(terminal_id)
+                .map(|record| AgentHostResponse::TerminalOutput {
+                    output: record.output.clone(),
+                    truncated: record.truncated,
+                    exit_code: record.exit_code,
+                    signal: record.signal.clone(),
+                })
+                .unwrap_or_else(|| unknown_terminal_response(terminal_id)),
+            AgentHostOperation::TerminalRelease { .. } => {
+                if terminals.remove(terminal_id).is_some() {
+                    AgentHostResponse::TerminalReleased
+                } else {
+                    unknown_terminal_response(terminal_id)
+                }
+            }
+            AgentHostOperation::TerminalWaitForExit { .. } => terminals
+                .get(terminal_id)
+                .map(|record| AgentHostResponse::TerminalExited {
+                    exit_code: record.exit_code,
+                    signal: record.signal.clone(),
+                })
+                .unwrap_or_else(|| unknown_terminal_response(terminal_id)),
+            AgentHostOperation::TerminalKill { .. } => {
+                if terminals.contains_key(terminal_id) {
+                    AgentHostResponse::TerminalKilled
+                } else {
+                    unknown_terminal_response(terminal_id)
+                }
+            }
+            AgentHostOperation::TerminalCreate { .. } => return false,
+        },
+        Err(_) => AgentHostResponse::Error {
+            code: -32000,
+            message: "ACP terminal state is unavailable".into(),
+        },
+    };
+    if session
+        .client
+        .resolve_host_request(&request.request_id, response)
+        .is_err()
+    {
+        set_progress_failed(session, "ACP terminal response could not be returned");
+        let _ = session.client.close();
+        return false;
+    }
+    true
+}
+
+fn unknown_terminal_response(terminal_id: &str) -> AgentHostResponse {
+    AgentHostResponse::Error {
+        code: -32001,
+        message: format!("Unknown ACP terminal: {terminal_id}"),
+    }
+}
+
+fn execute_agent_terminal_create(
+    session: Arc<AgentSession>,
+    daemon: DaemonState,
+    runner: LimaTaskRunner,
+    request: AgentHostRequest,
+    operation_id: OperationId,
+    authorized_revision: u64,
+    projection: AgentTurnProjection,
+) {
+    let AgentHostOperation::TerminalCreate {
+        output_byte_limit, ..
+    } = &request.operation
+    else {
+        set_progress_failed(
+            &session,
+            "ACP terminal worker received a mismatched request",
+        );
+        return;
+    };
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let response = match daemon.dispatch_isolated_task(
+        session.task_id,
+        operation_id,
+        authorized_revision,
+        &runner,
+        &cancelled,
+    ) {
+        Ok(receipt) => {
+            let terminal_id = format!("hyper-term-{operation_id}");
+            let (output, truncated) = retain_terminal_output(
+                &receipt.stdout,
+                &receipt.stderr,
+                *output_byte_limit as usize,
+            );
+            let exit_code = receipt.exit_code.and_then(|code| u32::try_from(code).ok());
+            let signal = match receipt.termination {
+                IsolatedTaskTermination::Exited => None,
+                IsolatedTaskTermination::Signaled => Some("signaled".into()),
+                IsolatedTaskTermination::TimedOut => Some("timeout".into()),
+                IsolatedTaskTermination::Cancelled => Some("cancelled".into()),
+            };
+            match session.terminals.lock() {
+                Ok(mut terminals) => {
+                    terminals.insert(
+                        terminal_id.clone(),
+                        AgentTerminalRecord {
+                            _source_operation_id: operation_id,
+                            output,
+                            truncated,
+                            exit_code,
+                            signal,
+                        },
+                    );
+                    AgentHostResponse::TerminalCreated { terminal_id }
+                }
+                Err(_) => AgentHostResponse::Error {
+                    code: -32000,
+                    message: "ACP terminal result could not be retained".into(),
+                },
+            }
+        }
+        Err(error) => AgentHostResponse::Error {
+            code: -32000,
+            message: bounded_error(&format!("Tier 2 terminal execution failed: {error}")),
+        },
+    };
+    if session
+        .client
+        .resolve_host_request(&request.request_id, response)
+        .is_err()
+    {
+        set_progress_failed(&session, "ACP terminal result could not be returned");
+        let _ = session.client.close();
+        return;
+    }
+    continue_turn(session, daemon, projection);
+}
+
+fn retain_terminal_output(stdout: &str, stderr: &str, output_byte_limit: usize) -> (String, bool) {
+    let mut output = String::with_capacity(stdout.len().saturating_add(stderr.len()));
+    output.push_str(stdout);
+    output.push_str(stderr);
+    if output.len() <= output_byte_limit {
+        return (output, false);
+    }
+    let mut start = output.len().saturating_sub(output_byte_limit);
+    while start < output.len() && !output.is_char_boundary(start) {
+        start += 1;
+    }
+    (output[start..].to_owned(), true)
 }
 
 fn operation_kind_and_risk(kind: AgentEffectKind) -> (OperationKind, RiskClass) {
@@ -5146,7 +5512,7 @@ mod tests {
         let executable = root.join("limactl");
         let environment_marker = root.join("limactl-environment");
         let script = format!(
-            "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nlast=''\nfor argument in \"$@\"; do\n  last=\"$argument\"\n  case \"$argument\" in validate|start|shell|stop|delete) [ -n \"$action\" ] || action=\"$argument\";; esac\ndone\nif [ \"$action\" = start ]; then printf '%s\\n' \"${{last%/*}}\" > '{}'; fi\nif [ \"$action\" = shell ]; then environment=$(cat '{}'); printf 'from tier2\\n' > \"$environment/worktree/generated.txt\"; fi\n",
+            "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--version\" ]; then echo 'limactl version 2.1.1'; exit 0; fi\naction=''\nlast=''\nfor argument in \"$@\"; do\n  last=\"$argument\"\n  case \"$argument\" in validate|start|shell|stop|delete) [ -n \"$action\" ] || action=\"$argument\";; esac\ndone\nif [ \"$action\" = start ]; then printf '%s\\n' \"${{last%/*}}\" > '{}'; fi\nif [ \"$action\" = shell ]; then environment=$(cat '{}'); printf 'from tier2\\n' > \"$environment/worktree/generated.txt\"; printf 'tier2-output\\n'; fi\n",
             environment_marker.display(),
             environment_marker.display()
         );
@@ -5197,6 +5563,16 @@ mod tests {
             css: String::new(),
             source_map: "{}".into(),
         }
+    }
+
+    #[test]
+    fn acp_terminal_output_retains_the_tail_at_a_utf8_boundary() {
+        assert_eq!(
+            retain_terminal_output("stdout", "stderr", 10),
+            ("doutstderr".into(), true)
+        );
+        assert_eq!(retain_terminal_output("ab🙂cd", "", 5), ("cd".into(), true));
+        assert_eq!(retain_terminal_output("ok", "", 2), ("ok".into(), false));
     }
 
     fn capsule_fixture() -> GenUiBugCapsule {
@@ -5664,6 +6040,7 @@ mod tests {
             genui_runtime: None,
             workbench_assets: None,
             debug_capsule: Some(expected.clone()),
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -5724,6 +6101,7 @@ mod tests {
             genui_runtime: None,
             workbench_assets: None,
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -5863,6 +6241,7 @@ mod tests {
             genui_runtime: None,
             workbench_assets: None,
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -6021,6 +6400,7 @@ mod tests {
             genui_runtime: None,
             workbench_assets: None,
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -6189,6 +6569,7 @@ mod tests {
             genui_runtime: None,
             workbench_assets: None,
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -6672,6 +7053,7 @@ mod tests {
             }),
             workbench_assets: None,
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -6834,6 +7216,7 @@ mod tests {
             }),
             workbench_assets: None,
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -7088,6 +7471,7 @@ mod tests {
             }),
             workbench_assets: Some(workbench_assets),
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -7382,6 +7766,172 @@ mod tests {
         gateway.shutdown().await.expect("shutdown gateway");
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_terminal_create_requires_approval_and_runs_only_in_tier2() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        run_git(&workspace, &["init", "-q"]);
+        run_git(&workspace, &["config", "user.name", "Hyper Term Test"]);
+        run_git(
+            &workspace,
+            &["config", "user.email", "hyper-term@example.invalid"],
+        );
+        std::fs::write(workspace.join("README.md"), "source\n").expect("fixture");
+        run_git(&workspace, &["add", "."]);
+        run_git(&workspace, &["commit", "-qm", "fixture"]);
+        let daemon = DaemonState::open(temporary.path().join("daemon-state")).expect("daemon");
+        let fake_acp = temporary.path().join("fixture-terminal-acp");
+        std::fs::write(
+            &fake_acp,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*'\"terminal\":true'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"terminal-session\"}}' ;;\n    *'\"method\":\"session/prompt\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-create-1\",\"method\":\"terminal/create\",\"params\":{\"sessionId\":\"terminal-session\",\"command\":\"printf\",\"args\":[\"tier2-output\\\\n\"],\"outputByteLimit\":4096}}' ;;\n    *'\"id\":\"terminal-create-1\"'*'\"terminalId\"'*) terminal_id=$(printf '%s' \"$line\" | sed -n 's/.*\"terminalId\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-output-1\",\"method\":\"terminal/output\",\"params\":{\"sessionId\":\"terminal-session\",\"terminalId\":\"%s\"}}\\n' \"$terminal_id\" ;;\n    *'\"id\":\"terminal-output-1\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-wait-1\",\"method\":\"terminal/wait_for_exit\",\"params\":{\"sessionId\":\"terminal-session\",\"terminalId\":\"%s\"}}\\n' \"$terminal_id\" ;;\n    *'\"id\":\"terminal-wait-1\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":\"terminal-release-1\",\"method\":\"terminal/release\",\"params\":{\"sessionId\":\"terminal-session\",\"terminalId\":\"%s\"}}\\n' \"$terminal_id\" ;;\n    *'\"id\":\"terminal-release-1\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"terminal-session\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Tier 2 terminal completed.\"}}}}' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+        )
+        .expect("fake ACP");
+        std::fs::set_permissions(&fake_acp, std::fs::Permissions::from_mode(0o700))
+            .expect("fake ACP executable");
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            token: token.clone(),
+            workspace: workspace.clone(),
+            state_directory: temporary.path().join("gateway-state"),
+            daemon: daemon.clone(),
+            codex_executable: None,
+            codex_auth_file: None,
+            acp_providers: vec![AcpAgentProviderConfig {
+                provider_id: "fixture-terminal-acp".into(),
+                executable: fake_acp,
+                arguments: Vec::new(),
+                environment: BTreeMap::new(),
+                implementation_version: "fixture-1".into(),
+            }],
+            mcp_executable: None,
+            genui_runtime: None,
+            workbench_assets: None,
+            debug_capsule: None,
+            tier2_runner: Some(fake_lima_runner(temporary.path())),
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .expect("agent gateway");
+        let session_path =
+            format!("/agent/session?token={token}&session_id=12&provider=fixture-terminal-acp");
+        let (status, body) = request_path(gateway.address(), &session_path, "POST", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("start response");
+        let task_id: TaskId = serde_json::from_value(started["task_id"].clone()).expect("task id");
+        let turn_path = format!("/agent/session/turn?token={token}&session_id=12");
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                &turn_path,
+                "POST",
+                b"Run the bounded terminal"
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+
+        let (operation_id, operation_revision) =
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let (status, body) = request(gateway.address(), &token, 12, "GET").await;
+                    assert_eq!(status, StatusCode::OK.as_u16());
+                    let snapshot: serde_json::Value =
+                        serde_json::from_slice(&body).expect("snapshot");
+                    assert_ne!(snapshot["status"], "failed", "{snapshot:#}");
+                    if snapshot["status"] == "waiting_approval" {
+                        let approval = snapshot["document"]["blocks"]
+                            .as_array()
+                            .expect("blocks")
+                            .iter()
+                            .find(|block| block["kind"] == "approval")
+                            .expect("approval block");
+                        break (
+                            approval["payload"]["operation_id"]
+                                .as_str()
+                                .expect("operation id")
+                                .to_owned(),
+                            approval["payload"]["operation_revision"]
+                                .as_u64()
+                                .expect("operation revision"),
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("ACP terminal did not reach approval");
+        let operation_uuid = uuid::Uuid::parse_str(&operation_id).expect("operation UUID");
+        let operation_id = OperationId::from_uuid(operation_uuid);
+        let operation = daemon.operation(operation_id).expect("terminal operation");
+        assert_eq!(operation.revision, operation_revision);
+        assert_eq!(operation.kind, OperationKind::Shell);
+        assert_eq!(operation.risk, RiskClass::ExternalEffect);
+        assert!(
+            operation
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == "sandbox.isolated_task")
+        );
+        assert!(!workspace.join("generated.txt").exists());
+
+        let approval = serde_json::to_vec(&serde_json::json!({
+            "operation_id": operation_id,
+            "expected_revision": operation_revision,
+            "decision": "allow_once"
+        }))
+        .expect("approval");
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                &format!("/agent/session/permission?token={token}&session_id=12"),
+                "POST",
+                &approval,
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (status, body) = request(gateway.address(), &token, 12, "GET").await;
+                assert_eq!(status, StatusCode::OK.as_u16());
+                let snapshot: serde_json::Value = serde_json::from_slice(&body).expect("snapshot");
+                assert_ne!(snapshot["status"], "failed", "{snapshot:#}");
+                if snapshot["status"] == "completed" {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ACP terminal turn did not complete");
+        assert!(
+            snapshot["document"]["blocks"]
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .any(|block| block["payload"]["text"] == "Tier 2 terminal completed.")
+        );
+        assert_eq!(
+            daemon
+                .operation(operation_id)
+                .expect("completed operation")
+                .state,
+            OperationState::Succeeded
+        );
+        let retained = daemon
+            .isolated_result_reviews(task_id)
+            .expect("Tier 2 results");
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].receipt.stdout.contains("tier2-output"));
+        assert!(!workspace.join("generated.txt").exists());
+        gateway.shutdown().await.expect("shutdown gateway");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_only_agent_can_reject_an_effect_and_finish_the_turn() {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -7414,6 +7964,7 @@ mod tests {
             genui_runtime: None,
             workbench_assets: None,
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -7561,6 +8112,7 @@ mod tests {
             genui_runtime: None,
             workbench_assets: None,
             debug_capsule: None,
+            tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
         })
         .await
@@ -7690,6 +8242,7 @@ mod tests {
                 }),
                 workbench_assets: None,
                 debug_capsule: None,
+                tier2_runner: None,
                 control_socket: temporary.path().join("hyperd.sock"),
             }),
             sessions: Arc::new(Mutex::new(HashMap::new())),

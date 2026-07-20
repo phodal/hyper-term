@@ -95,6 +95,7 @@ async fn acp_agent_discovers_the_real_brokered_deno_tool_catalog() {
         }),
         workbench_assets: None,
         debug_capsule: None,
+        tier2_runner: None,
         control_socket,
     })
     .await

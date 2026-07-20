@@ -163,6 +163,7 @@ fn run() -> Result<i32, String> {
                 }),
             workbench_assets: resolved.workbench_assets.clone(),
             debug_capsule: debug_capsule.clone(),
+            tier2_runner: None,
             control_socket,
         })
         .await
