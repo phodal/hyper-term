@@ -20,6 +20,6 @@ pub use sandbox::*;
 pub use terminal_web::*;
 pub use wire::*;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
 pub const BLOCK_SCHEMA_VERSION: u16 = 3;

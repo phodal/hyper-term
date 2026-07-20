@@ -7327,8 +7327,8 @@ done
             "hermetic"
         );
         assert_eq!(
-            snapshot["context"]["payload"]["context"]["receipts"][0]["credential_bindings"]
-                [0]["reference"]["secret_id"],
+            snapshot["context"]["payload"]["context"]["receipts"][0]["credential_bindings"][0]["reference"]
+                ["secret_id"],
             "managed-connect-proxy-session"
         );
         assert!(!String::from_utf8_lossy(&body).contains("\"variables\""));

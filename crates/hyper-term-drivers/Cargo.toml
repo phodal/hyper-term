@@ -13,11 +13,14 @@ hyper-term-core = { path = "../hyper-term-core" }
 hyper-term-protocol = { path = "../hyper-term-protocol" }
 hyper-term-sandbox = { path = "../hyper-term-sandbox" }
 libc.workspace = true
+process-wrap.workspace = true
+rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 similar.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

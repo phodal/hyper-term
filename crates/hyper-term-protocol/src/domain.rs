@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedGenUiArtifact, ActionDigest, AgentExecutionContextReceiptSet, AgentPlanEntry,
-    AgentToolCall, BlockId, CompiledSandboxProfile, EVENT_SCHEMA_VERSION, EventId, OperationId,
-    RunId, SandboxLeaseId, SandboxProfileDigest, SandboxReceipt, SandboxViolation, TaskId,
-    TerminalId,
+    AgentToolCall, BlockId, CompiledSandboxProfile, EVENT_SCHEMA_VERSION, EventId,
+    LocalMcpServerRuntimeReceipt, OperationId, RunId, SandboxLeaseId, SandboxProfileDigest,
+    SandboxReceipt, SandboxViolation, TaskId, TerminalId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -278,6 +278,9 @@ pub enum DomainEvent {
     AgentExecutionContextRecorded {
         context: AgentExecutionContextReceiptSet,
     },
+    LocalMcpServerRuntimeRecorded {
+        receipt: LocalMcpServerRuntimeReceipt,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -323,7 +326,10 @@ mod tests {
     use super::*;
     use crate::{
         ContextDigest, ContextReceipt, EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest,
-        ExecutionMode,
+        ExecutionMode, LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle,
+        LocalMcpServerRuntimeReceipt, LocalMcpToolContractReceipt, McpArgumentsDigest,
+        McpCapabilitiesDigest, McpCatalogDigest, McpRuntimeIdentityDigest, McpToolContractDigest,
+        SandboxProfileDigest,
     };
 
     #[test]
@@ -383,5 +389,55 @@ mod tests {
         assert_eq!(value["context"]["receipts"][0]["mode"], "hermetic");
         assert!(value["context"]["receipts"][0].get("variables").is_none());
         assert!(value.to_string().find("secret_value").is_none());
+    }
+
+    #[test]
+    fn local_mcp_runtime_receipts_serialize_as_redacted_evidence() {
+        let launch = LocalMcpServerLaunch {
+            schema_version: crate::LOCAL_MCP_LAUNCH_SCHEMA_VERSION,
+            server_id: "reviewed-files".into(),
+            executable: "/usr/bin/reviewed-mcp".into(),
+            executable_sha256: "a".repeat(64),
+            arguments_digest: McpArgumentsDigest::parse("b".repeat(64)).unwrap(),
+            argument_count: 2,
+            working_directory: "/workspace".into(),
+            context_digest: ContextDigest::parse("c".repeat(64)).unwrap(),
+            sandbox_profile_digest: SandboxProfileDigest::parse("d".repeat(64)).unwrap(),
+            roots_snapshot_sha256: Some("e".repeat(64)),
+            lifecycle: LocalMcpServerLifecycle::OneTask,
+            credential_scope: LocalMcpCredentialScope::ServerLifetime,
+            runtime_identity_digest: McpRuntimeIdentityDigest::parse("f".repeat(64)).unwrap(),
+        };
+        let event = DomainEvent::LocalMcpServerRuntimeRecorded {
+            receipt: LocalMcpServerRuntimeReceipt {
+                schema_version: crate::LOCAL_MCP_LAUNCH_SCHEMA_VERSION,
+                launch,
+                negotiated_protocol_version: "2025-11-25".into(),
+                server_name: "reviewed-files".into(),
+                server_version: "1.0.0".into(),
+                enforced_sandbox_profile_digest: SandboxProfileDigest::parse("1".repeat(64))
+                    .unwrap(),
+                capabilities_digest: McpCapabilitiesDigest::parse("2".repeat(64)).unwrap(),
+                catalog_digest: McpCatalogDigest::parse("3".repeat(64)).unwrap(),
+                runtime_identity_digest: McpRuntimeIdentityDigest::parse("4".repeat(64)).unwrap(),
+                tools: vec![LocalMcpToolContractReceipt {
+                    name: "read_file".into(),
+                    input_schema_sha256: "5".repeat(64),
+                    output_schema_sha256: Some("6".repeat(64)),
+                    contract_digest: McpToolContractDigest::parse("7".repeat(64)).unwrap(),
+                }],
+                credential_scope: LocalMcpCredentialScope::ServerLifetime,
+                per_call_isolation: false,
+            },
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "local_mcp_server_runtime_recorded");
+        assert_eq!(value["receipt"]["tools"][0]["name"], "read_file");
+        let encoded = value.to_string();
+        assert!(!encoded.contains("--secret"));
+        assert!(!encoded.contains("secret-token"));
+        assert!(!encoded.contains("environment"));
+        assert!(!encoded.contains("arguments\""));
     }
 }

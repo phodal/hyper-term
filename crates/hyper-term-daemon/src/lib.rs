@@ -25,13 +25,13 @@ use hyper_term_protocol::{
     BlockPatch, CapabilityLease, ClientId, CompiledSandboxProfile, ContextReceipt, ControlRequest,
     ControlRequestEnvelope, ControlResponse, ControlResponseEnvelope, DomainEvent,
     EXECUTION_CONTEXT_SCHEMA_VERSION, EventEnvelope, GenUiArtifactCandidate, InputLeaseId,
-    MessageRole, NewEvent, OperationAction, OperationCompletion, OperationId, OperationKind,
-    OperationOutcome, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass,
-    SandboxEnforcement, SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId,
-    SandboxLifetime, SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule,
-    SandboxProcessPolicy, SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame,
-    TerminalId, TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame,
-    read_frame, write_frame,
+    LocalMcpServerRuntimeReceipt, MessageRole, NewEvent, OperationAction, OperationCompletion,
+    OperationId, OperationKind, OperationOutcome, OperationState, PROTOCOL_VERSION,
+    PermissionDecision, RequestId, RiskClass, SandboxEnforcement, SandboxEnvironmentPolicy,
+    SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime, SandboxNetworkPolicy, SandboxOutcome,
+    SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy, SandboxReceipt,
+    SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId, TerminalInputFrame, TerminalSize,
+    TerminalSnapshotFrame, WireError, WireFrame, read_frame, write_frame,
 };
 use hyper_term_sandbox::{
     IsolatedTaskReceipt, IsolatedTaskRequest, IsolatedTaskTermination, IsolatedWorktree,
@@ -459,6 +459,88 @@ impl DaemonState {
                     && matches!(
                         event.payload,
                         DomainEvent::AgentExecutionContextRecorded { .. }
+                    )
+            })
+            .cloned())
+    }
+
+    pub fn record_local_mcp_server_runtime(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        receipt: LocalMcpServerRuntimeReceipt,
+    ) -> Result<(), DaemonError> {
+        let operation = self.operation(operation_id)?;
+        validate_operation_scope(&operation, task_id, expected_revision)?;
+        if operation.state != OperationState::Dispatching {
+            return Err(DaemonError::OperationNotDispatching(operation.state));
+        }
+        let OperationAction::McpServerLaunch { launch } = &operation.action else {
+            return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+        };
+        if operation.kind != OperationKind::McpServerLaunch || &receipt.launch != launch {
+            return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+        }
+        validate_local_mcp_runtime_receipt(&receipt)?;
+        let proposal_event_id = {
+            let authority = lock(&self.inner.authority)?;
+            if authority.journal.all().iter().any(|event| {
+                event.task_id == task_id
+                    && event.operation_id == Some(operation_id)
+                    && matches!(
+                        event.payload,
+                        DomainEvent::LocalMcpServerRuntimeRecorded { .. }
+                    )
+            }) {
+                return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+            }
+            authority
+                .journal
+                .all()
+                .iter()
+                .find(|event| {
+                    event.task_id == task_id
+                        && event.operation_id == Some(operation_id)
+                        && matches!(event.payload, DomainEvent::OperationProposed { .. })
+                })
+                .map(|event| event.event_id)
+                .ok_or(DaemonError::OperationNotFound(operation_id))?
+        };
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: Some(operation_id),
+            causation_id: Some(proposal_event_id),
+            correlation_id: Some(proposal_event_id),
+            payload: DomainEvent::LocalMcpServerRuntimeRecorded { receipt },
+        })
+    }
+
+    pub fn local_mcp_server_runtime_event(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+    ) -> Result<Option<EventEnvelope>, DaemonError> {
+        let operation = self.operation(operation_id)?;
+        if operation.task_id != task_id {
+            return Err(DaemonError::OperationTaskMismatch {
+                expected: operation.task_id,
+                actual: task_id,
+            });
+        }
+        let authority = lock(&self.inner.authority)?;
+        Ok(authority
+            .journal
+            .all()
+            .iter()
+            .rev()
+            .find(|event| {
+                event.task_id == task_id
+                    && event.operation_id == Some(operation_id)
+                    && matches!(
+                        event.payload,
+                        DomainEvent::LocalMcpServerRuntimeRecorded { .. }
                     )
             })
             .cloned())
@@ -2630,6 +2712,103 @@ fn validate_mcp_server_launch(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct McpToolContractIdentity<'a> {
+    planned_runtime_identity: &'a str,
+    name: &'a str,
+    input_schema_sha256: &'a str,
+    output_schema_sha256: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct NegotiatedMcpRuntimeIdentity<'a> {
+    planned_runtime_identity: &'a str,
+    negotiated_protocol_version: &'a str,
+    server_name: &'a str,
+    server_version: &'a str,
+    enforced_sandbox_profile_digest: &'a str,
+    capabilities_digest: &'a str,
+    catalog_digest: &'a str,
+}
+
+fn validate_local_mcp_runtime_receipt(
+    receipt: &LocalMcpServerRuntimeReceipt,
+) -> Result<(), DaemonError> {
+    validate_mcp_server_launch(&receipt.launch)
+        .map_err(|_| DaemonError::InvalidLocalMcpRuntimeReceipt)?;
+    if receipt.schema_version != hyper_term_protocol::LOCAL_MCP_LAUNCH_SCHEMA_VERSION
+        || !valid_mcp_receipt_text(&receipt.negotiated_protocol_version, 128)
+        || !valid_mcp_receipt_text(&receipt.server_name, 256)
+        || !valid_mcp_receipt_text(&receipt.server_version, 128)
+        || receipt.enforced_sandbox_profile_digest != receipt.launch.sandbox_profile_digest
+        || receipt.credential_scope != receipt.launch.credential_scope
+        || receipt.per_call_isolation
+        || receipt.tools.len() > 256
+    {
+        return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+    }
+
+    let mut previous_name: Option<&str> = None;
+    for tool in &receipt.tools {
+        if !valid_mcp_receipt_text(&tool.name, 256)
+            || previous_name.is_some_and(|previous| previous >= tool.name.as_str())
+            || !is_sha256(&tool.input_schema_sha256)
+            || tool
+                .output_schema_sha256
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+        {
+            return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+        }
+        let expected_contract = mcp_receipt_sha256(&McpToolContractIdentity {
+            planned_runtime_identity: receipt.launch.runtime_identity_digest.as_str(),
+            name: &tool.name,
+            input_schema_sha256: &tool.input_schema_sha256,
+            output_schema_sha256: tool.output_schema_sha256.as_deref(),
+        })?;
+        if tool.contract_digest.as_str() != expected_contract {
+            return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+        }
+        previous_name = Some(&tool.name);
+    }
+
+    let expected_catalog = mcp_receipt_sha256(&receipt.tools)?;
+    if receipt.catalog_digest.as_str() != expected_catalog {
+        return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+    }
+    let expected_runtime = mcp_receipt_sha256(&NegotiatedMcpRuntimeIdentity {
+        planned_runtime_identity: receipt.launch.runtime_identity_digest.as_str(),
+        negotiated_protocol_version: &receipt.negotiated_protocol_version,
+        server_name: &receipt.server_name,
+        server_version: &receipt.server_version,
+        enforced_sandbox_profile_digest: receipt.enforced_sandbox_profile_digest.as_str(),
+        capabilities_digest: receipt.capabilities_digest.as_str(),
+        catalog_digest: receipt.catalog_digest.as_str(),
+    })?;
+    if receipt.runtime_identity_digest.as_str() != expected_runtime {
+        return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+    }
+    let encoded =
+        serde_json::to_vec(receipt).map_err(|_| DaemonError::InvalidLocalMcpRuntimeReceipt)?;
+    if encoded.len() > 512 * 1024 {
+        return Err(DaemonError::InvalidLocalMcpRuntimeReceipt);
+    }
+    Ok(())
+}
+
+fn valid_mcp_receipt_text(value: &str, maximum: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn mcp_receipt_sha256(value: &impl Serialize) -> Result<String, DaemonError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| DaemonError::InvalidLocalMcpRuntimeReceipt)?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn validate_agent_tool_call(call: &hyper_term_protocol::AgentToolCall) -> Result<(), DaemonError> {
     if call.tool_call_id.is_empty()
         || call.tool_call_id.len() > 4096
@@ -3645,7 +3824,7 @@ pub enum DaemonError {
     OperationNotAuthorized(OperationState),
     #[error("operation is {0:?}, not dispatching")]
     OperationNotDispatching(OperationState),
-    #[error("generic dispatch accepts only opaque operation actions")]
+    #[error("generic dispatch accepts only opaque or local MCP server launch actions")]
     GenericDispatchRequiresOpaqueAction,
     #[error("artifact acceptance requires the dispatching hyper_term.genui.compile operation")]
     ArtifactAcceptanceRequiresGenUiCompile,
@@ -3670,6 +3849,8 @@ pub enum DaemonError {
     ActionKindMismatch,
     #[error("local MCP server launch identity is invalid")]
     InvalidMcpServerLaunch,
+    #[error("local MCP server runtime receipt is invalid")]
+    InvalidLocalMcpRuntimeReceipt,
     #[error("terminal dispatch only supports an exact shell action")]
     UnsupportedTerminalAction,
     #[error("sandboxed Agent commands require an explicit working directory")]
@@ -3789,6 +3970,7 @@ impl DaemonError {
             Self::InvalidBoundedText { .. }
             | Self::InvalidResultDigest
             | Self::InconsistentOperationOutcome
+            | Self::InvalidLocalMcpRuntimeReceipt
             | Self::EmptyMessage
             | Self::MessageTooLarge(_)
             | Self::ExternalMessageIdTooLarge

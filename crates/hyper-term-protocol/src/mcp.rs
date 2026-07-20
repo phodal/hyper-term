@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextDigest, McpArgumentsDigest, McpRuntimeIdentityDigest, SandboxProfileDigest};
+use crate::{
+    ContextDigest, McpArgumentsDigest, McpCapabilitiesDigest, McpCatalogDigest,
+    McpRuntimeIdentityDigest, McpToolContractDigest, SandboxProfileDigest,
+};
 
 pub const LOCAL_MCP_LAUNCH_SCHEMA_VERSION: u16 = 1;
 
@@ -39,4 +42,30 @@ pub struct LocalMcpServerLaunch {
     pub lifecycle: LocalMcpServerLifecycle,
     pub credential_scope: LocalMcpCredentialScope,
     pub runtime_identity_digest: McpRuntimeIdentityDigest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LocalMcpToolContractReceipt {
+    pub name: String,
+    pub input_schema_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema_sha256: Option<String>,
+    pub contract_digest: McpToolContractDigest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LocalMcpServerRuntimeReceipt {
+    pub schema_version: u16,
+    pub launch: LocalMcpServerLaunch,
+    pub negotiated_protocol_version: String,
+    pub server_name: String,
+    pub server_version: String,
+    pub enforced_sandbox_profile_digest: SandboxProfileDigest,
+    pub capabilities_digest: McpCapabilitiesDigest,
+    pub catalog_digest: McpCatalogDigest,
+    pub runtime_identity_digest: McpRuntimeIdentityDigest,
+    #[serde(default)]
+    pub tools: Vec<LocalMcpToolContractReceipt>,
+    pub credential_scope: LocalMcpCredentialScope,
+    pub per_call_isolation: bool,
 }

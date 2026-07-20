@@ -1,16 +1,32 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
 
-use hyper_term_core::sandbox_profile_digest;
-use hyper_term_protocol::{
-    EXECUTION_CONTEXT_SCHEMA_VERSION, ExecutionMode, LOCAL_MCP_LAUNCH_SCHEMA_VERSION,
-    LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle, McpArgumentsDigest,
-    McpRuntimeIdentityDigest, ResolvedExecutionContext, SandboxLifetime, SandboxProfile,
+use hyper_term_core::{
+    OperationRecord, SandboxCompileRequest, SandboxLauncher, sandbox_profile_digest,
 };
+use hyper_term_protocol::{
+    Actor, EXECUTION_CONTEXT_SCHEMA_VERSION, ExecutionMode, LOCAL_MCP_LAUNCH_SCHEMA_VERSION,
+    LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle,
+    LocalMcpServerRuntimeReceipt, LocalMcpToolContractReceipt, McpArgumentsDigest,
+    McpCapabilitiesDigest, McpCatalogDigest, McpRuntimeIdentityDigest, McpToolContractDigest,
+    OperationAction, OperationKind, OperationState, ResolvedExecutionContext, SandboxLifetime,
+    SandboxProfile, TerminalCommand,
+};
+use hyper_term_sandbox::MacOsSeatbeltLauncher;
+use process_wrap::tokio::{CommandWrap, KillOnDrop, ProcessGroup};
+use rmcp::service::RunningService;
+use rmcp::transport::TokioChildProcess;
+use rmcp::{RoleClient, ServiceExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::sha256_file;
 
@@ -18,6 +34,10 @@ const MAX_SERVER_ID_BYTES: usize = 64;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 const MAX_ARGUMENT_TOTAL_BYTES: usize = 64 * 1024;
+const MAX_DISCOVERED_TOOLS: usize = 256;
+const MAX_TOOL_NAME_BYTES: usize = 256;
+const MAX_TOOL_SCHEMA_BYTES: usize = 1024 * 1024;
+const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct LocalMcpServerConfig {
@@ -39,6 +59,343 @@ pub struct PreparedLocalMcpServer {
     pub arguments: Vec<OsString>,
     pub environment: BTreeMap<String, OsString>,
     pub sandbox: SandboxProfile,
+}
+
+pub struct AuthorizedLocalMcpServer {
+    prepared: PreparedLocalMcpServer,
+    sandbox_launch: hyper_term_core::SandboxLaunchPlan,
+}
+
+pub struct ManagedLocalMcpClient {
+    service: RunningService<RoleClient, ()>,
+    receipt: LocalMcpServerRuntimeReceipt,
+    stderr_tail: Arc<Mutex<VecDeque<u8>>>,
+    stderr_reader: JoinHandle<()>,
+}
+
+pub fn authorize_local_mcp_server(
+    prepared: PreparedLocalMcpServer,
+    operation: &OperationRecord,
+) -> Result<AuthorizedLocalMcpServer, LocalMcpPlanError> {
+    if operation.kind != OperationKind::McpServerLaunch
+        || operation.state != OperationState::Dispatching
+        || operation.revision == 0
+        || !matches!(
+            &operation.action,
+            OperationAction::McpServerLaunch { launch } if launch == &prepared.launch
+        )
+    {
+        return Err(LocalMcpPlanError::LaunchNotAuthorized);
+    }
+    let command = TerminalCommand {
+        program: prepared
+            .executable
+            .to_str()
+            .ok_or(LocalMcpPlanError::NonUtf8Executable)?
+            .to_owned(),
+        args: validate_arguments(&prepared.arguments)?,
+        cwd: Some(prepared.launch.working_directory.clone()),
+        env: prepared
+            .environment
+            .iter()
+            .map(|(name, value)| {
+                value
+                    .to_str()
+                    .map(|value| (name.clone(), value.to_owned()))
+                    .ok_or(LocalMcpPlanError::NonUtf8Environment)
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    let sandbox_launch = MacOsSeatbeltLauncher
+        .compile(&SandboxCompileRequest {
+            operation_id: operation.operation_id,
+            operation_revision: operation.revision,
+            actor: Actor::System,
+            command,
+            profile: prepared.sandbox.clone(),
+        })
+        .map_err(|error| LocalMcpPlanError::Sandbox(error.to_string()))?;
+    if !sandbox_launch.compiled.enforced || !sandbox_launch.clear_environment {
+        return Err(LocalMcpPlanError::UnsafeSandbox);
+    }
+    Ok(AuthorizedLocalMcpServer {
+        prepared,
+        sandbox_launch,
+    })
+}
+
+impl ManagedLocalMcpClient {
+    pub async fn launch(
+        authorized: AuthorizedLocalMcpServer,
+        startup_timeout: Duration,
+        discovery_timeout: Duration,
+    ) -> Result<Self, LocalMcpClientError> {
+        let mut command = tokio::process::Command::new(&authorized.sandbox_launch.command.program);
+        command
+            .args(&authorized.sandbox_launch.command.args)
+            .current_dir(
+                authorized
+                    .sandbox_launch
+                    .command
+                    .cwd
+                    .as_ref()
+                    .ok_or(LocalMcpClientError::InvalidSandboxLaunch)?,
+            )
+            .env_clear()
+            .envs(&authorized.sandbox_launch.command.env);
+        let mut command = CommandWrap::from(command);
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        command.wrap(KillOnDrop);
+        let (transport, stderr) = TokioChildProcess::builder(command)
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(LocalMcpClientError::Spawn)?;
+        let stderr = stderr.ok_or(LocalMcpClientError::MissingStderr)?;
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_BYTES)));
+        let stderr_reader = spawn_stderr_reader(stderr, Arc::clone(&stderr_tail));
+        let service = match tokio::time::timeout(startup_timeout, ().serve(transport)).await {
+            Ok(Ok(service)) => service,
+            Ok(Err(error)) => {
+                let tail = stderr_snapshot(&stderr_tail).await;
+                stderr_reader.abort();
+                return Err(LocalMcpClientError::Initialize(format!(
+                    "{error}; stderr: {tail}"
+                )));
+            }
+            Err(_) => {
+                let tail = stderr_snapshot(&stderr_tail).await;
+                stderr_reader.abort();
+                return Err(LocalMcpClientError::StartupTimeout(tail));
+            }
+        };
+        let tools = match tokio::time::timeout(discovery_timeout, service.list_all_tools()).await {
+            Ok(Ok(tools)) => tools,
+            Ok(Err(error)) => {
+                drop(service);
+                stderr_reader.abort();
+                return Err(LocalMcpClientError::Discovery(error.to_string()));
+            }
+            Err(_) => {
+                drop(service);
+                stderr_reader.abort();
+                return Err(LocalMcpClientError::DiscoveryTimeout);
+            }
+        };
+        let receipt = build_runtime_receipt(
+            authorized.prepared.launch,
+            authorized.sandbox_launch.compiled.profile_digest.clone(),
+            service
+                .peer_info()
+                .ok_or(LocalMcpClientError::MissingServerInfo)?
+                .as_ref(),
+            tools,
+        )?;
+        Ok(Self {
+            service,
+            receipt,
+            stderr_tail,
+            stderr_reader,
+        })
+    }
+
+    pub fn receipt(&self) -> &LocalMcpServerRuntimeReceipt {
+        &self.receipt
+    }
+
+    pub async fn stderr_tail(&self) -> String {
+        let mut tail = self.stderr_tail.lock().await;
+        String::from_utf8_lossy(tail.make_contiguous()).into_owned()
+    }
+
+    pub async fn close(&mut self, timeout: Duration) -> Result<(), LocalMcpClientError> {
+        let closed = self
+            .service
+            .close_with_timeout(timeout)
+            .await
+            .map_err(|error| LocalMcpClientError::Close(error.to_string()))?;
+        self.stderr_reader.abort();
+        if closed.is_none() {
+            return Err(LocalMcpClientError::CloseTimeout);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ManagedLocalMcpClient {
+    fn drop(&mut self) {
+        self.stderr_reader.abort();
+    }
+}
+
+fn build_runtime_receipt(
+    launch: LocalMcpServerLaunch,
+    enforced_sandbox_profile_digest: hyper_term_protocol::SandboxProfileDigest,
+    server: &rmcp::model::ServerInfo,
+    mut tools: Vec<rmcp::model::Tool>,
+) -> Result<LocalMcpServerRuntimeReceipt, LocalMcpClientError> {
+    if server.server_info.name.is_empty()
+        || server.server_info.name.len() > 256
+        || server.server_info.version.is_empty()
+        || server.server_info.version.len() > 128
+        || server
+            .server_info
+            .name
+            .chars()
+            .chain(server.server_info.version.chars())
+            .any(char::is_control)
+    {
+        return Err(LocalMcpClientError::InvalidServerInfo);
+    }
+    if tools.len() > MAX_DISCOVERED_TOOLS {
+        return Err(LocalMcpClientError::TooManyTools);
+    }
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut previous_name: Option<String> = None;
+    let mut tool_receipts = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let name = tool.name.into_owned();
+        if name.is_empty()
+            || name.len() > MAX_TOOL_NAME_BYTES
+            || name.chars().any(char::is_control)
+            || previous_name.as_deref() == Some(name.as_str())
+        {
+            return Err(LocalMcpClientError::InvalidToolCatalog);
+        }
+        let input_schema_sha256 = bounded_json_sha256(
+            tool.input_schema.as_ref(),
+            MAX_TOOL_SCHEMA_BYTES,
+            "input schema",
+        )?;
+        let output_schema_sha256 = tool
+            .output_schema
+            .as_ref()
+            .map(|schema| {
+                bounded_json_sha256(schema.as_ref(), MAX_TOOL_SCHEMA_BYTES, "output schema")
+            })
+            .transpose()?;
+        let contract_digest =
+            McpToolContractDigest::parse(client_sha256_json(&McpToolContractInput {
+                planned_runtime_identity: launch.runtime_identity_digest.as_str(),
+                name: &name,
+                input_schema_sha256: &input_schema_sha256,
+                output_schema_sha256: output_schema_sha256.as_deref(),
+            })?)
+            .map_err(|error| LocalMcpClientError::Digest(error.to_string()))?;
+        previous_name = Some(name.clone());
+        tool_receipts.push(LocalMcpToolContractReceipt {
+            name,
+            input_schema_sha256,
+            output_schema_sha256,
+            contract_digest,
+        });
+    }
+    let capabilities_digest = McpCapabilitiesDigest::parse(bounded_json_sha256(
+        &server.capabilities,
+        MAX_TOOL_SCHEMA_BYTES,
+        "server capabilities",
+    )?)
+    .map_err(|error| LocalMcpClientError::Digest(error.to_string()))?;
+    let catalog_digest = McpCatalogDigest::parse(client_sha256_json(&tool_receipts)?)
+        .map_err(|error| LocalMcpClientError::Digest(error.to_string()))?;
+    let negotiated_protocol_version = server.protocol_version.to_string();
+    let runtime_identity_digest =
+        McpRuntimeIdentityDigest::parse(client_sha256_json(&NegotiatedMcpRuntimeIdentityInput {
+            planned_runtime_identity: launch.runtime_identity_digest.as_str(),
+            negotiated_protocol_version: &negotiated_protocol_version,
+            server_name: &server.server_info.name,
+            server_version: &server.server_info.version,
+            enforced_sandbox_profile_digest: enforced_sandbox_profile_digest.as_str(),
+            capabilities_digest: capabilities_digest.as_str(),
+            catalog_digest: catalog_digest.as_str(),
+        })?)
+        .map_err(|error| LocalMcpClientError::Digest(error.to_string()))?;
+    Ok(LocalMcpServerRuntimeReceipt {
+        schema_version: LOCAL_MCP_LAUNCH_SCHEMA_VERSION,
+        credential_scope: launch.credential_scope,
+        launch,
+        negotiated_protocol_version,
+        server_name: server.server_info.name.clone(),
+        server_version: server.server_info.version.clone(),
+        enforced_sandbox_profile_digest,
+        capabilities_digest,
+        catalog_digest,
+        runtime_identity_digest,
+        tools: tool_receipts,
+        per_call_isolation: false,
+    })
+}
+
+fn spawn_stderr_reader(
+    mut stderr: tokio::process::ChildStderr,
+    tail: Arc<Mutex<VecDeque<u8>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = match stderr.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let mut tail = tail.lock().await;
+            let overflow = tail
+                .len()
+                .saturating_add(read)
+                .saturating_sub(STDERR_TAIL_BYTES);
+            if overflow > 0 {
+                let retained = tail.len();
+                tail.drain(..overflow.min(retained));
+            }
+            tail.extend(&buffer[..read]);
+        }
+    })
+}
+
+async fn stderr_snapshot(tail: &Arc<Mutex<VecDeque<u8>>>) -> String {
+    let mut tail = tail.lock().await;
+    String::from_utf8_lossy(tail.make_contiguous()).into_owned()
+}
+
+#[derive(Serialize)]
+struct McpToolContractInput<'a> {
+    planned_runtime_identity: &'a str,
+    name: &'a str,
+    input_schema_sha256: &'a str,
+    output_schema_sha256: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct NegotiatedMcpRuntimeIdentityInput<'a> {
+    planned_runtime_identity: &'a str,
+    negotiated_protocol_version: &'a str,
+    server_name: &'a str,
+    server_version: &'a str,
+    enforced_sandbox_profile_digest: &'a str,
+    capabilities_digest: &'a str,
+    catalog_digest: &'a str,
+}
+
+fn bounded_json_sha256(
+    value: &impl Serialize,
+    maximum: usize,
+    label: &'static str,
+) -> Result<String, LocalMcpClientError> {
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.len() > maximum {
+        return Err(LocalMcpClientError::CatalogValueTooLarge { label, maximum });
+    }
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn client_sha256_json(value: &impl Serialize) -> Result<String, LocalMcpClientError> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub fn prepare_local_mcp_server(
@@ -278,12 +635,18 @@ pub enum LocalMcpPlanError {
     TooManyArguments,
     #[error("local MCP argument is not UTF-8")]
     NonUtf8Argument,
+    #[error("local MCP executable path is not UTF-8")]
+    NonUtf8Executable,
+    #[error("local MCP environment is not UTF-8")]
+    NonUtf8Environment,
     #[error("local MCP argument is invalid")]
     InvalidArgument,
     #[error("local MCP arguments exceed their byte bound")]
     ArgumentsTooLarge,
     #[error("local MCP roots snapshot digest is invalid")]
     InvalidRootsSnapshotDigest,
+    #[error("local MCP server launch has not entered its exact dispatching operation")]
+    LaunchNotAuthorized,
     #[error("local MCP sandbox is invalid: {0}")]
     Sandbox(String),
     #[error("local MCP digest is invalid: {0}")]
@@ -292,6 +655,42 @@ pub enum LocalMcpPlanError {
     Json(#[from] serde_json::Error),
     #[error("local MCP executable inspection failed: {0}")]
     Driver(#[from] crate::DriverError),
+}
+
+#[derive(Debug, Error)]
+pub enum LocalMcpClientError {
+    #[error("cannot spawn the authorized local MCP server: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("authorized local MCP server did not expose stderr")]
+    MissingStderr,
+    #[error("authorized local MCP sandbox launch is incomplete")]
+    InvalidSandboxLaunch,
+    #[error("local MCP initialization timed out; stderr: {0}")]
+    StartupTimeout(String),
+    #[error("local MCP initialization failed: {0}")]
+    Initialize(String),
+    #[error("local MCP tool discovery timed out")]
+    DiscoveryTimeout,
+    #[error("local MCP tool discovery failed: {0}")]
+    Discovery(String),
+    #[error("local MCP server returned no negotiated identity")]
+    MissingServerInfo,
+    #[error("local MCP server identity is invalid")]
+    InvalidServerInfo,
+    #[error("local MCP server advertised too many tools")]
+    TooManyTools,
+    #[error("local MCP server advertised an invalid or duplicate tool")]
+    InvalidToolCatalog,
+    #[error("local MCP {label} exceeds the {maximum}-byte bound")]
+    CatalogValueTooLarge { label: &'static str, maximum: usize },
+    #[error("local MCP digest is invalid: {0}")]
+    Digest(String),
+    #[error("local MCP runtime receipt JSON failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("local MCP shutdown failed: {0}")]
+    Close(String),
+    #[error("local MCP process tree did not close within its deadline")]
+    CloseTimeout,
 }
 
 #[cfg(test)]
@@ -303,9 +702,10 @@ mod tests {
     use hyper_term_protocol::{
         BindingLifetime, BindingScope, CollisionPolicy, EnvironmentBindingOrigin,
         EnvironmentBindingSpec, EnvironmentClass, EnvironmentPlan, EnvironmentSource,
-        ExecutionContextSpec, OverridePolicy, RuntimeEnvironmentSpec, SandboxEnforcement,
-        SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxNetworkPolicy,
-        SandboxProcessPolicy, SandboxResourceLimits, WorkspaceContextSpec,
+        ExecutionContextSpec, OperationId, OverridePolicy, RiskClass, RuntimeEnvironmentSpec,
+        SandboxEnforcement, SandboxEnvironmentPolicy, SandboxFileSystemPolicy,
+        SandboxNetworkPolicy, SandboxProcessPolicy, SandboxResourceLimits, TaskId,
+        WorkspaceContextSpec,
     };
     use tempfile::TempDir;
 
@@ -381,6 +781,21 @@ mod tests {
         }
     }
 
+    fn operation(launch: LocalMcpServerLaunch, state: OperationState) -> OperationRecord {
+        OperationRecord {
+            task_id: TaskId::new(),
+            operation_id: OperationId::new(),
+            revision: 4,
+            kind: OperationKind::McpServerLaunch,
+            action: OperationAction::McpServerLaunch { launch },
+            summary: "Start reviewed fixture MCP".into(),
+            risk: RiskClass::ExternalEffect,
+            required_capabilities: vec!["mcp.server.launch".into()],
+            state,
+            permission_decision: Some(hyper_term_protocol::PermissionDecision::AllowOnce),
+        }
+    }
+
     #[test]
     fn pinned_local_mcp_plan_is_deterministic_and_redacted() {
         let temp = TempDir::new().unwrap();
@@ -453,6 +868,110 @@ mod tests {
             prepare_local_mcp_server(lifetime),
             Err(LocalMcpPlanError::UnsafeSandbox)
         ));
+    }
+
+    #[test]
+    fn only_the_exact_dispatching_operation_can_authorize_spawn() {
+        let temp = TempDir::new().unwrap();
+        let prepared = prepare_local_mcp_server(config(&temp, &[])).unwrap();
+        let waiting = operation(prepared.launch.clone(), OperationState::WaitingHuman);
+        assert!(matches!(
+            authorize_local_mcp_server(prepared.clone(), &waiting),
+            Err(LocalMcpPlanError::LaunchNotAuthorized)
+        ));
+
+        let mut substituted = operation(prepared.launch.clone(), OperationState::Dispatching);
+        if let OperationAction::McpServerLaunch { launch } = &mut substituted.action {
+            launch.argument_count += 1;
+        }
+        assert!(matches!(
+            authorize_local_mcp_server(prepared.clone(), &substituted),
+            Err(LocalMcpPlanError::LaunchNotAuthorized)
+        ));
+
+        #[cfg(target_os = "macos")]
+        {
+            let dispatching = operation(prepared.launch.clone(), OperationState::Dispatching);
+            authorize_local_mcp_server(prepared, &dispatching).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authorized_stdio_server_negotiates_a_bounded_catalog_and_closes() {
+        let temp = TempDir::new().unwrap();
+        let script = r#"
+printf 'fixture MCP ready\n' >&2
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"fixture-mcp","version":"1.0.0"}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"fixture.read","description":"Read fixture metadata","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},"outputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]}}'
+      ;;
+  esac
+done
+"#;
+        let mut fixture_config = config(&temp, &["-c", script]);
+        fixture_config.executable = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        fixture_config.executable_sha256 = sha256_file(&fixture_config.executable).unwrap();
+        let prepared = prepare_local_mcp_server(fixture_config).unwrap();
+        let dispatching = operation(prepared.launch.clone(), OperationState::Dispatching);
+        let authorized = authorize_local_mcp_server(prepared, &dispatching).unwrap();
+        let mut fixture = std::process::Command::new(&authorized.sandbox_launch.command.program)
+            .args(&authorized.sandbox_launch.command.args)
+            .current_dir(authorized.sandbox_launch.command.cwd.as_ref().unwrap())
+            .env_clear()
+            .envs(&authorized.sandbox_launch.command.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        fixture
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{}}\n")
+            .unwrap();
+        let fixture_output = fixture.wait_with_output().unwrap();
+        assert!(
+            fixture_output.status.success(),
+            "status={:?} stderr={}",
+            fixture_output.status.code(),
+            String::from_utf8_lossy(&fixture_output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&fixture_output.stdout).contains("fixture-mcp"),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&fixture_output.stdout),
+            String::from_utf8_lossy(&fixture_output.stderr)
+        );
+        let mut client = ManagedLocalMcpClient::launch(
+            authorized,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(client.receipt().negotiated_protocol_version, "2025-11-25");
+        assert_eq!(client.receipt().server_name, "fixture-mcp");
+        assert_eq!(client.receipt().server_version, "1.0.0");
+        assert_eq!(client.receipt().tools.len(), 1);
+        assert_eq!(client.receipt().tools[0].name, "fixture.read");
+        assert!(!client.receipt().per_call_isolation);
+        assert_eq!(
+            client.receipt().credential_scope,
+            LocalMcpCredentialScope::ServerLifetime
+        );
+        assert!(client.stderr_tail().await.contains("fixture MCP ready"));
+        let receipt = serde_json::to_string(client.receipt()).unwrap();
+        assert!(!receipt.contains("Read fixture metadata"));
+        assert!(!receipt.contains("while IFS="));
+        client.close(Duration::from_secs(2)).await.unwrap();
     }
 
     #[test]

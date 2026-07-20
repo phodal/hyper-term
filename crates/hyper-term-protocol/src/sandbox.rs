@@ -67,7 +67,10 @@ sha256_digest!(ActionDigest);
 sha256_digest!(ContextDigest);
 sha256_digest!(EnvironmentPlanDigest);
 sha256_digest!(McpArgumentsDigest);
+sha256_digest!(McpCapabilitiesDigest);
+sha256_digest!(McpCatalogDigest);
 sha256_digest!(McpRuntimeIdentityDigest);
+sha256_digest!(McpToolContractDigest);
 sha256_digest!(SandboxProfileDigest);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

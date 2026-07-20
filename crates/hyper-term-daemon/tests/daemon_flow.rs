@@ -14,13 +14,86 @@ use hyper_term_protocol::{
     BlockPayload, ClientId, ContextDigest, ContextReceipt, ControlRequest, ControlRequestEnvelope,
     ControlResponse, DomainEvent, EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest,
     ExecutionMode, GenUiArtifactCandidate, GenUiCompilerIdentity, LocalMcpCredentialScope,
-    LocalMcpServerLaunch, LocalMcpServerLifecycle, McpArgumentsDigest, McpRuntimeIdentityDigest,
-    OperationAction, OperationCompletion, OperationKind, OperationOutcome, OperationState,
-    PermissionDecision, RequestId, RiskClass, SandboxProfileDigest, TerminalCommand,
-    TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame, read_frame, write_frame,
+    LocalMcpServerLaunch, LocalMcpServerLifecycle, LocalMcpServerRuntimeReceipt,
+    LocalMcpToolContractReceipt, McpArgumentsDigest, McpCapabilitiesDigest, McpCatalogDigest,
+    McpRuntimeIdentityDigest, McpToolContractDigest, OperationAction, OperationCompletion,
+    OperationKind, OperationOutcome, OperationState, PermissionDecision, RequestId, RiskClass,
+    SandboxProfileDigest, TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize,
+    WireFrame, read_frame, write_frame,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
+
+fn json_sha256(value: &impl Serialize) -> String {
+    Sha256::digest(serde_json::to_vec(value).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[derive(Serialize)]
+struct ToolContractIdentity<'a> {
+    planned_runtime_identity: &'a str,
+    name: &'a str,
+    input_schema_sha256: &'a str,
+    output_schema_sha256: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RuntimeIdentity<'a> {
+    planned_runtime_identity: &'a str,
+    negotiated_protocol_version: &'a str,
+    server_name: &'a str,
+    server_version: &'a str,
+    enforced_sandbox_profile_digest: &'a str,
+    capabilities_digest: &'a str,
+    catalog_digest: &'a str,
+}
+
+fn local_mcp_runtime_receipt(launch: LocalMcpServerLaunch) -> LocalMcpServerRuntimeReceipt {
+    let input_schema_sha256 = "1".repeat(64);
+    let output_schema_sha256 = Some("2".repeat(64));
+    let contract_digest = McpToolContractDigest::parse(json_sha256(&ToolContractIdentity {
+        planned_runtime_identity: launch.runtime_identity_digest.as_str(),
+        name: "read_file",
+        input_schema_sha256: &input_schema_sha256,
+        output_schema_sha256: output_schema_sha256.as_deref(),
+    }))
+    .unwrap();
+    let tools = vec![LocalMcpToolContractReceipt {
+        name: "read_file".into(),
+        input_schema_sha256,
+        output_schema_sha256,
+        contract_digest,
+    }];
+    let catalog_digest = McpCatalogDigest::parse(json_sha256(&tools)).unwrap();
+    let capabilities_digest = McpCapabilitiesDigest::parse("3".repeat(64)).unwrap();
+    let runtime_identity_digest = McpRuntimeIdentityDigest::parse(json_sha256(&RuntimeIdentity {
+        planned_runtime_identity: launch.runtime_identity_digest.as_str(),
+        negotiated_protocol_version: "2025-11-25",
+        server_name: "fixture_read",
+        server_version: "1.0.0",
+        enforced_sandbox_profile_digest: launch.sandbox_profile_digest.as_str(),
+        capabilities_digest: capabilities_digest.as_str(),
+        catalog_digest: catalog_digest.as_str(),
+    }))
+    .unwrap();
+    LocalMcpServerRuntimeReceipt {
+        schema_version: hyper_term_protocol::LOCAL_MCP_LAUNCH_SCHEMA_VERSION,
+        credential_scope: launch.credential_scope,
+        enforced_sandbox_profile_digest: launch.sandbox_profile_digest.clone(),
+        launch,
+        negotiated_protocol_version: "2025-11-25".into(),
+        server_name: "fixture_read".into(),
+        server_version: "1.0.0".into(),
+        capabilities_digest,
+        catalog_digest,
+        runtime_identity_digest,
+        tools,
+        per_call_isolation: false,
+    }
+}
 
 #[test]
 fn agent_execution_context_receipt_is_correlated_and_survives_replay() {
@@ -772,7 +845,8 @@ fn opaque_tool_dispatch_requires_permission_and_records_its_receipt() {
 #[test]
 fn local_mcp_server_launch_is_separately_authorized_and_redacted() {
     let directory = tempdir().expect("tempdir");
-    let state = DaemonState::open(directory.path().join("state")).expect("open daemon");
+    let state_path = directory.path().join("state");
+    let state = DaemonState::open(&state_path).expect("open daemon");
     let task_id = state.create_task("Reviewed local MCP".into()).unwrap();
     let executable = std::fs::canonicalize("/bin/sh").unwrap();
     let executable_sha256 = Sha256::digest(std::fs::read(&executable).unwrap())
@@ -826,11 +900,95 @@ fn local_mcp_server_launch_is_separately_authorized_and_redacted() {
     let dispatching = state
         .begin_operation(task_id, proposed.operation_id, authorized.revision)
         .unwrap();
-    state
-        .complete_operation(
+    let receipt = local_mcp_runtime_receipt(launch.clone());
+    let mut false_isolation_claim = receipt.clone();
+    false_isolation_claim.per_call_isolation = true;
+    assert!(matches!(
+        state.record_local_mcp_server_runtime(
             task_id,
             proposed.operation_id,
             dispatching.revision,
+            false_isolation_claim,
+        ),
+        Err(DaemonError::InvalidLocalMcpRuntimeReceipt)
+    ));
+    let mut mismatched_launch = receipt.clone();
+    mismatched_launch.launch.server_id = "unreviewed-server".into();
+    assert!(matches!(
+        state.record_local_mcp_server_runtime(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision,
+            mismatched_launch,
+        ),
+        Err(DaemonError::InvalidLocalMcpRuntimeReceipt)
+    ));
+    assert!(matches!(
+        state.record_local_mcp_server_runtime(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision - 1,
+            receipt.clone(),
+        ),
+        Err(DaemonError::StaleOperationRevision { .. })
+    ));
+    state
+        .record_local_mcp_server_runtime(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision,
+            receipt.clone(),
+        )
+        .unwrap();
+    assert!(matches!(
+        state.record_local_mcp_server_runtime(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision,
+            receipt.clone(),
+        ),
+        Err(DaemonError::InvalidLocalMcpRuntimeReceipt)
+    ));
+    let runtime_event = state
+        .local_mcp_server_runtime_event(task_id, proposed.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime_event.operation_id, Some(proposed.operation_id));
+    assert_eq!(runtime_event.causation_id, runtime_event.correlation_id);
+    assert!(runtime_event.causation_id.is_some());
+    assert!(matches!(
+        &runtime_event.payload,
+        DomainEvent::LocalMcpServerRuntimeRecorded { receipt: recorded }
+            if recorded == &receipt
+    ));
+    drop(state);
+
+    let reopened = DaemonState::open(&state_path).expect("reopen daemon");
+    let replayed = reopened
+        .local_mcp_server_runtime_event(task_id, proposed.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replayed.event_id, runtime_event.event_id);
+    assert!(matches!(
+        reopened.complete_operation(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision,
+            OperationCompletion {
+                executor: "hyper-term-mcp-client".into(),
+                succeeded: true,
+                outcome: Some(OperationOutcome::Succeeded),
+                summary: "stale pre-restart completion".into(),
+                result_digest: Some(launch.runtime_identity_digest.to_string()),
+            },
+        ),
+        Err(DaemonError::StaleOperationRevision { .. })
+    ));
+    reopened
+        .complete_operation(
+            task_id,
+            proposed.operation_id,
+            dispatching.revision + 1,
             OperationCompletion {
                 executor: "hyper-term-mcp-client".into(),
                 succeeded: true,
@@ -841,12 +999,14 @@ fn local_mcp_server_launch_is_separately_authorized_and_redacted() {
         )
         .unwrap();
 
-    let events = std::fs::read_to_string(directory.path().join("state/events.jsonl")).unwrap();
+    let events = std::fs::read_to_string(state_path.join("events.jsonl")).unwrap();
     assert!(events.contains("mcp_server_launch"));
+    assert!(events.contains("local_mcp_server_runtime_recorded"));
+    assert!(events.contains("2025-11-25"));
     assert!(events.contains("fixture_read"));
     assert!(!events.contains("secret-token"));
     assert!(matches!(
-        state.propose_operation(
+        reopened.propose_operation(
             task_id,
             OperationKind::McpTool,
             OperationAction::McpServerLaunch { launch },
