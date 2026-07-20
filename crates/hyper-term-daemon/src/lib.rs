@@ -1,7 +1,10 @@
 //! Out-of-process authority host for Hyper Term.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -35,6 +38,7 @@ use hyper_term_sandbox::{
     LimaIsolatedTaskLauncher, LimaRunnerError, LimaTaskRunner, MacOsSeatbeltLauncher,
     cleanup_interrupted_lima_environment, read_isolated_task_receipt,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -59,7 +63,7 @@ use artifact_store::{ArtifactStore, ArtifactStoreError, StoredGenUiArtifact};
 use workspace_apply::{
     DurableWorkspaceApplyResult, WorkspaceApplySetPlan, WorkspaceTransactionContext,
     WorkspaceTransactionOutcome, acknowledge_workspace_transaction,
-    apply_workspace_set_plan_durable, prepare_workspace_apply_set,
+    apply_workspace_set_plan_durable, prepare_workspace_apply_set, validate_workspace_apply_set,
 };
 
 pub use artifact_debug_capsule::{BugCapsuleError, load_bug_capsule};
@@ -88,6 +92,9 @@ const ISOLATED_TASK_CAPABILITY: &str = "sandbox.isolated_task";
 const ISOLATED_TASK_WALL_TIME_MS: u64 = 10 * 60 * 1_000;
 const ISOLATED_TASK_MAX_PROCESSES: u32 = 256;
 const ISOLATED_TASK_MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+const ISOLATED_ACCEPTANCE_SCHEMA_VERSION: u32 = 1;
+const ISOLATED_ACCEPTANCE_DIRECTORY: &str = "isolated-acceptances";
+const MAX_ISOLATED_ACCEPTANCE_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GenUiArtifactHistoryEntry {
@@ -120,6 +127,7 @@ struct DaemonInner {
     isolated_results: Mutex<HashMap<OperationId, IsolatedResult>>,
     isolated_results_root: PathBuf,
     isolated_acceptances: Mutex<HashMap<OperationId, IsolatedAcceptance>>,
+    isolated_acceptances_root: PathBuf,
     state_directory: PathBuf,
     artifacts: ArtifactStore,
     artifact_acceptance: Mutex<()>,
@@ -184,6 +192,17 @@ struct IsolatedAcceptance {
     binding_digest: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StoredIsolatedAcceptance {
+    schema_version: u32,
+    acceptance_operation_id: OperationId,
+    task_id: TaskId,
+    source_operation_id: OperationId,
+    workspace: PathBuf,
+    plan: WorkspaceApplySetPlan,
+    binding_digest: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsolatedAcceptanceReview {
     pub operation: OperationRecord,
@@ -214,6 +233,8 @@ impl DaemonState {
         let isolated_worktree_manager = IsolatedWorktreeManager::discover()?;
         let isolated_results_root = state_directory.join("isolated-results");
         create_private_directory(&isolated_results_root)?;
+        let isolated_acceptances_root = state_directory.join(ISOLATED_ACCEPTANCE_DIRECTORY);
+        create_private_directory(&isolated_acceptances_root)?;
         let journal = JsonlJournal::open(state_directory.join("events.jsonl"))?;
         let mut operations = OperationReducer::default();
         let mut projectors = HashMap::new();
@@ -237,17 +258,22 @@ impl DaemonState {
             }
         }
 
+        let isolated_results = recover_completed_isolated_results(
+            &isolated_worktree_manager,
+            &isolated_results_root,
+            &operations,
+        )?;
+        let isolated_acceptances = recover_isolated_acceptances(
+            &isolated_acceptances_root,
+            &operations,
+            &isolated_results,
+        )?;
         let instance_id = Uuid::new_v4();
         let scratch_root = std::env::temp_dir()
             .join("hyper-term-agent")
             .join(instance_id.to_string());
         create_private_directory(&scratch_root)?;
         let scratch_root = fs::canonicalize(scratch_root)?;
-        let isolated_results = recover_completed_isolated_results(
-            &isolated_worktree_manager,
-            &isolated_results_root,
-            &operations,
-        )?;
         let daemon = Self {
             inner: Arc::new(DaemonInner {
                 instance_id,
@@ -270,7 +296,8 @@ impl DaemonState {
                 isolated_worktree_manager,
                 isolated_results: Mutex::new(isolated_results),
                 isolated_results_root,
-                isolated_acceptances: Mutex::new(HashMap::new()),
+                isolated_acceptances: Mutex::new(isolated_acceptances),
+                isolated_acceptances_root,
                 state_directory,
                 artifacts,
                 artifact_acceptance: Mutex::new(()),
@@ -1239,6 +1266,14 @@ impl DaemonState {
                 actual: task_id,
             });
         }
+        if lock(&self.inner.isolated_acceptances)?
+            .values()
+            .any(|acceptance| acceptance.source_operation_id == source_operation_id)
+        {
+            return Err(DaemonError::IsolatedAcceptanceAlreadyExists(
+                source_operation_id,
+            ));
+        }
         let result = lock(&self.inner.isolated_results)?
             .get(&source_operation_id)
             .cloned()
@@ -1269,8 +1304,9 @@ impl DaemonState {
         let binding_digest = isolated_acceptance_digest(
             source_operation_id,
             &result.receipt.changes.inventory_sha256,
-            &plan.result_digest,
-        );
+            &workspace,
+            &plan,
+        )?;
         let target_paths = plan
             .plans
             .iter()
@@ -1290,6 +1326,26 @@ impl DaemonState {
             RiskClass::WorkspaceWrite,
             vec!["workspace.write".into(), "sandbox.tier2.accept".into()],
         )?;
+        let stored = StoredIsolatedAcceptance {
+            schema_version: ISOLATED_ACCEPTANCE_SCHEMA_VERSION,
+            acceptance_operation_id: operation.operation_id,
+            task_id,
+            source_operation_id,
+            workspace: workspace.clone(),
+            plan: plan.clone(),
+            binding_digest: binding_digest.clone(),
+        };
+        if let Err(error) =
+            write_isolated_acceptance(&self.inner.isolated_acceptances_root, &stored)
+        {
+            let _ = self.decide_permission(
+                task_id,
+                operation.operation_id,
+                operation.revision,
+                PermissionDecision::Cancelled,
+            );
+            return Err(error);
+        }
         let previous = lock(&self.inner.isolated_acceptances)?.insert(
             operation.operation_id,
             IsolatedAcceptance {
@@ -1306,6 +1362,46 @@ impl DaemonState {
             result_digest: plan.result_digest,
             target_paths,
         })
+    }
+
+    pub fn isolated_acceptance_review(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<IsolatedAcceptanceReview, DaemonError> {
+        let acceptance = lock(&self.inner.isolated_acceptances)?
+            .get(&operation_id)
+            .cloned()
+            .ok_or(DaemonError::IsolatedAcceptanceMissing(operation_id))?;
+        let operation = self.operation(operation_id)?;
+        Ok(IsolatedAcceptanceReview {
+            operation,
+            source_operation_id: acceptance.source_operation_id,
+            result_digest: acceptance.plan.result_digest.clone(),
+            target_paths: acceptance
+                .plan
+                .plans
+                .iter()
+                .map(|plan| plan.target_path.clone())
+                .collect(),
+        })
+    }
+
+    pub fn decide_isolated_acceptance_permission(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        decision: PermissionDecision,
+    ) -> Result<OperationRecord, DaemonError> {
+        if !lock(&self.inner.isolated_acceptances)?.contains_key(&operation_id) {
+            return Err(DaemonError::IsolatedAcceptanceMissing(operation_id));
+        }
+        let updated = self.decide_permission(task_id, operation_id, expected_revision, decision)?;
+        if matches!(updated.state, OperationState::Cancelled) {
+            remove_isolated_acceptance(&self.inner.isolated_acceptances_root, operation_id)?;
+            lock(&self.inner.isolated_acceptances)?.remove(&operation_id);
+        }
+        Ok(updated)
     }
 
     pub fn accept_isolated_result(
@@ -1332,8 +1428,9 @@ impl DaemonState {
         if isolated_acceptance_digest(
             acceptance.source_operation_id,
             &source.changes.inventory_sha256,
-            &acceptance.plan.result_digest,
-        ) != acceptance.binding_digest
+            &acceptance.workspace,
+            &acceptance.plan,
+        )? != acceptance.binding_digest
         {
             return Err(DaemonError::IsolatedAcceptanceMismatch);
         }
@@ -1352,18 +1449,27 @@ impl DaemonState {
             Ok(DurableWorkspaceApplyResult::Committed(receipt))
             | Ok(DurableWorkspaceApplyResult::RolledBack(receipt)) => receipt,
             Err(error) => {
-                let _ = self.complete_operation(
-                    task_id,
-                    operation_id,
-                    dispatching.revision,
-                    OperationCompletion {
-                        executor: "hyper-term-tier2-accept".into(),
-                        succeeded: false,
-                        outcome: Some(OperationOutcome::UnknownExecution),
-                        summary: error.to_string(),
-                        result_digest: None,
-                    },
-                );
+                if self
+                    .complete_operation(
+                        task_id,
+                        operation_id,
+                        dispatching.revision,
+                        OperationCompletion {
+                            executor: "hyper-term-tier2-accept".into(),
+                            succeeded: false,
+                            outcome: Some(OperationOutcome::UnknownExecution),
+                            summary: error.to_string(),
+                            result_digest: None,
+                        },
+                    )
+                    .is_ok()
+                {
+                    let _ = remove_isolated_acceptance(
+                        &self.inner.isolated_acceptances_root,
+                        operation_id,
+                    );
+                    lock(&self.inner.isolated_acceptances)?.remove(&operation_id);
+                }
                 return Err(DaemonError::WorkspaceApply(error.to_string()));
             }
         };
@@ -1396,6 +1502,7 @@ impl DaemonState {
         )?;
         acknowledge_workspace_transaction(&self.inner.state_directory, receipt.transaction_id)
             .map_err(|error| DaemonError::WorkspaceApply(error.to_string()))?;
+        remove_isolated_acceptance(&self.inner.isolated_acceptances_root, operation_id)?;
         lock(&self.inner.isolated_acceptances)?.remove(&operation_id);
         if committed {
             self.discard_isolated_result(acceptance.source_operation_id)?;
@@ -2381,6 +2488,174 @@ fn recover_completed_isolated_results(
     Ok(recovered)
 }
 
+fn recover_isolated_acceptances(
+    root: &Path,
+    operations: &OperationReducer,
+    results: &HashMap<OperationId, IsolatedResult>,
+) -> Result<HashMap<OperationId, IsolatedAcceptance>, DaemonError> {
+    let mut recovered = HashMap::new();
+    let mut recovered_sources = HashSet::new();
+    for entry in fs::read_dir(root)?.take(1_025) {
+        let entry = entry?;
+        let file_name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| DaemonError::InvalidIsolatedAcceptanceStore)?;
+        if file_name.starts_with('.') && file_name.ends_with(".tmp") {
+            if !entry.file_type()?.is_file() {
+                return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+            }
+            fs::remove_file(entry.path())?;
+            continue;
+        }
+        if recovered.len() == 1_024 || !entry.file_type()?.is_file() {
+            return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+        }
+        let operation_text = file_name
+            .strip_suffix(".json")
+            .ok_or(DaemonError::InvalidIsolatedAcceptanceStore)?;
+        let operation_id = OperationId::from(
+            Uuid::parse_str(operation_text)
+                .map_err(|_| DaemonError::InvalidIsolatedAcceptanceStore)?,
+        );
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_ISOLATED_ACCEPTANCE_BYTES
+        {
+            return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+        }
+        let bytes = fs::read(entry.path())?;
+        let stored: StoredIsolatedAcceptance = serde_json::from_slice(&bytes)
+            .map_err(|_| DaemonError::InvalidIsolatedAcceptanceStore)?;
+        if stored.schema_version != ISOLATED_ACCEPTANCE_SCHEMA_VERSION
+            || stored.acceptance_operation_id != operation_id
+            || !is_sha256(&stored.binding_digest)
+        {
+            return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+        }
+        validate_workspace_apply_set(&stored.plan)
+            .map_err(|_| DaemonError::InvalidIsolatedAcceptanceStore)?;
+        let operation = operations
+            .records()
+            .find(|record| record.operation_id == operation_id)
+            .ok_or(DaemonError::InvalidIsolatedAcceptanceStore)?;
+        if operation.task_id != stored.task_id
+            || !matches!(
+                &operation.action,
+                OperationAction::Opaque { kind, payload_digest }
+                    if kind == "hyper_term.tier2.accept"
+                        && payload_digest == &stored.binding_digest
+            )
+        {
+            return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+        }
+        let source_operation = operations
+            .records()
+            .find(|record| record.operation_id == stored.source_operation_id)
+            .ok_or(DaemonError::InvalidIsolatedAcceptanceStore)?;
+        let result = results
+            .get(&stored.source_operation_id)
+            .ok_or(DaemonError::InvalidIsolatedAcceptanceStore)?;
+        if source_operation.task_id != stored.task_id
+            || result.environment.manifest.source_workspace != stored.workspace
+            || isolated_acceptance_digest(
+                stored.source_operation_id,
+                &result.receipt.changes.inventory_sha256,
+                &stored.workspace,
+                &stored.plan,
+            )? != stored.binding_digest
+            || stored.plan.plans.iter().any(|plan| {
+                !result.receipt.changes.changed_files.iter().any(|change| {
+                    change.path == Path::new(&plan.target_path)
+                        && change.content_sha256.as_deref() == Some(&plan.proposed_digest)
+                })
+            })
+        {
+            return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+        }
+        if !matches!(
+            operation.state,
+            OperationState::WaitingHuman
+                | OperationState::Authorized
+                | OperationState::Dispatching
+                | OperationState::UnknownExecution
+        ) {
+            fs::remove_file(entry.path())?;
+            continue;
+        }
+        if !recovered_sources.insert(stored.source_operation_id) {
+            return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+        }
+        recovered.insert(
+            operation_id,
+            IsolatedAcceptance {
+                source_operation_id: stored.source_operation_id,
+                workspace: stored.workspace,
+                plan: stored.plan,
+                binding_digest: stored.binding_digest,
+            },
+        );
+    }
+    acceptance_root_file(root)?.sync_all()?;
+    Ok(recovered)
+}
+
+fn isolated_acceptance_path(root: &Path, operation_id: OperationId) -> PathBuf {
+    root.join(format!("{operation_id}.json"))
+}
+
+fn acceptance_root_file(root: &Path) -> Result<File, DaemonError> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?)
+}
+
+fn write_isolated_acceptance(
+    root: &Path,
+    stored: &StoredIsolatedAcceptance,
+) -> Result<(), DaemonError> {
+    let bytes =
+        serde_json::to_vec(stored).map_err(|_| DaemonError::InvalidIsolatedAcceptanceStore)?;
+    if bytes.len() as u64 > MAX_ISOLATED_ACCEPTANCE_BYTES {
+        return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+    }
+    let target = isolated_acceptance_path(root, stored.acceptance_operation_id);
+    if target.exists() {
+        return Err(DaemonError::InvalidIsolatedAcceptanceStore);
+    }
+    let temporary = root.join(format!(
+        ".{}.{}.tmp",
+        stored.acceptance_operation_id,
+        Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &target)?;
+        acceptance_root_file(root)?.sync_all()?;
+        Ok::<(), DaemonError>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn remove_isolated_acceptance(root: &Path, operation_id: OperationId) -> Result<(), DaemonError> {
+    match fs::remove_file(isolated_acceptance_path(root, operation_id)) {
+        Ok(()) => acceptance_root_file(root)?.sync_all().map_err(Into::into),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn safe_isolated_result_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && !path.is_absolute()
@@ -2392,20 +2667,24 @@ fn safe_isolated_result_path(path: &Path) -> bool {
 fn isolated_acceptance_digest(
     source_operation_id: OperationId,
     inventory_sha256: &str,
-    result_digest: &str,
-) -> String {
+    workspace: &Path,
+    plan: &WorkspaceApplySetPlan,
+) -> Result<String, DaemonError> {
+    let plan = serde_json::to_vec(plan).map_err(|_| DaemonError::InvalidIsolatedAcceptanceStore)?;
     let mut digest = Sha256::new();
-    digest.update(b"hyper-term-tier2-acceptance-v1\0");
+    digest.update(b"hyper-term-tier2-acceptance-v2\0");
     digest.update(source_operation_id.to_string().as_bytes());
     digest.update([0]);
     digest.update(inventory_sha256.as_bytes());
     digest.update([0]);
-    digest.update(result_digest.as_bytes());
-    digest
+    digest.update(workspace.as_os_str().as_bytes());
+    digest.update([0]);
+    digest.update(plan);
+    Ok(digest
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .collect())
 }
 
 fn bounded_nonempty(
@@ -3044,6 +3323,10 @@ pub enum DaemonError {
     UnsupportedIsolatedAcceptance,
     #[error("operation {0} has no prepared Tier 2 acceptance review")]
     IsolatedAcceptanceMissing(OperationId),
+    #[error("operation {0} already has a pending Tier 2 acceptance review")]
+    IsolatedAcceptanceAlreadyExists(OperationId),
+    #[error("Tier 2 acceptance review store failed integrity validation")]
+    InvalidIsolatedAcceptanceStore,
     #[error("Tier 2 acceptance no longer matches its reviewed result and workspace base")]
     IsolatedAcceptanceMismatch,
     #[error("operation {0} has no live one-use sandbox authorization")]
@@ -3114,6 +3397,8 @@ impl DaemonError {
             | Self::IsolatedResultDigestMismatch
             | Self::UnsupportedIsolatedAcceptance
             | Self::IsolatedAcceptanceMissing(_)
+            | Self::IsolatedAcceptanceAlreadyExists(_)
+            | Self::InvalidIsolatedAcceptanceStore
             | Self::IsolatedAcceptanceMismatch
             | Self::IsolatedWorktree(_)
             | Self::LimaRunner(_)

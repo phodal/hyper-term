@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -210,7 +211,34 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         .propose_isolated_result_acceptance(task_id, operation.operation_id)
         .unwrap();
     assert_eq!(acceptance.target_paths, vec!["generated.txt"]);
+    let acceptance_path = state_path
+        .join("isolated-acceptances")
+        .join(format!("{}.json", acceptance.operation.operation_id));
+    assert_eq!(
+        std::fs::metadata(&acceptance_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     assert!(!workspace.join("generated.txt").exists());
+    drop(state);
+    let stored_acceptance = std::fs::read_to_string(&acceptance_path).unwrap();
+    let mut tampered: serde_json::Value = serde_json::from_str(&stored_acceptance).unwrap();
+    tampered["workspace"] =
+        serde_json::Value::String(workspace.join("other").display().to_string());
+    std::fs::write(&acceptance_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    assert!(matches!(
+        DaemonState::open(&state_path),
+        Err(DaemonError::InvalidIsolatedAcceptanceStore)
+    ));
+    std::fs::write(&acceptance_path, stored_acceptance).unwrap();
+    let state = DaemonState::open(&state_path).unwrap();
+    let recovered_acceptance = state
+        .isolated_acceptance_review(acceptance.operation.operation_id)
+        .unwrap();
+    assert_eq!(recovered_acceptance, acceptance);
     assert!(matches!(
         state.accept_isolated_result(
             task_id,
@@ -220,7 +248,7 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         Err(DaemonError::OperationNotAuthorized(_))
     ));
     let authorized_acceptance = state
-        .decide_permission(
+        .decide_isolated_acceptance_permission(
             task_id,
             acceptance.operation.operation_id,
             acceptance.operation.revision,
@@ -235,6 +263,7 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         )
         .unwrap();
     assert_eq!(completed.state, OperationState::Succeeded);
+    assert!(!acceptance_path.exists());
     assert_eq!(
         std::fs::read_to_string(workspace.join("generated.txt")).unwrap(),
         "isolated only\n"

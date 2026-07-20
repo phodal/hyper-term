@@ -21,7 +21,7 @@ const WORKSPACE_TRANSACTION_SCHEMA_VERSION: u32 = 1;
 const MAX_WORKSPACE_TRANSACTION_MANIFEST_BYTES: u64 = 256 * 1024;
 const WORKSPACE_TRANSACTION_DIRECTORY: &str = "workspace-transactions";
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct WorkspaceFileSnapshot {
     pub content: String,
     pub digest: String,
@@ -30,7 +30,7 @@ pub(crate) struct WorkspaceFileSnapshot {
     mode: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct WorkspaceApplyPlan {
     pub target_path: String,
     pub proposed_content: String,
@@ -53,7 +53,7 @@ impl WorkspaceApplyPlan {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct WorkspaceApplySetPlan {
     pub plans: Vec<WorkspaceApplyPlan>,
     pub result_digest: String,
@@ -570,14 +570,46 @@ impl WorkspaceTransactionManifest {
     }
 }
 
-fn validate_workspace_set(set: &WorkspaceApplySetPlan) -> Result<(), WorkspaceApplyError> {
-    if set.plans.is_empty()
-        || set.plans.len() > MAX_WORKSPACE_APPLY_FILES
-        || workspace_set_digest(&set.plans) != set.result_digest
-    {
+pub(crate) fn validate_workspace_apply_set(
+    set: &WorkspaceApplySetPlan,
+) -> Result<(), WorkspaceApplyError> {
+    if set.plans.is_empty() || set.plans.len() > MAX_WORKSPACE_APPLY_FILES {
         return Err(WorkspaceApplyError::InvalidPath);
     }
+    let mut targets = BTreeSet::new();
+    let mut proposed_bytes = 0_usize;
+    let mut base_bytes = 0_usize;
+    for plan in &set.plans {
+        validate_target_path(&plan.target_path)?;
+        if !targets.insert(&plan.target_path)
+            || plan.proposed_content.len() > MAX_WORKSPACE_FILE_BYTES
+            || sha256_bytes(plan.proposed_content.as_bytes()) != plan.proposed_digest
+            || plan.base.as_ref().is_some_and(|base| {
+                base.content.len() > MAX_WORKSPACE_FILE_BYTES
+                    || sha256_bytes(base.content.as_bytes()) != base.digest
+                    || base.content == plan.proposed_content
+            })
+        {
+            return Err(WorkspaceApplyError::InvalidPath);
+        }
+        proposed_bytes = proposed_bytes
+            .checked_add(plan.proposed_content.len())
+            .ok_or(WorkspaceApplyError::TooLarge)?;
+        base_bytes = base_bytes
+            .checked_add(plan.base_content().len())
+            .ok_or(WorkspaceApplyError::TooLarge)?;
+    }
+    if proposed_bytes > MAX_WORKSPACE_APPLY_BYTES
+        || base_bytes > MAX_WORKSPACE_APPLY_BYTES
+        || workspace_set_digest(&set.plans) != set.result_digest
+    {
+        return Err(WorkspaceApplyError::TooLarge);
+    }
     Ok(())
+}
+
+fn validate_workspace_set(set: &WorkspaceApplySetPlan) -> Result<(), WorkspaceApplyError> {
+    validate_workspace_apply_set(set)
 }
 
 fn workspace_transaction_root(state_directory: &Path) -> Result<PathBuf, WorkspaceApplyError> {
