@@ -626,7 +626,13 @@ Unit tests exercise success, non-zero exit, cancellation, timeout, output
 flood, cleanup, dirty-worktree separation, durable result reopen, digest-bound
 reads, review inventory, rejection before acceptance approval, and exact
 transactional apply. On macOS the generated configuration is also validated by
-the installed Lima 2.1.1 parser without booting a VM.
+the installed Lima 2.1.1 parser without booting a VM. The opt-in real backend
+test has additionally passed with Lima's digest-pinned Alpine 3.23.3 aarch64
+cloud image: it boots the VZ guest, proves the command UID is non-zero, proves
+an external network request fails inside the task namespace, inventories the
+generated worktree file, and verifies that stop/delete leaves no hostagent or
+VM process. The test remains opt-in because the 225 MiB image must be supplied
+locally and is never downloaded by the product or normal test suite.
 
 This remains an experimental Tier 2 baseline. Cleanup/reconciliation for a VM
 interrupted before its receipt, recovery of a pending pre-apply review, a

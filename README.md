@@ -227,6 +227,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Run the opt-in real Tier 2 VM conformance gate with a local, digest-pinned
+aarch64 cloud image and Lima 2.1.1 or newer:
+
+```bash
+HYPER_TERM_LIMA_IMAGE=/absolute/path/to/image.qcow2 \
+HYPER_TERM_LIMA_IMAGE_SHA256=<lowercase-sha256> \
+cargo test -p hyper-term-sandbox \
+  real_lima_runs_an_offline_unprivileged_exact_commit_task \
+  -- --ignored --nocapture
+```
+
+The test proves that the real VZ guest runs as a non-root user without task
+network access, writes only the exact-commit worktree, and leaves no VM or Lima
+instance behind. The image is never downloaded implicitly by Hyper Term.
+
 Run the Workbench gates:
 
 ```bash
