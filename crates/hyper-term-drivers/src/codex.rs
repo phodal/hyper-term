@@ -1242,7 +1242,12 @@ done
         })
         .unwrap();
 
-        let thread_id = client.initialize_session(Duration::from_secs(2)).unwrap();
+        // This fixture runs beside process-heavy PTY, Seatbelt, and gateway
+        // tests in the full workspace suite. Keep the production caller-owned
+        // deadline semantics, but do not make this integration fixture depend
+        // on two seconds of otherwise unrelated host scheduler headroom.
+        let fixture_timeout = Duration::from_secs(10);
+        let thread_id = client.initialize_session(fixture_timeout).unwrap();
         assert_eq!(thread_id, "thread-1");
         let initial = client.session_capabilities().unwrap();
         assert_eq!(initial.config_options.len(), 2);
@@ -1261,7 +1266,7 @@ done
                 AgentSessionConfigValue::Id {
                     value: "gpt-b".into(),
                 },
-                Duration::from_secs(2),
+                fixture_timeout,
             )
             .unwrap();
         assert_eq!(
@@ -1309,12 +1314,12 @@ done
         );
         assert_eq!(
             client
-                .start_turn(&thread_id, "Build it", Duration::from_secs(2))
+                .start_turn(&thread_id, "Build it", fixture_timeout)
                 .unwrap(),
             "turn-1"
         );
         assert_eq!(
-            client.next_event(Duration::from_secs(2)).unwrap(),
+            client.next_event(fixture_timeout).unwrap(),
             AgentDriverEvent::TurnCompleted {
                 sequence: 6,
                 thread_id: "thread-1".into(),
