@@ -29,6 +29,14 @@ The final bundle contains:
   official Codex ACP 1.1.4 and Claude Agent ACP 0.59.0, plus a per-file digest
   manifest and the Deno lockfile used to reproduce them.
 
+The validation job does not stop at adapter `--version` output. After building
+the frozen runtime it launches the exact packaged Deno executable and real
+Codex ACP entrypoint, connects through `AcpAgentClient`, and completes an ACP
+`initialize` exchange against a deterministic external Codex app-server
+fixture. This proves the packaged adapter can load its dependency graph, spawn
+the configured provider path, translate the provider handshake, and return the
+official ACP capability response without requiring an account or network.
+
 The ACP runtime build follows Deno's production links into one self-contained
 tree but excludes the top-level `.pnpm` content store and installer metadata.
 Those files duplicate the same dependencies and provider binaries and are not
@@ -38,6 +46,12 @@ probe contained 5,972 verified ACP files and reduced the complete application
 from 1.9 GiB to 184 MiB while both offline adapter `--version` probes passed.
 These figures are evidence for that toolchain snapshot, not a permanent package
 size guarantee.
+
+The adapter dependency tree may contain provider launcher metadata, but Hyper
+Term deliberately excludes platform-specific Codex and Claude binaries. The
+runtime contract requires a separately discovered, authenticated provider CLI;
+the release handshake supplies the same boundary with a deterministic fixture
+instead of accidentally testing an unusable bundled launcher.
 
 Native SDK first creates an unsigned `.app`. The workflow then composes the
 complete bundle, signs every Mach-O executable and the outer bundle, submits it
