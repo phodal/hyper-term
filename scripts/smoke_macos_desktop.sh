@@ -245,12 +245,24 @@ PY
     'Approval required' \
     'Shell command · external effect' \
     'Isolated Tier 2 command · no ordinary PTY access' \
+    'name="Active Agent goal"' \
+    'role=button name="Goal · Run the isolated terminal"' \
+    '0 / 2' \
     'role=button name="Allow once".*enabled=true'
   smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
   native automate widget-click hyper-term-canvas "$smoke_allow_id"
   native automate assert \
     'Tier 2 terminal completed.' \
+    'role=button name="Goal complete"' \
+    '2 / 2' \
     'Decision: allowed once'
+  smoke_goal_id=$(smoke_widget_id 'role=button name="Goal complete"')
+  native automate widget-click hyper-term-canvas "$smoke_goal_id"
+  native automate assert \
+    'Run the isolated terminal' \
+    'Review the retained result'
+  native automate widget-click hyper-term-canvas "$smoke_goal_id"
+  native automate assert --absent 'Review the retained result'
   native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
   native automate screenshot hyper-term-canvas
   smoke_agent_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png

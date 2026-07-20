@@ -11,6 +11,7 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/prompt"'*)
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"desktop-terminal-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Requesting an isolated Tier 2 terminal."}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"desktop-terminal-session","update":{"sessionUpdate":"plan","entries":[{"content":"Run the isolated terminal","priority":"high","status":"in_progress"},{"content":"Review the retained result","priority":"medium","status":"pending"}]}}}'
       printf '%s\n' '{"jsonrpc":"2.0","id":"terminal-create-1","method":"terminal/create","params":{"sessionId":"desktop-terminal-session","command":"printf","args":["tier2-output\\n"],"outputByteLimit":4096}}'
       ;;
     *'"id":"terminal-create-1"'*'"terminalId"'*)
@@ -25,6 +26,7 @@ while IFS= read -r line; do
       ;;
     *'"id":"terminal-release-1"'*)
       printf '%s\n' \
+        '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"desktop-terminal-session","update":{"sessionUpdate":"plan","entries":[{"content":"Run the isolated terminal","priority":"high","status":"completed"},{"content":"Review the retained result","priority":"medium","status":"completed"}]}}}' \
         '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"desktop-terminal-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Tier 2 terminal completed."}}}}' \
         '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
       ;;
