@@ -385,6 +385,7 @@ struct BrokeredMcpLaunch {
 enum AgentStatus {
     Ready,
     Running,
+    Cancelling,
     Completed,
     WaitingApproval,
     Failed,
@@ -1021,6 +1022,7 @@ pub async fn spawn_agent_gateway(
                 .delete(close_session),
         )
         .route("/agent/session/turn", post(start_turn))
+        .route("/agent/session/cancel", post(cancel_turn))
         .route("/agent/session/stream", get(stream_session))
         .route("/agent/session/config", post(set_session_config))
         .route("/agent/session/permission", post(decide_permission))
@@ -2158,6 +2160,30 @@ async fn start_turn(
     }
 }
 
+async fn cancel_turn(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let result = tokio::task::spawn_blocking(move || runtime.cancel_turn(session_id)).await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::ACCEPTED, &response),
+        Ok(Err(SessionError::NotFound)) => {
+            status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
+        }
+        Ok(Err(SessionError::NoActiveTurn)) => {
+            status_response(StatusCode::CONFLICT, "Agent session has no active turn")
+        }
+        Ok(Err(_)) | Err(_) => status_response(
+            StatusCode::BAD_GATEWAY,
+            "Agent turn cancellation could not be delivered safely",
+        ),
+    }
+}
+
 async fn decide_permission(
     State(runtime): State<AgentGatewayRuntime>,
     Query(query): Query<AgentSessionQuery>,
@@ -2396,6 +2422,7 @@ enum StartError {
 enum SessionError {
     NotFound,
     Busy,
+    NoActiveTurn,
     PromptTooLarge,
     InvalidConfig,
     Unsupported,
@@ -4069,7 +4096,7 @@ impl AgentGatewayRuntime {
             let mut progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
             if matches!(
                 progress.status,
-                AgentStatus::Running | AgentStatus::WaitingApproval
+                AgentStatus::Running | AgentStatus::Cancelling | AgentStatus::WaitingApproval
             ) {
                 return Err(SessionError::Busy);
             }
@@ -4102,6 +4129,103 @@ impl AgentGatewayRuntime {
         })
     }
 
+    fn cancel_turn(&self, session_id: u16) -> Result<AgentTurnResponse, SessionError> {
+        let session = self.session(session_id)?;
+        let (turn_id, waiting_approval) = {
+            let mut progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
+            match progress.status {
+                AgentStatus::Cancelling => {
+                    return Ok(AgentTurnResponse {
+                        session_id,
+                        status: AgentStatus::Cancelling,
+                    });
+                }
+                AgentStatus::Running | AgentStatus::WaitingApproval => {}
+                _ => return Err(SessionError::NoActiveTurn),
+            }
+            let waiting_approval = progress.status == AgentStatus::WaitingApproval;
+            progress.status = AgentStatus::Cancelling;
+            progress.error = None;
+            (progress.turn_id.clone(), waiting_approval)
+        };
+
+        let pending = session
+            .pending_effect
+            .lock()
+            .map_err(|_| SessionError::Lock)?
+            .take();
+        let projection = if let Some(effect) = pending {
+            let decided = self
+                .config
+                .daemon
+                .decide_permission(
+                    session.task_id,
+                    effect.operation_id,
+                    effect.operation_revision,
+                    PermissionDecision::Cancelled,
+                )
+                .map_err(|_| SessionError::StalePermission)?;
+            if let Some(host_request) = &effect.host_request {
+                session
+                    .client
+                    .resolve_host_request(
+                        &host_request.request_id,
+                        AgentHostResponse::Error {
+                            code: -32800,
+                            message: "Agent turn cancelled by user".into(),
+                        },
+                    )
+                    .map_err(|_| SessionError::Driver)?;
+            } else {
+                session
+                    .client
+                    .resolve_effect(
+                        &effect.request_id,
+                        AgentEffectAuthorization {
+                            operation_id: effect.operation_id,
+                            operation_revision: decided.revision,
+                            proposal_sha256: effect.payload_sha256,
+                            decision: PermissionDecision::Cancelled,
+                        },
+                    )
+                    .map_err(|_| SessionError::Driver)?;
+            }
+            Some(effect.projection)
+        } else {
+            None
+        };
+
+        if let Some(turn_id) = turn_id.as_deref()
+            && session
+                .client
+                .cancel_turn(&session.thread_id, turn_id)
+                .is_err()
+        {
+            set_progress_failed(&session, "Agent turn cancellation could not be delivered");
+            return Err(SessionError::Driver);
+        }
+
+        if waiting_approval && projection.is_none() {
+            return Err(SessionError::NoPendingEffect);
+        }
+        if let Some(projection) = projection {
+            let daemon = self.config.daemon.clone();
+            let worker_session = Arc::clone(&session);
+            std::thread::Builder::new()
+                .name(format!("hyper-term-agent-{session_id}-cancel"))
+                .spawn(move || continue_turn(worker_session, daemon, projection))
+                .map_err(|_| {
+                    set_progress_failed(&session, "Agent cancellation worker could not start");
+                    SessionError::Thread
+                })?;
+        }
+
+        Ok(AgentTurnResponse {
+            session_id,
+            status: AgentStatus::Cancelling,
+        })
+    }
+
     fn set_session_config(
         &self,
         session_id: u16,
@@ -4115,7 +4239,7 @@ impl AgentGatewayRuntime {
             let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
             if matches!(
                 progress.status,
-                AgentStatus::Running | AgentStatus::WaitingApproval
+                AgentStatus::Running | AgentStatus::Cancelling | AgentStatus::WaitingApproval
             ) {
                 return Err(SessionError::Busy);
             }
@@ -5319,10 +5443,21 @@ fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
             return;
         }
     };
-    if let Ok(mut progress) = session.progress.lock() {
+    let cancellation_requested = if let Ok(mut progress) = session.progress.lock() {
         progress.turn_id = Some(turn_id.clone());
+        progress.status == AgentStatus::Cancelling
     } else {
         let _ = session.client.close();
+        return;
+    };
+
+    if cancellation_requested
+        && session
+            .client
+            .cancel_turn(&session.thread_id, &turn_id)
+            .is_err()
+    {
+        set_progress_failed(&session, "Agent turn cancellation could not be delivered");
         return;
     }
 
@@ -5529,7 +5664,9 @@ fn continue_turn(
                     host_request: None,
                 });
                 drop(pending);
-                if let Ok(mut progress) = session.progress.lock() {
+                if let Ok(mut progress) = session.progress.lock()
+                    && progress.status != AgentStatus::Cancelling
+                {
                     progress.status = AgentStatus::WaitingApproval;
                 }
                 return;
@@ -5636,7 +5773,9 @@ fn continue_turn(
                     host_request: Some(request),
                 });
                 drop(pending);
-                if let Ok(mut progress) = session.progress.lock() {
+                if let Ok(mut progress) = session.progress.lock()
+                    && progress.status != AgentStatus::Cancelling
+                {
                     progress.status = AgentStatus::WaitingApproval;
                 }
                 return;
@@ -6959,6 +7098,107 @@ done
             StatusCode::NO_CONTENT.as_u16()
         );
         gateway.shutdown().await.expect("shutdown gateway");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_endpoint_interrupts_turn_and_keeps_session_reusable() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let fake_codex = temporary.path().join("codex");
+        std::fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"fake-codex"}}' ;;
+    *'"method":"model/list"'*) printf '%s\n' '{"id":2,"result":{"data":[{"model":"gpt-test","displayName":"GPT Test","description":"Fixture","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"Medium"}],"defaultReasoningEffort":"medium","isDefault":true}]}}' ;;
+    *'"method":"skills/list"'*) printf '%s\n' '{"id":3,"result":{"data":[]}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":4,"result":{"thread":{"id":"thread-cancel"}}}' ;;
+    *'"method":"turn/start"'*) printf '%s\n' '{"id":5,"result":{"turn":{"id":"turn-cancel"}}}' ;;
+    *'"method":"turn/interrupt"'*'"threadId":"thread-cancel"'*'"turnId":"turn-cancel"'*)
+      printf '%s\n' '{"id":6,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-cancel","turn":{"id":"turn-cancel","status":"interrupted"}}}' ;;
+  esac
+done
+"#,
+        )
+        .expect("fake Codex");
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_agent_gateway(AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: token.clone(),
+            workspace,
+            state_directory: temporary.path().join("gateway-state"),
+            daemon: DaemonState::open(temporary.path().join("daemon-state")).unwrap(),
+            provider_home: temporary.path().to_owned(),
+            codex_executable: Some(fake_codex),
+            codex_auth_file: None,
+            acp_providers: Vec::new(),
+            mcp_executable: None,
+            genui_runtime: None,
+            workbench_assets: None,
+            debug_capsule: None,
+            tier2_runner: None,
+            control_socket: temporary.path().join("hyperd.sock"),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(request(gateway.address(), &token, 4, "POST").await.0, 200);
+        let turn_path = format!("/agent/session/turn?token={token}&session_id=4");
+        assert_eq!(
+            request_path(gateway.address(), &turn_path, "POST", b"Keep working")
+                .await
+                .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+        loop {
+            let (_, body) = request(gateway.address(), &token, 4, "GET").await;
+            let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if snapshot["status"] == "running" && snapshot["turn_id"] == "turn-cancel" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let cancel_path = format!("/agent/session/cancel?token={token}&session_id=4");
+        let (status, body) = request_path(gateway.address(), &cancel_path, "POST", b"").await;
+        assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{body:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"],
+            "cancelling"
+        );
+        loop {
+            let (_, body) = request(gateway.address(), &token, 4, "GET").await;
+            let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if snapshot["status"] == "completed" {
+                assert!(snapshot["error"].is_null());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            request_path(gateway.address(), &cancel_path, "POST", b"")
+                .await
+                .0,
+            StatusCode::CONFLICT.as_u16()
+        );
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                "/agent/session/cancel?token=wrong&session_id=4",
+                "POST",
+                b""
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        gateway.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

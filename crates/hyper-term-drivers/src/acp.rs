@@ -89,6 +89,10 @@ impl StructuredAgentClient for AcpAgentClient {
         Ok(AcpAgentClient::next_event(self, timeout)?)
     }
 
+    fn cancel_turn(&self, session_id: &str, _turn_id: &str) -> Result<(), AgentClientError> {
+        Ok(AcpAgentClient::cancel_turn(self, session_id)?)
+    }
+
     fn session_capabilities(&self) -> Result<AgentSessionCapabilities, AgentClientError> {
         Ok(AcpAgentClient::session_capabilities(self)?)
     }
@@ -384,6 +388,57 @@ impl AcpAgentClient {
             return Err(error.into());
         }
         Ok(turn_id)
+    }
+
+    pub fn cancel_turn(&self, session_id: &str) -> Result<(), AcpAdapterError> {
+        let session_id = bounded(session_id.to_owned(), 4096)?;
+        let _gate = lock(&self.request_gate)?;
+        let pending = lock(&self.pending_prompt)?
+            .clone()
+            .ok_or(AcpAdapterError::NoActivePrompt)?;
+        if pending.session_id != session_id {
+            return Err(AcpAdapterError::NoActivePrompt);
+        }
+
+        // ACP requires every outstanding permission request to be answered as
+        // cancelled when the client cancels active session work.
+        let approval_ids = lock(&self.pending_approvals)?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for request_id in &approval_ids {
+            let response =
+                v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled);
+            self.process.send_json(&json!({
+                "jsonrpc": "2.0",
+                "id": request_id_value(request_id),
+                "result": response,
+            }))?;
+        }
+        lock(&self.pending_approvals)?.clear();
+
+        // Host requests are also bounded provider-owned work. Return an
+        // explicit cancellation error so they cannot remain retained forever.
+        let host_request_ids = lock(&self.pending_host_requests)?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for request_id in &host_request_ids {
+            self.process.send_json(&json!({
+                "jsonrpc": "2.0",
+                "id": request_id_value(request_id),
+                "error": {"code": -32800, "message": "cancelled by Hyper Term"},
+            }))?;
+        }
+        lock(&self.pending_host_requests)?.clear();
+
+        let notification = v1::CancelNotification::new(session_id);
+        self.process.send_json(&json!({
+            "jsonrpc": "2.0",
+            "method": notification.method(),
+            "params": notification,
+        }))?;
+        Ok(())
     }
 
     pub fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AcpAdapterError> {
@@ -1802,6 +1857,8 @@ pub enum AcpAdapterError {
     DecisionUnavailable,
     #[error("an ACP prompt is already running")]
     PromptAlreadyRunning,
+    #[error("ACP session has no active prompt to cancel")]
+    NoActivePrompt,
     #[error("invalid operation authorization: {0}")]
     InvalidAuthorization(String),
     #[error("ACP adapter lock was poisoned")]
@@ -1866,6 +1923,34 @@ mod tests {
             AgentDriverEvent::TurnCompleted { status: Some(status), .. } if status == "end_turn"
         ));
         assert_eq!(client.state().unwrap(), DriverState::Ready);
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[test]
+    fn acp_cancel_notifies_agent_and_cancels_pending_permission() {
+        let (_temporary, executable) = fake_agent(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-cancel\"}}' ;;\n    *'\"method\":\"session/prompt\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"permission-cancel\",\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"session-cancel\",\"toolCall\":{\"toolCallId\":\"tool-cancel\",\"kind\":\"execute\",\"title\":\"Run tests\"},\"options\":[{\"optionId\":\"allow-once\",\"name\":\"Allow\",\"kind\":\"allow_once\"}]}}' ;;\n    *'\"id\":\"permission-cancel\"'*'\"outcome\":\"cancelled\"'*) ;;\n    *'\"method\":\"session/cancel\"'*'\"sessionId\":\"session-cancel\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"cancelled\"}}' ;;\n  esac\ndone\n",
+        );
+        let workspace = TempDir::new().unwrap();
+        let client = launch(&executable, workspace.path());
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
+        client.start_turn(&session_id, "run tests").unwrap();
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::EffectProposed { .. }
+        ));
+
+        client.cancel_turn(&session_id).unwrap();
+        assert!(client.pending_effects().unwrap().is_empty());
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::TurnCompleted { status: Some(status), .. } if status == "cancelled"
+        ));
+        assert!(matches!(
+            client.cancel_turn(&session_id),
+            Err(AcpAdapterError::NoActivePrompt)
+        ));
         assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 

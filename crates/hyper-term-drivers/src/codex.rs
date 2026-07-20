@@ -352,6 +352,27 @@ impl CodexAppServerClient {
             .and_then(|value| bounded(value.to_owned(), 4096))
     }
 
+    pub fn cancel_turn(&self, thread_id: &str, turn_id: &str) -> Result<(), CodexAdapterError> {
+        let thread_id = bounded(thread_id.to_owned(), 4096)?;
+        let turn_id = bounded(turn_id.to_owned(), 4096)?;
+        if thread_id.is_empty() || turn_id.is_empty() {
+            return Err(CodexAdapterError::InvalidMessage(
+                "turn/interrupt requires thread and turn ids".into(),
+            ));
+        }
+        let _gate = lock(&self.request_gate)?;
+        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        // The event pump remains the sole reader while a turn is active. The
+        // app-server response is consumed as a protocol notice; turn/completed
+        // with status=interrupted is the authoritative acknowledgement.
+        self.process.send_json(&json!({
+            "id": id,
+            "method": "turn/interrupt",
+            "params": {"threadId": thread_id, "turnId": turn_id}
+        }))?;
+        Ok(())
+    }
+
     pub fn resolve_effect(
         &self,
         request_id: &ExternalRequestId,
@@ -666,6 +687,12 @@ impl StructuredAgentClient for CodexAppServerClient {
 
     fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AgentClientError> {
         Ok(CodexAppServerClient::next_event(self, timeout)?)
+    }
+
+    fn cancel_turn(&self, session_id: &str, turn_id: &str) -> Result<(), AgentClientError> {
+        Ok(CodexAppServerClient::cancel_turn(
+            self, session_id, turn_id,
+        )?)
     }
 
     fn session_capabilities(&self) -> Result<AgentSessionCapabilities, AgentClientError> {
@@ -1435,6 +1462,66 @@ done
                 status: Some("completed".into()),
             }
         );
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_codex_interrupts_active_turn_without_closing_thread() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let runtime = temporary.path().join("runtime");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        let executable = temporary.path().join("codex");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"fake"}}' ;;
+    *'"method":"model/list"'*) printf '%s\n' '{"id":2,"result":{"data":[{"model":"gpt-test","displayName":"GPT Test","description":"Fixture","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"Medium"}],"defaultReasoningEffort":"medium","isDefault":true}]}}' ;;
+    *'"method":"skills/list"'*) printf '%s\n' '{"id":3,"result":{"data":[]}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":4,"result":{"thread":{"id":"thread-cancel"}}}' ;;
+    *'"method":"turn/start"'*) printf '%s\n' '{"id":5,"result":{"turn":{"id":"turn-cancel"}}}' ;;
+    *'"method":"turn/interrupt"'*'"threadId":"thread-cancel"'*'"turnId":"turn-cancel"'*)
+      printf '%s\n' '{"id":6,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-cancel","turn":{"id":"turn-cancel","status":"interrupted"}}}' ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let client = CodexAppServerClient::launch(CodexAppServerConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            implementation_version: "test".into(),
+            workspace,
+            codex_home: runtime.join("codex-home"),
+            scratch_directory: runtime.join("scratch"),
+            auth_file: None,
+            brokered_mcp_server: None,
+            containment: None,
+        })
+        .unwrap();
+        let timeout = Duration::from_secs(10);
+        let thread_id = client.initialize_session(timeout).unwrap();
+        let turn_id = client
+            .start_turn(&thread_id, "keep working", timeout)
+            .unwrap();
+        client.cancel_turn(&thread_id, &turn_id).unwrap();
+        assert!(matches!(
+            client.next_event(timeout).unwrap(),
+            AgentDriverEvent::ProtocolNotice { .. }
+        ));
+        assert!(matches!(
+            client.next_event(timeout).unwrap(),
+            AgentDriverEvent::TurnCompleted { status: Some(status), .. } if status == "interrupted"
+        ));
+        assert_eq!(client.state().unwrap(), DriverState::Ready);
         assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 

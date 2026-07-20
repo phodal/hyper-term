@@ -20,6 +20,10 @@ pub trait StructuredAgentClient: Send + Sync {
         prompt: &str,
         timeout: Duration,
     ) -> Result<String, AgentClientError>;
+    /// Requests cancellation of the active turn without tearing down the
+    /// provider session. Delivery is acknowledged by this call; the provider's
+    /// eventual completion event remains authoritative for turn state.
+    fn cancel_turn(&self, session_id: &str, turn_id: &str) -> Result<(), AgentClientError>;
     fn next_event(&self, timeout: Duration) -> Result<AgentDriverEvent, AgentClientError>;
     fn session_capabilities(&self) -> Result<AgentSessionCapabilities, AgentClientError>;
     fn set_session_config_option(
