@@ -915,7 +915,7 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
         \\  {"block_id":"00000000-0000-4000-8000-000000000035","kind":"message","payload":{"type":"message","role":"thought","text":"Inspecting the workspace before editing."}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000032","kind":"agent_tool_call","payload":{"type":"agent_tool_call","turn_id":"turn-1","call":{"tool_call_id":"edit-1","title":"Edit src/lib.rs","kind":"edit","status":"completed","locations":[{"path":"/workspace/src/lib.rs","line":7}],"content":[{"type":"diff","path":"/workspace/src/lib.rs","patch":"--- a/src/lib.rs\n+++ b/src/lib.rs\n-old\n+new\n","added_lines":1,"removed_lines":1},{"type":"terminal","terminal_id":"terminal-7"}],"raw_input":null,"raw_output":"{\"ok\":true}"}}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000034","kind":"agent_tool_call","payload":{"type":"agent_tool_call","turn_id":"turn-1","call":{"tool_call_id":"exec-1","title":"sed -n '1,240p' Cargo.toml && rg -n '^name' --glob Cargo.toml .","kind":"execute","status":"completed","locations":[],"content":[{"type":"terminal","terminal_id":"terminal-9"}],"raw_input":"{\"command\":\"sed Cargo.toml\"}","raw_output":null}}},
-        \\  {"block_id":"00000000-0000-4000-8000-000000000033","kind":"agent_plan","payload":{"type":"agent_plan","turn_id":"turn-1","entries":[{"content":"Inspect the workspace","priority":"high","status":"completed"},{"content":"Polish the notes","priority":"low","status":"pending"},{"content":"Verify the edit","priority":"medium","status":"in_progress"}]}}
+        \\  {"block_id":"00000000-0000-4000-8000-000000000033","kind":"agent_plan","payload":{"type":"agent_plan","turn_id":"turn-1","entries":[{"content":"Inspect the workspace","priority":"high","status":"completed"},{"content":"Polish the notes","priority":"low","status":"pending"},{"content":"Verify the edit after reviewing the complete repository architecture","priority":"medium","status":"in_progress"}]}}
         \\]}}
         ,
     } }, &fx);
@@ -928,9 +928,10 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(!model.agentBlocks()[1].expanded);
     const plan = model.agentPlan().?;
     try testing.expect(!plan.expanded);
-    try testing.expectEqualStrings("Goal · Verify the edit · 1 / 3", plan.activityTitle());
+    try testing.expectEqualStrings("Goal · Verify the edit after reviewing the comple…", plan.activityTitle());
+    try testing.expectEqualStrings("1 / 3", plan.activityMeta());
     try testing.expectEqualStrings(
-        "- [x] Inspect the workspace\n- [ ] Polish the notes\n- [ ] Verify the edit\n",
+        "- [x] Inspect the workspace\n- [ ] Polish the notes\n- [ ] Verify the edit after reviewing the complete repository architecture\n",
         plan.content(),
     );
 
@@ -942,16 +943,16 @@ test "ACP activity renders compact plans diffs terminals and hides low-signal ti
     try testing.expect(!containsText(tree.root, "Model metadata for"));
     try testing.expect(containsText(tree.root, "Hi! What are we working on today?"));
     try testing.expect(containsText(tree.root, "Processed"));
-    try testing.expect(containsText(tree.root, "Goal · Verify the edit · 1 / 3"));
+    try testing.expect(containsText(tree.root, "Goal · Verify the edit after reviewing the comple…"));
     try testing.expectEqual(@as(f32, 1), findByLabel(tree.root, "Active Agent goal").?.layout.grow);
     try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Processed").?.icon);
-    try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Goal · Verify the edit · 1 / 3").?.icon);
+    try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Goal · Verify the edit after reviewing the comple…").?.icon);
 
     main.update(&model, .{ .toggle_agent_block = plan.id }, &fx);
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Goal · Verify the edit · 1 / 3").?.icon);
+    try testing.expectEqualStrings("chevron-down", findByText(tree.root, .button, "Goal · Verify the edit after reviewing the comple…").?.icon);
 
     main.update(&model, .{ .toggle_agent_block = model.agentBlocks()[1].id }, &fx);
     arena_state.deinit();

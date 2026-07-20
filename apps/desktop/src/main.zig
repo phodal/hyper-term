@@ -36,6 +36,7 @@ const max_agent_operation_id_bytes: usize = 36;
 const max_agent_operation_kind_bytes: usize = 96;
 const max_agent_activity_title_bytes: usize = 512;
 const max_agent_activity_meta_bytes: usize = 512;
+const max_agent_goal_step_columns: usize = 42;
 const max_agent_error_bytes: usize = 512;
 const max_agent_prompt_bytes: usize = 16 * 1024;
 const max_agent_config_options: usize = 4;
@@ -2739,24 +2740,32 @@ fn projectAgentPlan(view: *AgentBlockView, entries: []const AgentPlanEntryWire) 
         appendActivityFmt(view, "- [{s}] {s}\n", .{ marker, entry.content });
     }
     var meta: [max_agent_activity_meta_bytes]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&meta, "{d} / {d} steps complete", .{ completed, entries.len }) catch "Goal";
+    const rendered = std.fmt.bufPrint(&meta, "{d} / {d}", .{ completed, entries.len }) catch "Goal";
     copyActivityMeta(view, rendered);
     if (completed == entries.len) {
-        var title: [max_agent_activity_title_bytes]u8 = undefined;
-        const title_rendered = std.fmt.bufPrint(&title, "Goal complete · {d} / {d}", .{ completed, entries.len }) catch "Goal complete";
-        copyActivityTitle(view, title_rendered);
+        copyActivityTitle(view, "Goal complete");
     } else {
         copyActivityTitle(view, "Goal · ");
-        var suffix_storage: [64]u8 = undefined;
-        const suffix = std.fmt.bufPrint(&suffix_storage, " · {d} / {d}", .{ completed, entries.len }) catch "";
-        const available = view.title_storage.len - view.title_len;
-        const step_capacity = available -| suffix.len;
         const step = active_step orelse next_step orelse entries[0].content;
-        const step_length = utf8BoundedLength(step, step_capacity);
+        const step_length = utf8DisplayColumnPrefixLength(step, max_agent_goal_step_columns);
         appendActivityTitle(view, step[0..step_length]);
-        appendActivityTitle(view, suffix);
+        if (step_length < step.len) appendActivityTitle(view, "…");
     }
     view.expanded = false;
+}
+
+fn utf8DisplayColumnPrefixLength(value: []const u8, maximum_columns: usize) usize {
+    var index: usize = 0;
+    var columns: usize = 0;
+    while (index < value.len) {
+        const sequence_length = std.unicode.utf8ByteSequenceLength(value[index]) catch break;
+        if (index + sequence_length > value.len) break;
+        const width: usize = if (sequence_length == 1) 1 else 2;
+        if (columns + width > maximum_columns) break;
+        columns += width;
+        index += sequence_length;
+    }
+    return index;
 }
 
 fn parseAgentToolStatus(value: []const u8) AgentToolStatus {
