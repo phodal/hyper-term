@@ -199,6 +199,23 @@ fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
         "ACP answer did not contain {expected:?}: output={output:?} status={status:?} stderr={}",
         client.stderr_tail().unwrap_or_default()
     );
+    if let Ok(expected_command) = std::env::var("HYPER_TERM_ACP_EXPECT_COMMAND") {
+        let capabilities = client
+            .session_capabilities()
+            .unwrap_or_else(|error| panic_with_stderr(&client, "session capabilities", error));
+        assert!(
+            capabilities
+                .available_commands
+                .iter()
+                .any(|command| command.name == expected_command),
+            "ACP command catalog did not retain {expected_command:?}: {:?}",
+            capabilities
+                .available_commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
     assert_eq!(client.close().unwrap(), DriverState::Closed);
 }
 
@@ -419,6 +436,17 @@ fn launch_installed_acp_agent_with_mcp(
 }
 
 fn adapter_arguments() -> Vec<OsString> {
+    if let Some(arguments) = std::env::var_os("HYPER_TERM_ACP_ARGS_JSON") {
+        return serde_json::from_str::<Vec<String>>(
+            arguments
+                .to_str()
+                .expect("HYPER_TERM_ACP_ARGS_JSON must be UTF-8"),
+        )
+        .expect("HYPER_TERM_ACP_ARGS_JSON must be a JSON string array")
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    }
     let Some(entrypoint) = std::env::var_os("HYPER_TERM_ACP_DENO_ENTRYPOINT") else {
         return Vec::new();
     };

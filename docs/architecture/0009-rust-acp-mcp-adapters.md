@@ -190,6 +190,14 @@ set is enabled per release.
   subscription authentication on macOS requires the exact Claude executable
   plus `USER` and `LOGNAME` so its Keychain entry remains visible; API keys are
   not inherited by the adapter.
+- ACP command catalogs are optional composer metadata, not turn-critical state.
+  A real Codex ACP prompt can advertise more than 96 entries when installed
+  Skills are projected as commands. Rust now prioritizes `/skills` and `$skill`
+  entries, removes duplicates and invalid oversized values, retains at most 96,
+  and emits an `available_commands_truncated` protocol notice instead of
+  failing the turn. Credential-using gates prove real Codex, Claude, and
+  `copilot --acp --stdio` prompts all complete; the Codex gate additionally
+  requires the bounded projection to retain `skills`.
 - The signed app build now materializes both official adapter packages through
   a frozen Deno lockfile, removes their redundant provider binaries, records a
   bounded per-file digest inventory, and runs the offline entrypoints with the

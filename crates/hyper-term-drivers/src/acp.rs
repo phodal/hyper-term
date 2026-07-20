@@ -731,12 +731,22 @@ impl AcpAgentClient {
                 })
             }
             v1::SessionUpdate::AvailableCommandsUpdate(update) => {
-                lock(&self.session_capabilities)?.available_commands =
-                    normalize_available_commands(update.available_commands)?;
+                let normalized = normalize_available_commands(update.available_commands);
+                let notice_method = if normalized.truncated {
+                    "session/update/available_commands_truncated"
+                } else {
+                    "session/update"
+                };
+                let retained = normalized.commands.len();
+                lock(&self.session_capabilities)?.available_commands = normalized.commands;
                 protocol_notice(
                     sequence,
-                    Some("session/update"),
-                    &serde_json::to_value("available_commands_update")?,
+                    Some(notice_method),
+                    &json!({
+                        "type": "available_commands_update",
+                        "retained": retained,
+                        "truncated": normalized.truncated,
+                    }),
                 )
             }
             v1::SessionUpdate::ConfigOptionUpdate(update) => {
@@ -1546,30 +1556,74 @@ fn normalize_config_choice(
     })
 }
 
+struct NormalizedAvailableCommands {
+    commands: Vec<AgentAvailableCommand>,
+    truncated: bool,
+}
+
 fn normalize_available_commands(
-    commands: Vec<v1::AvailableCommand>,
-) -> Result<Vec<AgentAvailableCommand>, AcpAdapterError> {
-    if commands.len() > MAX_AVAILABLE_COMMANDS {
-        return Err(AcpAdapterError::InvalidMessage(
-            "ACP available commands exceeded their bound".into(),
-        ));
+    mut commands: Vec<v1::AvailableCommand>,
+) -> NormalizedAvailableCommands {
+    let received = commands.len();
+    // ACP command catalogs are optional composer metadata. Current Codex ACP
+    // versions can publish one entry per installed skill, so rejecting a
+    // catalog larger than our UI budget must not abort the active turn. Keep
+    // the provider's order within each group, but make the skills entry and
+    // explicit skill mentions reachable before ordinary slash commands.
+    commands.sort_by_key(|command| available_command_priority(&command.name));
+
+    let mut normalized = Vec::with_capacity(received.min(MAX_AVAILABLE_COMMANDS));
+    let mut seen = HashSet::with_capacity(received.min(MAX_AVAILABLE_COMMANDS));
+    let mut truncated = false;
+    for command in commands {
+        if normalized.len() == MAX_AVAILABLE_COMMANDS {
+            truncated = true;
+            break;
+        }
+        let command = match normalize_available_command(command) {
+            Ok(command) => command,
+            Err(_) => {
+                truncated = true;
+                continue;
+            }
+        };
+        if !seen.insert(command.name.clone()) {
+            truncated = true;
+            continue;
+        }
+        normalized.push(command);
     }
-    commands
-        .into_iter()
-        .map(|command| {
-            let input_hint = match command.input {
-                Some(v1::AvailableCommandInput::Unstructured(input)) => {
-                    Some(bounded(input.hint, MAX_CAPABILITY_DESCRIPTION_BYTES)?)
-                }
-                _ => None,
-            };
-            Ok(AgentAvailableCommand {
-                name: bounded(command.name, MAX_CAPABILITY_ID_BYTES)?,
-                description: bounded(command.description, MAX_CAPABILITY_DESCRIPTION_BYTES)?,
-                input_hint,
-            })
-        })
-        .collect()
+    truncated |= normalized.len() < received;
+    NormalizedAvailableCommands {
+        commands: normalized,
+        truncated,
+    }
+}
+
+fn available_command_priority(name: &str) -> u8 {
+    if name == "skills" {
+        0
+    } else if name.starts_with('$') {
+        1
+    } else {
+        2
+    }
+}
+
+fn normalize_available_command(
+    command: v1::AvailableCommand,
+) -> Result<AgentAvailableCommand, AcpAdapterError> {
+    let input_hint = match command.input {
+        Some(v1::AvailableCommandInput::Unstructured(input)) => {
+            Some(bounded(input.hint, MAX_CAPABILITY_DESCRIPTION_BYTES)?)
+        }
+        _ => None,
+    };
+    Ok(AgentAvailableCommand {
+        name: bounded(command.name, MAX_CAPABILITY_ID_BYTES)?,
+        description: bounded(command.description, MAX_CAPABILITY_DESCRIPTION_BYTES)?,
+        input_hint,
+    })
 }
 
 fn validate_config_value(
@@ -1975,6 +2029,134 @@ mod tests {
         let capabilities = client.session_capabilities().unwrap();
         assert_eq!(capabilities.available_commands[0].name, "skills");
         assert_eq!(capabilities.config_options[0].id, "thought");
+    }
+
+    #[test]
+    fn oversized_available_command_catalog_is_truncated_without_hiding_skills() {
+        let mut commands = (0..MAX_AVAILABLE_COMMANDS + 12)
+            .map(|index| {
+                json!({
+                    "name": format!("command-{index}"),
+                    "description": format!("Command {index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        commands.push(json!({
+            "name": "$review",
+            "description": "Review with a skill",
+        }));
+        commands.push(json!({
+            "name": "skills",
+            "description": "Configure skills",
+        }));
+        commands.push(json!({
+            "name": "skills",
+            "description": "Duplicate skills command",
+        }));
+        commands.push(json!({
+            "name": "x".repeat(MAX_CAPABILITY_ID_BYTES + 1),
+            "description": "Invalid oversized command",
+        }));
+        let commands = serde_json::from_value::<Vec<v1::AvailableCommand>>(Value::Array(commands))
+            .expect("ACP available commands");
+
+        let normalized = normalize_available_commands(commands);
+
+        assert!(normalized.truncated);
+        assert_eq!(normalized.commands.len(), MAX_AVAILABLE_COMMANDS);
+        assert_eq!(normalized.commands[0].name, "skills");
+        assert_eq!(normalized.commands[1].name, "$review");
+        assert_eq!(
+            normalized
+                .commands
+                .iter()
+                .filter(|command| command.name == "skills")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn oversized_available_command_update_does_not_abort_the_turn() {
+        let mut commands = (0..MAX_AVAILABLE_COMMANDS + 10)
+            .map(|index| {
+                json!({
+                    "name": format!("command-{index}"),
+                    "description": format!("Command {index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        commands.push(json!({
+            "name": "skills",
+            "description": "Configure skills",
+        }));
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {},
+                "authMethods": [],
+            },
+        });
+        let session = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "sessionId": "session-command-overflow" },
+        });
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-command-overflow",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": commands,
+                },
+            },
+        });
+        let completed = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": { "stopReason": "end_turn" },
+        });
+        let script = format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{initialize}' ;;
+    *'"method":"session/new"'*) printf '%s\n' '{session}' ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{update}'
+      printf '%s\n' '{completed}' ;;
+  esac
+done
+"#,
+        );
+        let (temporary, executable) = fake_agent(&script);
+        let client = launch(&executable, temporary.path());
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
+        client.start_turn(&session_id, "show skills").unwrap();
+
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::ProtocolNotice {
+                method: Some(method),
+                ..
+            } if method == "session/update/available_commands_truncated"
+        ));
+        let capabilities = client.session_capabilities().unwrap();
+        assert_eq!(
+            capabilities.available_commands.len(),
+            MAX_AVAILABLE_COMMANDS
+        );
+        assert_eq!(capabilities.available_commands[0].name, "skills");
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::TurnCompleted { .. }
+        ));
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 
     #[test]
