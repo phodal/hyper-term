@@ -107,6 +107,7 @@ pub fn authorize_local_mcp_server(
     {
         return Err(LocalMcpPlanError::LaunchNotAuthorized);
     }
+    validate_prepared_local_mcp_server(&prepared)?;
     let command = TerminalCommand {
         program: prepared
             .executable
@@ -142,6 +143,81 @@ pub fn authorize_local_mcp_server(
         prepared,
         sandbox_launch,
     })
+}
+
+fn validate_prepared_local_mcp_server(
+    prepared: &PreparedLocalMcpServer,
+) -> Result<(), LocalMcpPlanError> {
+    validate_server_id(&prepared.launch.server_id)?;
+    if prepared.launch.schema_version != LOCAL_MCP_LAUNCH_SCHEMA_VERSION {
+        return Err(LocalMcpPlanError::PreparedIdentityChanged("schema"));
+    }
+    let executable = canonical_exact_file(&prepared.executable, "MCP executable")?;
+    let executable_sha256 = sha256_file(&executable)?;
+    if executable != prepared.launch.executable
+        || executable_sha256 != prepared.launch.executable_sha256
+    {
+        return Err(LocalMcpPlanError::PreparedIdentityChanged("executable"));
+    }
+    let working_directory = canonical_exact_directory(&prepared.launch.working_directory)?;
+    if working_directory != prepared.launch.working_directory {
+        return Err(LocalMcpPlanError::PreparedIdentityChanged(
+            "working directory",
+        ));
+    }
+    let arguments = validate_arguments(&prepared.arguments)?;
+    let arguments_sha256 = sha256_json(&arguments)?;
+    let argument_count =
+        u16::try_from(arguments.len()).map_err(|_| LocalMcpPlanError::TooManyArguments)?;
+    if arguments_sha256 != prepared.launch.arguments_digest.as_str()
+        || argument_count != prepared.launch.argument_count
+    {
+        return Err(LocalMcpPlanError::PreparedIdentityChanged("arguments"));
+    }
+    if prepared.sandbox.lifetime != SandboxLifetime::OneTask
+        || !prepared.sandbox.environment.clear_inherited
+    {
+        return Err(LocalMcpPlanError::UnsafeSandbox);
+    }
+    let environment = prepared
+        .environment
+        .iter()
+        .map(|(name, value)| {
+            value
+                .to_str()
+                .map(|value| (name.clone(), value.to_owned()))
+                .ok_or(LocalMcpPlanError::NonUtf8Environment)
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if environment != prepared.sandbox.environment.variables {
+        return Err(LocalMcpPlanError::PreparedIdentityChanged("environment"));
+    }
+    let sandbox_profile_sha256 = sandbox_profile_digest(&prepared.sandbox)
+        .map_err(|error| LocalMcpPlanError::Sandbox(error.to_string()))?;
+    if sandbox_profile_sha256 != prepared.launch.sandbox_profile_digest {
+        return Err(LocalMcpPlanError::PreparedIdentityChanged("sandbox"));
+    }
+    validate_optional_sha256(prepared.launch.roots_snapshot_sha256.as_deref())?;
+    let runtime_identity = LocalMcpRuntimeIdentityInput {
+        schema_version: prepared.launch.schema_version,
+        server_id: &prepared.launch.server_id,
+        executable: &executable,
+        executable_sha256: &executable_sha256,
+        arguments_digest: &arguments_sha256,
+        argument_count,
+        working_directory: &working_directory,
+        context_digest: prepared.launch.context_digest.as_str(),
+        sandbox_profile_digest: sandbox_profile_sha256.as_str(),
+        roots_snapshot_sha256: prepared.launch.roots_snapshot_sha256.as_deref(),
+        lifecycle: prepared.launch.lifecycle,
+        credential_scope: prepared.launch.credential_scope,
+    };
+    if sha256_json(&runtime_identity)? != prepared.launch.runtime_identity_digest.as_str() {
+        return Err(LocalMcpPlanError::PreparedIdentityChanged(
+            "runtime identity",
+        ));
+    }
+    Ok(())
 }
 
 pub fn prepare_local_mcp_tool_call(
@@ -766,6 +842,8 @@ pub enum LocalMcpPlanError {
     InvalidRootsSnapshotDigest,
     #[error("local MCP server launch has not entered its exact dispatching operation")]
     LaunchNotAuthorized,
+    #[error("prepared local MCP {0} changed after review")]
+    PreparedIdentityChanged(&'static str),
     #[error("local MCP sandbox is invalid: {0}")]
     Sandbox(String),
     #[error("local MCP digest is invalid: {0}")]
@@ -1002,6 +1080,49 @@ mod tests {
         assert!(matches!(
             prepare_local_mcp_server(symlink),
             Err(LocalMcpPlanError::Path { .. })
+        ));
+    }
+
+    #[test]
+    fn reviewed_runtime_inputs_are_revalidated_at_the_spawn_boundary() {
+        let temp = TempDir::new().unwrap();
+
+        let prepared = prepare_local_mcp_server(config(&temp, &[])).unwrap();
+        fs::write(&prepared.executable, b"replaced after approval").unwrap();
+        let dispatching = operation(prepared.launch.clone(), OperationState::Dispatching);
+        assert!(matches!(
+            authorize_local_mcp_server(prepared, &dispatching),
+            Err(LocalMcpPlanError::PreparedIdentityChanged("executable"))
+        ));
+
+        let mut prepared = prepare_local_mcp_server(config(&temp, &["--reviewed"])).unwrap();
+        prepared.arguments[0] = "--substituted".into();
+        let dispatching = operation(prepared.launch.clone(), OperationState::Dispatching);
+        assert!(matches!(
+            authorize_local_mcp_server(prepared, &dispatching),
+            Err(LocalMcpPlanError::PreparedIdentityChanged("arguments"))
+        ));
+
+        let mut prepared = prepare_local_mcp_server(config(&temp, &[])).unwrap();
+        prepared
+            .environment
+            .insert("MCP_FIXTURE_LABEL".into(), "substituted".into());
+        let dispatching = operation(prepared.launch.clone(), OperationState::Dispatching);
+        assert!(matches!(
+            authorize_local_mcp_server(prepared, &dispatching),
+            Err(LocalMcpPlanError::PreparedIdentityChanged("environment"))
+        ));
+
+        let mut prepared = prepare_local_mcp_server(config(&temp, &[])).unwrap();
+        prepared.sandbox.network = SandboxNetworkPolicy::ProxyOnly {
+            proxy_url: "http://127.0.0.1:43128".into(),
+            allowed_hosts: vec!["example.com".into()],
+            allowed_unix_sockets: Vec::new(),
+        };
+        let dispatching = operation(prepared.launch.clone(), OperationState::Dispatching);
+        assert!(matches!(
+            authorize_local_mcp_server(prepared, &dispatching),
+            Err(LocalMcpPlanError::PreparedIdentityChanged("sandbox"))
         ));
     }
 
