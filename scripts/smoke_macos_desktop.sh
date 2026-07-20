@@ -6,6 +6,16 @@ smoke_supervisor=${1:-"$smoke_repo_root/target/debug/hyper-term-desktop"}
 smoke_renderer=${2:-"$smoke_repo_root/apps/desktop/zig-out/bin/hyper-term"}
 smoke_artifact_dir=${HYPER_TERM_SMOKE_ARTIFACT_DIR:-}
 
+if [[ "$smoke_supervisor" != /* ]]; then
+  smoke_supervisor="$PWD/$smoke_supervisor"
+fi
+if [[ "$smoke_renderer" != /* ]]; then
+  smoke_renderer="$PWD/$smoke_renderer"
+fi
+if [[ -n "$smoke_artifact_dir" && "$smoke_artifact_dir" != /* ]]; then
+  smoke_artifact_dir="$PWD/$smoke_artifact_dir"
+fi
+
 if [[ $(uname -s) != Darwin ]]; then
   echo "macOS desktop smoke requires a macOS host" >&2
   exit 1
