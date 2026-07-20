@@ -33,7 +33,7 @@ use hyper_term_sandbox::{
     IsolatedTaskReceipt, IsolatedTaskRequest, IsolatedTaskTermination, IsolatedWorktree,
     IsolatedWorktreeError, IsolatedWorktreeManager, IsolatedWorktreeRequest,
     LimaIsolatedTaskLauncher, LimaRunnerError, LimaTaskRunner, MacOsSeatbeltLauncher,
-    read_isolated_task_receipt,
+    cleanup_interrupted_lima_environment, read_isolated_task_receipt,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -2339,19 +2339,27 @@ fn recover_completed_isolated_results(
             return Err(DaemonError::InvalidIsolatedResultStore);
         }
         let mut completed = None;
+        let mut removed_interrupted = false;
         for environment_entry in fs::read_dir(operation_entry.path())?.take(3) {
             let environment_entry = environment_entry?;
             if !environment_entry.file_type()?.is_dir() {
                 return Err(DaemonError::InvalidIsolatedResultStore);
             }
-            if !environment_entry.path().join("task-receipt.json").is_file() {
+            let environment = manager.reopen(environment_entry.path())?;
+            if environment.manifest.task_id != operation_id.to_string() {
+                return Err(DaemonError::InvalidIsolatedResultStore);
+            }
+            if !environment
+                .environment_root
+                .join("task-receipt.json")
+                .is_file()
+            {
+                cleanup_interrupted_lima_environment(&environment.manifest.environment_id)?;
+                manager.destroy(&environment)?;
+                removed_interrupted = true;
                 continue;
             }
             if completed.is_some() {
-                return Err(DaemonError::InvalidIsolatedResultStore);
-            }
-            let environment = manager.reopen(environment_entry.path())?;
-            if environment.manifest.task_id != operation_id.to_string() {
                 return Err(DaemonError::InvalidIsolatedResultStore);
             }
             let receipt = read_isolated_task_receipt(&environment)?;
@@ -2366,6 +2374,8 @@ fn recover_completed_isolated_results(
         }
         if let Some(result) = completed {
             recovered.insert(operation_id, result);
+        } else if removed_interrupted {
+            cleanup_scratch_directory(&operation_entry.path());
         }
     }
     Ok(recovered)

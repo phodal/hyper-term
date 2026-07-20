@@ -440,6 +440,74 @@ pub fn read_isolated_task_receipt(
     Ok(receipt)
 }
 
+/// Reaps a deterministic private Lima instance left behind before a task
+/// receipt could be committed. A missing home is already clean; any existing
+/// instance must be deleted successfully before its state directory is removed.
+pub fn cleanup_interrupted_lima_environment(environment_id: &str) -> Result<(), LimaRunnerError> {
+    cleanup_interrupted_lima_environment_with(environment_id, None)
+}
+
+fn cleanup_interrupted_lima_environment_with(
+    environment_id: &str,
+    executable_override: Option<&Path>,
+) -> Result<(), LimaRunnerError> {
+    let lima_home = private_lima_home_path(environment_id);
+    if !lima_home.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(&lima_home)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LimaRunnerError::InsecureLimaHome(lima_home));
+    }
+    let instance_name = instance_name(environment_id);
+    let instance_directory = lima_home.join(&instance_name);
+    if instance_directory.exists() {
+        let executable = executable_override
+            .map(Path::to_path_buf)
+            .or_else(discover_limactl)
+            .ok_or(LimaRunnerError::LimaUnavailable)?;
+        let _ = run_lima_recovery_command(
+            &executable,
+            &lima_home,
+            ["--tty=false", "stop", "--force", &instance_name],
+        );
+        run_lima_recovery_command(
+            &executable,
+            &lima_home,
+            ["--tty=false", "delete", "--force", &instance_name],
+        )?;
+    }
+    fs::remove_dir_all(&lima_home)?;
+    Ok(())
+}
+
+fn run_lima_recovery_command<const N: usize>(
+    executable: &Path,
+    lima_home: &Path,
+    arguments: [&str; N],
+) -> Result<(), LimaRunnerError> {
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .env("HOME", lima_home)
+        .env("LIMA_HOME", lima_home)
+        .env("LC_ALL", "C")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .stdin(Stdio::null())
+        .args(arguments);
+    let result = run_bounded(command, CLEANUP_TIMEOUT, 256 * 1024, None)?;
+    if result.termination != IsolatedTaskTermination::Exited
+        || !result.status.is_some_and(|status| status.success())
+    {
+        return Err(LimaRunnerError::ControlFailed {
+            command: "recovery".into(),
+            status: result.status.and_then(|status| status.code()),
+            stderr: result.stderr,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Execution {
     status: Option<ExitStatus>,
@@ -745,10 +813,14 @@ fn create_private_lima_home(environment_id: &str) -> Result<PathBuf, LimaRunnerE
     } else {
         create_private_directory(&root)?;
     }
-    let digest = hex_digest(environment_id.as_bytes());
-    let home = root.join(&digest[..16]);
+    let home = private_lima_home_path(environment_id);
     create_private_directory(&home)?;
     Ok(home)
+}
+
+fn private_lima_home_path(environment_id: &str) -> PathBuf {
+    let digest = hex_digest(environment_id.as_bytes());
+    PathBuf::from("/tmp/ht-lima").join(&digest[..16])
 }
 
 fn command_digest(argv: &[String]) -> String {
@@ -1045,6 +1117,40 @@ mod tests {
         assert_eq!(receipt.termination, IsolatedTaskTermination::Cancelled);
         assert!(fs::read_to_string(log).unwrap().ends_with("stop\ndelete\n"));
         manager.destroy(&environment).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_recovery_reaps_an_interrupted_private_instance() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let environment_id = format!("recovery-{}", std::process::id());
+        let home = private_lima_home_path(&environment_id);
+        let root = home.parent().unwrap();
+        if !root.exists() {
+            create_private_directory(root).unwrap();
+        }
+        if home.exists() {
+            fs::remove_dir_all(&home).unwrap();
+        }
+        fs::create_dir_all(home.join(instance_name(&environment_id))).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = temporary.path().join("limactl");
+        let log = temporary.path().join("recovery.log");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nset -eu\nfor argument in \"$@\"; do\n  case \"$argument\" in stop|delete) printf '%s\\n' \"$argument\" >> '{}';; esac\ndone\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        cleanup_interrupted_lima_environment_with(&environment_id, Some(&executable)).unwrap();
+        assert!(!home.exists());
+        assert_eq!(fs::read_to_string(log).unwrap(), "stop\ndelete\n");
     }
 
     #[cfg(target_os = "macos")]
