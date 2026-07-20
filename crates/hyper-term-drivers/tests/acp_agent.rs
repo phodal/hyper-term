@@ -36,6 +36,31 @@ fn bundled_codex_acp_completes_the_release_initialize_handshake() {
     assert_eq!(client.close().unwrap(), DriverState::Closed);
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "requires HYPER_TERM_ACP_RUNTIME_ROOT, HYPER_TERM_DENO_PATH, and HYPER_TERM_DENO_SHA256"]
+fn bundled_claude_acp_creates_a_release_session_with_external_provider() {
+    let (client, runtime) = launch_bundled_claude_acp();
+    client
+        .initialize(Duration::from_secs(20))
+        .unwrap_or_else(|error| panic_with_release_stderr(&client, &runtime, "initialize", error));
+    let session_id = client
+        .start_session(Duration::from_secs(20))
+        .unwrap_or_else(|error| panic_with_release_stderr(&client, &runtime, "session/new", error));
+
+    assert!(!session_id.is_empty());
+    assert_eq!(client.state().unwrap(), DriverState::Ready);
+    let provider_log = fs::read_to_string(runtime.path().join("provider.log"))
+        .expect("bundled adapter must launch the configured provider path");
+    assert!(provider_log.contains("started:"));
+    assert!(provider_log.contains("\"type\":\"control_request\""));
+    assert!(provider_log.contains("\"subtype\":\"initialize\""));
+    assert!(provider_log.contains("\"subtype\":\"get_context_usage\""));
+    assert!(provider_log.contains("--input-format stream-json"));
+    assert!(provider_log.contains("--output-format stream-json"));
+    assert_eq!(client.close().unwrap(), DriverState::Closed);
+}
+
 #[test]
 #[ignore = "requires HYPER_TERM_ACP_PATH, HYPER_TERM_ACP_SHA256, and an installed ACP adapter"]
 fn installed_acp_agent_completes_a_real_initialize_handshake() {
@@ -183,9 +208,7 @@ fn launch_installed_acp_agent() -> (AcpAgentClient, TempDir) {
 
 #[cfg(unix)]
 fn launch_bundled_codex_acp() -> (AcpAgentClient, TempDir) {
-    let runtime_root = required_path("HYPER_TERM_ACP_RUNTIME_ROOT")
-        .canonicalize()
-        .expect("HYPER_TERM_ACP_RUNTIME_ROOT must resolve to the built ACP runtime");
+    let runtime_root = bundled_acp_runtime_root();
     let entrypoint = runtime_root
         .join("node_modules/@agentclientprotocol/codex-acp/dist/index.js")
         .canonicalize()
@@ -212,17 +235,7 @@ fn launch_bundled_codex_acp() -> (AcpAgentClient, TempDir) {
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700))
         .expect("executable Codex app-server fixture");
 
-    let arguments = [
-        "run",
-        "--cached-only",
-        "--no-config",
-        "--node-modules-dir=manual",
-        "-A",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .chain(std::iter::once(entrypoint.into_os_string()))
-    .collect();
+    let arguments = bundled_deno_arguments(entrypoint);
     let mut environment = adapter_environment(&executable);
     environment.insert("HOME".into(), root.path().as_os_str().to_owned());
     environment.insert("CODEX_PATH".into(), provider.into_os_string());
@@ -240,6 +253,140 @@ fn launch_bundled_codex_acp() -> (AcpAgentClient, TempDir) {
     })
     .expect("launch bundled Codex ACP adapter");
     (client, root)
+}
+
+#[cfg(unix)]
+fn launch_bundled_claude_acp() -> (AcpAgentClient, TempDir) {
+    let runtime_root = bundled_acp_runtime_root();
+    let entrypoint = runtime_root
+        .join("node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js")
+        .canonicalize()
+        .expect("built Claude ACP entrypoint");
+    assert!(
+        entrypoint.starts_with(&runtime_root),
+        "Claude ACP entrypoint escaped the built runtime"
+    );
+    let executable = required_path("HYPER_TERM_DENO_PATH")
+        .canonicalize()
+        .expect("HYPER_TERM_DENO_PATH must resolve to the inspected Deno runtime");
+    let executable_sha256 = std::env::var("HYPER_TERM_DENO_SHA256")
+        .expect("HYPER_TERM_DENO_SHA256 must identify that exact Deno runtime");
+
+    let root = TempDir::new().expect("temporary bundled Claude ACP release gate");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("temporary ACP workspace");
+    let provider_script = root.path().join("claude-fixture.js");
+    fs::write(
+        &provider_script,
+        r#"const logPath = `${Deno.env.get("HOME")}/provider.log`;
+const appendLog = (line) => Deno.writeTextFileSync(logPath, `${line}\n`, { append: true });
+appendLog(`started: ${Deno.args.join(" ")}`);
+
+const encoder = new TextEncoder();
+const send = async (message) => {
+  await Deno.stdout.write(encoder.encode(`${JSON.stringify(message)}\n`));
+};
+const success = (requestId, response) => ({
+  type: "control_response",
+  response: { subtype: "success", request_id: requestId, response },
+});
+const decoder = new TextDecoder();
+let buffer = "";
+for await (const chunk of Deno.stdin.readable) {
+  buffer += decoder.decode(chunk, { stream: true });
+  while (buffer.includes("\n")) {
+    const newline = buffer.indexOf("\n");
+    const line = buffer.slice(0, newline).trim();
+    buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    appendLog(`request: ${line}`);
+    const frame = JSON.parse(line);
+    if (frame.type !== "control_request") continue;
+    const subtype = frame.request?.subtype;
+    let response = {};
+    if (subtype === "initialize") {
+      response = {
+        commands: [],
+        agents: [],
+        output_style: "default",
+        available_output_styles: ["default"],
+        models: [{
+          value: "claude-release-gate",
+          displayName: "Claude Release Gate",
+          description: "Deterministic packaged-runtime fixture",
+          supportsEffort: false,
+          supportsAdaptiveThinking: false,
+          supportsFastMode: false,
+          supportsAutoMode: false,
+        }],
+        account: { apiProvider: "firstParty" },
+      };
+    } else if (subtype === "get_context_usage") {
+      response = { model: "claude-release-gate", rawMaxTokens: 200000 };
+    } else if (subtype === "supported_agents") {
+      response = { agents: [] };
+    }
+    await send(success(frame.request_id, response));
+  }
+}
+"#,
+    )
+    .expect("deterministic Claude stream-json fixture");
+    let provider = root.path().join("claude");
+    fs::write(
+        &provider,
+        "#!/bin/sh\nset -eu\nexec \"$HYPER_TERM_PROVIDER_DENO\" run --no-config -A \"$HYPER_TERM_PROVIDER_SCRIPT\" \"$@\"\n",
+    )
+    .expect("deterministic Claude executable fixture");
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700))
+        .expect("executable Claude fixture");
+
+    let arguments = bundled_deno_arguments(entrypoint);
+    let mut environment = adapter_environment(&executable);
+    environment.insert("HOME".into(), root.path().as_os_str().to_owned());
+    environment.insert("CLAUDE_CODE_EXECUTABLE".into(), provider.into_os_string());
+    environment.insert(
+        "HYPER_TERM_PROVIDER_DENO".into(),
+        executable.as_os_str().to_owned(),
+    );
+    environment.insert(
+        "HYPER_TERM_PROVIDER_SCRIPT".into(),
+        provider_script.into_os_string(),
+    );
+    let client = AcpAgentClient::launch(AcpAgentConfig {
+        executable,
+        executable_sha256,
+        arguments,
+        environment,
+        implementation_version: "bundled-release-gate".into(),
+        provider_id: "claude-acp".into(),
+        workspace,
+        brokered_mcp_server: None,
+        containment: None,
+        terminal_client: false,
+    })
+    .expect("launch bundled Claude ACP adapter");
+    (client, root)
+}
+
+fn bundled_acp_runtime_root() -> PathBuf {
+    required_path("HYPER_TERM_ACP_RUNTIME_ROOT")
+        .canonicalize()
+        .expect("HYPER_TERM_ACP_RUNTIME_ROOT must resolve to the built ACP runtime")
+}
+
+fn bundled_deno_arguments(entrypoint: PathBuf) -> Vec<OsString> {
+    [
+        "run",
+        "--cached-only",
+        "--no-config",
+        "--node-modules-dir=manual",
+        "-A",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain(std::iter::once(entrypoint.into_os_string()))
+    .collect()
 }
 
 fn launch_installed_acp_agent_with_mcp(
@@ -335,6 +482,20 @@ fn adapter_environment(executable: &Path) -> BTreeMap<String, OsString> {
 fn panic_with_stderr(client: &AcpAgentClient, stage: &str, error: impl std::fmt::Display) -> ! {
     panic!(
         "ACP {stage} failed: {error}; stderr={}",
+        client.stderr_tail().unwrap_or_default()
+    )
+}
+
+fn panic_with_release_stderr(
+    client: &AcpAgentClient,
+    runtime: &TempDir,
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> ! {
+    let provider_log = fs::read_to_string(runtime.path().join("provider.log"))
+        .unwrap_or_else(|log_error| format!("provider log unavailable: {log_error}"));
+    panic!(
+        "bundled ACP {stage} failed: {error}; provider={provider_log}; stderr={}",
         client.stderr_tail().unwrap_or_default()
     )
 }

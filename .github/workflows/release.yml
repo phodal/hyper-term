@@ -134,6 +134,17 @@ jobs:
               -- \
               --ignored \
               --exact
+          HYPER_TERM_ACP_RUNTIME_ROOT="$GITHUB_WORKSPACE/dist/runtime/acp" \
+          HYPER_TERM_DENO_PATH="$deno_path" \
+          HYPER_TERM_DENO_SHA256="$deno_sha256" \
+            cargo test \
+              --locked \
+              --package hyper-term-drivers \
+              --test acp_agent \
+              bundled_claude_acp_creates_a_release_session_with_external_provider \
+              -- \
+              --ignored \
+              --exact
 
       - name: Run Native SDK release gates
         working-directory: apps/desktop
