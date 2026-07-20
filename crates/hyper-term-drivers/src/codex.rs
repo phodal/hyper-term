@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use hyper_term_protocol::PermissionDecision;
+use hyper_term_protocol::{AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, PermissionDecision};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -32,6 +32,7 @@ const CODEX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CODEX_MODELS: usize = 24;
 const MAX_CODEX_REASONING_EFFORTS: usize = 16;
 const MAX_CODEX_SKILLS: usize = 24;
+const MAX_CODEX_PLAN_ENTRIES: usize = 128;
 const HYPER_TERM_MCP_TOOLS: &[&str] = &[
     "hyper_term.genui.compile",
     "hyper_term.lsp.query",
@@ -597,6 +598,12 @@ impl CodexAppServerClient {
                 turn_id: required_string(params, "turnId")?,
                 text: required_string(params, "delta")?,
             }),
+            Some("turn/plan/updated") => Ok(AgentDriverEvent::PlanUpdated {
+                sequence,
+                thread_id: required_string(params, "threadId")?,
+                turn_id: required_string(params, "turnId")?,
+                entries: normalize_codex_plan(params)?,
+            }),
             Some("turn/completed") => {
                 if self.process.state()? == DriverState::Busy {
                     self.process.finish_effect()?;
@@ -1050,6 +1057,44 @@ fn optional_bounded_string(params: &Value, key: &str) -> Result<Option<String>, 
         .transpose()
 }
 
+fn normalize_codex_plan(params: &Value) -> Result<Vec<AgentPlanEntry>, CodexAdapterError> {
+    let entries = params
+        .get("plan")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CodexAdapterError::InvalidMessage("missing plan".into()))?;
+    if entries.len() > MAX_CODEX_PLAN_ENTRIES {
+        return Err(CodexAdapterError::InvalidMessage(
+            "Codex plan exceeds 128 entries".into(),
+        ));
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let content = required_string(entry, "step")?;
+            if content.is_empty() || content.len() > 16 * 1024 {
+                return Err(CodexAdapterError::InvalidMessage(
+                    "Codex plan step is empty or exceeds 16 KiB".into(),
+                ));
+            }
+            let status = match entry.get("status").and_then(Value::as_str) {
+                Some("pending") => AgentPlanStatus::Pending,
+                Some("inProgress") => AgentPlanStatus::InProgress,
+                Some("completed") => AgentPlanStatus::Completed,
+                _ => {
+                    return Err(CodexAdapterError::InvalidMessage(
+                        "Codex plan step has an unsupported status".into(),
+                    ));
+                }
+            };
+            Ok(AgentPlanEntry {
+                content,
+                priority: AgentPlanPriority::Medium,
+                status,
+            })
+        })
+        .collect()
+}
+
 fn bounded(value: String, maximum: usize) -> Result<String, CodexAdapterError> {
     if value.len() > maximum {
         Err(CodexAdapterError::InvalidMessage(format!(
@@ -1199,6 +1244,43 @@ mod tests {
         assert_eq!(required_string(&params, "delta").unwrap(), "working");
     }
 
+    #[test]
+    fn turn_plan_updates_become_bounded_goal_entries() {
+        assert_eq!(
+            normalize_codex_plan(&json!({
+                "plan": [
+                    {"step": "Inspect the repository", "status": "completed"},
+                    {"step": "Review the architecture", "status": "inProgress"},
+                    {"step": "Summarize the findings", "status": "pending"}
+                ]
+            }))
+            .unwrap(),
+            vec![
+                AgentPlanEntry {
+                    content: "Inspect the repository".into(),
+                    priority: AgentPlanPriority::Medium,
+                    status: AgentPlanStatus::Completed,
+                },
+                AgentPlanEntry {
+                    content: "Review the architecture".into(),
+                    priority: AgentPlanPriority::Medium,
+                    status: AgentPlanStatus::InProgress,
+                },
+                AgentPlanEntry {
+                    content: "Summarize the findings".into(),
+                    priority: AgentPlanPriority::Medium,
+                    status: AgentPlanStatus::Pending,
+                },
+            ]
+        );
+        assert!(
+            normalize_codex_plan(&json!({
+                "plan": [{"step": "Unknown", "status": "blocked"}]
+            }))
+            .is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn direct_codex_exposes_models_reasoning_and_skill_mentions() {
@@ -1219,6 +1301,7 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*) printf '%s\n' '{"id":4,"result":{"thread":{"id":"thread-1"}}}' ;;
     *'"method":"turn/start"'*'"model":"gpt-b"'*'"effort":"high"'*)
       printf '%s\n' '{"id":5,"result":{"turn":{"id":"turn-1"}}}'
+      printf '%s\n' '{"method":"turn/plan/updated","params":{"threadId":"thread-1","turnId":"turn-1","explanation":"Inspect before editing","plan":[{"step":"Inspect the repository","status":"completed"},{"step":"Review the architecture","status":"inProgress"},{"step":"Summarize the findings","status":"pending"}]}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}'
       ;;
   esac
@@ -1320,8 +1403,33 @@ done
         );
         assert_eq!(
             client.next_event(fixture_timeout).unwrap(),
-            AgentDriverEvent::TurnCompleted {
+            AgentDriverEvent::PlanUpdated {
                 sequence: 6,
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                entries: vec![
+                    AgentPlanEntry {
+                        content: "Inspect the repository".into(),
+                        priority: AgentPlanPriority::Medium,
+                        status: AgentPlanStatus::Completed,
+                    },
+                    AgentPlanEntry {
+                        content: "Review the architecture".into(),
+                        priority: AgentPlanPriority::Medium,
+                        status: AgentPlanStatus::InProgress,
+                    },
+                    AgentPlanEntry {
+                        content: "Summarize the findings".into(),
+                        priority: AgentPlanPriority::Medium,
+                        status: AgentPlanStatus::Pending,
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            client.next_event(fixture_timeout).unwrap(),
+            AgentDriverEvent::TurnCompleted {
+                sequence: 7,
                 thread_id: "thread-1".into(),
                 turn_id: Some("turn-1".into()),
                 status: Some("completed".into()),
