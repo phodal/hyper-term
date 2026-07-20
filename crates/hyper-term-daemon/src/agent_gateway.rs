@@ -28,11 +28,11 @@ use hyper_term_drivers::{
     sha256_file, stage_codex_auth_file,
 };
 use hyper_term_protocol::{
-    AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, GenUiArtifactCandidate,
-    GenUiBugCapsule, GenUiBugCapsuleEnvironment, GenUiRuntimeTraceAppendRequest,
-    GenUiRuntimeTraceProjection, MessageRole, OperationAction, OperationCompletion, OperationId,
-    OperationKind, OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
-    TerminalCommand,
+    AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, EventEnvelope,
+    GenUiArtifactCandidate, GenUiBugCapsule, GenUiBugCapsuleEnvironment,
+    GenUiRuntimeTraceAppendRequest, GenUiRuntimeTraceProjection, MessageRole, OperationAction,
+    OperationCompletion, OperationId, OperationKind, OperationOutcome, OperationState,
+    PermissionDecision, RiskClass, TaskId, TerminalCommand,
 };
 use hyper_term_sandbox::{IsolatedChange, IsolatedTaskTermination, LimaTaskRunner};
 use serde::{Deserialize, Serialize};
@@ -423,6 +423,7 @@ struct AgentSnapshotResponse {
     turn_id: Option<String>,
     error: Option<String>,
     capabilities: AgentSessionCapabilities,
+    context: Option<EventEnvelope>,
     document: BlockDocument,
 }
 
@@ -2862,6 +2863,24 @@ impl AgentGatewayRuntime {
                 return Err(StartError::Driver);
             }
         };
+        let context_receipts = launched.client.execution_context_receipts();
+        if !context_receipts.is_empty()
+            && self
+                .config
+                .daemon
+                .record_agent_execution_context(
+                    task_id,
+                    provider_id.to_owned(),
+                    structured_protocol_name(protocol).into(),
+                    thread_id.clone(),
+                    context_receipts,
+                )
+                .is_err()
+        {
+            let _ = launched.client.close();
+            let _ = std::fs::remove_dir_all(&session_root);
+            return Err(StartError::Driver);
+        }
         let session = Arc::new(AgentSession {
             client: launched.client,
             provider_id: provider_id.to_owned(),
@@ -3044,12 +3063,18 @@ impl AgentGatewayRuntime {
             .client
             .session_capabilities()
             .map_err(|_| SessionError::Driver)?;
+        let context = self
+            .config
+            .daemon
+            .agent_execution_context_event(session.task_id)
+            .map_err(|_| SessionError::Daemon)?;
         Ok(AgentSnapshotResponse {
             session_id,
             status,
             turn_id,
             error,
             capabilities,
+            context,
             document,
         })
     }
@@ -7285,6 +7310,28 @@ done
             snapshot["capabilities"]["config_options"][0]["kind"]["current_value"],
             "fast"
         );
+        assert_eq!(
+            snapshot["context"]["payload"]["type"],
+            "agent_execution_context_recorded"
+        );
+        assert_eq!(
+            snapshot["context"]["causation_id"],
+            snapshot["context"]["correlation_id"]
+        );
+        assert_eq!(
+            snapshot["context"]["payload"]["context"]["provider_id"],
+            "fixture-acp"
+        );
+        assert_eq!(
+            snapshot["context"]["payload"]["context"]["receipts"][0]["mode"],
+            "hermetic"
+        );
+        assert_eq!(
+            snapshot["context"]["payload"]["context"]["receipts"][0]["credential_bindings"]
+                [0]["reference"]["secret_id"],
+            "managed-connect-proxy-session"
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("\"variables\""));
         let config_path = format!("/agent/session/config?token={token}&session_id=8");
         let config_request = serde_json::to_vec(&serde_json::json!({
             "config_id": "model",

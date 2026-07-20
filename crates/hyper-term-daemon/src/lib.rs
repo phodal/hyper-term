@@ -21,16 +21,17 @@ use hyper_term_core::{
     TerminalSupervisor, UserShellConfig,
 };
 use hyper_term_protocol::{
-    AcceptedGenUiArtifact, Actor, BlockDocument, BlockId, BlockPatch, CapabilityLease, ClientId,
-    CompiledSandboxProfile, ControlRequest, ControlRequestEnvelope, ControlResponse,
-    ControlResponseEnvelope, DomainEvent, GenUiArtifactCandidate, InputLeaseId, MessageRole,
-    NewEvent, OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
-    OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, SandboxEnforcement,
-    SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime,
-    SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy,
-    SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId,
-    TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame, read_frame,
-    write_frame,
+    AcceptedGenUiArtifact, Actor, AgentExecutionContextReceiptSet, BlockDocument, BlockId,
+    BlockPatch, CapabilityLease, ClientId, CompiledSandboxProfile, ContextReceipt, ControlRequest,
+    ControlRequestEnvelope, ControlResponse, ControlResponseEnvelope, DomainEvent,
+    EXECUTION_CONTEXT_SCHEMA_VERSION, EventEnvelope, GenUiArtifactCandidate, InputLeaseId,
+    MessageRole, NewEvent, OperationAction, OperationCompletion, OperationId, OperationKind,
+    OperationOutcome, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass,
+    SandboxEnforcement, SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId,
+    SandboxLifetime, SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule,
+    SandboxProcessPolicy, SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame,
+    TerminalId, TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame,
+    read_frame, write_frame,
 };
 use hyper_term_sandbox::{
     IsolatedTaskReceipt, IsolatedTaskRequest, IsolatedTaskTermination, IsolatedWorktree,
@@ -400,6 +401,67 @@ impl DaemonState {
                 text,
             },
         })
+    }
+
+    pub fn record_agent_execution_context(
+        &self,
+        task_id: TaskId,
+        provider_id: String,
+        protocol: String,
+        thread_id: String,
+        receipts: Vec<ContextReceipt>,
+    ) -> Result<(), DaemonError> {
+        self.require_task(task_id)?;
+        validate_agent_execution_context(&provider_id, &protocol, &thread_id, &receipts)?;
+        let task_created_event_id = {
+            let authority = lock(&self.inner.authority)?;
+            authority
+                .journal
+                .all()
+                .iter()
+                .find(|event| {
+                    event.task_id == task_id
+                        && matches!(event.payload, DomainEvent::TaskCreated { .. })
+                })
+                .map(|event| event.event_id)
+                .ok_or(DaemonError::TaskNotFound(task_id))?
+        };
+        self.record(NewEvent {
+            task_id,
+            run_id: None,
+            operation_id: None,
+            causation_id: Some(task_created_event_id),
+            correlation_id: Some(task_created_event_id),
+            payload: DomainEvent::AgentExecutionContextRecorded {
+                context: AgentExecutionContextReceiptSet {
+                    provider_id,
+                    protocol,
+                    thread_id,
+                    receipts,
+                },
+            },
+        })
+    }
+
+    pub fn agent_execution_context_event(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<EventEnvelope>, DaemonError> {
+        self.require_task(task_id)?;
+        let authority = lock(&self.inner.authority)?;
+        Ok(authority
+            .journal
+            .all()
+            .iter()
+            .rev()
+            .find(|event| {
+                event.task_id == task_id
+                    && matches!(
+                        event.payload,
+                        DomainEvent::AgentExecutionContextRecorded { .. }
+                    )
+            })
+            .cloned())
     }
 
     pub fn update_agent_tool_call(
@@ -2528,6 +2590,69 @@ fn validate_agent_tool_call(call: &hyper_term_protocol::AgentToolCall) -> Result
     if encoded.len() > 512 * 1024 {
         return Err(DaemonError::InvalidAgentProjection(
             "Agent tool call exceeds the 512 KiB journal bound".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_agent_execution_context(
+    provider_id: &str,
+    protocol: &str,
+    thread_id: &str,
+    receipts: &[ContextReceipt],
+) -> Result<(), DaemonError> {
+    if provider_id.is_empty()
+        || provider_id.len() > 64
+        || !provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        || protocol.is_empty()
+        || protocol.len() > 64
+        || !protocol
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || thread_id.is_empty()
+        || thread_id.len() > 4096
+        || thread_id.chars().any(char::is_control)
+        || receipts.is_empty()
+        || receipts.len() > 4
+    {
+        return Err(DaemonError::InvalidAgentProjection(
+            "Agent execution-context identity or receipt count is invalid".into(),
+        ));
+    }
+    let mut context_ids = HashSet::new();
+    for receipt in receipts {
+        if receipt.schema_version != EXECUTION_CONTEXT_SCHEMA_VERSION
+            || receipt.context_id.is_empty()
+            || receipt.context_id.len() > 128
+            || !context_ids.insert(receipt.context_id.as_str())
+            || receipt.bindings.len() > 128
+            || receipt.credential_bindings.len() > 32
+            || receipt.credential_bindings.iter().any(|credential| {
+                credential.binding_id.is_empty()
+                    || credential.binding_id.len() > 128
+                    || credential.reference.provider_id.is_empty()
+                    || credential.reference.provider_id.len() > 128
+                    || credential.reference.secret_id.is_empty()
+                    || credential.reference.secret_id.len() > 256
+                    || credential.target_name.is_empty()
+                    || credential.target_name.len() > 128
+                    || credential.audience.is_empty()
+                    || credential.audience.len() > 2048
+                    || credential.audience.chars().any(char::is_control)
+            })
+        {
+            return Err(DaemonError::InvalidAgentProjection(
+                "Agent execution-context receipt is invalid or unbounded".into(),
+            ));
+        }
+    }
+    let encoded = serde_json::to_vec(receipts)
+        .map_err(|error| DaemonError::InvalidAgentProjection(error.to_string()))?;
+    if encoded.len() > 256 * 1024 {
+        return Err(DaemonError::InvalidAgentProjection(
+            "Agent execution-context receipts exceed the 256 KiB journal bound".into(),
         ));
     }
     Ok(())

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use hyper_term_protocol::ContextReceipt;
 use thiserror::Error;
 
 use crate::{
@@ -13,6 +14,9 @@ use crate::{
 pub trait StructuredAgentClient: Send + Sync {
     fn provider_id(&self) -> &str;
     fn protocol(&self) -> StructuredAgentProtocol;
+    fn execution_context_receipts(&self) -> Vec<ContextReceipt> {
+        Vec::new()
+    }
     fn initialize_session(&self, timeout: Duration) -> Result<String, AgentClientError>;
     fn start_turn(
         &self,

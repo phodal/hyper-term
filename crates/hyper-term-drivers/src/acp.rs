@@ -80,6 +80,16 @@ impl StructuredAgentClient for AcpAgentClient {
         StructuredAgentProtocol::Acp
     }
 
+    fn execution_context_receipts(&self) -> Vec<ContextReceipt> {
+        [
+            self.context_receipt.clone(),
+            self.mcp_context_receipt.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     fn initialize_session(&self, timeout: Duration) -> Result<String, AgentClientError> {
         AcpAgentClient::initialize(self, timeout)?;
         Ok(AcpAgentClient::start_session(self, timeout)?)

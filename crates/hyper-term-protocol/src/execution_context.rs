@@ -252,3 +252,11 @@ pub struct ContextReceipt {
     #[serde(default)]
     pub credential_bindings: Vec<CredentialRequirement>,
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentExecutionContextReceiptSet {
+    pub provider_id: String,
+    pub protocol: String,
+    pub thread_id: String,
+    pub receipts: Vec<ContextReceipt>,
+}

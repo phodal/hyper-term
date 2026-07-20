@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedGenUiArtifact, ActionDigest, AgentPlanEntry, AgentToolCall, BlockId,
-    CompiledSandboxProfile, EVENT_SCHEMA_VERSION, EventId, OperationId, RunId, SandboxLeaseId,
-    SandboxProfileDigest, SandboxReceipt, SandboxViolation, TaskId, TerminalId,
+    AcceptedGenUiArtifact, ActionDigest, AgentExecutionContextReceiptSet, AgentPlanEntry,
+    AgentToolCall, BlockId, CompiledSandboxProfile, EVENT_SCHEMA_VERSION, EventId, OperationId,
+    RunId, SandboxLeaseId, SandboxProfileDigest, SandboxReceipt, SandboxViolation, TaskId,
+    TerminalId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -270,6 +271,9 @@ pub enum DomainEvent {
         turn_id: String,
         entries: Vec<AgentPlanEntry>,
     },
+    AgentExecutionContextRecorded {
+        context: AgentExecutionContextReceiptSet,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -313,6 +317,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::{
+        ContextDigest, ContextReceipt, EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest,
+        ExecutionMode,
+    };
 
     #[test]
     fn legacy_boolean_receipts_remain_readable_without_an_outcome_field() {
@@ -343,5 +351,33 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn agent_execution_context_receipts_serialize_as_redacted_evidence() {
+        let event = DomainEvent::AgentExecutionContextRecorded {
+            context: AgentExecutionContextReceiptSet {
+                provider_id: "codex-acp".into(),
+                protocol: "acp".into(),
+                thread_id: "thread-1".into(),
+                receipts: vec![ContextReceipt {
+                    schema_version: EXECUTION_CONTEXT_SCHEMA_VERSION,
+                    context_id: "agent-provider".into(),
+                    context_revision: 1,
+                    mode: ExecutionMode::Hermetic,
+                    context_digest: ContextDigest::parse("a".repeat(64)).unwrap(),
+                    environment_digest: EnvironmentPlanDigest::parse("b".repeat(64)).unwrap(),
+                    clear_inherited: true,
+                    bindings: Vec::new(),
+                    credential_bindings: Vec::new(),
+                }],
+            },
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "agent_execution_context_recorded");
+        assert_eq!(value["context"]["receipts"][0]["mode"], "hermetic");
+        assert!(value["context"]["receipts"][0].get("variables").is_none());
+        assert!(value.to_string().find("secret_value").is_none());
     }
 }
