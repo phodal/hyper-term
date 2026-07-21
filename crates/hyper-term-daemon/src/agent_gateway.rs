@@ -1180,12 +1180,21 @@ async fn workbench_index(
     State(runtime): State<AgentGatewayRuntime>,
     Query(query): Query<AgentSessionQuery>,
 ) -> Response {
-    let session_id = match authorize(&runtime, &query) {
-        Ok(session_id) => session_id,
-        Err(response) => return *response,
-    };
-    if runtime.session(session_id).is_err() {
-        return status_response(StatusCode::NOT_FOUND, "Agent session does not exist");
+    if query.session_id.is_some() {
+        let session_id = match authorize(&runtime, &query) {
+            Ok(session_id) => session_id,
+            Err(response) => return *response,
+        };
+        if runtime.session(session_id).is_err() {
+            return status_response(StatusCode::NOT_FOUND, "Agent session does not exist");
+        }
+    } else {
+        if let Err(response) = authorize_gateway_token(&runtime, &query) {
+            return *response;
+        }
+        if runtime.config.debug_capsule.is_none() {
+            return status_response(StatusCode::NOT_FOUND, "Offline Bug Capsule is unavailable");
+        }
     }
     serve_workbench_asset(&runtime, Path::new("index.html")).await
 }
@@ -7350,6 +7359,13 @@ done
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
+        let workbench_assets = temporary.path().join("workbench");
+        std::fs::create_dir_all(&workbench_assets).unwrap();
+        std::fs::write(
+            workbench_assets.join("index.html"),
+            "<html><body>offline-capsule-workbench</body></html>",
+        )
+        .unwrap();
         let token = "0123456789abcdef0123456789abcdef".to_owned();
         let expected = capsule_fixture();
         let gateway = spawn_agent_gateway(AgentGatewayConfig {
@@ -7365,7 +7381,7 @@ done
             local_mcp_servers: Vec::new(),
             mcp_executable: None,
             genui_runtime: None,
-            workbench_assets: None,
+            workbench_assets: Some(workbench_assets),
             debug_capsule: Some(expected.clone()),
             tier2_runner: None,
             control_socket: temporary.path().join("hyperd.sock"),
@@ -7377,10 +7393,29 @@ done
         assert_eq!(status, StatusCode::OK.as_u16());
         let actual: GenUiBugCapsule = serde_json::from_slice(&body).unwrap();
         assert_eq!(actual, expected);
+        let workbench_path = format!("/agent/workbench/?surface=capsule&token={token}");
+        let (status, body) = request_path(gateway.address(), &workbench_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("offline-capsule-workbench")
+        );
         assert_eq!(
             request_path(
                 gateway.address(),
                 "/agent/debug-capsule?token=wrong",
+                "GET",
+                b""
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                "/agent/workbench/?surface=capsule&token=wrong",
                 "GET",
                 b""
             )
