@@ -30,8 +30,8 @@ use hyper_term_drivers::{
     stage_codex_auth_file,
 };
 use hyper_term_protocol::{
-    AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockPatch, EventEnvelope,
-    GenUiArtifactCandidate, GenUiBugCapsule, GenUiBugCapsuleEnvironment,
+    AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockKind, BlockPatch,
+    EventEnvelope, GenUiArtifactCandidate, GenUiBugCapsule, GenUiBugCapsuleEnvironment,
     GenUiRuntimeTraceAppendRequest, GenUiRuntimeTraceProjection, LocalMcpServerRuntimeReceipt,
     LocalMcpToolCallReceipt, MessageRole, OperationAction, OperationCompletion, OperationId,
     OperationKind, OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
@@ -45,6 +45,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::agent_session_store::AgentSessionBindingStore;
 use crate::artifact_debug_capsule::build_bug_capsule;
 use crate::artifact_editor_store::{
     ArtifactEditorCheckpoint, ArtifactEditorCheckpointRequest, ArtifactEditorStore,
@@ -266,6 +267,7 @@ struct AgentGatewayRuntime {
     config: Arc<AgentGatewayConfig>,
     local_mcp: Arc<LocalMcpRuntimeManager>,
     sessions: Arc<Mutex<HashMap<u16, Arc<AgentSession>>>>,
+    session_bindings: Arc<AgentSessionBindingStore>,
     preview_shell: Option<Arc<str>>,
     workbench_assets: Option<Arc<PathBuf>>,
     editor_lsp: Option<Arc<EditorLspService>>,
@@ -343,6 +345,7 @@ struct AgentSession {
     protocol: StructuredAgentProtocol,
     task_id: TaskId,
     thread_id: String,
+    history_restored: bool,
     runtime_root: PathBuf,
     progress: Mutex<AgentProgress>,
     pending_effect: Mutex<Option<PendingAgentEffect>>,
@@ -426,6 +429,7 @@ struct AgentSessionResponse {
     status: &'static str,
     task_id: TaskId,
     thread_id: String,
+    history_restored: bool,
 }
 
 #[derive(Serialize)]
@@ -434,6 +438,8 @@ struct AgentSnapshotResponse {
     status: AgentStatus,
     turn_id: Option<String>,
     error: Option<String>,
+    history_restored: bool,
+    pending_operation_id: Option<OperationId>,
     capabilities: AgentSessionCapabilities,
     goal: Option<AgentThreadGoal>,
     context: Option<EventEnvelope>,
@@ -1035,6 +1041,10 @@ pub async fn spawn_agent_gateway(
         ArtifactEditorStore::open(&config.state_directory)
             .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?,
     );
+    let session_bindings = Arc::new(
+        AgentSessionBindingStore::open(&config.state_directory)
+            .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?,
+    );
     let artifact_runtime_trace_store = Arc::new(
         ArtifactRuntimeTraceStore::open(&config.state_directory)
             .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?,
@@ -1071,6 +1081,7 @@ pub async fn spawn_agent_gateway(
         config: Arc::new(config),
         local_mcp,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        session_bindings,
         preview_shell,
         workbench_assets,
         editor_lsp,
@@ -1339,11 +1350,15 @@ async fn close_session(
         Ok(session_id) => session_id,
         Err(response) => return *response,
     };
-    let task_id = runtime
-        .session(session_id)
-        .ok()
-        .map(|session| session.task_id);
-    runtime.close_session(session_id);
+    let task_id = match runtime.close_session(session_id, true) {
+        Ok(task_id) => task_id,
+        Err(_) => {
+            return status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Agent session history could not be forgotten safely",
+            );
+        }
+    };
     if let Some(task_id) = task_id {
         runtime.local_mcp.close_task(task_id).await;
     }
@@ -1469,6 +1484,8 @@ struct AgentStreamStateFrame {
     status: AgentStatus,
     turn_id: Option<String>,
     error: Option<String>,
+    history_restored: bool,
+    pending_operation_id: Option<OperationId>,
     document_revision: u64,
     capabilities: AgentSessionCapabilities,
     goal: Option<AgentThreadGoal>,
@@ -3113,11 +3130,27 @@ impl AgentGatewayRuntime {
         {
             return Err(StartError::Unavailable);
         }
-        let task_id = self
-            .config
-            .daemon
-            .create_task(format!("{provider_id} Agent session {session_id}"))
-            .map_err(|_| StartError::Driver)?;
+        let restored_task_id = self
+            .session_bindings
+            .task_for(session_id, provider_id)
+            .map_err(|_| StartError::Driver)?
+            .filter(|task_id| self.config.daemon.block_snapshot(*task_id).is_ok());
+        let task_id = match restored_task_id {
+            Some(task_id) => task_id,
+            None => self
+                .config
+                .daemon
+                .create_task(format!("{provider_id} Agent session {session_id}"))
+                .map_err(|_| StartError::Driver)?,
+        };
+        let history_restored = restored_task_id
+            .and_then(|task_id| self.config.daemon.block_snapshot(task_id).ok())
+            .is_some_and(|document| {
+                document
+                    .blocks
+                    .iter()
+                    .any(|block| block.kind != BlockKind::Task)
+            });
         let session_root = self
             .config
             .state_directory
@@ -3174,6 +3207,7 @@ impl AgentGatewayRuntime {
             protocol,
             task_id,
             thread_id,
+            history_restored,
             runtime_root: session_root,
             progress: Mutex::new(AgentProgress {
                 status: AgentStatus::Ready,
@@ -3184,6 +3218,16 @@ impl AgentGatewayRuntime {
             terminals: Mutex::new(HashMap::new()),
             _managed_proxy: launched.managed_proxy,
         });
+        if self
+            .session_bindings
+            .bind(session_id, provider_id, task_id)
+            .is_err()
+        {
+            let _ = session.client.close();
+            self.cleanup_brokered_mcp_runtime(task_id);
+            let _ = std::fs::remove_dir_all(&session.runtime_root);
+            return Err(StartError::Driver);
+        }
         let response = ready_response(session_id, &session);
         sessions.insert(session_id, session);
         Ok(response)
@@ -3334,6 +3378,12 @@ impl AgentGatewayRuntime {
         let turn_id = progress.turn_id.clone();
         let error = progress.error.clone();
         drop(progress);
+        let pending_operation_id = session
+            .pending_effect
+            .lock()
+            .map_err(|_| SessionError::Lock)?
+            .as_ref()
+            .map(|effect| effect.operation_id);
         let document = self
             .config
             .daemon
@@ -3357,6 +3407,8 @@ impl AgentGatewayRuntime {
             status,
             turn_id,
             error,
+            history_restored: session.history_restored,
+            pending_operation_id,
             capabilities,
             goal,
             context,
@@ -3409,6 +3461,12 @@ impl AgentGatewayRuntime {
         let turn_id = progress.turn_id.clone();
         let error = progress.error.clone();
         drop(progress);
+        let pending_operation_id = session
+            .pending_effect
+            .lock()
+            .map_err(|_| SessionError::Lock)?
+            .as_ref()
+            .map(|effect| effect.operation_id);
         let document_revision = self
             .config
             .daemon
@@ -3426,6 +3484,8 @@ impl AgentGatewayRuntime {
             status,
             turn_id,
             error,
+            history_restored: session.history_restored,
+            pending_operation_id,
             document_revision,
             capabilities,
             goal,
@@ -5267,7 +5327,16 @@ impl AgentGatewayRuntime {
         }))
     }
 
-    fn close_session(&self, session_id: u16) {
+    fn close_session(
+        &self,
+        session_id: u16,
+        forget_history: bool,
+    ) -> Result<Option<TaskId>, SessionError> {
+        if forget_history {
+            self.session_bindings
+                .forget(session_id)
+                .map_err(|_| SessionError::Daemon)?;
+        }
         self.close_artifact_drafts(session_id);
         self.close_workspace_applies(session_id);
         let session = self
@@ -5276,13 +5345,19 @@ impl AgentGatewayRuntime {
             .ok()
             .and_then(|mut sessions| sessions.remove(&session_id));
         if let Some(session) = session {
+            let task_id = session.task_id;
             let _ = session.client.close();
             self.cleanup_brokered_mcp_runtime(session.task_id);
             let _ = std::fs::remove_dir_all(&session.runtime_root);
+            if let Some(editor_lsp) = &self.editor_lsp {
+                editor_lsp.close_session(session_id);
+            }
+            return Ok(Some(task_id));
         }
         if let Some(editor_lsp) = &self.editor_lsp {
             editor_lsp.close_session(session_id);
         }
+        Ok(None)
     }
 
     fn close_all(&self) {
@@ -5292,18 +5367,7 @@ impl AgentGatewayRuntime {
             .map(|sessions| sessions.keys().copied().collect::<Vec<_>>())
             .unwrap_or_default();
         for session_id in session_ids {
-            self.close_artifact_drafts(session_id);
-            self.close_workspace_applies(session_id);
-        }
-        let sessions = if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.drain().map(|(_, session)| session).collect()
-        } else {
-            Vec::new()
-        };
-        for session in sessions {
-            let _ = session.client.close();
-            self.cleanup_brokered_mcp_runtime(session.task_id);
-            let _ = std::fs::remove_dir_all(&session.runtime_root);
+            let _ = self.close_session(session_id, false);
         }
         if let Some(editor_lsp) = &self.editor_lsp {
             editor_lsp.close_all();
@@ -6486,6 +6550,7 @@ fn ready_response(session_id: u16, session: &AgentSession) -> AgentSessionRespon
         status: "ready",
         task_id: session.task_id,
         thread_id: session.thread_id.clone(),
+        history_restored: session.history_restored,
     }
 }
 
@@ -6691,6 +6756,39 @@ done
             roots_snapshot_sha256: Some("a".repeat(64)),
             lifecycle: LocalMcpServerLifecycle::OneTask,
             credential_scope: LocalMcpCredentialScope::ServerLifetime,
+        }
+    }
+
+    fn restart_history_gateway_config(
+        workspace: &Path,
+        state_directory: &Path,
+        daemon: DaemonState,
+        provider_home: &Path,
+        executable: &Path,
+    ) -> AgentGatewayConfig {
+        AgentGatewayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: "0123456789abcdef0123456789abcdef".into(),
+            workspace: workspace.to_owned(),
+            state_directory: state_directory.to_owned(),
+            daemon,
+            provider_home: provider_home.to_owned(),
+            codex_executable: None,
+            codex_auth_file: None,
+            acp_providers: vec![AcpAgentProviderConfig {
+                provider_id: "fixture-acp".into(),
+                executable: executable.to_owned(),
+                arguments: Vec::new(),
+                environment: BTreeMap::new(),
+                implementation_version: "fixture-restart-1".into(),
+            }],
+            local_mcp_servers: Vec::new(),
+            mcp_executable: None,
+            genui_runtime: None,
+            workbench_assets: None,
+            debug_capsule: None,
+            tier2_runner: None,
+            control_socket: provider_home.join("hyperd.sock"),
         }
     }
 
@@ -8163,6 +8261,116 @@ done
                 .count(),
             0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_gateway_restart_restores_agent_history_without_reusing_the_agent_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let daemon_state = temporary.path().join("daemon-state");
+        let gateway_state = temporary.path().join("gateway-state");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let fake_acp = temporary.path().join("fixture-acp-restart");
+        std::fs::write(
+            &fake_acp,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[],"agentInfo":{"name":"fixture-acp-restart","version":"1"}}}' ;;
+    *'"method":"session/new"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fresh-provider-process"}}' ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh-provider-process","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Fresh provider answered."}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}' ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_acp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let start_path = format!("/agent/session?token={token}&session_id=8&provider=fixture-acp");
+        let turn_path = format!("/agent/session/turn?token={token}&session_id=8");
+
+        let first = spawn_agent_gateway(restart_history_gateway_config(
+            &workspace,
+            &gateway_state,
+            DaemonState::open(&daemon_state).unwrap(),
+            temporary.path(),
+            &fake_acp,
+        ))
+        .await
+        .unwrap();
+        let (_, body) = request_path(first.address(), &start_path, "POST", b"").await;
+        let first_start: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first_start["history_restored"], false);
+        let task_id = first_start["task_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            request_path(
+                first.address(),
+                &turn_path,
+                "POST",
+                b"Remember this durable prompt",
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+        loop {
+            let (_, body) = request(first.address(), token, 8, "GET").await;
+            let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if snapshot["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        first.shutdown().await.unwrap();
+
+        let bindings = gateway_state.join(crate::agent_session_store::AGENT_SESSION_BINDING_FILE);
+        assert_eq!(
+            std::fs::metadata(&bindings).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let binding_json = std::fs::read_to_string(&bindings).unwrap();
+        assert!(binding_json.contains(&task_id));
+        assert!(!binding_json.contains("Remember this durable prompt"));
+
+        let second = spawn_agent_gateway(restart_history_gateway_config(
+            &workspace,
+            &gateway_state,
+            DaemonState::open(&daemon_state).unwrap(),
+            temporary.path(),
+            &fake_acp,
+        ))
+        .await
+        .unwrap();
+        let (_, body) = request_path(second.address(), &start_path, "POST", b"").await;
+        let second_start: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second_start["history_restored"], true);
+        assert_eq!(second_start["task_id"], task_id);
+        assert_eq!(second_start["thread_id"], "fresh-provider-process");
+
+        let (_, body) = request(second.address(), token, 8, "GET").await;
+        let restored: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(restored["history_restored"], true);
+        assert!(restored["pending_operation_id"].is_null());
+        assert!(
+            restored["document"]["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block["payload"]["text"] == "Remember this durable prompt")
+        );
+
+        assert_eq!(
+            request_path(second.address(), &start_path, "DELETE", b"")
+                .await
+                .0,
+            StatusCode::NO_CONTENT.as_u16()
+        );
+        second.shutdown().await.unwrap();
+        let bindings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bindings).unwrap()).unwrap();
+        assert_eq!(bindings["entries"], serde_json::json!([]));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9945,6 +10153,7 @@ done
             }),
             local_mcp: Arc::new(LocalMcpRuntimeManager::new(daemon.clone(), Vec::new()).unwrap()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_bindings: Arc::new(AgentSessionBindingStore::open(&state_directory).unwrap()),
             preview_shell: None,
             workbench_assets: None,
             editor_lsp: None,

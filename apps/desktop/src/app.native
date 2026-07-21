@@ -61,6 +61,12 @@
       </if>
       <if test="{hasAgentThreadActions}">
         <row gap="5" padding="3" cross="center">
+          <if test="{hasAgentRestoredHistory}">
+            <row gap="5" cross="center" label="Recovered Agent history">
+              <icon name="refresh-cw" width="11" height="11" foreground="text_muted" />
+              <text foreground="text_muted">History restored</text>
+            </row>
+          </if>
           <if test="{hasAgentExecutionContext}">
             <button size="sm" variant="ghost" icon="circle-dot" on-press="toggle_agent_execution_context" label="Inspect Agent execution context">{agentExecutionContextSummary}</button>
           </if>

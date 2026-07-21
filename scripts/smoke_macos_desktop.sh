@@ -515,7 +515,11 @@ PY
   native automate assert \
     'role=button name="Claude ACP 6".*state=.*selected' \
     'role=group name="Agent conversation"'
-  python3 - "$smoke_root/state/desktop-workspace.json" .zig-cache/native-sdk-automation/workspace-before-application-restart.json <<'PY'
+  python3 \
+    - "$smoke_root/state/desktop-workspace.json" \
+    "$smoke_root/state/agent-runtime/agent-session-bindings.json" \
+    .zig-cache/native-sdk-automation/workspace-before-application-restart.json \
+    .zig-cache/native-sdk-automation/agent-bindings-before-application-restart.json <<'PY'
 import json
 import pathlib
 import stat
@@ -523,7 +527,9 @@ import sys
 import time
 
 state_path = pathlib.Path(sys.argv[1])
-evidence_path = pathlib.Path(sys.argv[2])
+binding_path = pathlib.Path(sys.argv[2])
+workspace_evidence_path = pathlib.Path(sys.argv[3])
+binding_evidence_path = pathlib.Path(sys.argv[4])
 last = None
 for _ in range(100):
     try:
@@ -553,7 +559,33 @@ else:
 mode = stat.S_IMODE(state_path.stat().st_mode)
 if mode != 0o600:
     raise SystemExit(f"desktop workspace mode is {mode:o}, expected 600")
-evidence_path.write_text(json.dumps(last, sort_keys=True) + "\n")
+workspace_evidence_path.write_text(json.dumps(last, sort_keys=True) + "\n")
+
+bindings = None
+for _ in range(100):
+    try:
+        bindings = json.loads(binding_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        time.sleep(0.05)
+        continue
+    entries = [
+        (entry["session_id"], entry["provider"])
+        for entry in bindings.get("entries", [])
+    ]
+    if entries == [(5, "codex-acp"), (6, "claude-acp")]:
+        break
+    time.sleep(0.05)
+else:
+    raise SystemExit(f"durable Agent bindings did not settle: {bindings!r}")
+
+mode = stat.S_IMODE(binding_path.stat().st_mode)
+if mode != 0o600:
+    raise SystemExit(f"Agent binding mode is {mode:o}, expected 600")
+encoded = binding_path.read_text()
+for forbidden in ("Run the bounded terminal", "Tier 2 terminal completed", "token"):
+    if forbidden in encoded:
+        raise SystemExit(f"Agent binding leaked transcript or secret content: {forbidden!r}")
+binding_evidence_path.write_text(json.dumps(bindings, sort_keys=True) + "\n")
 PY
 
   smoke_supervisor_before_application_restart=$smoke_pid
@@ -595,8 +627,16 @@ PY
     'role=button name="Close Claude ACP 6"' \
     'role=button name="Claude ACP 6".*state=.*selected' \
     'role=group name="Agent conversation"' \
+    'role=group name="Recovered Agent history"' \
+    'History restored' \
+    'Run the bounded terminal' \
+    'Tier 2 terminal completed\.' \
+    'role=button name="Allowed once"' \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
+  native automate screenshot hyper-term-canvas
+  smoke_restored_agent_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-agent-restored.png
+  cp "$smoke_screenshot" "$smoke_restored_agent_screenshot"
 
   smoke_terminal_tab_id=$(smoke_widget_id 'role=button name="zsh 3"')
   native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
@@ -613,6 +653,9 @@ PY
   native automate assert \
     'role=button name="Claude ACP 6".*state=.*selected' \
     'role=group name="Agent conversation"' \
+    'role=group name="Recovered Agent history"' \
+    'Run the bounded terminal' \
+    'Tier 2 terminal completed\.' \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
   smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
@@ -635,10 +678,13 @@ PY
     "renderer_before=$smoke_renderer_before_application_restart" \
     "renderer_after=$smoke_renderer_after_application_restart" \
     'durable_workspace_mode=0600' \
+    'durable_agent_binding_mode=0600' \
     'workspace_tabs_restored=true' \
     'active_agent_restored=true' \
+    'agent_history_restored=true' \
     'terminal_gateway_token_rotated=true' \
-    'agent_session_recreated_and_prompted=true' \
+    'agent_provider_process_recreated=true' \
+    'agent_history_and_new_turn_verified=true' \
     > .zig-cache/native-sdk-automation/application-restart.txt
   kill -INT "$smoke_pid" 2>/dev/null || true
   wait "$smoke_pid" 2>/dev/null || true
@@ -659,6 +705,9 @@ if [[ -n "$smoke_artifact_dir" ]]; then
     "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png" \
     "$smoke_artifact_dir/screenshot-hyper-term-agent.png"
   cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-agent-restored.png" \
+    "$smoke_artifact_dir/screenshot-hyper-term-agent-restored.png"
+  cp \
     "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-search.png" \
     "$smoke_artifact_dir/screenshot-hyper-term-search.png"
   cp \
@@ -673,6 +722,9 @@ if [[ -n "$smoke_artifact_dir" ]]; then
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/workspace-before-application-restart.json" \
     "$smoke_artifact_dir/workspace-before-application-restart.json"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/agent-bindings-before-application-restart.json" \
+    "$smoke_artifact_dir/agent-bindings-before-application-restart.json"
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/application-restart.txt" \
     "$smoke_artifact_dir/application-restart.txt"

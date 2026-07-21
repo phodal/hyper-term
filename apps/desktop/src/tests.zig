@@ -1172,7 +1172,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"completed","error":null,"document":{"blocks":[
+        \\{"status":"waiting_approval","error":null,"pending_operation_id":"11111111-1111-4111-8111-111111111111","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000001","kind":"task","payload":{"type":"task","title":"Agent"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000002","kind":"message","payload":{"type":"message","role":"user","text":"What changed?"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000003","kind":"message","payload":{"type":"message","role":"agent","text":"The Agent tab now streams **BlockDocument** messages."}},
@@ -1182,7 +1182,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
         ,
     } }, &fx);
 
-    try testing.expectEqual(main.AgentTurnStatus.completed, model.agent_turn_status);
+    try testing.expectEqual(main.AgentTurnStatus.waiting_approval, model.agent_turn_status);
     try testing.expectEqual(@as(usize, 4), model.agentBlocks().len);
     try testing.expectEqualStrings("What changed?", model.agentBlocks()[0].content());
     try testing.expectEqualStrings("The Agent tab now streams **BlockDocument** messages.", model.agentBlocks()[1].content());
@@ -1199,7 +1199,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     try testing.expect(containsText(tree.root, "touch forbidden"));
     try testing.expect(containsText(tree.root, "Allow unavailable until Rust can enforce"));
     try testing.expect(findByLabel(tree.root, "Agent prompt composer") != null);
-    try testing.expect(findByLabel(tree.root, "Send prompt") != null);
+    try testing.expect(findByLabel(tree.root, "Stop Agent turn") != null);
     const tokens = main.hyperTermTokens(&model);
     const sweep = canvas.LayoutAuditSweepOptions{
         .tokens = tokens,
@@ -1234,6 +1234,50 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     } }, &fx);
     try testing.expect(!model.agentPermissionBusy());
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+}
+
+test "restored Agent history archives approvals from the previous runtime" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"status":"ready","error":null,"history_restored":true,"document":{"blocks":[
+        \\  {"block_id":"00000000-0000-4000-8000-000000000081","kind":"message","payload":{"type":"message","role":"user","text":"Keep this after restart"}},
+        \\  {"block_id":"00000000-0000-4000-8000-000000000082","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"88888888-8888-4888-8888-888888888888","kind":"shell","summary":"Previous runtime command","risk":"external_effect","state":"waiting_human"}},
+        \\  {"block_id":"00000000-0000-4000-8000-000000000083","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"88888888-8888-4888-8888-888888888888","operation_revision":3,"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
+        \\]}}
+        ,
+    } }, &fx);
+
+    try testing.expect(model.hasAgentRestoredHistory());
+    try testing.expectEqual(@as(usize, 0), model.agent_pending_operation_len);
+
+    var first_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer first_arena.deinit();
+    const first_tree = try buildTree(first_arena.allocator(), &model);
+    try testing.expect(findByLabel(first_tree.root, "Recovered Agent history") != null);
+    try testing.expect(containsText(first_tree.root, "History restored"));
+    try testing.expect(containsText(first_tree.root, "Keep this after restart"));
+    const archived = findByText(first_tree.root, .button, "Archived approval").?;
+    try testing.expect(findByText(first_tree.root, .button, "Allow once") == null);
+    try testing.expect(findByText(first_tree.root, .button, "Reject") == null);
+    try testing.expect(findByText(first_tree.root, .button, "Cancel") == null);
+
+    main.update(&model, first_tree.msgForPointer(archived.id, .up).?, &fx);
+    var expanded_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer expanded_arena.deinit();
+    const expanded_tree = try buildTree(expanded_arena.allocator(), &model);
+    try testing.expect(containsText(expanded_tree.root, "Previous Agent runtime ended before a decision"));
 }
 
 test "Agent activity renders compact plans goals diffs terminals and hides low-signal tips" {
@@ -1634,7 +1678,7 @@ test "read-only MCP approvals expose an exact Allow once action" {
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"running","error":null,"document":{"blocks":[
+        \\{"status":"waiting_approval","error":null,"pending_operation_id":"44444444-4444-4444-8444-444444444444","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000021","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"44444444-4444-4444-8444-444444444444","kind":"mcp_tool","summary":"Build a bounded diff review","risk":"read_only","state":"waiting_human"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000022","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"44444444-4444-4444-8444-444444444444","operation_revision":3,"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
         \\]}}
@@ -1672,7 +1716,7 @@ test "reviewed Tier 2 workspace edits expose a compact exact approval" {
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"waiting_approval","error":null,"document":{"blocks":[
+        \\{"status":"waiting_approval","error":null,"pending_operation_id":"55555555-5555-4555-8555-555555555555","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000031","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"55555555-5555-4555-8555-555555555555","kind":"file_edit","summary":"Apply 1 reviewed Tier 2 file: src/main.rs","risk":"workspace_write","state":"waiting_human"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000032","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"55555555-5555-4555-8555-555555555555","operation_revision":3,"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
         \\]}}
@@ -1716,7 +1760,7 @@ test "ACP Tier 2 terminal approvals expose the Rust-backed Allow once action" {
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"waiting_approval","error":null,"document":{"blocks":[
+        \\{"status":"waiting_approval","error":null,"pending_operation_id":"66666666-6666-4666-8666-666666666666","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000041","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"66666666-6666-4666-8666-666666666666","kind":"shell","summary":"Agent terminal in Tier 2: cargo test","risk":"external_effect","required_capabilities":["shell","sandbox.isolated_task"],"state":"waiting_human"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000042","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"66666666-6666-4666-8666-666666666666","operation_revision":3,"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
         \\]}}

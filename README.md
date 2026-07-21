@@ -163,10 +163,11 @@ supervisor keeps PTY and Agent gateways alive while it performs a bounded
 restart of a crashed Native renderer. Terminal and Agent tab layout, the active
 tab, and Agent session bindings are restored across that renderer replacement.
 The same layout and active tab also survive a full application restart through
-private Rust-owned state; a full restart intentionally creates fresh Terminal
-and Agent runtimes instead of pretending their old processes survived. The
-current focus is reliability, accessibility, containment, and signed macOS
-distribution.
+private Rust-owned state. Agent tabs reattach their existing Rust
+`BlockDocument` history through a bounded private Task ID binding, while the
+provider process and every Terminal PTY still start fresh instead of pretending
+their old processes survived. The current focus is reliability, accessibility,
+containment, and signed macOS distribution.
 
 ## Contributing
 

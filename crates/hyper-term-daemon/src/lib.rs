@@ -46,6 +46,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod agent_gateway;
+mod agent_session_store;
 mod artifact_debug_capsule;
 mod artifact_editor_store;
 mod artifact_runtime_trace_store;

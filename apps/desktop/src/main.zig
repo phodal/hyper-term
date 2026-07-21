@@ -757,6 +757,7 @@ pub const Model = struct {
     agent_block_count: usize = 0,
     agent_block_index_base: u64 = 0,
     agent_history_clipped: bool = false,
+    agent_history_restored: bool = false,
     agent_plan: AgentBlockView = .{},
     agent_plan_visible: bool = false,
     agent_goal: AgentGoalView = .{},
@@ -776,6 +777,8 @@ pub const Model = struct {
     agent_turn_status: AgentTurnStatus = .idle,
     agent_error_storage: [max_agent_error_bytes]u8 = [_]u8{0} ** max_agent_error_bytes,
     agent_error_len: usize = 0,
+    agent_pending_operation_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
+    agent_pending_operation_len: usize = 0,
     agent_snapshot_in_flight_session_id: u8 = 0,
     agent_snapshot_resync_revision: u64 = 0,
     agent_stream_session_id: u8 = 0,
@@ -843,6 +846,7 @@ pub const Model = struct {
         "agent_blocks",
         "agent_block_count",
         "agent_block_index_base",
+        "agent_history_restored",
         "agent_plan",
         "agent_plan_visible",
         "agent_goal",
@@ -863,6 +867,8 @@ pub const Model = struct {
         "agent_turn_status",
         "agent_error_storage",
         "agent_error_len",
+        "agent_pending_operation_storage",
+        "agent_pending_operation_len",
         "agent_snapshot_in_flight_session_id",
         "agent_snapshot_resync_revision",
         "agent_stream_session_id",
@@ -1134,8 +1140,24 @@ pub const Model = struct {
         return model.agent_block_count > 0;
     }
 
+    pub fn hasAgentRestoredHistory(model: *const Model) bool {
+        return model.activeSession().mode == .agent and model.agent_history_restored;
+    }
+
     pub fn agentPermissionBusy(model: *const Model) bool {
         return model.agent_permission_in_flight_session_id != 0;
+    }
+
+    pub fn isLiveAgentApproval(model: *const Model, block: *const AgentBlockView) bool {
+        if (!block.isApprovalPending() or model.agent_turn_status != .waiting_approval) {
+            return false;
+        }
+        if (model.agent_pending_operation_len == 0) return true;
+        return std.mem.eql(
+            u8,
+            block.operationId(),
+            model.agent_pending_operation_storage[0..model.agent_pending_operation_len],
+        );
     }
 
     pub fn agentConfigOptions(model: *const Model) []const AgentConfigOptionView {
@@ -1196,7 +1218,8 @@ pub const Model = struct {
     }
 
     pub fn hasAgentThreadActions(model: *const Model) bool {
-        return model.hasAgentExecutionContext() or model.canOpenAgentEditor();
+        return model.hasAgentRestoredHistory() or
+            model.hasAgentExecutionContext() or model.canOpenAgentEditor();
     }
 
     pub fn agentSearchOpen(model: *const Model) bool {
@@ -1450,7 +1473,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     (block.isActivity() or
                         block.isThoughtMessage() or
                         block.isSystemMessage() or
-                        (block.isApproval() and !block.isApprovalPending())))
+                        (block.isApproval() and
+                            (!block.isApprovalPending() or !model.isLiveAgentApproval(block)))))
                 {
                     block.expanded = !block.expanded;
                     break;
@@ -2353,6 +2377,8 @@ const AgentSnapshotWire = struct {
     session_id: ?u8 = null,
     status: []const u8,
     @"error": ?[]const u8 = null,
+    history_restored: bool = false,
+    pending_operation_id: ?[]const u8 = null,
     capabilities: AgentCapabilitiesWire = .{},
     goal: ?AgentGoalWire = null,
     context: ?AgentExecutionContextEventWire = null,
@@ -2428,6 +2454,8 @@ const AgentStreamFrameWire = struct {
     type: []const u8,
     status: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
+    history_restored: ?bool = null,
+    pending_operation_id: ?[]const u8 = null,
     document_revision: ?u64 = null,
     capabilities: AgentCapabilitiesWire = .{},
     goal: ?AgentGoalWire = null,
@@ -2824,6 +2852,8 @@ fn applyAgentStreamLine(model: *Model, line: native_sdk.EffectLine, fx: *Effects
     defer parsed.deinit();
     const frame = parsed.value;
     if (std.mem.eql(u8, frame.type, "state")) {
+        if (frame.history_restored) |restored| model.agent_history_restored = restored;
+        projectPendingAgentOperation(model, frame.pending_operation_id);
         projectAgentCapabilities(model, frame.capabilities);
         projectAgentGoal(model, frame.goal);
         if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
@@ -2954,12 +2984,22 @@ fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8) bo
     projectAgentCapabilities(model, parsed.value.capabilities);
     projectAgentGoal(model, parsed.value.goal);
     projectAgentBlocks(model, parsed.value.document.blocks);
+    model.agent_history_restored = parsed.value.history_restored;
+    projectPendingAgentOperation(model, parsed.value.pending_operation_id);
     model.agent_document_revision = parsed.value.document.revision;
     model.agent_stream_sequence = parsed.value.document.revision;
     model.agent_turn_status = parseAgentTurnStatus(parsed.value.status);
     if (parsed.value.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
     reconcilePendingAgentPrompt(model, session_id);
     return true;
+}
+
+fn projectPendingAgentOperation(model: *Model, operation_id: ?[]const u8) void {
+    model.agent_pending_operation_len = 0;
+    const value = operation_id orelse return;
+    if (!validOperationId(value)) return;
+    @memcpy(model.agent_pending_operation_storage[0..value.len], value);
+    model.agent_pending_operation_len = value.len;
 }
 
 fn projectAgentExecutionContext(
@@ -3898,6 +3938,7 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_block_count = 0;
     model.agent_block_index_base = 0;
     model.agent_history_clipped = false;
+    model.agent_history_restored = false;
     model.agent_plan = .{};
     model.agent_plan_visible = false;
     model.agent_goal = .{};
@@ -3911,6 +3952,7 @@ fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_stream_sequence = 0;
     model.agent_turn_status = .idle;
     model.agent_error_len = 0;
+    model.agent_pending_operation_len = 0;
     model.agent_snapshot_resync_revision = 0;
     model.agent_permission_in_flight_session_id = 0;
     for (&model.agent_config_options) |*option| option.* = .{};
@@ -4804,7 +4846,13 @@ fn agentOperationNode(ui: *HyperTermUi, block: *const AgentBlockView) HyperTermU
 }
 
 fn agentApprovalNode(ui: *HyperTermUi, model: *const Model, block: *const AgentBlockView) HyperTermUi.Node {
-    if (!block.isApprovalPending()) {
+    const live_approval = model.isLiveAgentApproval(block);
+    if (!block.isApprovalPending() or !live_approval) {
+        const title = if (block.isApprovalPending()) "Archived approval" else block.approvalTitle();
+        const decision = if (block.isApprovalPending())
+            "Previous Agent runtime ended before a decision"
+        else
+            ui.fmt("Decision: {s}", .{block.decisionLabel()});
         return ui.column(.{ .grow = 1 }, .{
             ui.row(.{ .grow = 1, .gap = 5, .padding = 2, .cross = .center }, .{
                 ui.icon(.{ .width = 12, .height = 12, .style_tokens = .{ .foreground = .warning } }, "circle-dot"),
@@ -4813,7 +4861,7 @@ fn agentApprovalNode(ui: *HyperTermUi, model: *const Model, block: *const AgentB
                     .variant = .ghost,
                     .icon = if (block.expanded) "chevron-down" else "chevron-right",
                     .on_press = Msg{ .toggle_agent_block = block.id },
-                }, block.approvalTitle()),
+                }, title),
                 ui.spacer(1),
                 ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
             }),
@@ -4824,7 +4872,7 @@ fn agentApprovalNode(ui: *HyperTermUi, model: *const Model, block: *const AgentB
                     .style_tokens = .{ .background = .surface_subtle, .radius = .md },
                 }, .{
                     ui.text(.{ .wrap = true }, block.content()),
-                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Decision: {s}", .{block.decisionLabel()})),
+                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, decision),
                 })
             else
                 ui.el(.stack, .{}, .{}),
