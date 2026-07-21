@@ -75,6 +75,7 @@ use crate::{
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
 const MAX_AGENT_TERMINALS: usize = 64;
+const MAX_CLAUDE_AUTH_METADATA_BYTES: u64 = 2 * 1024 * 1024;
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const START_TURN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPLETE_TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -2932,7 +2933,12 @@ fn acp_provider_read_paths(provider: &AcpAgentProviderConfig) -> Vec<PathBuf> {
     };
     let credential_paths: &[&str] = match provider.provider_id.as_str() {
         "codex-acp" => &[".codex/auth.json", ".codex/config.toml", ".codex/AGENTS.md"],
-        "claude-acp" => &[".claude", ".claude.json", ".config/claude"],
+        "claude-acp" => &[
+            ".claude",
+            ".claude.json",
+            ".config/claude",
+            "Library/Keychains",
+        ],
         "copilot-acp" => &[".config/github-copilot", ".config/gh"],
         _ => &[],
     };
@@ -3097,6 +3103,133 @@ fn stage_acp_codex_preferences(_home: &Path, _codex_home: &Path) -> Result<(), s
     Ok(())
 }
 
+#[cfg(unix)]
+fn stage_acp_claude_home(home: &Path, isolated_home: &Path) -> Result<(), std::io::Error> {
+    use std::fs::OpenOptions;
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+
+    if !home.is_absolute() || !isolated_home.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "ACP Claude homes must be absolute",
+        ));
+    }
+    let claude_home = isolated_home.join(".claude");
+    let library = isolated_home.join("Library");
+    create_private_runtime_root(&claude_home)?;
+    create_private_runtime_root(&library)?;
+
+    let source_metadata_path = home.join(".claude.json");
+    if let Ok(source_metadata) = std::fs::symlink_metadata(&source_metadata_path) {
+        if source_metadata.file_type().is_symlink()
+            || !source_metadata.is_file()
+            || source_metadata.uid() != unsafe { libc::geteuid() }
+            || source_metadata.permissions().mode() & 0o077 != 0
+            || source_metadata.len() > MAX_CLAUDE_AUTH_METADATA_BYTES
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ACP Claude auth metadata is not a bounded private user file",
+            ));
+        }
+        let source = std::fs::read(&source_metadata_path)?;
+        let source: serde_json::Value = serde_json::from_slice(&source)
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+        let mut staged = serde_json::Map::new();
+        if let Some(account) = source
+            .get("oauthAccount")
+            .filter(|account| account.is_object())
+        {
+            staged.insert("oauthAccount".into(), account.clone());
+        }
+        let staged = serde_json::to_vec(&serde_json::Value::Object(staged))
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+        let target = isolated_home.join(".claude.json");
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(target)?;
+        target.write_all(&staged)?;
+        target.sync_all()?;
+    }
+
+    let source_claude_home = home.join(".claude");
+    if let Ok(canonical_root) = source_claude_home.canonicalize() {
+        for relative in [
+            "settings.json",
+            "settings.local.json",
+            "CLAUDE.md",
+            "skills",
+        ] {
+            let source = source_claude_home.join(relative);
+            let Ok(metadata) = std::fs::symlink_metadata(&source) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink()
+                || (!metadata.is_file() && !metadata.is_dir())
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ACP Claude preference source is unsafe",
+                ));
+            }
+            let canonical = source.canonicalize()?;
+            if !canonical.starts_with(&canonical_root) {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ACP Claude preference source escaped its root",
+                ));
+            }
+            symlink(canonical, claude_home.join(relative))?;
+        }
+
+        let credentials = source_claude_home.join(".credentials.json");
+        if let Ok(metadata) = std::fs::symlink_metadata(&credentials) {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o077 != 0
+                || metadata.len() > MAX_CLAUDE_AUTH_METADATA_BYTES
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ACP Claude credential file is unsafe",
+                ));
+            }
+            let mut target = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(claude_home.join(".credentials.json"))?;
+            target.write_all(&std::fs::read(credentials)?)?;
+            target.sync_all()?;
+        }
+    }
+
+    let keychains = home.join("Library/Keychains");
+    if let Ok(metadata) = std::fs::symlink_metadata(&keychains) {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ACP Claude Keychain source is unsafe",
+            ));
+        }
+        symlink(keychains.canonicalize()?, library.join("Keychains"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn stage_acp_claude_home(_home: &Path, _isolated_home: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
 impl AgentGatewayRuntime {
     fn start_agent(
         &self,
@@ -3175,7 +3308,23 @@ impl AgentGatewayRuntime {
         let protocol = launched.client.protocol();
         let thread_id = match launched.client.initialize_session(INITIALIZE_TIMEOUT) {
             Ok(thread_id) => thread_id,
-            Err(_) => {
+            Err(error) => {
+                if agent_diagnostics_enabled() {
+                    let stderr = launched.client.stderr_tail().unwrap_or_default();
+                    eprintln!(
+                        "hyper-term-agent: {provider_id} initialization failed: {}; stderr={}",
+                        bounded_agent_diagnostic(&error.to_string()),
+                        bounded_agent_diagnostic(&stderr),
+                    );
+                    if provider_id == "claude-acp"
+                        && let Some(debug) = latest_claude_debug_tail(&session_root)
+                    {
+                        eprintln!(
+                            "hyper-term-agent: claude-acp SDK debug tail={}",
+                            bounded_agent_diagnostic(&debug),
+                        );
+                    }
+                }
                 let _ = launched.client.close();
                 self.cleanup_brokered_mcp_runtime(task_id);
                 let _ = std::fs::remove_dir_all(&session_root);
@@ -3338,6 +3487,23 @@ impl AgentGatewayRuntime {
             environment.insert("HOME".into(), isolated_home.into_os_string());
             environment.insert("CODEX_HOME".into(), codex_home.into_os_string());
             environment.insert("TMPDIR".into(), scratch.into_os_string());
+        } else if provider.provider_id == "claude-acp" {
+            let isolated_home = session_root.join("home");
+            let scratch = session_root.join("scratch");
+            for directory in [&isolated_home, &scratch] {
+                create_private_runtime_root(directory).map_err(|_| StartError::Driver)?;
+            }
+            if let Some(home) = provider.environment.get("HOME") {
+                stage_acp_claude_home(Path::new(home), &isolated_home)
+                    .map_err(|_| StartError::Driver)?;
+            }
+            environment.insert("HOME".into(), isolated_home.into_os_string());
+            environment.remove("CLAUDE_CONFIG_DIR");
+            environment.insert("TMPDIR".into(), scratch.clone().into_os_string());
+            environment.insert("CLAUDE_CODE_TMPDIR".into(), scratch.into_os_string());
+            if agent_diagnostics_enabled() {
+                environment.insert("DEBUG_CLAUDE_AGENT_SDK".into(), "1".into());
+            }
         }
         let client = AcpAgentClient::launch(AcpAgentConfig {
             executable: provider.executable.clone(),
@@ -5459,6 +5625,56 @@ impl AgentGatewayRuntime {
     }
 }
 
+fn agent_diagnostics_enabled() -> bool {
+    std::env::var_os("HYPER_TERM_AGENT_DIAGNOSTICS").is_some_and(|value| value == "1")
+}
+
+fn bounded_agent_diagnostic(value: &str) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 4096;
+    value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .take(MAX_DIAGNOSTIC_CHARS)
+        .collect()
+}
+
+#[cfg(unix)]
+fn latest_claude_debug_tail(session_root: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_DEBUG_FILE_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_DEBUG_TAIL_BYTES: usize = 4096;
+    let debug_directory = session_root.join("home/.claude/debug");
+    let directory_metadata = std::fs::symlink_metadata(&debug_directory).ok()?;
+    if directory_metadata.file_type().is_symlink()
+        || !directory_metadata.is_dir()
+        || directory_metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return None;
+    }
+    let path = std::fs::read_dir(debug_directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
+            (!metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.len() <= MAX_DEBUG_FILE_BYTES)
+                .then_some((metadata.modified().ok()?, entry.path()))
+        })
+        .max_by_key(|(modified, _)| *modified)?
+        .1;
+    let bytes = std::fs::read(path).ok()?;
+    let start = bytes.len().saturating_sub(MAX_DEBUG_TAIL_BYTES);
+    Some(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
+#[cfg(not(unix))]
+fn latest_claude_debug_tail(_session_root: &Path) -> Option<String> {
+    None
+}
+
 impl ArtifactDraftCompiler {
     fn new(
         runtime: &AgentGenUiRuntimeConfig,
@@ -6713,6 +6929,87 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    #[test]
+    fn agent_diagnostics_drop_unsafe_controls_and_stay_bounded() {
+        let diagnostic = format!("prefix\0{}suffix", "x".repeat(5000));
+        let bounded = bounded_agent_diagnostic(&diagnostic);
+
+        assert!(!bounded.contains('\0'));
+        assert_eq!(bounded.chars().count(), 4096);
+        assert!(bounded.starts_with("prefix"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_home_stages_only_auth_metadata_and_read_only_preferences() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("provider-home");
+        let source_config = home.join(".claude");
+        let keychains = home.join("Library/Keychains");
+        std::fs::create_dir_all(source_config.join("skills")).unwrap();
+        std::fs::create_dir_all(&keychains).unwrap();
+        let source_metadata = home.join(".claude.json");
+        std::fs::write(
+            &source_metadata,
+            r#"{"oauthAccount":{"accountUuid":"fixture"},"mcpServers":{"unsafe":{}}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&source_metadata, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(source_config.join("settings.json"), "{}").unwrap();
+        let credentials = source_config.join(".credentials.json");
+        std::fs::write(
+            &credentials,
+            r#"{"claudeAiOauth":{"accessToken":"fixture"}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let isolated_home = temporary.path().join("runtime/home");
+        stage_acp_claude_home(&home, &isolated_home).unwrap();
+
+        let staged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(isolated_home.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(staged["oauthAccount"]["accountUuid"], "fixture");
+        assert!(staged.get("mcpServers").is_none());
+        assert_eq!(
+            std::fs::metadata(isolated_home.join(".claude.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        assert!(
+            std::fs::symlink_metadata(isolated_home.join(".claude/settings.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(isolated_home.join(".claude/skills"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !std::fs::symlink_metadata(isolated_home.join(".claude/.credentials.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(isolated_home.join(".claude/.credentials.json")).unwrap(),
+            std::fs::read(credentials).unwrap()
+        );
+        assert!(
+            std::fs::symlink_metadata(isolated_home.join("Library/Keychains"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     fn gateway_local_mcp_config(
         temporary: &tempfile::TempDir,

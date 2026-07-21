@@ -48,24 +48,38 @@ Native view/sizing snapshot with HTTP and Rust projection checks instead of
 claiming unsupported DOM screenshot coverage.
 
 The repository also provides `scripts/smoke_macos_real_codex_acp.sh` as an
-explicit developer-only post-package gate. When Codex is already authenticated,
-it launches the assembled app with an automation-enabled Native renderer and
-proves Native composer input reaches the bundled Codex ACP adapter, enters the
-streaming/stop state, and returns to an enabled composer with the expected
-Agent Block. This account-using gate is intentionally excluded from CI and
-never invokes login. By default it does not authorize a tool call.
+explicit developer-only post-package gate for authenticated Codex and Claude
+accounts. It launches the assembled app with an automation-enabled Native
+renderer and proves Native composer input reaches the selected bundled ACP
+adapter, enters the streaming/stop state, and returns to an enabled composer
+with the expected Agent Block. This account-using gate is intentionally
+excluded from CI and never invokes login. By default it does not authorize a
+tool call. Select Claude with `HYPER_TERM_REAL_ACP_PROVIDER=claude`; Codex is
+the default.
 
-Set `HYPER_TERM_REAL_ACP_GENUI=1` for the stricter path: Codex ACP must call
-`hyper_term.genui.compile`, the Native approval UI must authorize it, and the
-Rust journal must contain an accepted artifact plus a successful MCP receipt.
-The same run then opens the Native artifact-editor disclosure, verifies the
-token-bound built Workbench and its hashed assets, loads the exact Rust source
-and checkpoint, and requests diagnostics from the Rust-managed Deno LSP. It
-also rejects an invalid gateway token and can retain the snapshot, screenshot,
-supervisor log, and machine-readable editor evidence through
-`HYPER_TERM_REAL_ACP_ARTIFACT_DIR`. The connector stays inside the Agent sandbox
-while Rust launches the supervised Deno compiler outside that process tree,
-avoiding nested Seatbelt.
+Set `HYPER_TERM_REAL_ACP_GENUI=1` for the stricter path: the selected ACP must
+call `hyper_term.genui.compile`, the Native approval UI must authorize it, and
+the Rust journal must contain an accepted artifact plus a successful MCP
+receipt. The same run then opens the Native artifact-editor disclosure,
+verifies the token-bound built Workbench and its hashed assets, loads the exact
+Rust source and checkpoint, and requests diagnostics from the Rust-managed
+Deno LSP. It also rejects an invalid gateway token and can retain the snapshot,
+screenshot, supervisor log, and machine-readable editor evidence through
+`HYPER_TERM_REAL_ACP_ARTIFACT_DIR`. The connector stays inside the Agent
+sandbox while Rust launches the supervised Deno compiler outside that process
+tree, avoiding nested Seatbelt.
+
+For example, after packaging the app and building the explicitly
+automation-enabled test renderer:
+
+```bash
+(cd apps/desktop && native build -Dautomation=true)
+HYPER_TERM_REAL_ACP_PROVIDER=claude \
+HYPER_TERM_REAL_ACP_GENUI=1 \
+./scripts/smoke_macos_real_codex_acp.sh \
+  "dist/macos/Hyper Term.app" \
+  "apps/desktop/zig-out/bin/hyper-term"
+```
 
 The final bundle contains:
 

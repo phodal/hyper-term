@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Opt-in release confidence gate. This deliberately talks to the user's real,
-# authenticated Codex account, so it is never part of unattended CI.
+# authenticated Codex or Claude account, so it is never part of unattended CI.
 
 real_repo_root=$(cd "$(dirname "$0")/.." && pwd)
 real_app=${1:-"$real_repo_root/dist/macos/Hyper Term.app"}
@@ -10,6 +10,7 @@ real_renderer=${2:-"$real_repo_root/apps/desktop/zig-out/bin/hyper-term"}
 real_expected=${HYPER_TERM_REAL_ACP_EXPECTED_TEXT:-HYPER_TERM_REAL_DESKTOP_ACP_OK}
 real_artifact_dir=${HYPER_TERM_REAL_ACP_ARTIFACT_DIR:-}
 real_genui=${HYPER_TERM_REAL_ACP_GENUI:-0}
+real_provider=${HYPER_TERM_REAL_ACP_PROVIDER:-codex}
 
 if [[ "$real_app" != /* ]]; then
   real_app="$PWD/$real_app"
@@ -25,28 +26,53 @@ if [[ "$real_genui" != 0 && "$real_genui" != 1 ]]; then
   echo "HYPER_TERM_REAL_ACP_GENUI must be 0 or 1" >&2
   exit 1
 fi
+case "$real_provider" in
+  codex)
+    real_provider_label="Codex ACP"
+    real_provider_shortcut="hyper-term.new-codex-acp-agent"
+    real_provider_flag="--codex"
+    real_agent_command="codex"
+    real_adapter_package="@agentclientprotocol/codex-acp"
+    ;;
+  claude)
+    real_provider_label="Claude ACP"
+    real_provider_shortcut="hyper-term.new-claude-acp-agent"
+    real_provider_flag="--claude"
+    real_agent_command="claude"
+    real_adapter_package="@agentclientprotocol/claude-agent-acp"
+    ;;
+  *)
+    echo "HYPER_TERM_REAL_ACP_PROVIDER must be codex or claude" >&2
+    exit 1
+    ;;
+esac
 
 if [[ $(uname -s) != Darwin ]]; then
-  echo "real Codex ACP desktop smoke requires macOS" >&2
+  echo "real $real_provider_label desktop smoke requires macOS" >&2
   exit 1
 fi
 
-for real_command in codex grep native python3 sed stat tail; do
+for real_command in "$real_agent_command" grep native python3 sed stat tail; do
   if ! command -v "$real_command" >/dev/null 2>&1; then
     echo "required command is unavailable: $real_command" >&2
     exit 1
   fi
 done
 
-real_codex=$(command -v codex)
-if ! "$real_codex" login status 2>&1 | grep -q '^Logged in'; then
-  echo "Codex is not authenticated; run 'codex login' before this opt-in smoke" >&2
+real_agent=$(command -v "$real_agent_command")
+if [[ "$real_provider" == codex ]]; then
+  if ! "$real_agent" login status 2>&1 | grep -q '^Logged in'; then
+    echo "Codex is not authenticated; run 'codex login' before this opt-in smoke" >&2
+    exit 1
+  fi
+elif ! "$real_agent" auth status 2>&1 | grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'; then
+  echo "Claude is not authenticated; run 'claude auth login' before this opt-in smoke" >&2
   exit 1
 fi
 
 real_supervisor="$real_app/Contents/MacOS/hyper-term"
 real_runtime="$real_app/Contents/Resources/runtime"
-real_adapter="$real_runtime/acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
+real_adapter="$real_runtime/acp/node_modules/$real_adapter_package/dist/index.js"
 for real_path in \
   "$real_supervisor" \
   "$real_renderer" \
@@ -55,7 +81,7 @@ for real_path in \
   "$real_repo_root/dist/terminal/index.html" \
   "$real_repo_root/dist/workbench/index.html"; do
   if [[ ! -e "$real_path" ]]; then
-    echo "real Codex ACP desktop input is unavailable: $real_path" >&2
+    echo "real $real_provider_label desktop input is unavailable: $real_path" >&2
     exit 1
   fi
 done
@@ -64,8 +90,8 @@ if [[ -n "$real_artifact_dir" && "$real_artifact_dir" != /* ]]; then
   real_artifact_dir="$PWD/$real_artifact_dir"
 fi
 
-real_root=$(mktemp -d /tmp/hyper-term-real-codex-acp.XXXXXX)
-real_log="$real_root/hyper-term-real-codex-acp.log"
+real_root=$(mktemp -d "/tmp/hyper-term-real-${real_provider}-acp.XXXXXX")
+real_log="$real_root/hyper-term-real-${real_provider}-acp.log"
 real_pid=""
 
 real_copy_evidence() {
@@ -81,10 +107,10 @@ real_copy_evidence() {
   if [[ -f "$real_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png" ]]; then
     cp \
       "$real_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png" \
-      "$real_artifact_dir/screenshot-hyper-term-real-codex-acp.png"
+      "$real_artifact_dir/screenshot-hyper-term-real-${real_provider}-acp.png"
   fi
   if [[ -f "$real_log" ]]; then
-    cp "$real_log" "$real_artifact_dir/hyper-term-real-codex-acp.log"
+    cp "$real_log" "$real_artifact_dir/hyper-term-real-${real_provider}-acp.log"
   fi
   if [[ -f "$real_root/state/events.jsonl" ]]; then
     cp "$real_root/state/events.jsonl" "$real_artifact_dir/events.jsonl"
@@ -105,7 +131,7 @@ real_cleanup() {
   fi
   real_copy_evidence
   if [[ $real_status -ne 0 ]]; then
-    echo "real Codex ACP desktop smoke failed; supervisor log follows:" >&2
+    echo "real $real_provider_label desktop smoke failed; supervisor log follows:" >&2
     tail -n 100 "$real_log" >&2 || true
   fi
   rm -rf "$real_root"
@@ -124,13 +150,14 @@ real_widget_id() {
 
 (
   cd "$real_root"
+  export HYPER_TERM_AGENT_DIAGNOSTICS=1
   exec "$real_supervisor" \
     --ui "$real_renderer" \
     --state-dir "$real_root/state" \
     --terminal-assets "$real_repo_root/dist/terminal" \
     --workbench-assets "$real_repo_root/dist/workbench" \
     --shell-cwd "$real_repo_root" \
-    --codex "$real_codex"
+    "$real_provider_flag" "$real_agent"
 ) >"$real_log" 2>&1 &
 real_pid=$!
 
@@ -141,15 +168,15 @@ real_pid=$!
     'ready=true' \
     'gpu_nonblank=true' \
     'role=button name="New Agent tab"'
-  native automate shortcut hyper-term.new-codex-acp-agent
+  native automate shortcut "$real_provider_shortcut"
   native automate assert --timeout-ms 30000 \
-    'Codex ACP' \
+    "$real_provider_label" \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
 
   real_composer_id=$(real_widget_id 'role=textbox name="Agent prompt".*enabled=true')
   if [[ -z "$real_composer_id" ]]; then
-    echo "real Codex ACP composer widget is unavailable" >&2
+    echo "real $real_provider_label composer widget is unavailable" >&2
     exit 1
   fi
   if [[ "$real_genui" == 1 ]]; then
@@ -165,7 +192,7 @@ real_pid=$!
 
   real_send_id=$(real_widget_id 'role=button name="Send prompt".*enabled=true')
   if [[ -z "$real_send_id" ]]; then
-    echo "real Codex ACP send widget is unavailable" >&2
+    echo "real $real_provider_label send widget is unavailable" >&2
     exit 1
   fi
   native automate widget-click hyper-term-canvas "$real_send_id"
@@ -176,7 +203,7 @@ real_pid=$!
       'role=button name="Allow once".*enabled=true'
     real_allow_id=$(real_widget_id 'role=button name="Allow once".*enabled=true')
     if [[ -z "$real_allow_id" ]]; then
-      echo "real Codex ACP GenUI approval button is unavailable" >&2
+      echo "real $real_provider_label GenUI approval button is unavailable" >&2
       exit 1
     fi
     native automate widget-click hyper-term-canvas "$real_allow_id"
@@ -200,7 +227,7 @@ real_pid=$!
     real_editor_id=$(real_widget_id \
       'role=button name="Open ACP artifact editor".*enabled=true')
     if [[ -z "$real_editor_id" ]]; then
-      echo "real Codex ACP artifact editor control is unavailable" >&2
+      echo "real $real_provider_label artifact editor control is unavailable" >&2
       exit 1
     fi
     native automate widget-click hyper-term-canvas "$real_editor_id"
@@ -349,12 +376,12 @@ PY
   native automate screenshot hyper-term-canvas
   real_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png
   if [[ ! -s "$real_screenshot" ]]; then
-    echo "real Codex ACP screenshot is empty" >&2
+    echo "real $real_provider_label screenshot is empty" >&2
     exit 1
   fi
   real_screenshot_bytes=$(stat -f '%z' "$real_screenshot")
   if (( real_screenshot_bytes < 100000 )); then
-    echo "real Codex ACP screenshot is unexpectedly small: $real_screenshot_bytes bytes" >&2
+    echo "real $real_provider_label screenshot is unexpectedly small: $real_screenshot_bytes bytes" >&2
     exit 1
   fi
 )
@@ -362,7 +389,7 @@ PY
 real_copy_evidence
 
 if [[ "$real_genui" == 1 ]]; then
-  echo "real Codex ACP GenUI desktop smoke passed: $real_expected"
+  echo "real $real_provider_label GenUI desktop smoke passed: $real_expected"
 else
-  echo "real Codex ACP desktop smoke passed: $real_expected"
+  echo "real $real_provider_label desktop smoke passed: $real_expected"
 fi

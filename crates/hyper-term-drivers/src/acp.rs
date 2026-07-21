@@ -935,7 +935,7 @@ impl AcpAgentClient {
         let mut calls = lock(&self.brokered_mcp_calls)?;
         match update {
             v1::SessionUpdate::ToolCall(call) => {
-                let Some(tool_name) = brokered_mcp_tool(call) else {
+                let Some(tool_name) = brokered_mcp_tool(&self.provider_id, call) else {
                     return Ok(());
                 };
                 let tool_call_id = bounded(call.tool_call_id.to_string(), 4096)?;
@@ -967,12 +967,13 @@ impl AcpAgentClient {
         request_id: &ExternalRequestId,
         request: &v1::RequestPermissionRequest,
     ) -> Result<bool, AcpAdapterError> {
-        // Codex ACP asks its client for transport-level consent before it sends
-        // the correlated tools/call to the configured MCP server. Forward that
-        // consent only for a previously observed, allowlisted Hyper Term tool.
+        // Codex and Claude ACP ask their client for transport-level consent
+        // before they send the correlated tools/call to the configured MCP
+        // server. Forward that consent only for a previously observed,
+        // allowlisted Hyper Term tool.
         // The digest-pinned MCP server still validates the exact arguments and
         // creates the user-visible Rust broker operation before executing it.
-        if self.mcp_servers.is_empty() || !is_brokered_mcp_consent(request) {
+        if self.mcp_servers.is_empty() {
             return Ok(false);
         }
         let tool_call_id = request.tool_call.tool_call_id.to_string();
@@ -1334,40 +1335,38 @@ fn host_response_value(
     Ok(HostResponseValue::Result(result))
 }
 
-fn brokered_mcp_tool(call: &v1::ToolCall) -> Option<&str> {
-    if call.kind != v1::ToolKind::Execute
-        || call
+fn brokered_mcp_tool<'a>(provider_id: &str, call: &'a v1::ToolCall) -> Option<&'a str> {
+    let codex_shape = call.kind == v1::ToolKind::Execute
+        && call
             .meta
             .as_ref()
             .and_then(|meta| meta.get("is_mcp_tool_call"))
             .and_then(Value::as_bool)
-            != Some(true)
-    {
-        return None;
+            == Some(true);
+    if codex_shape {
+        let input = call.raw_input.as_ref()?.as_object()?;
+        if input.get("server").and_then(Value::as_str) != Some("hyper_term")
+            || !input.get("arguments").is_some_and(Value::is_object)
+        {
+            return None;
+        }
+        let tool_name = input.get("tool").and_then(Value::as_str)?;
+        return (HYPER_TERM_MCP_TOOLS.contains(&tool_name)
+            && call.title == format!("mcp.hyper_term.{tool_name}"))
+        .then_some(tool_name);
     }
-    let input = call.raw_input.as_ref()?.as_object()?;
-    if input.get("server").and_then(Value::as_str) != Some("hyper_term")
-        || !input.get("arguments").is_some_and(Value::is_object)
-    {
-        return None;
-    }
-    let tool_name = input.get("tool").and_then(Value::as_str)?;
-    if !HYPER_TERM_MCP_TOOLS.contains(&tool_name)
-        || call.title != format!("mcp.hyper_term.{tool_name}")
-    {
-        return None;
-    }
-    Some(tool_name)
-}
 
-fn is_brokered_mcp_consent(request: &v1::RequestPermissionRequest) -> bool {
-    request.tool_call.fields.kind == Some(v1::ToolKind::Execute)
-        && request
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get("is_mcp_tool_approval"))
-            .and_then(Value::as_bool)
-            == Some(true)
+    // Claude ACP exposes MCP calls with a flattened, provider-specific title
+    // and the actual MCP arguments as rawInput. Correlation to the observed
+    // tool-call id is still mandatory before transport consent is returned;
+    // the digest-pinned Rust MCP broker performs the enforceable approval.
+    if provider_id != "claude-acp" {
+        return None;
+    }
+    call.raw_input.as_ref()?.as_object()?;
+    HYPER_TERM_MCP_TOOLS.iter().copied().find(|tool_name| {
+        call.title == format!("mcp__hyper_term__{}", tool_name.replace(['.', '-'], "_"))
+    })
 }
 
 fn content_text(content: v1::ContentBlock) -> Result<String, AcpAdapterError> {
@@ -2459,6 +2458,80 @@ done
             client.next_event(Duration::from_secs(2)).unwrap(),
             AgentDriverEvent::ToolCallUpdated { call, .. }
                 if call.title == "mcp.hyper_term.hyper_term.genui.compile"
+        ));
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::ProtocolNotice {
+                method: Some(method),
+                ..
+            } if method == "session/request_permission"
+        ));
+        assert!(client.pending_effects().unwrap().is_empty());
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::TurnCompleted { .. }
+        ));
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
+    }
+
+    #[test]
+    fn claude_mcp_shape_is_not_trusted_for_other_providers() {
+        let call: v1::ToolCall = serde_json::from_value(json!({
+            "toolCallId": "provider-bound-call",
+            "kind": "other",
+            "title": "mcp__hyper_term__hyper_term_genui_compile",
+            "status": "pending",
+            "rawInput": {"entry": "App.tsx", "source": "export default null"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            brokered_mcp_tool("claude-acp", &call),
+            Some("hyper_term.genui.compile")
+        );
+        assert_eq!(brokered_mcp_tool("fixture-acp", &call), None);
+    }
+
+    #[test]
+    fn claude_acp_brokered_mcp_consent_uses_the_explicit_tool_allowlist() {
+        let (temporary, executable) = fake_agent(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-claude-mcp\"}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-claude-mcp\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"claude-mcp-call-1\",\"kind\":\"other\",\"title\":\"mcp__hyper_term__hyper_term_genui_compile\",\"status\":\"pending\",\"rawInput\":{\"entry\":\"App.tsx\",\"source\":\"export default function App() { return null }\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"claude-mcp-consent-1\",\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"session-claude-mcp\",\"toolCall\":{\"toolCallId\":\"claude-mcp-call-1\",\"kind\":\"other\",\"status\":\"pending\"},\"options\":[{\"optionId\":\"allow_once\",\"name\":\"Allow\",\"kind\":\"allow_once\"},{\"optionId\":\"decline\",\"name\":\"Decline\",\"kind\":\"reject_once\"}]}}' ;;\n    *'\"id\":\"claude-mcp-consent-1\"'*'\"optionId\":\"allow_once\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+        );
+        let workspace = TempDir::new().unwrap();
+        let mcp = temporary.path().join("hyper-term-mcp");
+        std::fs::write(&mcp, "fixture MCP").unwrap();
+        let mut permissions = std::fs::metadata(&mcp).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&mcp, permissions).unwrap();
+        let client = AcpAgentClient::launch(AcpAgentConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            arguments: vec![],
+            environment: BTreeMap::new(),
+            implementation_version: "fixture-claude".into(),
+            provider_id: "claude-acp".into(),
+            workspace: workspace.path().to_owned(),
+            brokered_mcp_server: Some(AcpMcpServerConfig {
+                executable: mcp.clone(),
+                executable_sha256: sha256_file(&mcp).unwrap(),
+                arguments: vec!["--agent-mode".into()],
+                runtime_home: temporary.path().join("mcp-home"),
+                runtime_temp: temporary.path().join("mcp-tmp"),
+            }),
+            containment: None,
+            terminal_client: false,
+        })
+        .unwrap();
+
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
+        client
+            .start_turn(&session_id, "compile the counter")
+            .unwrap();
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::ToolCallUpdated { call, .. }
+                if call.title == "mcp__hyper_term__hyper_term_genui_compile"
         ));
         assert!(matches!(
             client.next_event(Duration::from_secs(2)).unwrap(),
