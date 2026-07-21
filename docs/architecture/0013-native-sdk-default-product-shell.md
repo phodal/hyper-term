@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-18
-- Amended: 2026-07-20 (hybrid reload and compact Agent workspace)
+- Amended: 2026-07-21 (hybrid reload, compact Agent workspace, and native input)
 - Supersedes the product-shell decision in:
   [ADR 0012](0012-native-sdk-renderer-spike.md)
 - Depends on: [ADR 0002](0002-runtime-authority-boundaries.md),
@@ -207,6 +207,32 @@ rails at exactly 760 points inside an 840-point window, with 40-point symmetric
 gutters, an accessible 66-point one-line composer, and no frame-budget or
 dispatch errors. A structural layout test locks those widths for both the Zig
 transcript projection and compiled Native composer.
+
+## Native composer input evidence (2026-07-21)
+
+The Agent composer uses Native SDK's bounded `TextBuffer` as its model mirror,
+including UTF-8 selection and IME composition state. Focus is requested only on
+explicit product edges: an Agent becomes ready, the user returns to an Agent
+tab, a prompt is sent, Agent search or the artifact editor closes, or Goal edit
+begins. Opening search or a Goal menu drops the prior request first so a later
+return produces a real source-level autofocus edge instead of repeatedly
+stealing keyboard focus.
+
+Composer drafts are isolated by session slot. Creating a new Agent tab starts
+with an empty draft, switching tabs saves and restores each tab's bounded
+buffer, and closing a tab shifts its draft with the same native session
+lifecycle. Draft text is deliberately process-local and is not added to the
+durable workspace manifest.
+
+Native unit coverage applies `set_composition` and `commit_composition` to the
+same model update path used by the retained editor. The macOS automation smoke
+also drives those verbs through the real widget action path: `中文输入` appears
+with composition range `0..12`, remains after commit, and loses the composition
+marker. The same smoke proves focus restoration after send and Agent-history
+search, per-tab draft isolation, Goal-edit autofocus, ordinary Terminal tab
+behavior, renderer restart, and application restart. This evidence covers the
+Native Agent composer; terminal-grid IME and system-WebView capture remain
+separate release gates.
 
 ## Rejected alternatives
 

@@ -749,6 +749,9 @@ pub const Model = struct {
     terminal_webview_mounted: bool = false,
     genui_webview_mounted: bool = false,
     agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
+    agent_composer_drafts: [max_sessions]canvas.TextBuffer(max_agent_prompt_bytes) =
+        [_]canvas.TextBuffer(max_agent_prompt_bytes){.{}} ** max_sessions,
+    agent_composer_focus_requested: bool = false,
     agent_search_buffer: canvas.TextBuffer(max_agent_search_bytes) = .{},
     agent_search_open: bool = false,
     agent_pending_prompts: [max_sessions]PendingAgentPrompt = [_]PendingAgentPrompt{.{}} ** max_sessions,
@@ -837,6 +840,8 @@ pub const Model = struct {
         "genui_source_revision",
         "agent_editor_open_session_id",
         "agent_composer_buffer",
+        "agent_composer_drafts",
+        "agent_composer_focus_requested",
         "agent_search_buffer",
         "agent_search_open",
         "agent_pending_prompts",
@@ -853,6 +858,7 @@ pub const Model = struct {
         "agent_goal_visible",
         "agent_goal_menu_open",
         "agent_goal_editing",
+        "agentGoalEditing",
         "agent_goal_in_flight_session_id",
         "agentGoalActionDisabled",
         "agentGoalEditDisabled",
@@ -1065,6 +1071,13 @@ pub const Model = struct {
 
     pub fn agentComposerText(model: *const Model) []const u8 {
         return model.agent_composer_buffer.text();
+    }
+
+    pub fn agentComposerAutofocus(model: *const Model) bool {
+        return model.activeSession().mode == .agent and
+            model.activeSession().agent_connection == .ready and
+            !model.agent_search_open and
+            (model.agent_composer_focus_requested or model.agent_goal_editing);
     }
 
     pub fn agentComposerInputDisabled(model: *const Model) bool {
@@ -1415,8 +1428,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .choose_copilot_acp_agent => createAgentSession(model, .copilot_acp, fx),
         .select_session => |session_id| {
             const previous = model.active_session_id;
+            saveActiveAgentComposer(model);
             selectSession(model, session_id);
             if (previous != model.active_session_id) {
+                loadActiveAgentComposer(model);
                 markDesktopWorkspaceChanged(model, fx);
                 clearAgentSearch(model);
                 acknowledgeSessionAttention(model, model.active_session_id);
@@ -1426,6 +1441,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 if (model.activeSession().mode != .agent and hasAgentSessions(model)) {
                     requestAgentAttention(model, fx);
                 }
+                requestAgentComposerFocus(model);
             }
         },
         .close_session => |session_id| closeSession(model, session_id, fx),
@@ -1436,14 +1452,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .agent_session_closed => {},
         .agent_composer_changed => |edit| {
             model.agent_goal_editing = false;
+            model.agent_composer_focus_requested = false;
             model.agent_composer_buffer.apply(edit);
         },
         .open_agent_search => {
-            if (model.activeSession().mode == .agent) model.agent_search_open = true;
+            if (model.activeSession().mode == .agent) {
+                model.agent_search_open = true;
+                model.agent_composer_focus_requested = false;
+            }
         },
         .close_agent_search => {
-            model.agent_search_open = false;
-            model.agent_search_buffer.clear();
+            clearAgentSearch(model);
+            requestAgentComposerFocus(model);
         },
         .agent_search_changed => |edit| {
             if (model.activeSession().mode == .agent and model.agent_search_open) {
@@ -1487,6 +1507,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Dropping the source focus request here creates a fresh
                 // false -> true edge when Edit is selected again.
                 model.agent_goal_editing = false;
+                model.agent_composer_focus_requested = false;
                 model.agent_goal_menu_open = !model.agent_goal_menu_open;
             }
         },
@@ -1521,6 +1542,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_agent_editor => {
             if (model.agent_editor_open_session_id == model.active_session_id) {
                 model.agent_editor_open_session_id = 0;
+                requestAgentComposerFocus(model);
             }
         },
         .agent_split_resized => |fraction| model.agent_split = std.math.clamp(fraction, 0.48, 0.76),
@@ -1539,7 +1561,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 
 fn appendSession(model: *Model, mode: SessionMode) ?u8 {
     if (model.session_count >= max_sessions) return null;
+    saveActiveAgentComposer(model);
     const session_id = model.next_session_id;
+    model.agent_composer_drafts[model.session_count] = .{};
     model.session_slots[model.session_count] = .{
         .id = session_id,
         .mode = mode,
@@ -1550,6 +1574,7 @@ fn appendSession(model: *Model, mode: SessionMode) ?u8 {
     model.agent_pending_prompts[model.session_count] = .{};
     model.session_count += 1;
     model.active_session_id = session_id;
+    loadActiveAgentComposer(model);
     clearAgentSearch(model);
     model.next_session_id +%= 1;
     if (model.next_session_id == 0) model.next_session_id = 1;
@@ -1570,6 +1595,7 @@ fn createAgentSession(model: *Model, provider: AgentProvider, fx: *Effects) void
 }
 
 fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
+    saveActiveAgentComposer(model);
     var closing_index: ?usize = null;
     for (model.openSessions(), 0..) |session, index| {
         if (session.id == session_id) {
@@ -1628,11 +1654,14 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     var cursor = index;
     while (cursor + 1 < model.session_count) : (cursor += 1) {
         model.session_slots[cursor] = model.session_slots[cursor + 1];
+        model.agent_composer_drafts[cursor] = model.agent_composer_drafts[cursor + 1];
         model.agent_pending_prompts[cursor] = model.agent_pending_prompts[cursor + 1];
     }
     model.session_count -= 1;
     model.session_slots[model.session_count] = .{};
+    model.agent_composer_drafts[model.session_count] = .{};
     model.agent_pending_prompts[model.session_count] = .{};
+    loadActiveAgentComposer(model);
     if (!hasAgentSessions(model)) {
         fx.cancel(agent_attention_effect_key);
         fx.cancelTimer(agent_attention_poll_timer_key);
@@ -1644,6 +1673,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         clearAgentSearch(model);
         resetAgentProjection(model, model.active_session_id);
         requestActiveAgentStream(model, fx);
+        requestAgentComposerFocus(model);
     }
 }
 
@@ -2016,6 +2046,7 @@ fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse, f
         resetAgentProjection(model, session_id);
         model.agent_turn_status = if (ready) .ready else .failed;
         if (ready) {
+            requestAgentComposerFocus(model);
             requestAgentSnapshot(model, session_id, fx);
             requestAgentStream(model, session_id, fx);
         } else {
@@ -2059,6 +2090,7 @@ fn requestAgentTurn(model: *Model, fx: *Effects) void {
     });
     model.agent_composer_buffer.clear();
     model.agent_goal_editing = false;
+    requestAgentComposerFocus(model);
     model.agent_turn_status = .running;
     model.agent_error_len = 0;
 }
@@ -4123,9 +4155,33 @@ fn selectSession(model: *Model, session_id: u8) void {
     }
 }
 
+fn activeSessionIndex(model: *const Model) usize {
+    for (model.openSessions(), 0..) |session, index| {
+        if (session.id == model.active_session_id) return index;
+    }
+    return 0;
+}
+
+fn saveActiveAgentComposer(model: *Model) void {
+    model.agent_composer_drafts[activeSessionIndex(model)] = model.agent_composer_buffer;
+}
+
+fn loadActiveAgentComposer(model: *Model) void {
+    model.agent_composer_buffer = model.agent_composer_drafts[activeSessionIndex(model)];
+    model.agent_goal_editing = false;
+    model.agent_composer_focus_requested = false;
+}
+
 fn clearAgentSearch(model: *Model) void {
     model.agent_search_open = false;
     model.agent_search_buffer.clear();
+}
+
+fn requestAgentComposerFocus(model: *Model) void {
+    model.agent_composer_focus_requested =
+        model.activeSession().mode == .agent and
+        model.activeSession().agent_connection == .ready and
+        !model.agent_search_open;
 }
 
 pub fn command(name: []const u8) ?Msg {
@@ -5061,6 +5117,8 @@ pub fn restoreDesktopWorkspace(model: *Model, document: []const u8) bool {
     }
     if (!active_found or seen[wire.next_session_id]) return false;
     model.session_slots = sessions;
+    model.agent_composer_buffer = .{};
+    for (&model.agent_composer_drafts) |*draft| draft.* = .{};
     for (&model.agent_pending_prompts) |*pending| pending.* = .{};
     model.session_count = wire.sessions.len;
     model.active_session_id = wire.active_session_id;

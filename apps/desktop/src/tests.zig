@@ -493,6 +493,7 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
         .body = "{\"session_id\":2,\"provider\":\"codex\",\"protocol\":\"codex-app-server-v2\",\"status\":\"ready\"}",
     } }, &fx);
     try testing.expectEqual(main.AgentConnection.ready, model.activeSession().agent_connection);
+    try testing.expect(model.agentComposerAutofocus());
     try testing.expectEqualStrings("Agent ready", model.agentStatus());
     try testing.expect(!model.hasAgentStatusNotice());
     try testing.expectEqual(@as(usize, 3), fx.pendingFetchCount());
@@ -508,6 +509,11 @@ test "Agent tabs start the brokered Codex runtime and render readiness" {
         "http://127.0.0.1:55321/agent/session/stream?token=abcdef0123456789abcdef0123456789&session_id=2",
         fx.pendingFetchAt(2).?.url,
     );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(tree.root, "Agent prompt").?.autofocus);
 }
 
 test "Agent NDJSON stream applies message patches and state without polling" {
@@ -761,6 +767,7 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     try testing.expectEqualStrings("Explain the PTY boundary", request.body);
     try testing.expectEqualStrings("", model.agentComposerText());
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+    try testing.expect(model.agentComposerAutofocus());
 
     main.update(&model, .{ .agent_turn_started = .{
         .key = main.agent_turn_effect_key_base + 2,
@@ -769,6 +776,81 @@ test "Agent composer posts a bounded prompt to the active Codex turn" {
     } }, &fx);
     try testing.expectEqual(@as(usize, 1), fx.pendingTimerCount());
     try testing.expectEqual(main.agent_poll_timer_key_base + 2, fx.pendingTimerAt(0).?.key);
+}
+
+test "Agent composer preserves IME composition and restores focus after search" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    main.update(&model, .{ .agent_session_started = .{
+        .key = main.agent_start_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"session_id\":2,\"provider\":\"codex\",\"protocol\":\"codex-app-server-v2\",\"status\":\"ready\"}",
+    } }, &fx);
+    try testing.expect(model.agentComposerAutofocus());
+
+    main.update(&model, .{ .agent_composer_changed = .{ .set_composition = .{
+        .text = "中文",
+        .cursor = 6,
+    } } }, &fx);
+    try testing.expectEqualStrings("中文", model.agentComposerText());
+    try testing.expectEqualDeep(
+        @as(?canvas.TextRange, canvas.TextRange.init(0, 6)),
+        model.agent_composer_buffer.composition,
+    );
+    try testing.expect(!model.agentComposerAutofocus());
+
+    main.update(&model, .{ .agent_composer_changed = .commit_composition }, &fx);
+    try testing.expectEqualStrings("中文", model.agentComposerText());
+    try testing.expect(model.agent_composer_buffer.composition == null);
+
+    main.update(&model, .open_agent_search, &fx);
+    try testing.expect(model.agentSearchOpen());
+    try testing.expect(!model.agentComposerAutofocus());
+
+    main.update(&model, .close_agent_search, &fx);
+    try testing.expect(!model.agentSearchOpen());
+    try testing.expect(model.agentComposerAutofocus());
+}
+
+test "Agent tabs keep independent composer drafts" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.agent_composer_buffer.set("First Agent draft");
+
+    main.update(&model, .choose_agent, &fx);
+    try testing.expectEqual(@as(u8, 3), model.active_session_id);
+    try testing.expectEqualStrings("", model.agentComposerText());
+    model.agent_composer_buffer.set("Second Agent draft");
+
+    main.update(&model, .{ .select_session = 2 }, &fx);
+    try testing.expectEqualStrings("First Agent draft", model.agentComposerText());
+
+    main.update(&model, .{ .select_session = 3 }, &fx);
+    try testing.expectEqualStrings("Second Agent draft", model.agentComposerText());
+
+    main.update(&model, .{ .close_session = 2 }, &fx);
+    try testing.expectEqual(@as(u8, 3), model.active_session_id);
+    try testing.expectEqualStrings("Second Agent draft", model.agentComposerText());
+
+    main.update(&model, .choose_agent, &fx);
+    try testing.expectEqualStrings("", model.agentComposerText());
+    model.agent_composer_buffer.set("Third Agent draft");
+    main.update(&model, .{ .select_session = 3 }, &fx);
+    main.update(&model, .{ .close_session = 3 }, &fx);
+    try testing.expectEqual(@as(u8, 4), model.active_session_id);
+    try testing.expectEqualStrings("Third Agent draft", model.agentComposerText());
 }
 
 test "Agent stop control posts cancellation and enters compact stopping state" {
@@ -1351,7 +1433,9 @@ test "Agent activity renders compact plans goals diffs terminals and hides low-s
     try testing.expectEqualStrings("chevron-right", findByText(tree.root, .button, "Goal · Ship the compact Agent UI without losing t…").?.icon);
     const goal_actions = findByLabel(tree.root, "Goal actions").?;
     try testing.expect(!goal_actions.state.disabled);
+    model.agent_composer_focus_requested = true;
     main.update(&model, tree.msgForPointer(goal_actions.id, .up).?, &fx);
+    try testing.expect(!model.agentComposerAutofocus());
     arena_state.deinit();
     arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     tree = try buildTree(arena_state.allocator(), &model);

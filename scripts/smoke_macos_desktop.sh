@@ -415,6 +415,13 @@ PY
   native automate assert --absent 'name="Agent execution context details"'
 
   smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_composer_id" set-composition '中文输入'
+  native automate assert \
+    'role=textbox name="Agent prompt".*text="中文输入"' \
+    'role=textbox name="Agent prompt".*composition=0\.\.12'
+  native automate widget-action hyper-term-canvas "$smoke_composer_id" commit-composition
+  native automate assert 'role=textbox name="Agent prompt".*text="中文输入"'
+  native automate assert --absent 'role=textbox name="Agent prompt".*composition='
   native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text 'Show the file change.'
   native automate assert \
     'role=textbox name="Agent prompt".*text="Show the file change\."' \
@@ -423,7 +430,8 @@ PY
   native automate widget-click hyper-term-canvas "$smoke_send_id"
   native automate assert \
     'role=button name="Processed"' \
-    'The proposed file change is ready to review.'
+    'The proposed file change is ready to review.' \
+    'role=textbox name="Agent prompt".*focused=true'
   smoke_activity_id=$(smoke_widget_id 'role=button name="Processed"')
   native automate widget-click hyper-term-canvas "$smoke_activity_id"
   native automate assert \
@@ -455,7 +463,9 @@ PY
   native automate assert --absent \
     'role=group name="Agent history search"' \
     'role=textbox name="Search Agent history"'
-  native automate assert 'The proposed file change is ready to review\.'
+  native automate assert \
+    'The proposed file change is ready to review\.' \
+    'role=textbox name="Agent prompt".*focused=true'
 
   native automate shortcut hyper-term.new-claude-acp-agent
   native automate assert \
