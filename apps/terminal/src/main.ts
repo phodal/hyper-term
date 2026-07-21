@@ -28,6 +28,10 @@ import {
 } from "./terminal-preferences.ts";
 import { TerminalInputFocusLease } from "./input-focus.ts";
 import { installGpuRenderer } from "./terminal-renderer.ts";
+import {
+  TerminalDiagnostics,
+  type TerminalDiagnosticsSnapshot,
+} from "./terminal-diagnostics.ts";
 import "./styles.css";
 
 const attachmentStorageKey = terminalAttachmentStorageKey(
@@ -50,6 +54,7 @@ const searchPrevious = requiredElement<HTMLButtonElement>(
 const searchClose = requiredElement<HTMLButtonElement>(
   "#terminal-search-close",
 );
+const diagnostics = terminalDiagnostics(globalThis.location.href);
 
 const terminal = new Terminal({
   allowProposedApi: false,
@@ -103,6 +108,7 @@ terminal.loadAddon(fit);
 terminal.loadAddon(search);
 terminal.open(terminalElement);
 const inputFocus = new TerminalInputFocusLease(() => terminal.focus());
+terminal.onRender(() => diagnostics?.recordRender());
 installGpuRenderer(
   terminal,
   new WebglAddon(),
@@ -160,6 +166,7 @@ terminal.onBinary((data) => {
 });
 
 const resizeObserver = new ResizeObserver(() => {
+  diagnostics?.recordResize();
   fitTerminal();
   if (!connectionState.canSend(socket?.readyState === WebSocket.OPEN)) return;
   sendControl({
@@ -280,6 +287,11 @@ function receiveBinary(encoded: ArrayBuffer): void {
     if (frame.kind === TerminalWebBinaryKind.Output) {
       if (frame.sequence <= afterSequence) return;
       afterSequence = frame.sequence;
+      diagnostics?.recordOutput(
+        frame.bytes.byteLength,
+        frame.sequence,
+        performance.now(),
+      );
       terminal.write(frame.bytes);
       return;
     }
@@ -290,6 +302,24 @@ function receiveBinary(encoded: ArrayBuffer): void {
     showProtocolError(error);
     socket?.close(1002, "invalid terminal frame");
   }
+}
+
+function terminalDiagnostics(url: string): TerminalDiagnostics | null {
+  if (new URL(url).searchParams.get("diagnostics") !== "1") return null;
+  const value = new TerminalDiagnostics();
+  Object.defineProperty(
+    globalThis as typeof globalThis & {
+      __hyperTermDiagnostics?: () => TerminalDiagnosticsSnapshot;
+    },
+    "__hyperTermDiagnostics",
+    {
+      configurable: false,
+      enumerable: false,
+      value: () => value.snapshot(),
+      writable: false,
+    },
+  );
+  return value;
 }
 
 function sendInput(bytes: Uint8Array): void {

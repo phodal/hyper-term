@@ -267,6 +267,17 @@ tree, activates the control with focus plus Enter, and then finds the real CJK
 PTY output in list items. This keeps performance and accessibility explicit
 rather than silently sacrificing either one.
 
+The same browser probe runs an 8 MiB real-zsh burst after two viewport resizes
+with screen-reader mode disabled. A diagnostics-only query mode exposes bounded
+byte, frame, render, resize, sequence, and monotonic-time counters; it never
+exports PTY content. The initial Apple M4 Max result received 8,647,110 bytes in
+631 ordered output frames, observed 17 xterm render events, and saw the last
+frame after 583 ms. The release alarm allows 10 seconds and retains a WebGL
+screenshot with the burst completion marker. This is transport-to-browser
+evidence, not yet a glyph-present or cross-terminal performance claim; the full
+limitations and next measurements are recorded in the
+[Terminal browser baseline](../benchmarks/terminal-browser-baseline-2026-07-21.md).
+
 ## Rejected alternatives
 
 - **Use a full-window WebView as the default UI.** It fails the native-first

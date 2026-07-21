@@ -68,7 +68,7 @@ if [[ -z "$verify_origin" ]]; then
   exit 1
 fi
 
-verify_url="$verify_origin/?token=$verify_token&tab=1"
+verify_url="$verify_origin/?token=$verify_token&tab=1&diagnostics=1"
 agent-browser --session "$verify_session" open "$verify_url" >/dev/null
 agent-browser --session "$verify_session" wait 500 >/dev/null
 
@@ -138,12 +138,40 @@ verify_accessibility=$(agent-browser --session "$verify_session" eval \
 grep -q '"OK"' <<<"$verify_accessibility"
 agent-browser --session "$verify_session" screenshot "$verify_artifact_dir/terminal-screen-reader-toggle.png" >/dev/null
 
+# Return to the default high-throughput path before measuring resize and burst
+# behavior. Diagnostics expose counters and timestamps only, never PTY content.
+agent-browser --session "$verify_session" press Enter >/dev/null
+verify_accessibility_off=$(agent-browser --session "$verify_session" eval \
+  '!document.querySelector(".xterm-accessibility-tree") ? "OK" : "FAIL"')
+grep -q '"OK"' <<<"$verify_accessibility_off"
+
+agent-browser --session "$verify_session" eval \
+  'window.__hyperTermResizeBaseline=window.__hyperTermDiagnostics().resizeEvents' >/dev/null
+agent-browser --session "$verify_session" set viewport 900 560 >/dev/null
+agent-browser --session "$verify_session" set viewport 1260 600 >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+verify_resize=$(agent-browser --session "$verify_session" eval \
+  'window.__hyperTermDiagnostics().resizeEvents-window.__hyperTermResizeBaseline>=2 ? "OK" : "FAIL"')
+grep -q '"OK"' <<<"$verify_resize"
+
+agent-browser --session "$verify_session" eval \
+  'window.__hyperTermBurstBaseline=window.__hyperTermDiagnostics();window.__hyperTermBurstStartedAt=performance.now()' >/dev/null
+agent-browser --session "$verify_session" keyboard type \
+  "yes '0123456789abcdef0123456789abcdef' | head -c 8388608; printf '\\n__HYPER_TERM_BURST_DONE__\\n'" >/dev/null
+agent-browser --session "$verify_session" press Enter >/dev/null
+verify_burst=$(agent-browser --session "$verify_session" eval \
+  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const current=window.__hyperTermDiagnostics();const bytes=current.outputBytes-window.__hyperTermBurstBaseline.outputBytes;const frames=current.outputFrames-window.__hyperTermBurstBaseline.outputFrames;const renders=current.renderEvents-window.__hyperTermBurstBaseline.renderEvents;const idle=performance.now()-current.lastOutputAt;const durationMs=current.lastOutputAt-window.__hyperTermBurstStartedAt;if(bytes>=8388608&&frames>1&&renders>0&&idle>=200){clearInterval(poll);durationMs<=10000?resolve(JSON.stringify({ok:true,bytes,frames,renders,durationMs})):reject(new Error(JSON.stringify({reason:"burst budget exceeded",bytes,frames,renders,durationMs})));}else if(performance.now()-started>15000){clearInterval(poll);reject(new Error(JSON.stringify({reason:"burst timed out",bytes,frames,renders,idle,current})));}},50)})')
+grep -q '\\"ok\\":true' <<<"$verify_burst"
+agent-browser --session "$verify_session" screenshot "$verify_artifact_dir/terminal-burst.png" >/dev/null
+
 verify_errors=$(agent-browser --session "$verify_session" errors)
 if [[ -n "$verify_errors" ]]; then
   echo "$verify_errors" >&2
   exit 1
 fi
 
-echo "Terminal browser verified: WebGL xterm, zsh input, selection, search focus, IME, and opt-in accessibility tree"
+echo "Terminal browser verified: WebGL xterm, zsh input, selection, search focus, IME, accessibility, resize, and 8 MiB burst"
 echo "Terminal browser screenshot: $verify_artifact_dir/terminal-input.png"
 echo "Terminal accessibility screenshot: $verify_artifact_dir/terminal-screen-reader-toggle.png"
+echo "Terminal burst result: $verify_burst"
+echo "Terminal burst screenshot: $verify_artifact_dir/terminal-burst.png"
