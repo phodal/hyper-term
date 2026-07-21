@@ -55,7 +55,8 @@
     "build:runtime": "deno task clean:runtime && deno bundle --platform=deno --sourcemap=linked --output=dist/runtime/genui-compiler.js runtime/genui-compiler.ts && deno bundle --platform=browser --sourcemap=inline --output=dist/runtime/genui/preview-shell.js apps/workbench/genui/preview-shell.ts && deno run --allow-read=apps/workbench/genui,dist/runtime/genui --allow-write=dist/runtime/genui scripts/inline_preview_shell.ts runtime && deno run --allow-read --allow-write=dist/runtime scripts/copy_esbuild_wasm.ts runtime && deno run --allow-read=dist/runtime --allow-write=dist/runtime scripts/verify_runtime_build.ts && deno task build:acp-runtime",
     "build:workbench:watch": "deno bundle --watch --platform=browser --sourcemap=linked --outdir=dist/workbench apps/workbench/index.html",
     "build": "deno task build:terminal && deno task build:workbench && deno task build:runtime",
-    "verify:runtime": "deno run --allow-read=runtime scripts/verify_deno_runtime.ts"
+    "verify:runtime": "deno run --allow-read=runtime scripts/verify_deno_runtime.ts",
+    "verify:terminal-browser": "./scripts/verify_terminal_browser.sh"
   },
   "exclude": [
     "dist",

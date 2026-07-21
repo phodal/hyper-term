@@ -24,6 +24,7 @@ import {
   type TerminalShortcut,
   terminalShortcut,
 } from "./terminal-preferences.ts";
+import { TerminalInputFocusLease } from "./input-focus.ts";
 import { installGpuRenderer } from "./terminal-renderer.ts";
 import "./styles.css";
 
@@ -95,13 +96,14 @@ const search = new SearchAddon();
 terminal.loadAddon(fit);
 terminal.loadAddon(search);
 terminal.open(terminalElement);
+const inputFocus = new TerminalInputFocusLease(() => terminal.focus());
 installGpuRenderer(
   terminal,
   new WebglAddon(),
   (backend) => terminalElement.dataset.renderer = backend,
 );
 fitTerminal();
-terminal.focus();
+inputFocus.claimTerminal();
 
 let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;
@@ -112,6 +114,10 @@ let transientStatusTimer: number | null = null;
 const connectionState = new TerminalConnectionState();
 
 searchInput.addEventListener("input", () => findNext(true));
+searchInput.addEventListener("focus", () => inputFocus.claimSearch());
+terminalElement.addEventListener("pointerdown", () => {
+  if (searchForm.hidden) inputFocus.claimTerminal();
+});
 searchForm.addEventListener("submit", (event) => {
   event.preventDefault();
   findNext(false);
@@ -147,10 +153,10 @@ const resizeObserver = new ResizeObserver(() => {
   });
 });
 resizeObserver.observe(terminalElement);
-globalThis.addEventListener("focus", () => terminal.focus());
+globalThis.addEventListener("focus", () => inputFocus.restore());
 globalThis.addEventListener("online", connect);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) terminal.focus();
+  if (!document.hidden) inputFocus.restore();
 });
 
 connect();
@@ -230,7 +236,7 @@ function receiveControl(message: TerminalWebServerControl): void {
         message.resize_generation,
       );
       setStatus("Connected", false);
-      terminal.focus();
+      inputFocus.restore();
       break;
     case "exited":
       setStatus(
@@ -333,6 +339,7 @@ function handleApplicationShortcut(event: KeyboardEvent): void {
 }
 
 function openSearch(): void {
+  inputFocus.claimSearch();
   searchForm.hidden = false;
   const selection = terminal.getSelection().replaceAll("\n", " ").trim();
   if (selection.length > 0 && selection.length <= 512) {
@@ -347,7 +354,7 @@ function closeSearch(): void {
   searchForm.hidden = true;
   search.clearDecorations();
   searchResults.value = "";
-  terminal.focus();
+  inputFocus.claimTerminal();
 }
 
 function findNext(incremental: boolean): void {

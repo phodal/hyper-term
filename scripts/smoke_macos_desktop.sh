@@ -148,7 +148,7 @@ smoke_start_supervisor
     'role=button name="New Terminal tab"' \
     'role=button name="New Agent tab"' \
     'role=button name="Close zsh 1"' \
-    'hyper-term-terminal-view.*url="http://127.0.0.1:47437/.*tab=1"'
+    'hyper-term-terminal-view.*focused=true.*url="http://127.0.0.1:47437/.*tab=1"'
   native automate assert --absent \
     'view @w1/hyper-term-genui-view' \
     'error event=' \
@@ -177,7 +177,7 @@ PY
   native automate assert \
     'role=button name="Close zsh 1"' \
     'role=button name="Close zsh 2"' \
-    'hyper-term-terminal-view.*tab=2"'
+    'hyper-term-terminal-view.*focused=true.*tab=2"'
 
   native automate widget-key hyper-term-canvas cmd+w
   native automate assert --absent \
@@ -320,7 +320,7 @@ PY
   native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
   native automate assert \
     'role=button name="zsh 3".*state=.*selected' \
-    'hyper-term-terminal-view.*tab=3"'
+    'hyper-term-terminal-view.*focused=true.*tab=3"'
   smoke_terminal_url_after_restart=$(smoke_terminal_url)
   if [[ "${smoke_terminal_url_after_restart%&tab=*}" != "${smoke_terminal_url_before_restart%&tab=*}" ]]; then
     echo "renderer restart replaced the Rust terminal gateway identity" >&2

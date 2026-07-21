@@ -231,8 +231,33 @@ with composition range `0..12`, remains after commit, and loses the composition
 marker. The same smoke proves focus restoration after send and Agent-history
 search, per-tab draft isolation, Goal-edit autofocus, ordinary Terminal tab
 behavior, renderer restart, and application restart. This evidence covers the
-Native Agent composer; terminal-grid IME and system-WebView capture remain
-separate release gates.
+Native Agent composer; terminal-grid IME and system-WebView capture use the
+separate browser and host gates below.
+
+## Terminal input focus evidence (2026-07-21)
+
+Input ownership is explicit on both sides of the system-WebView boundary. The
+Native host transfers the platform first responder only when the active surface
+changes between Terminal, Agent canvas, and GenUI editor. A Terminal-to-Terminal
+tab change is also an edge, so the newly navigated xterm receives input without
+requiring an extra click. Ordinary model rebuilds do not refocus a surface and
+therefore cannot interrupt an in-progress composition.
+
+Inside the Terminal WebView, a small focus lease selects either the xterm grid
+or its local search field. Window activation, reconnection, and visibility
+restoration refocus xterm only while the grid owns that lease. Command-F claims
+the search lease before focusing its field; Escape returns it to xterm. This
+prevents the previous bug where a window focus event could steal keyboard and
+IME input from terminal-history search.
+
+Native tests prove first-responder transfer across initial mount, Terminal,
+Agent, and GenUI surfaces. The macOS smoke locks the focused WebView into the
+same assertions as each selected Terminal tab. `verify:terminal-browser` starts
+the real Rust loopback gateway and drives the built WebGL xterm in a browser:
+text reaches a real zsh PTY, terminal selection seeds Command-F, search retains
+focus across a window activation, xterm displays and dismisses a CJK composition
+preedit, and committed CJK input reaches the shell. Browser console errors and
+the rendered Terminal screenshot are retained as release evidence.
 
 ## Rejected alternatives
 

@@ -5422,6 +5422,8 @@ fn trustedGatewayToken(token: []const u8) bool {
 /// the Artifact Workbench does not exist until an editor or Capsule needs it.
 /// Both views remain presentation-only children of the trusted canvas.
 pub const DeferredWebViewApp = struct {
+    const FocusSurface = enum { none, canvas, terminal, genui };
+
     inner: native_sdk.App,
     model: *Model,
     primary_window_id: native_sdk.WindowId = 0,
@@ -5429,6 +5431,8 @@ pub const DeferredWebViewApp = struct {
     mounting_enabled: bool = false,
     app_active: bool = true,
     acknowledged_attention: ?AgentAttention = null,
+    focused_surface: FocusSurface = .none,
+    focused_terminal_session_id: u8 = 0,
 
     pub fn init(app_state: *HyperTermApp) DeferredWebViewApp {
         return .{
@@ -5494,6 +5498,7 @@ pub const DeferredWebViewApp = struct {
         if (self.model.isCapsule() or self.model.hasAgentEditor()) {
             try self.mountGenUi(runtime);
         }
+        self.projectInputFocus(runtime);
     }
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
@@ -5563,6 +5568,34 @@ pub const DeferredWebViewApp = struct {
             .url = url,
         });
         self.model.genui_webview_mounted = true;
+    }
+
+    /// Transfers the platform first responder only when the active interactive
+    /// surface changes. DOM/widget-local focus remains owned by that surface,
+    /// so ordinary rebuilds cannot steal an in-progress IME composition.
+    fn projectInputFocus(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) void {
+        const next: FocusSurface = if (self.model.isTerminal())
+            .terminal
+        else if (self.model.isCapsule() or self.model.hasAgentEditor())
+            .genui
+        else
+            .canvas;
+        const terminal_session_changed = next == .terminal and
+            self.focused_terminal_session_id != self.model.active_session_id;
+        if (next == self.focused_surface and !terminal_session_changed) return;
+
+        const label = switch (next) {
+            .none => return,
+            .canvas => canvas_label,
+            .terminal => terminal_view_label,
+            .genui => genui_view_label,
+        };
+        runtime.focusView(self.primary_window_id, label) catch |err| {
+            std.log.warn("native input focus lease could not move to '{s}': {s}", .{ label, @errorName(err) });
+            return;
+        };
+        self.focused_surface = next;
+        self.focused_terminal_session_id = if (next == .terminal) self.model.active_session_id else 0;
     }
 };
 

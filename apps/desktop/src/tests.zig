@@ -128,7 +128,9 @@ test "desktop defers WebViews until native glass and mounts GenUI on demand" {
     try harness.runtime.dispatchPlatformEvent(app, timer_event);
     try testing.expect(app_state.model.terminal_webview_mounted);
     try testing.expect(!app_state.model.genui_webview_mounted);
-    try testing.expectEqual(@as(usize, 2), harness.runtime.listViews(1, &views_buffer).len);
+    const terminal_views = harness.runtime.listViews(1, &views_buffer);
+    try testing.expectEqual(@as(usize, 2), terminal_views.len);
+    try testing.expect(terminal_views[1].focused);
 
     app_state.model.session_slots[0].mode = .capsule;
     @memcpy(app_state.model.genui_workbench_url_storage[0..capsule_url.len], capsule_url);
@@ -139,6 +141,66 @@ test "desktop defers WebViews until native glass and mounts GenUI on demand" {
     try testing.expectEqual(@as(usize, 3), mounted_views.len);
     try testing.expectEqualStrings(main.terminal_view_label, mounted_views[1].label);
     try testing.expectEqualStrings(main.genui_view_label, mounted_views[2].label);
+    try testing.expect(mounted_views[2].focused);
+}
+
+test "desktop focus lease follows Terminal tabs and returns to Native Agent canvas" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const allowed_origins = [_][]const u8{ "zero://inline", "http://127.0.0.1:47437" };
+    const app_state = try main.HyperTermApp.create(std.heap.page_allocator, .{
+        .name = "hyper-term-focus-lease-test",
+        .scene = main.shell_scene,
+        .canvas_label = main.canvas_label,
+        .update_fx = main.update,
+        .tokens_fn = main.hyperTermTokens,
+        .view = main.rootView,
+        .web_panes = main.desktopPanes,
+    });
+    defer app_state.destroy();
+    app_state.model = main.initialModelWithTerminalUrl(terminal_url);
+
+    var deferred = main.DeferredWebViewApp.init(app_state);
+    const app = deferred.app();
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{
+        .size = geometry.SizeF.init(main.window_width, main.window_height),
+    });
+    defer harness.destroy(testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &allowed_origins;
+    try harness.start(app);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .window_id = 1,
+        .label = main.canvas_label,
+        .size = geometry.SizeF.init(main.window_width, main.window_height),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    const timer_event = harness.null_platform.fireTimer(main.deferred_webview_timer_id, 2_000_000).?;
+    try harness.runtime.dispatchPlatformEvent(app, timer_event);
+
+    var views_buffer: [4]native_sdk.ViewInfo = undefined;
+    var views = harness.runtime.listViews(1, &views_buffer);
+    try testing.expect(views[1].focused);
+
+    main.update(&app_state.model, .choose_agent, &app_state.effects);
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    views = harness.runtime.listViews(1, &views_buffer);
+    try testing.expect(views[0].focused);
+    try testing.expect(!views[1].focused);
+
+    main.update(&app_state.model, .{ .select_session = 1 }, &app_state.effects);
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    views = harness.runtime.listViews(1, &views_buffer);
+    try testing.expect(views[1].focused);
+
+    main.update(&app_state.model, .choose_terminal, &app_state.effects);
+    const second_terminal_id = app_state.model.active_session_id;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try testing.expectEqual(second_terminal_id, deferred.focused_terminal_session_id);
+    views = harness.runtime.listViews(1, &views_buffer);
+    try testing.expect(views[1].focused);
 }
 
 test "desktop attention is background-only semantic and deduplicated" {
