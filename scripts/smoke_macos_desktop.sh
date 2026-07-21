@@ -30,7 +30,7 @@ if [[ $(uname -s) != Darwin ]]; then
   echo "macOS desktop smoke requires a macOS host" >&2
   exit 1
 fi
-for smoke_command in git native python3 shasum stat; do
+for smoke_command in git native pgrep python3 shasum stat; do
   if ! command -v "$smoke_command" >/dev/null 2>&1; then
     echo "required command is unavailable: $smoke_command" >&2
     exit 1
@@ -217,6 +217,68 @@ raise SystemExit(f"widget not found: {pattern.pattern}")
 PY
   }
 
+  smoke_terminal_url() {
+    python3 - .zig-cache/native-sdk-automation/snapshot.txt <<'PY'
+import pathlib
+import re
+import sys
+
+snapshot = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r'hyper-term-terminal-view.*url="([^"]+)"', snapshot)
+if match is None:
+    raise SystemExit("terminal WebView URL is missing from Native snapshot")
+print(match.group(1))
+PY
+  }
+
+  smoke_terminal_url_before_restart=$(smoke_terminal_url)
+  smoke_renderer_pid=$(pgrep -P "$smoke_pid" -f "$smoke_renderer" | head -n 1)
+  if [[ ! "$smoke_renderer_pid" =~ ^[0-9]+$ ]]; then
+    echo "cannot resolve supervised Native renderer pid" >&2
+    exit 1
+  fi
+  kill -KILL "$smoke_renderer_pid"
+  smoke_restarted_renderer_pid=""
+  for _ in {1..100}; do
+    smoke_restarted_renderer_pid=$(pgrep -P "$smoke_pid" -f "$smoke_renderer" | head -n 1 || true)
+    if [[ "$smoke_restarted_renderer_pid" =~ ^[0-9]+$ ]] &&
+      [[ "$smoke_restarted_renderer_pid" != "$smoke_renderer_pid" ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  if [[ ! "$smoke_restarted_renderer_pid" =~ ^[0-9]+$ ]] ||
+    [[ "$smoke_restarted_renderer_pid" == "$smoke_renderer_pid" ]]; then
+    echo "Rust supervisor did not restart the crashed Native renderer" >&2
+    exit 1
+  fi
+  if ! kill -0 "$smoke_pid" 2>/dev/null; then
+    echo "Rust desktop supervisor exited with the crashed renderer" >&2
+    exit 1
+  fi
+  native automate assert --timeout-ms 30000 \
+    "publisher_pid=$smoke_restarted_renderer_pid" \
+    'ready=true' \
+    'gpu_nonblank=true' \
+    'role=button name="Close zsh 1"' \
+    'hyper-term-terminal-view.*tab=1"'
+  smoke_terminal_url_after_restart=$(smoke_terminal_url)
+  if [[ "$smoke_terminal_url_after_restart" != "$smoke_terminal_url_before_restart" ]]; then
+    echo "renderer restart replaced the Rust terminal gateway identity" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'native renderer exited with signal: 9' "$smoke_log"; then
+    echo "Rust supervisor did not record the bounded renderer restart" >&2
+    exit 1
+  fi
+  smoke_restart_evidence=.zig-cache/native-sdk-automation/renderer-restart.txt
+  printf '%s\n' \
+    "supervisor_pid=$smoke_pid" \
+    "renderer_before=$smoke_renderer_pid" \
+    "renderer_after=$smoke_restarted_renderer_pid" \
+    'terminal_gateway_identity_preserved=true' \
+    > "$smoke_restart_evidence"
+
   native automate shortcut hyper-term.new-codex-agent
   native automate assert \
     'role=group name="Agent conversation"' \
@@ -400,6 +462,9 @@ if [[ -n "$smoke_artifact_dir" ]]; then
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-goal.png" \
     "$smoke_artifact_dir/screenshot-hyper-term-goal.png"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/renderer-restart.txt" \
+    "$smoke_artifact_dir/renderer-restart.txt"
   cp "$smoke_log" "$smoke_artifact_dir/hyper-term-smoke.log"
 fi
 

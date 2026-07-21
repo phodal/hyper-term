@@ -158,8 +158,10 @@ Start with these documents when you want more detail:
 
 The PTY kernel, native Terminal tabs, structured Agent tabs, provider adapters,
 and isolated artifact preview all have runnable baselines. Workspace apply,
-replay, sandboxing, and the Workbench are still experimental. The current focus
-is reliability, accessibility, containment, and signed macOS distribution.
+replay, sandboxing, and the Workbench are still experimental. The Rust desktop
+supervisor keeps PTY and Agent gateways alive while it performs a bounded
+restart of a crashed Native renderer. The current focus is reliability,
+accessibility, containment, and signed macOS distribution.
 
 ## Contributing
 

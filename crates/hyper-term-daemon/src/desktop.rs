@@ -32,6 +32,8 @@ const AGENT_URL_ENV: &str = "HYPER_TERM_AGENT_URL";
 const AGENT_PROVIDERS_ENV: &str = "HYPER_TERM_AGENT_PROVIDERS";
 const AGENT_PROVIDER_STATUS_ENV: &str = "HYPER_TERM_AGENT_PROVIDER_STATUS";
 const BUG_CAPSULE_URL_ENV: &str = "HYPER_TERM_BUG_CAPSULE_URL";
+const RENDERER_RESTART_LIMIT: usize = 3;
+const RENDERER_RESTART_BASE_DELAY: Duration = Duration::from_millis(100);
 const ACP_PACKAGE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
 const ACP_RUNTIME_MANIFEST_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const ACP_RUNTIME_MAX_FILES: usize = 8 * 1024;
@@ -61,6 +63,16 @@ Options:\n  --ui PATH                 Native renderer executable\n  \
 --lima-image-sha256 HEX   Pinned SHA-256 for the Tier 2 image\n  \
 --verify-bundle           Verify this packaged application and exit\n  \
 -h, --help                Show this help";
+
+// Deliberately not Debug: both gateway URLs contain bearer tokens.
+#[derive(Default)]
+struct RendererEnvironment {
+    terminal_url: String,
+    agent_url: String,
+    agent_providers: String,
+    agent_provider_status: String,
+    bug_capsule_url: String,
+}
 
 fn main() {
     match run() {
@@ -188,18 +200,14 @@ fn run() -> Result<i32, String> {
                 agent_gateway.address()
             )
         });
-        let mut renderer = Command::new(&resolved.ui)
-            .env(TERMINAL_URL_ENV, terminal_url)
-            .env(AGENT_URL_ENV, agent_url)
-            .env(AGENT_PROVIDERS_ENV, agent_provider_ids)
-            .env(AGENT_PROVIDER_STATUS_ENV, provider_status)
-            .env(
-                BUG_CAPSULE_URL_ENV,
-                bug_capsule_url.as_deref().unwrap_or_default(),
-            )
-            .spawn()
-            .map_err(|error| format!("cannot start native renderer: {error}"))?;
-        let status = wait_for_renderer(&mut renderer).await?;
+        let renderer_environment = RendererEnvironment {
+            terminal_url,
+            agent_url,
+            agent_providers: agent_provider_ids,
+            agent_provider_status: provider_status,
+            bug_capsule_url: bug_capsule_url.unwrap_or_default(),
+        };
+        let status = supervise_renderer(&resolved.ui, &renderer_environment).await?;
         agent_gateway
             .shutdown()
             .await
@@ -221,8 +229,82 @@ fn run() -> Result<i32, String> {
 }
 
 #[cfg(unix)]
-async fn wait_for_renderer(renderer: &mut std::process::Child) -> Result<ExitStatus, String> {
-    wait_for_renderer_until(renderer, desktop_shutdown_signal()).await
+fn spawn_renderer(
+    executable: &Path,
+    environment: &RendererEnvironment,
+) -> Result<std::process::Child, String> {
+    Command::new(executable)
+        .env(TERMINAL_URL_ENV, &environment.terminal_url)
+        .env(AGENT_URL_ENV, &environment.agent_url)
+        .env(AGENT_PROVIDERS_ENV, &environment.agent_providers)
+        .env(
+            AGENT_PROVIDER_STATUS_ENV,
+            &environment.agent_provider_status,
+        )
+        .env(BUG_CAPSULE_URL_ENV, &environment.bug_capsule_url)
+        .spawn()
+        .map_err(|error| format!("cannot start native renderer: {error}"))
+}
+
+#[cfg(unix)]
+async fn supervise_renderer(
+    executable: &Path,
+    environment: &RendererEnvironment,
+) -> Result<ExitStatus, String> {
+    supervise_renderer_until(executable, environment, desktop_shutdown_signal()).await
+}
+
+fn renderer_restart_delay(restart: usize) -> Duration {
+    let shift = restart.saturating_sub(1).min(2) as u32;
+    RENDERER_RESTART_BASE_DELAY.saturating_mul(1_u32 << shift)
+}
+
+#[cfg(unix)]
+async fn supervise_renderer_until(
+    executable: &Path,
+    environment: &RendererEnvironment,
+    shutdown: impl Future<Output = Result<(), String>>,
+) -> Result<ExitStatus, String> {
+    tokio::pin!(shutdown);
+    let mut restart_count = 0;
+    loop {
+        let mut renderer = spawn_renderer(executable, environment)?;
+        let status = loop {
+            if let Some(status) = renderer
+                .try_wait()
+                .map_err(|error| format!("cannot inspect native renderer: {error}"))?
+            {
+                break status;
+            }
+            tokio::select! {
+                result = &mut shutdown => {
+                    result?;
+                    let _ = renderer.kill();
+                    return renderer
+                        .wait()
+                        .map_err(|error| format!("cannot stop native renderer: {error}"));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        };
+
+        if status.success() || restart_count >= RENDERER_RESTART_LIMIT {
+            return Ok(status);
+        }
+        restart_count += 1;
+        let delay = renderer_restart_delay(restart_count);
+        eprintln!(
+            "hyper-term-desktop: native renderer exited with {status}; restarting {restart_count}/{RENDERER_RESTART_LIMIT} after {} ms",
+            delay.as_millis()
+        );
+        tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                return Ok(status);
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -240,7 +322,7 @@ async fn desktop_shutdown_signal() -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 async fn wait_for_renderer_until(
     renderer: &mut std::process::Child,
     shutdown: impl Future<Output = Result<(), String>>,
@@ -1456,6 +1538,19 @@ fn validate_executable(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn renderer_fixture(directory: &Path, body: &str) -> PathBuf {
+        let executable = directory.join("renderer-fixture");
+        std::fs::write(&executable, format!("#!/bin/sh\nset -eu\n{body}\n"))
+            .expect("write renderer fixture");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("renderer fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("make renderer fixture executable");
+        executable
+    }
+
     #[test]
     fn packaged_defaults_keep_authority_and_renderer_separate() {
         let options = Options::default()
@@ -1750,6 +1845,99 @@ mod tests {
 
         assert!(!status.success());
         assert!(renderer.try_wait().expect("inspect renderer").is_some());
+    }
+
+    #[tokio::test]
+    async fn renderer_crash_restarts_without_replacing_the_supervisor() {
+        let temporary = tempfile::tempdir().expect("temporary renderer runtime");
+        let count_file = temporary.path().join("launch-count");
+        let body = format!(
+            r#"
+count_file='{}'
+count=0
+if [ -f "$count_file" ]; then read -r count < "$count_file"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then exit 75; fi
+exec /bin/sleep 30
+"#,
+            count_file.display()
+        );
+        let executable = renderer_fixture(temporary.path(), &body);
+
+        let observed_count = count_file.clone();
+        let status =
+            supervise_renderer_until(&executable, &RendererEnvironment::default(), async move {
+                for _ in 0..100 {
+                    if std::fs::read_to_string(&observed_count)
+                        .is_ok_and(|launches| launches.trim() == "2")
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err("renderer did not reach its restarted process".into())
+            })
+            .await
+            .expect("supervise renderer");
+
+        assert!(!status.success());
+        let launches = std::fs::read_to_string(count_file).expect("renderer launch count");
+        assert_eq!(launches.trim(), "2");
+    }
+
+    #[tokio::test]
+    async fn renderer_restart_loop_is_bounded() {
+        let temporary = tempfile::tempdir().expect("temporary renderer runtime");
+        let count_file = temporary.path().join("launch-count");
+        let body = format!(
+            r#"
+count_file='{}'
+count=0
+if [ -f "$count_file" ]; then read -r count < "$count_file"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+exit 75
+"#,
+            count_file.display()
+        );
+        let executable = renderer_fixture(temporary.path(), &body);
+
+        let status = supervise_renderer_until(
+            &executable,
+            &RendererEnvironment::default(),
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .expect("supervise renderer");
+
+        assert_eq!(status.code(), Some(75));
+        let launches = std::fs::read_to_string(count_file).expect("renderer launch count");
+        assert_eq!(launches.trim(), (RENDERER_RESTART_LIMIT + 1).to_string());
+    }
+
+    #[tokio::test]
+    async fn clean_renderer_exit_does_not_restart() {
+        let temporary = tempfile::tempdir().expect("temporary renderer runtime");
+        let count_file = temporary.path().join("launch-count");
+        let body = format!("printf '%s\\n' 1 > '{}'\nexit 0", count_file.display());
+        let executable = renderer_fixture(temporary.path(), &body);
+
+        let status = supervise_renderer_until(
+            &executable,
+            &RendererEnvironment::default(),
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .expect("supervise renderer");
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(count_file)
+                .expect("renderer launch count")
+                .trim(),
+            "1"
+        );
     }
 
     #[test]
