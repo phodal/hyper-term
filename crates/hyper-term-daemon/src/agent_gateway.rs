@@ -3374,16 +3374,12 @@ impl AgentGatewayRuntime {
     fn snapshot(&self, session_id: u16) -> Result<AgentSnapshotResponse, SessionError> {
         let session = self.session(session_id)?;
         let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
-        let status = progress.status;
+        let progress_status = progress.status;
         let turn_id = progress.turn_id.clone();
         let error = progress.error.clone();
         drop(progress);
-        let pending_operation_id = session
-            .pending_effect
-            .lock()
-            .map_err(|_| SessionError::Lock)?
-            .as_ref()
-            .map(|effect| effect.operation_id);
+        let pending_operation_id = self.pending_agent_operation(&session)?;
+        let status = projected_agent_status(progress_status, pending_operation_id);
         let document = self
             .config
             .daemon
@@ -3428,11 +3424,13 @@ impl AgentGatewayRuntime {
         sessions
             .into_iter()
             .map(|(session_id, session)| {
-                let status = session
+                let progress_status = session
                     .progress
                     .lock()
                     .map_err(|_| SessionError::Lock)?
                     .status;
+                let pending_operation_id = self.pending_agent_operation(&session)?;
+                let status = projected_agent_status(progress_status, pending_operation_id);
                 let document_revision = self
                     .config
                     .daemon
@@ -3457,16 +3455,12 @@ impl AgentGatewayRuntime {
     fn stream_state(&self, session_id: u16) -> Result<AgentStreamStateFrame, SessionError> {
         let session = self.session(session_id)?;
         let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
-        let status = progress.status;
+        let progress_status = progress.status;
         let turn_id = progress.turn_id.clone();
         let error = progress.error.clone();
         drop(progress);
-        let pending_operation_id = session
-            .pending_effect
-            .lock()
-            .map_err(|_| SessionError::Lock)?
-            .as_ref()
-            .map(|effect| effect.operation_id);
+        let pending_operation_id = self.pending_agent_operation(&session)?;
+        let status = projected_agent_status(progress_status, pending_operation_id);
         let document_revision = self
             .config
             .daemon
@@ -3490,6 +3484,25 @@ impl AgentGatewayRuntime {
             capabilities,
             goal,
         })
+    }
+
+    fn pending_agent_operation(
+        &self,
+        session: &AgentSession,
+    ) -> Result<Option<OperationId>, SessionError> {
+        if let Some(operation_id) = session
+            .pending_effect
+            .lock()
+            .map_err(|_| SessionError::Lock)?
+            .as_ref()
+            .map(|effect| effect.operation_id)
+        {
+            return Ok(Some(operation_id));
+        }
+        self.config
+            .daemon
+            .pending_operation_id(session.task_id)
+            .map_err(|_| SessionError::Daemon)
     }
 
     fn preview_document(
@@ -6498,6 +6511,22 @@ fn operation_kind_and_risk(kind: AgentEffectKind) -> (OperationKind, RiskClass) 
     }
 }
 
+fn projected_agent_status(
+    progress_status: AgentStatus,
+    pending_operation_id: Option<OperationId>,
+) -> AgentStatus {
+    if pending_operation_id.is_some()
+        && matches!(
+            progress_status,
+            AgentStatus::Ready | AgentStatus::Running | AgentStatus::Completed
+        )
+    {
+        AgentStatus::WaitingApproval
+    } else {
+        progress_status
+    }
+}
+
 fn set_progress_failed(session: &AgentSession, message: &str) {
     if let Ok(mut progress) = session.progress.lock() {
         progress.status = AgentStatus::Failed;
@@ -7835,7 +7864,7 @@ done
             token: token.clone(),
             workspace,
             state_directory: state,
-            daemon,
+            daemon: daemon.clone(),
             provider_home: temporary.path().to_owned(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
@@ -7906,6 +7935,74 @@ done
         assert_eq!(initial["goal"]["objective"], "Ship the compact Agent UI");
         assert!(initial["document_revision"].as_u64().is_some());
         assert!(initial.get("document").is_none());
+
+        // A brokered MCP server proposes directly through the Rust authority;
+        // there is intentionally no matching ACP pending_effect in this
+        // process. The Agent snapshot and stream must still expose the live
+        // approval instead of rendering its approval block as archived.
+        let task_id: TaskId = serde_json::from_value(response["task_id"].clone()).unwrap();
+        let brokered = daemon
+            .propose_operation(
+                task_id,
+                OperationKind::McpTool,
+                OperationAction::Opaque {
+                    kind: "hyper_term.genui.compile".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                "Compile a bounded GenUI artifact".into(),
+                RiskClass::ReadOnly,
+                vec!["genui_compile".into()],
+            )
+            .unwrap();
+        let (_, body) = request(gateway.address(), &token, 3, "GET").await;
+        let waiting_snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(waiting_snapshot["status"], "waiting_approval");
+        assert_eq!(
+            waiting_snapshot["pending_operation_id"],
+            brokered.operation_id.to_string()
+        );
+        loop {
+            let body = tokio::time::timeout(Duration::from_secs(1), updates.next())
+                .await
+                .expect("brokered MCP stream update timeout")
+                .expect("Agent stream stayed open")
+                .expect("Agent stream body");
+            let frame: serde_json::Value = serde_json::from_slice(body.as_ref()).unwrap();
+            if frame["type"] == "state" && frame["status"] == "waiting_approval" {
+                assert_eq!(
+                    frame["pending_operation_id"],
+                    brokered.operation_id.to_string()
+                );
+                break;
+            }
+        }
+        let permission_path = format!("/agent/session/permission?token={token}&session_id=3");
+        let permission = serde_json::to_vec(&serde_json::json!({
+            "operation_id": brokered.operation_id,
+            "expected_revision": brokered.revision,
+            "decision": "reject_once",
+        }))
+        .unwrap();
+        assert_eq!(
+            request_path(gateway.address(), &permission_path, "POST", &permission)
+                .await
+                .0,
+            StatusCode::ACCEPTED.as_u16()
+        );
+        loop {
+            let body = tokio::time::timeout(Duration::from_secs(1), updates.next())
+                .await
+                .expect("brokered MCP decision stream timeout")
+                .expect("Agent stream stayed open")
+                .expect("Agent stream body");
+            let frame: serde_json::Value = serde_json::from_slice(body.as_ref()).unwrap();
+            if frame["type"] == "state"
+                && frame["status"] == "ready"
+                && frame["pending_operation_id"].is_null()
+            {
+                break;
+            }
+        }
 
         let unrelated_task = gateway
             .runtime

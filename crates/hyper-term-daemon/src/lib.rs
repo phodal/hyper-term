@@ -2465,6 +2465,18 @@ impl DaemonState {
             .revision())
     }
 
+    pub(crate) fn pending_operation_id(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<OperationId>, DaemonError> {
+        let authority = lock(&self.inner.authority)?;
+        Ok(authority
+            .projectors
+            .get(&task_id)
+            .ok_or(DaemonError::TaskNotFound(task_id))?
+            .latest_waiting_operation_id())
+    }
+
     fn reconcile_interrupted_dispatches(&self) -> Result<(), DaemonError> {
         let interrupted = {
             let authority = lock(&self.inner.authority)?;

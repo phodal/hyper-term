@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use hyper_term_protocol::{
     AttentionState, BLOCK_SCHEMA_VERSION, BlockAction, BlockDocument, BlockEnvelope, BlockId,
     BlockKind, BlockLifecycle, BlockOperation, BlockPatch, BlockPayload, DomainEvent,
-    EventEnvelope, OperationOutcome, OperationState, PermissionDecision, RenderSlot, RiskClass,
-    TaskId, TrustClass,
+    EventEnvelope, OperationId, OperationOutcome, OperationState, PermissionDecision, RenderSlot,
+    RiskClass, TaskId, TrustClass,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -511,6 +511,28 @@ impl BlockProjector {
             semantic_digest,
             blocks,
         })
+    }
+
+    /// Returns the newest operation that still needs a human decision.
+    ///
+    /// Brokered MCP tools create their operation directly through the Rust
+    /// authority, so an Agent driver does not necessarily retain a matching
+    /// pending effect. The projector remains the task-scoped source of truth
+    /// for that approval without requiring a full document clone on every
+    /// low-latency Agent stream refresh.
+    pub fn latest_waiting_operation_id(&self) -> Option<OperationId> {
+        self.blocks
+            .values()
+            .filter_map(|block| match &block.payload {
+                BlockPayload::Operation {
+                    operation_id,
+                    state: OperationState::WaitingHuman,
+                    ..
+                } => Some((block.document_revision, *operation_id)),
+                _ => None,
+            })
+            .max_by_key(|(revision, _)| *revision)
+            .map(|(_, operation_id)| operation_id)
     }
 
     pub fn revision(&self) -> u64 {
