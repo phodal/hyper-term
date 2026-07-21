@@ -45,6 +45,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod acp_provider_home;
 mod agent_gateway;
 mod agent_session_store;
 mod artifact_debug_capsule;

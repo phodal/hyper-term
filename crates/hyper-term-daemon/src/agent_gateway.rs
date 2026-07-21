@@ -45,6 +45,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::acp_provider_home::{
+    stage_acp_claude_home, stage_acp_codex_preferences, stage_acp_copilot_home,
+};
 use crate::agent_session_store::AgentSessionBindingStore;
 use crate::artifact_debug_capsule::build_bug_capsule;
 use crate::artifact_editor_store::{
@@ -75,7 +78,6 @@ use crate::{
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
 const MAX_AGENT_TERMINALS: usize = 64;
-const MAX_CLAUDE_AUTH_METADATA_BYTES: u64 = 2 * 1024 * 1024;
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const START_TURN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPLETE_TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -2939,7 +2941,7 @@ fn acp_provider_read_paths(provider: &AcpAgentProviderConfig) -> Vec<PathBuf> {
             ".config/claude",
             "Library/Keychains",
         ],
-        "copilot-acp" => &[".config/github-copilot", ".config/gh"],
+        "copilot-acp" => &[".config/github-copilot", ".config/gh", "Library/Keychains"],
         _ => &[],
     };
     for relative in credential_paths {
@@ -3051,183 +3053,6 @@ fn add_unique_acp_read_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf
     if seen.insert(path.clone()) {
         paths.push(path);
     }
-}
-
-#[cfg(unix)]
-fn stage_acp_codex_preferences(home: &Path, codex_home: &Path) -> Result<(), std::io::Error> {
-    use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::symlink;
-
-    if !home.is_absolute() || !codex_home.is_absolute() {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "ACP Codex homes must be absolute",
-        ));
-    }
-    let source_root = home.join(".codex");
-    let Ok(canonical_root) = source_root.canonicalize() else {
-        return Ok(());
-    };
-    for relative in ["config.toml", "AGENTS.md"] {
-        let source = source_root.join(relative);
-        let Ok(metadata) = std::fs::symlink_metadata(&source) else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ACP Codex preference source is not a regular file or directory",
-            ));
-        }
-        let canonical = source.canonicalize()?;
-        if !canonical.starts_with(&canonical_root) {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ACP Codex preference source escaped its root",
-            ));
-        }
-        let target = codex_home.join(relative);
-        if std::fs::symlink_metadata(&target).is_ok() {
-            return Err(Error::new(
-                ErrorKind::AlreadyExists,
-                "ACP Codex preference target already exists",
-            ));
-        }
-        symlink(canonical, target)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn stage_acp_codex_preferences(_home: &Path, _codex_home: &Path) -> Result<(), std::io::Error> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn stage_acp_claude_home(home: &Path, isolated_home: &Path) -> Result<(), std::io::Error> {
-    use std::fs::OpenOptions;
-    use std::io::{Error, ErrorKind, Write};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
-
-    if !home.is_absolute() || !isolated_home.is_absolute() {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "ACP Claude homes must be absolute",
-        ));
-    }
-    let claude_home = isolated_home.join(".claude");
-    let library = isolated_home.join("Library");
-    create_private_runtime_root(&claude_home)?;
-    create_private_runtime_root(&library)?;
-
-    let source_metadata_path = home.join(".claude.json");
-    if let Ok(source_metadata) = std::fs::symlink_metadata(&source_metadata_path) {
-        if source_metadata.file_type().is_symlink()
-            || !source_metadata.is_file()
-            || source_metadata.uid() != unsafe { libc::geteuid() }
-            || source_metadata.permissions().mode() & 0o077 != 0
-            || source_metadata.len() > MAX_CLAUDE_AUTH_METADATA_BYTES
-        {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ACP Claude auth metadata is not a bounded private user file",
-            ));
-        }
-        let source = std::fs::read(&source_metadata_path)?;
-        let source: serde_json::Value = serde_json::from_slice(&source)
-            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
-        let mut staged = serde_json::Map::new();
-        if let Some(account) = source
-            .get("oauthAccount")
-            .filter(|account| account.is_object())
-        {
-            staged.insert("oauthAccount".into(), account.clone());
-        }
-        let staged = serde_json::to_vec(&serde_json::Value::Object(staged))
-            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
-        let target = isolated_home.join(".claude.json");
-        let mut target = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(target)?;
-        target.write_all(&staged)?;
-        target.sync_all()?;
-    }
-
-    let source_claude_home = home.join(".claude");
-    if let Ok(canonical_root) = source_claude_home.canonicalize() {
-        for relative in [
-            "settings.json",
-            "settings.local.json",
-            "CLAUDE.md",
-            "skills",
-        ] {
-            let source = source_claude_home.join(relative);
-            let Ok(metadata) = std::fs::symlink_metadata(&source) else {
-                continue;
-            };
-            if metadata.file_type().is_symlink()
-                || (!metadata.is_file() && !metadata.is_dir())
-                || metadata.uid() != unsafe { libc::geteuid() }
-            {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ACP Claude preference source is unsafe",
-                ));
-            }
-            let canonical = source.canonicalize()?;
-            if !canonical.starts_with(&canonical_root) {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ACP Claude preference source escaped its root",
-                ));
-            }
-            symlink(canonical, claude_home.join(relative))?;
-        }
-
-        let credentials = source_claude_home.join(".credentials.json");
-        if let Ok(metadata) = std::fs::symlink_metadata(&credentials) {
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.permissions().mode() & 0o077 != 0
-                || metadata.len() > MAX_CLAUDE_AUTH_METADATA_BYTES
-            {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ACP Claude credential file is unsafe",
-                ));
-            }
-            let mut target = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(claude_home.join(".credentials.json"))?;
-            target.write_all(&std::fs::read(credentials)?)?;
-            target.sync_all()?;
-        }
-    }
-
-    let keychains = home.join("Library/Keychains");
-    if let Ok(metadata) = std::fs::symlink_metadata(&keychains) {
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-        {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ACP Claude Keychain source is unsafe",
-            ));
-        }
-        symlink(keychains.canonicalize()?, library.join("Keychains"))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn stage_acp_claude_home(_home: &Path, _isolated_home: &Path) -> Result<(), std::io::Error> {
-    Ok(())
 }
 
 impl AgentGatewayRuntime {
@@ -3504,6 +3329,22 @@ impl AgentGatewayRuntime {
             if agent_diagnostics_enabled() {
                 environment.insert("DEBUG_CLAUDE_AGENT_SDK".into(), "1".into());
             }
+        } else if provider.provider_id == "copilot-acp" {
+            let isolated_home = session_root.join("home");
+            let scratch = session_root.join("scratch");
+            for directory in [&isolated_home, &scratch] {
+                create_private_runtime_root(directory).map_err(|_| StartError::Driver)?;
+            }
+            if let Some(home) = provider.environment.get("HOME") {
+                stage_acp_copilot_home(Path::new(home), &isolated_home)
+                    .map_err(|_| StartError::Driver)?;
+            }
+            environment.insert("HOME".into(), isolated_home.clone().into_os_string());
+            environment.insert(
+                "COPILOT_HOME".into(),
+                isolated_home.join(".copilot").into_os_string(),
+            );
+            environment.insert("TMPDIR".into(), scratch.into_os_string());
         }
         let client = AcpAgentClient::launch(AcpAgentConfig {
             executable: provider.executable.clone(),
@@ -6938,77 +6779,6 @@ mod tests {
         assert!(!bounded.contains('\0'));
         assert_eq!(bounded.chars().count(), 4096);
         assert!(bounded.starts_with("prefix"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn claude_home_stages_only_auth_metadata_and_read_only_preferences() {
-        let temporary = tempfile::tempdir().unwrap();
-        let home = temporary.path().join("provider-home");
-        let source_config = home.join(".claude");
-        let keychains = home.join("Library/Keychains");
-        std::fs::create_dir_all(source_config.join("skills")).unwrap();
-        std::fs::create_dir_all(&keychains).unwrap();
-        let source_metadata = home.join(".claude.json");
-        std::fs::write(
-            &source_metadata,
-            r#"{"oauthAccount":{"accountUuid":"fixture"},"mcpServers":{"unsafe":{}}}"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&source_metadata, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::write(source_config.join("settings.json"), "{}").unwrap();
-        let credentials = source_config.join(".credentials.json");
-        std::fs::write(
-            &credentials,
-            r#"{"claudeAiOauth":{"accessToken":"fixture"}}"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        let isolated_home = temporary.path().join("runtime/home");
-        stage_acp_claude_home(&home, &isolated_home).unwrap();
-
-        let staged: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(isolated_home.join(".claude.json")).unwrap())
-                .unwrap();
-        assert_eq!(staged["oauthAccount"]["accountUuid"], "fixture");
-        assert!(staged.get("mcpServers").is_none());
-        assert_eq!(
-            std::fs::metadata(isolated_home.join(".claude.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o077,
-            0
-        );
-        assert!(
-            std::fs::symlink_metadata(isolated_home.join(".claude/settings.json"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(
-            std::fs::symlink_metadata(isolated_home.join(".claude/skills"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(
-            !std::fs::symlink_metadata(isolated_home.join(".claude/.credentials.json"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            std::fs::read(isolated_home.join(".claude/.credentials.json")).unwrap(),
-            std::fs::read(credentials).unwrap()
-        );
-        assert!(
-            std::fs::symlink_metadata(isolated_home.join("Library/Keychains"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
     }
 
     fn gateway_local_mcp_config(
