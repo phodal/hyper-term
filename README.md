@@ -305,6 +305,21 @@ The Capsule smoke then opens a verified offline fixture, proves the dynamic
 GenUI WebView receives the built Workbench rather than an HTTP error, verifies
 its token-bound replay-only projection, and retains a second Native snapshot.
 
+After packaging, an authenticated developer can opt into a real Codex ACP
+desktop gate. It uses the Deno and official Codex ACP adapter from the assembled
+`.app`, types a no-tools prompt through the Native composer, observes the live
+Stop control, and waits for the exact streamed answer to appear as an Agent
+Block. It never runs in unattended CI or starts an interactive login flow:
+
+```bash
+(cd apps/desktop && native build --release=fast -Dautomation=true)
+./scripts/smoke_macos_real_codex_acp.sh
+```
+
+Set `HYPER_TERM_REAL_ACP_ARTIFACT_DIR` to retain the Native snapshot,
+deterministic canvas screenshot, and supervisor log. The prompt explicitly
+forbids tools and file changes; this gate still consumes one real Agent turn.
+
 Regenerate and test the README's vector UI preview:
 
 ```bash

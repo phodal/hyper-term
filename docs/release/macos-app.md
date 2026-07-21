@@ -32,6 +32,14 @@ cannot capture system WebView pixels, so this gate deliberately pairs the
 Native view/sizing snapshot with HTTP and Rust projection checks instead of
 claiming unsupported DOM screenshot coverage.
 
+The repository also provides `scripts/smoke_macos_real_codex_acp.sh` as an
+explicit developer-only post-package gate. When Codex is already authenticated,
+it launches the assembled app with an automation-enabled Native renderer and
+proves Native composer input reaches the bundled Codex ACP adapter, enters the
+streaming/stop state, and returns to an enabled composer with the expected
+Agent Block. This account-using gate is intentionally excluded from CI and
+never invokes login or authorizes a tool call.
+
 The final bundle contains:
 
 - `Contents/MacOS/hyper-term`: the Rust desktop supervisor and PTY authority;
