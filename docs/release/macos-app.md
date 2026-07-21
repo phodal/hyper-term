@@ -32,6 +32,13 @@ overflow. Wide and narrow screenshots are retained as
 `workbench-browser-smoke`; this complements Native automation because Native
 SDK snapshots deliberately cannot inspect WebView DOM content.
 
+The pinned Deno runtime is also exercised through three real LSP layers before
+packaging: the driver must initialize and shut down `deno lsp`, the editor
+service must return cross-file diagnostics and completions from a private draft
+snapshot, and the authenticated ACP Artifact endpoint must preserve the exact
+session, artifact, revision, and fixed file inventory. These checks run through
+`deno task verify:deno-lsp`; they are not protocol fixtures.
+
 A second macOS smoke opens a Rust-verified offline Bug Capsule. It asserts that
 the cold-path GenUI WebView is mounted only for that Capsule, fetches the real
 built Workbench index and hashed assets through its token-bound loopback URL,

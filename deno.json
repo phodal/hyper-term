@@ -56,6 +56,7 @@
     "build:workbench:watch": "deno bundle --watch --platform=browser --sourcemap=linked --outdir=dist/workbench apps/workbench/index.html",
     "build": "deno task build:terminal && deno task build:workbench && deno task build:runtime",
     "verify:runtime": "deno run --allow-read=runtime scripts/verify_deno_runtime.ts",
+    "verify:deno-lsp": "./scripts/verify_deno_lsp.sh",
     "verify:terminal-browser": "./scripts/verify_terminal_browser.sh",
     "verify:workbench-browser": "./scripts/verify_workbench_browser.sh"
   },

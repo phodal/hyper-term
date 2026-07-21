@@ -128,6 +128,7 @@ Run the Deno checks:
 
 ```bash
 deno task verify:runtime
+deno task verify:deno-lsp
 deno task check
 deno task test
 deno task build:workbench

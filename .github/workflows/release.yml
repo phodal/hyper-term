@@ -158,6 +158,9 @@ jobs:
               -- \
               --ignored \
               --exact
+          HYPER_TERM_DENO_PATH="$deno_path" \
+          HYPER_TERM_DENO_SHA256="$deno_sha256" \
+            deno task verify:deno-lsp
           HYPER_TERM_ACP_RUNTIME_ROOT="$GITHUB_WORKSPACE/dist/runtime/acp" \
           HYPER_TERM_DENO_PATH="$deno_path" \
           HYPER_TERM_DENO_SHA256="$deno_sha256" \
