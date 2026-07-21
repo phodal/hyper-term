@@ -1,5 +1,20 @@
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct AgentTurnProjection {
+    turn_id: String,
+    user_block_id: BlockId,
+    user_message_id: Option<String>,
+    user_message_phase: u32,
+    user_message_bytes: usize,
+    agent_block_id: BlockId,
+    agent_message_phase: u32,
+    plan_block_id: BlockId,
+    agent_message_bytes: usize,
+    agent_message_interrupted: bool,
+    plan_bytes: usize,
+}
+
 pub(super) fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: String) {
     let turn_id = match session
         .client
@@ -34,6 +49,10 @@ pub(super) fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: 
         daemon,
         AgentTurnProjection {
             turn_id,
+            user_block_id: BlockId::new(),
+            user_message_id: None,
+            user_message_phase: 0,
+            user_message_bytes: 0,
             agent_block_id: BlockId::new(),
             agent_message_phase: 0,
             plan_block_id: BlockId::new(),
@@ -65,6 +84,55 @@ pub(super) fn continue_turn(
             }
         };
         match event {
+            AgentDriverEvent::UserMessageDelta {
+                thread_id,
+                turn_id: event_turn_id,
+                message_id,
+                text,
+                ..
+            } if thread_id == session.thread_id && event_turn_id == projection.turn_id => {
+                if text.is_empty() {
+                    continue;
+                }
+                projection.agent_message_interrupted |= projection.agent_message_bytes > 0;
+                if projection.user_message_bytes > 0 && message_id != projection.user_message_id {
+                    projection.user_message_phase = projection.user_message_phase.saturating_add(1);
+                    projection.user_block_id = BlockId::new();
+                }
+                projection.user_message_bytes =
+                    match projection.user_message_bytes.checked_add(text.len()) {
+                        Some(total) if total <= MAX_AGENT_MESSAGE_BYTES => total,
+                        _ => {
+                            set_progress_failed(
+                                &session,
+                                "Agent user-message replay exceeded its 256 KiB bound",
+                            );
+                            let _ = session.client.close();
+                            return;
+                        }
+                    };
+                projection.user_message_id = message_id.clone();
+                let external_message_id = message_id.or_else(|| {
+                    Some(format!(
+                        "{}-user-message-{}",
+                        projection.turn_id, projection.user_message_phase
+                    ))
+                });
+                if daemon
+                    .append_message(
+                        session.task_id,
+                        projection.user_block_id,
+                        MessageRole::User,
+                        external_message_id,
+                        text,
+                    )
+                    .is_err()
+                {
+                    set_progress_failed(&session, "Agent user message could not be journaled");
+                    let _ = session.client.close();
+                    return;
+                }
+            }
             AgentDriverEvent::MessageDelta {
                 thread_id,
                 turn_id: event_turn_id,

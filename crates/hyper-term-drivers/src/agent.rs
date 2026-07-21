@@ -224,6 +224,13 @@ pub enum AgentDriverEvent {
         turn_id: String,
         text: String,
     },
+    UserMessageDelta {
+        sequence: u64,
+        thread_id: String,
+        turn_id: String,
+        message_id: Option<String>,
+        text: String,
+    },
     PlanDelta {
         sequence: u64,
         thread_id: String,

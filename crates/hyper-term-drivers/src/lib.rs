@@ -2,6 +2,7 @@
 
 mod acp;
 mod acp_capabilities;
+mod acp_session_update;
 mod agent;
 mod codec;
 mod codex;

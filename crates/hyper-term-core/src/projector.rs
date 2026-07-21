@@ -74,8 +74,8 @@ impl BlockProjector {
             DomainEvent::MessageAppended {
                 block_id,
                 role,
+                external_message_id,
                 text,
-                ..
             } => {
                 if let Some(block) = self.blocks.get_mut(block_id) {
                     let previous_revision = block.block_revision;
@@ -83,7 +83,10 @@ impl BlockProjector {
                         BlockPayload::Message {
                             role: existing_role,
                             text: existing_text,
-                        } if existing_role == role => {
+                            external_message_id: existing_external_message_id,
+                        } if existing_role == role
+                            && existing_external_message_id == external_message_id =>
+                        {
                             existing_text.push_str(text);
                             block.block_revision += 1;
                             block.document_revision = event.sequence;
@@ -105,6 +108,7 @@ impl BlockProjector {
                         BlockPayload::Message {
                             role: *role,
                             text: text.clone(),
+                            external_message_id: external_message_id.clone(),
                         },
                     );
                     vec![self.upsert(block, event.sequence)?]
@@ -783,8 +787,28 @@ mod tests {
         assert_eq!(client, projector.snapshot().unwrap());
         assert!(client.blocks.iter().any(|block| matches!(
             &block.payload,
-            BlockPayload::Message { text, .. } if text == "hello world"
+            BlockPayload::Message {
+                text,
+                external_message_id: Some(external_message_id),
+                ..
+            } if text == "hello world" && external_message_id == "agent-1"
         )));
+
+        let mismatched_identity = event(
+            4,
+            task_id,
+            None,
+            DomainEvent::MessageAppended {
+                block_id: message_id,
+                role: MessageRole::Agent,
+                external_message_id: Some("agent-2".into()),
+                text: "must not merge".into(),
+            },
+        );
+        assert!(matches!(
+            projector.apply(&mismatched_identity),
+            Err(ProjectorError::BlockKindMismatch(block_id)) if block_id == message_id
+        ));
     }
 
     #[test]

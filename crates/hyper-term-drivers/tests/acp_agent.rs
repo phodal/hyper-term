@@ -188,6 +188,7 @@ fn installed_acp_agent_completes_a_real_prompt_without_executing_tools() {
                 );
             }
             AgentDriverEvent::Connected { .. }
+            | AgentDriverEvent::UserMessageDelta { .. }
             | AgentDriverEvent::PlanDelta { .. }
             | AgentDriverEvent::PlanUpdated { .. }
             | AgentDriverEvent::ToolCallUpdated { .. }

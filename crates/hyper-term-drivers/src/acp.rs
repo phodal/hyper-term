@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::JsonRpcMessage;
 use agent_client_protocol::schema::{ProtocolVersion, v1};
+#[cfg(test)]
+use hyper_term_protocol::AgentPlanStatus;
 use hyper_term_protocol::{
-    AgentMediaKind, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentToolCall,
-    AgentToolContent, AgentToolKind, AgentToolLocation, AgentToolStatus, ContextReceipt,
-    PermissionDecision,
+    AgentMediaKind, AgentToolCall, AgentToolContent, AgentToolKind, AgentToolLocation,
+    AgentToolStatus, ContextReceipt, PermissionDecision,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -25,6 +26,7 @@ use crate::acp_capabilities::{
     normalize_available_commands, normalize_session_capabilities,
     replace_config_options_preserving_mode, update_session_mode, validate_config_value,
 };
+use crate::acp_session_update::normalize_content_update;
 use crate::codex_containment::{
     agent_task_sandbox_profile, apply_managed_proxy_environment,
     compile_agent_task_sandbox_from_profile,
@@ -829,29 +831,12 @@ impl AcpAgentClient {
                 &serde_json::to_value(kind)?,
             );
         }
+        if let Some(event) =
+            normalize_content_update(sequence, &thread_id, &turn_id, &notification.update)?
+        {
+            return Ok(event);
+        }
         match notification.update {
-            v1::SessionUpdate::AgentMessageChunk(chunk) => Ok(AgentDriverEvent::MessageDelta {
-                sequence,
-                thread_id,
-                turn_id,
-                text: content_text(chunk.content)?,
-            }),
-            v1::SessionUpdate::AgentThoughtChunk(chunk) => Ok(AgentDriverEvent::ThoughtDelta {
-                sequence,
-                thread_id,
-                turn_id,
-                text: content_text(chunk.content)?,
-            }),
-            v1::SessionUpdate::Plan(plan) => Ok(AgentDriverEvent::PlanUpdated {
-                sequence,
-                thread_id,
-                turn_id,
-                entries: plan
-                    .entries
-                    .into_iter()
-                    .map(normalize_plan_entry)
-                    .collect::<Result<Vec<_>, _>>()?,
-            }),
             v1::SessionUpdate::ToolCall(call) => {
                 let id = bounded(call.tool_call_id.to_string(), 4096)?;
                 let normalized = normalize_tool_call(&call)?;
@@ -1462,31 +1447,6 @@ fn brokered_mcp_tool<'a>(provider_id: &str, call: &'a v1::ToolCall) -> Option<&'
         }),
         _ => None,
     }
-}
-
-fn content_text(content: v1::ContentBlock) -> Result<String, AcpAdapterError> {
-    match content {
-        v1::ContentBlock::Text(text) => bounded(text.text, 64 * 1024),
-        other => bounded(serde_json::to_string(&other)?, 64 * 1024),
-    }
-}
-
-fn normalize_plan_entry(entry: v1::PlanEntry) -> Result<AgentPlanEntry, AcpAdapterError> {
-    Ok(AgentPlanEntry {
-        content: bounded(entry.content, 16 * 1024)?,
-        priority: match entry.priority {
-            v1::PlanEntryPriority::High => AgentPlanPriority::High,
-            v1::PlanEntryPriority::Medium => AgentPlanPriority::Medium,
-            v1::PlanEntryPriority::Low => AgentPlanPriority::Low,
-            _ => AgentPlanPriority::Medium,
-        },
-        status: match entry.status {
-            v1::PlanEntryStatus::Pending => AgentPlanStatus::Pending,
-            v1::PlanEntryStatus::InProgress => AgentPlanStatus::InProgress,
-            v1::PlanEntryStatus::Completed => AgentPlanStatus::Completed,
-            _ => AgentPlanStatus::Pending,
-        },
-    })
 }
 
 fn normalize_tool_call(call: &v1::ToolCall) -> Result<AgentToolCall, AcpAdapterError> {

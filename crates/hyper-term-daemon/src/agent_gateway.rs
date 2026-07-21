@@ -78,12 +78,12 @@ use crate::{
 mod view_model;
 use view_model::*;
 mod agent_turn;
+use agent_turn::{
+    AgentTurnProjection, bounded_error, continue_turn, execute_agent_terminal_create,
+    projected_agent_status, run_turn, set_progress_failed,
+};
 #[cfg(test)]
 use agent_turn::{agent_error_summary, retain_terminal_output};
-use agent_turn::{
-    bounded_error, continue_turn, execute_agent_terminal_create, projected_agent_status, run_turn,
-    set_progress_failed,
-};
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
@@ -310,17 +310,6 @@ struct AgentSession {
 struct LaunchedAgentProvider {
     client: Arc<dyn StructuredAgentClient>,
     managed_proxy: Option<ManagedConnectProxy>,
-}
-
-#[derive(Clone)]
-struct AgentTurnProjection {
-    turn_id: String,
-    agent_block_id: BlockId,
-    agent_message_phase: u32,
-    plan_block_id: BlockId,
-    agent_message_bytes: usize,
-    agent_message_interrupted: bool,
-    plan_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -7061,7 +7050,7 @@ done
         let fake_acp = temporary.path().join("fixture-acp");
         std::fs::write(
             &fake_acp,
-            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-session-8\",\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"fast\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"},{\"value\":\"deep\",\"name\":\"Deep\"}]}]}}' ;;\n    *'\"method\":\"session/set_config_option\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"deep\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"},{\"value\":\"deep\",\"name\":\"Deep\"}]}]}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[{\"name\":\"skills\",\"description\":\"Configure skills\"}]}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Provider-neutral ACP is live.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Checking workspace\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Final answer.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture-acp\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-session-8\",\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"fast\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"},{\"value\":\"deep\",\"name\":\"Deep\"}]}]}}' ;;\n    *'\"method\":\"session/set_config_option\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"deep\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"},{\"value\":\"deep\",\"name\":\"Deep\"}]}]}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[{\"name\":\"skills\",\"description\":\"Configure skills\"}]}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"5ee0f5a8-b508-4a0f-864d-9f69759b2087\",\"content\":{\"type\":\"text\",\"text\":\"Agent-injected user context.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Provider-neutral ACP is live.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Checking workspace\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-session-8\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Final answer.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
         )
         .expect("fake ACP");
         let mut permissions = std::fs::metadata(&fake_acp).unwrap().permissions();
@@ -7190,6 +7179,15 @@ done
             snapshot["capabilities"]["available_commands"][0]["name"],
             "skills"
         );
+        let injected_user_message = blocks
+            .iter()
+            .position(|block| {
+                block["payload"]["role"] == "user"
+                    && block["payload"]["text"] == "Agent-injected user context."
+                    && block["payload"]["external_message_id"]
+                        == "5ee0f5a8-b508-4a0f-864d-9f69759b2087"
+            })
+            .expect("ACP user message update");
         let initial_message = blocks
             .iter()
             .position(|block| {
@@ -7210,6 +7208,7 @@ done
                 block["payload"]["role"] == "agent" && block["payload"]["text"] == "Final answer."
             })
             .expect("final Agent message");
+        assert!(injected_user_message < initial_message);
         assert!(initial_message < thought);
         assert!(thought < final_message);
         assert_eq!(

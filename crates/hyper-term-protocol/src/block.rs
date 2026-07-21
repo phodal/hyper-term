@@ -182,6 +182,8 @@ pub enum BlockPayload {
     Message {
         role: MessageRole,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_message_id: Option<String>,
     },
     Operation {
         operation_id: OperationId,
