@@ -22,7 +22,7 @@ verify_cleanup() {
   fi
   agent-browser --session "$verify_session" close >/dev/null 2>&1 || true
   if [[ -n "$verify_pid" ]] && kill -0 "$verify_pid" 2>/dev/null; then
-    kill -INT "$verify_pid" 2>/dev/null || true
+    kill -TERM "$verify_pid" 2>/dev/null || true
     wait "$verify_pid" 2>/dev/null || true
   fi
   if [[ -d "$verify_root" && "$verify_root" == "${TMPDIR:-/tmp}"/hyper-term-workbench-browser.* ]]; then

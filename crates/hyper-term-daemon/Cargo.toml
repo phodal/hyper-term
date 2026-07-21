@@ -10,6 +10,9 @@ version.workspace = true
 name = "hyper_term_daemon"
 path = "src/lib.rs"
 
+[features]
+test-fixtures = []
+
 [[bin]]
 name = "hyperd"
 path = "src/main.rs"
@@ -21,6 +24,11 @@ path = "src/desktop.rs"
 [[bin]]
 name = "hyper-term-mcp"
 path = "src/mcp.rs"
+
+[[bin]]
+name = "artifact-workbench-fixture"
+path = "src/artifact_workbench_fixture.rs"
+required-features = ["test-fixtures"]
 
 [dependencies]
 axum.workspace = true

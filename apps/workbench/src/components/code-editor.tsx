@@ -83,6 +83,29 @@ const editorTheme = EditorView.theme({
   ".cm-scroller": {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
   },
+  ".cm-tooltip": {
+    border: "1px solid #465238",
+    borderRadius: "6px",
+    background: "#171b14",
+    color: "#e9ebdf",
+    boxShadow: "0 12px 32px rgba(0, 0, 0, .48)",
+  },
+  ".cm-tooltip-autocomplete > ul": {
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  },
+  ".cm-tooltip-autocomplete > ul > li": {
+    color: "#dce4d2",
+  },
+  ".cm-tooltip-autocomplete > ul > li[aria-selected]": {
+    background: "#344525",
+    color: "#f5ffd8",
+  },
+  ".cm-completionDetail": { color: "#89917e" },
+  ".cm-tooltip-lint .cm-diagnostic": {
+    borderLeftColor: "#ff8d83",
+    color: "#f2d5d1",
+  },
+  ".cm-tooltip-lint .cm-diagnosticSource": { color: "#a8b29a" },
 });
 
 export function CodeEditor(

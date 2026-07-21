@@ -185,6 +185,11 @@ jobs:
           agent-browser --version
           agent-browser install
           deno task verify:workbench-browser
+          deno_path="$(command -v deno)"
+          deno_sha256="$(shasum -a 256 "$deno_path" | awk '{print $1}')"
+          HYPER_TERM_DENO_PATH="$deno_path" \
+          HYPER_TERM_DENO_SHA256="$deno_sha256" \
+            deno task verify:artifact-workbench-browser
 
       - name: Run Native SDK release gates
         working-directory: apps/desktop
@@ -246,6 +251,15 @@ jobs:
         with:
           name: workbench-browser-smoke
           path: .zig-cache/workbench-browser/*.png
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Artifact Workbench Deno LSP evidence
+        if: ${{ always() && hashFiles('.zig-cache/artifact-workbench-browser/*.png') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: artifact-workbench-browser-smoke
+          path: .zig-cache/artifact-workbench-browser/*.png
           if-no-files-found: error
           retention-days: 7
 
