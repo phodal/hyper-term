@@ -221,6 +221,19 @@ raise SystemExit(f"widget not found: {pattern.pattern}")
 PY
   }
 
+  smoke_select_tab() {
+    smoke_tab_pattern=$1
+    if smoke_tab_id=$(smoke_widget_id "$smoke_tab_pattern" 2>/dev/null); then
+      native automate widget-click hyper-term-canvas "$smoke_tab_id"
+      return
+    fi
+    smoke_all_tabs_id=$(smoke_widget_id 'role=button name="Show all open tabs"')
+    native automate widget-click hyper-term-canvas "$smoke_all_tabs_id"
+    native automate assert 'name="All open tabs"'
+    smoke_tab_id=$(smoke_widget_id "$smoke_tab_pattern")
+    native automate widget-click hyper-term-canvas "$smoke_tab_id"
+  }
+
   smoke_terminal_url() {
     python3 - .zig-cache/native-sdk-automation/snapshot.txt <<'PY'
 import pathlib
@@ -239,12 +252,14 @@ PY
   native automate widget-key hyper-term-canvas cmd+t
   native automate shortcut hyper-term.new-codex-agent
   native automate assert \
-    'role=button name="Close .* 1"' \
-    'role=button name="Close .* 3"' \
     'role=button name="Close Codex 4"' \
+    'role=button name="Show all open tabs"' \
     'role=group name="Agent conversation"' \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
+  native automate assert --absent \
+    'role=button name="Close .* 1"' \
+    'role=button name="Close .* 3"'
   python3 - "$smoke_terminal_url_before_restart" .zig-cache/native-sdk-automation/workspace-before-restart.json <<'PY'
 import json
 import pathlib
@@ -310,14 +325,12 @@ PY
     "publisher_pid=$smoke_restarted_renderer_pid" \
     'ready=true' \
     'gpu_nonblank=true' \
-    'role=button name="Close .* 1"' \
-    'role=button name="Close .* 3"' \
     'role=button name="Close Codex 4"' \
+    'role=button name="Show all open tabs"' \
     'role=group name="Agent conversation"' \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
-  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name=".* tab 3"')
-  native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
+  smoke_select_tab 'role=(button|menuitem) name=".* tab 3"'
   native automate assert \
     'role=button name=".* tab 3".*state=.*selected' \
     'hyper-term-terminal-view.*focused=true.*tab=3"'
@@ -326,8 +339,7 @@ PY
     echo "renderer restart replaced the Rust terminal gateway identity" >&2
     exit 1
   fi
-  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Codex tab 4.*"')
-  native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
+  smoke_select_tab 'role=(button|menuitem) name="Codex tab 4.*"'
   native automate assert \
     'role=button name="Codex tab 4.*".*state=.*selected' \
     'role=group name="Agent conversation"' \
@@ -471,8 +483,13 @@ PY
   native automate assert \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
+  smoke_all_tabs_id=$(smoke_widget_id 'role=button name="Show all open tabs"')
+  native automate widget-click hyper-term-canvas "$smoke_all_tabs_id"
   native automate assert --timeout-ms 30000 \
-    'role=group name="Codex ACP tab [0-9]+, review ready"'
+    'name="All open tabs"' \
+    'name="Codex ACP tab [0-9]+, review ready"'
+  native automate widget-click hyper-term-canvas "$smoke_all_tabs_id"
+  native automate assert --absent 'name="All open tabs"'
   smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
   native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text 'Run the bounded terminal'
   native automate assert \
@@ -514,14 +531,12 @@ PY
   cp "$smoke_screenshot" "$smoke_agent_screenshot"
   cp "$smoke_terminal_screenshot" "$smoke_screenshot"
 
-  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name=".* tab 3"')
-  native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
+  smoke_select_tab 'role=(button|menuitem) name=".* tab 3"'
   native automate assert \
     'role=button name=".* tab 3".*state=.*selected' \
     'hyper-term-terminal-view.*tab=3"'
   smoke_terminal_url_before_application_restart=$(smoke_terminal_url)
-  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Claude ACP tab 6.*"')
-  native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
+  smoke_select_tab 'role=(button|menuitem) name="Claude ACP tab 6.*"'
   native automate assert \
     'role=button name="Claude ACP tab 6.*".*state=.*selected' \
     'role=group name="Agent conversation"'
@@ -631,10 +646,8 @@ PY
     "publisher_pid=$smoke_renderer_after_application_restart" \
     'ready=true' \
     'gpu_nonblank=true' \
-    'role=button name="Close .* 1"' \
-    'role=button name="Close .* 3"' \
-    'role=button name="Close Codex ACP 5"' \
     'role=button name="Close Claude ACP 6"' \
+    'role=button name="Show all open tabs"' \
     'role=button name="Claude ACP tab 6.*".*state=.*selected' \
     'role=group name="Agent conversation"' \
     'role=group name="Recovered Agent history"' \
@@ -644,12 +657,21 @@ PY
     'role=button name="Allowed once"' \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
+  smoke_all_tabs_id=$(smoke_widget_id 'role=button name="Show all open tabs"')
+  native automate widget-click hyper-term-canvas "$smoke_all_tabs_id"
+  native automate assert \
+    'name="All open tabs"' \
+    'name=".* tab 1"' \
+    'name=".* tab 3"' \
+    'name="Codex ACP tab 5.*"' \
+    'name="Claude ACP tab 6.*"'
+  native automate widget-click hyper-term-canvas "$smoke_all_tabs_id"
+  native automate assert --absent 'name="All open tabs"'
   native automate screenshot hyper-term-canvas
   smoke_restored_agent_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-agent-restored.png
   cp "$smoke_screenshot" "$smoke_restored_agent_screenshot"
 
-  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name=".* tab 3"')
-  native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
+  smoke_select_tab 'role=(button|menuitem) name=".* tab 3"'
   native automate assert \
     'role=button name=".* tab 3".*state=.*selected' \
     'hyper-term-terminal-view.*tab=3"'
@@ -658,8 +680,7 @@ PY
     echo "application restart reused the previous terminal gateway token" >&2
     exit 1
   fi
-  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Claude ACP tab 6.*"')
-  native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
+  smoke_select_tab 'role=(button|menuitem) name="Claude ACP tab 6.*"'
   native automate assert \
     'role=button name="Claude ACP tab 6.*".*state=.*selected' \
     'role=group name="Agent conversation"' \

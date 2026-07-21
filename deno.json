@@ -38,8 +38,9 @@
     "react/jsx-runtime": "npm:react@19.2.7/jsx-runtime"
   },
   "tasks": {
-    "check": "deno task check:design && deno fmt --check apps scripts runtime deno.json && deno lint apps scripts runtime && deno check apps/terminal/src/main.ts apps/workbench/src/main.tsx apps/workbench/src/genui/compiler.worker.ts apps/workbench/genui/preview-shell.ts runtime/genui-compiler.ts scripts/*.ts",
+    "check": "deno task check:design && deno task check:size && deno fmt --check apps scripts runtime deno.json && deno lint apps scripts runtime && deno check apps/terminal/src/main.ts apps/workbench/src/main.tsx apps/workbench/src/genui/compiler.worker.ts apps/workbench/genui/preview-shell.ts runtime/genui-compiler.ts scripts/*.ts",
     "check:design": "deno run --allow-read --allow-env designmd lint DESIGN.md",
+    "check:size": "deno run --allow-read=apps,crates,runtime,scripts scripts/check_source_size.ts",
     "test": "deno test --allow-read=.",
     "render:readme": "cd packages/native-svg && zig build render-readme",
     "check:readme-svg": "cd packages/native-svg && zig build check-readme",
