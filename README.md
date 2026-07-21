@@ -139,8 +139,10 @@ Hyper Term uses Deno's frozen lockfile and built-in bundler. There is no Vite or
 pnpm build. The optional browser gate requires `agent-browser`; it edits the
 built Workbench, waits for the esbuild-wasm live preview, opens the editable
 Diff, enforces a 100 ms warm edit-to-preview p95 with no main-thread long tasks,
-measures 100/500/1,000-module Worker rebuilds and cancellation, and verifies that
-Studio remains reachable at 480 px.
+measures 100/500/1,000-module Worker slice rebuilds and cancellation, and
+verifies that Studio remains reachable at 480 px. Semantics-sensitive module
+features fall back to a complete esbuild build, while authoritative artifact
+publication remains a Rust-supervised Deno build.
 
 ## Project map
 

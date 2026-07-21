@@ -42,24 +42,31 @@ preview realm.
 ```text
 User or Agent edit
   -> immutable source revision
-  -> parse declarations and update dependency graph
-  -> affected reverse closure for selected preview
+  -> select a conservative module-slice or full-build path
+  -> transform changed modules and update the dependency graph
   -> stable virtual modules + explicit package capsules
-  -> persistent esbuild-wasm context.rebuild()
-  -> JS, CSS, source map, metafile, diagnostics
-  -> Rust manifest validation and artifact acceptance
-  -> isolated preview switches to accepted revision
+  -> cached module registry, or persistent esbuild-wasm context.rebuild()
+  -> JS, CSS, source map, diagnostics
+  -> bounded local preview candidate
+  -> isolated preview switches to the last good revision
+  -> approved publish performs a complete Deno build and Rust acceptance
 ```
 
-Declaration parsing, graph maintenance, reverse-closure selection, public-shape
-fingerprints, and conservative fallback belong to Hyper Term's Canvas/Piece
-compiler layer; they are not esbuild features.
+Module graph maintenance and conservative fallback belong to Hyper Term's
+Canvas/Piece compiler layer; they are not esbuild features. Declaration parsing,
+public-shape fingerprints, and declaration-local reverse-closure selection are
+still a finer-grained future optimization, not a property of the current
+module-slice implementation.
 
 `esbuild.initialize({ worker: false })` runs once inside the dedicated worker,
-avoiding a nested worker. Virtual module paths remain stable across revisions so
-incremental rebuild caches are useful. A newer edit awaits cancellation of old
-work before starting the next rebuild; every request and result carries a source
-revision, and stale results are discarded.
+avoiding a nested worker. Virtual module paths remain stable across revisions.
+For the bounded static ESM subset, each TS/TSX/JS/JSX/JSON module is transformed
+to a cached CommonJS factory and the Worker rapidly composes a fresh isolated
+module registry. Only source-changed modules are transformed. Semantics-sensitive
+features such as dynamic `import()`, `import.meta`, source CommonJS, CSS
+`@import`, and CSS `url()` use the shared full-build context instead. A newer
+edit awaits cancellation of old work before starting the next build; every
+request and result carries a source revision, and stale results are discarded.
 
 The compiler never executes application source during analysis or compilation.
 Its virtual filesystem has no implicit host filesystem or network fallback.
@@ -75,9 +82,12 @@ The compiler produces:
 - compiler, WASM, registry, lockfile, and option versions;
 - Time Travel instrumentation locations and trace schema version.
 
-Only a validated candidate replaces the preview. Compilation or runtime failure
-keeps the last-known-good artifact visible and attaches source-mapped diagnostics
-to the failed revision.
+Only a bounded, digest-checked candidate replaces the local isolated preview.
+This browser candidate is not an authoritative publication: publishing an
+edited artifact still crosses the approval endpoint and is rebuilt by the
+Rust-supervised Deno compiler before Artifact Store acceptance. Compilation or
+runtime failure keeps the last-known-good artifact visible and attaches
+source-mapped diagnostics to the failed revision.
 
 ## Incremental correctness contract
 
@@ -194,8 +204,10 @@ queued-edit coalescing. The ignored Rust integration test compiles three real
 artifacts through pinned Deno and `esbuild.wasm`: an initial TSX snapshot, a
 same-inventory rebuild, and a two-file inventory change.
 
-Incremental declaration-slice invalidation, randomized clean-build equivalence,
-hostile-runtime recovery, and the scale/cold-path benchmarks remain open gates.
+Module-slice invalidation, deterministic clean-build equivalence, hostile-runtime
+recovery, and scale measurement are now implemented below. Broader randomized
+syntax generation, declaration-local invalidation, and memory/cache-pressure
+measurement remain open gates.
 
 ## Warm interactive evidence (2026-07-22)
 
@@ -217,9 +229,9 @@ when any sample is cold or missing, or when a main-thread long task overlaps a
 sample.
 
 This closes the reference warm single-module p95 and main-thread long-task
-slice. Initial Worker/WASM startup, memory and cache bounds, randomized
-clean-build equivalence, and acceptable 100/500/1,000-module rebuild latency
-remain required before the broader performance section is complete.
+slice. Initial Worker/WASM startup, memory and cache bounds, broader randomized
+syntax equivalence, and acceptable 100/500/1,000-module rebuild latency remained
+required at this checkpoint; the module-scale latency is closed below.
 
 ## Scale evidence (2026-07-22)
 
@@ -249,7 +261,39 @@ was observed. In twelve-revision 1,000-module bursts, nine to ten queued
 revisions were reported as `compile_superseded` and the final revision compiled
 successfully.
 
-This benchmark closes the missing scale measurement, but it also disproves that
-the current full-graph esbuild-wasm rebuild is interactive at 500 or 1,000
-modules. Declaration-slice invalidation or a faster replaceable compiler backend
-is therefore a release-performance requirement, not an optional optimization.
+This benchmark closed the missing scale measurement, but it also disproved that
+the full-graph esbuild-wasm rebuild was interactive at 500 or 1,000 modules. It
+triggered the module-slice implementation measured below.
+
+## Module-slice evidence (2026-07-22)
+
+The production browser Worker now selects a conservative module-slice compiler
+for static ESM graphs. It caches transform output by virtual path and exact
+source, reconstructs a bounded module registry on every revision, concatenates
+reachable CSS in dependency order, and emits an indexed source map. Runtime
+diagnostics flatten that map before resolving a generated position. The Deno
+compiler continues to use the complete bundled build; publication behavior and
+Rust Artifact Store authority are unchanged.
+
+The release browser gate compiled complete linked graphs, changed only the leaf
+module five times, then sent a twelve-revision 1,000-module burst:
+
+| Modules | Initial | Rebuild p50 | Rebuild p95/max | Source map |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 109.0 ms | 1.2 ms | 1.3 ms | 20,890 B |
+| 500 | 365.0 ms | 2.8 ms | 4.0 ms | 104,607 B |
+| 1,000 | 468.9 ms | 5.5 ms | 6.9 ms | 209,607 B |
+
+The same built-page run produced 6.9 ms p50 and 14.0 ms p95/max
+edit-to-preview latency with no main-thread long task. Nine of twelve queued
+burst revisions were superseded and the last revision compiled. Unit coverage
+executes static TypeScript, JSON, simple CSS, safe circular ESM, missing
+dependency rejection, indexed runtime mappings, and eight deterministic
+branched graphs against both the slice and clean full-build engines. The browser
+gate also exercises React capsules and the isolated hostile-preview denial path.
+
+The standalone cold-process benchmark includes a new Deno process and WASM
+initialization. At 1,000 modules it measured 4,248.4 ms cold, 19.1 ms warm p50,
+and 26.2 ms warm p95/max. This is below the editor timeout and confirms that the
+fast result is not dependent on an already-created module cache. These numbers
+are reference-machine evidence, not a cross-machine guarantee.

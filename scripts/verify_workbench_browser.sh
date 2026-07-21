@@ -221,7 +221,10 @@ void new Promise((resolve, reject) => {
     }
     const candidate = response.candidate;
     const sourceMap = JSON.parse(candidate.source_map);
-    const mappedModules = sourceMap.sources.filter((source) =>
+    const mappedSources = Array.isArray(sourceMap.sections)
+      ? sourceMap.sections.flatMap((section) => section.map?.sources || [])
+      : sourceMap.sources || [];
+    const mappedModules = mappedSources.filter((source) =>
       source.includes("/App.tsx") || source.includes("/module-")
     ).length;
     if (mappedModules < count || !/^[0-9a-f]{64}$/.test(candidate.content_digest)) {

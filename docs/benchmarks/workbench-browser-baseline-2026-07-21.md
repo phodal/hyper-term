@@ -59,11 +59,30 @@ Two consecutive successful runs produced these ranges:
 
 Every source map retained the full module inventory, twelve-edit bursts
 superseded nine to ten intermediate revisions and compiled the last, and no
-main-thread task reached 50 ms. The data is intentionally a failing product signal: the
-current full-graph WASM rebuild is not interactive for large graphs and requires
-slice invalidation or a faster backend before scale performance is complete.
+main-thread task reached 50 ms. This is retained as the failing full-build
+baseline that triggered module-slice invalidation.
 
-This is a same-build correctness alarm, not a general browser compatibility or
-cross-machine performance guarantee. The macOS release pairs it with Native SDK automation
+## Module-slice result — 2026-07-22
+
+The production Worker now transforms only source-changed modules for the bounded
+static ESM subset and rapidly recomposes its isolated module registry. Dynamic
+imports, `import.meta`, source CommonJS, and complex CSS conservatively retain
+the complete build path. Publishing an edit still uses the Rust-supervised Deno
+compiler; the slice result is a local preview candidate only.
+
+| Modules | Initial | Rebuild p50 | Rebuild p95/max |
+| ---: | ---: | ---: | ---: |
+| 100 | 109.0 ms | 1.2 ms | 1.3 ms |
+| 500 | 365.0 ms | 2.8 ms | 4.0 ms |
+| 1,000 | 468.9 ms | 5.5 ms | 6.9 ms |
+
+All 1,000 indexed source-map sections resolved, nine of twelve burst revisions
+were superseded, the final revision compiled, and no main-thread task reached
+50 ms. The same built-page run recorded 6.9 ms p50 and 14.0 ms p95/max for twelve
+editor-to-iframe edits. A separate cold-process benchmark measured 4,248.4 ms
+initial and 26.2 ms warm p95/max for 1,000 modules, including fresh WASM startup.
+
+The retained full-build table is a same-build correctness alarm, not a general
+browser compatibility or cross-machine performance guarantee. The macOS release pairs it with Native SDK automation
 and Rust-owned artifact and permission tests. The separate Terminal browser
 gate exercises the real zsh-to-xterm path during local release qualification.

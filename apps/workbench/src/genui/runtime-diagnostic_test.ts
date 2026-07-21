@@ -37,6 +37,23 @@ Deno.test("preview supplied positions take precedence over later stack frames", 
   assertEquals(diagnostic.original, { file: "/App.tsx", line: 1, column: 1 });
 });
 
+Deno.test("runtime errors map indexed preview-slice source maps", () => {
+  const indexed = JSON.stringify({
+    version: 3,
+    sections: [{
+      offset: { line: 4, column: 0 },
+      map: JSON.parse(sourceMap()),
+    }],
+  });
+  const diagnostic = mapPreviewRuntimeError({
+    message: "slice failed",
+    generated_line: 6,
+    generated_column: 1,
+  }, indexed);
+
+  assertEquals(diagnostic.original, { file: "/App.tsx", line: 2, column: 1 });
+});
+
 Deno.test("runtime mapper rejects capsule and oversized source maps", () => {
   assertEquals(
     mapPreviewRuntimeError({

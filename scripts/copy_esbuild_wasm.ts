@@ -10,9 +10,13 @@ const destinationUrl = target === "workbench"
   ? new URL("../dist/workbench/esbuild.wasm", import.meta.url)
   : target === "runtime"
   ? new URL("../dist/runtime/esbuild.wasm", import.meta.url)
+  : target === "test"
+  ? new URL("../.zig-cache/test-runtime/esbuild.wasm", import.meta.url)
   : null;
 if (destinationUrl === null) {
-  throw new Error("copy_esbuild_wasm target must be workbench or runtime");
+  throw new Error(
+    "copy_esbuild_wasm target must be workbench, runtime, or test",
+  );
 }
 const destination = fromFileUrl(destinationUrl);
 await Deno.mkdir(dirname(destination), { recursive: true });

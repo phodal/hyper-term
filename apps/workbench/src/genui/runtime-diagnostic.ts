@@ -1,4 +1,4 @@
-import { originalPositionFor, TraceMap } from "@jridgewell/trace-mapping";
+import { AnyMap, originalPositionFor } from "@jridgewell/trace-mapping";
 import {
   boundedRuntimeText,
   generatedPositionFromStack,
@@ -66,7 +66,7 @@ function mapGeneratedPosition(
     return undefined;
   }
   try {
-    const mapped = originalPositionFor(new TraceMap(sourceMap), {
+    const mapped = originalPositionFor(AnyMap(sourceMap, null), {
       line,
       column: column - 1,
     });

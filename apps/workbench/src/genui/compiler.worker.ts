@@ -8,6 +8,11 @@ import {
   diagnosticsFrom,
   initializeCompiler,
 } from "./compiler-engine.ts";
+import {
+  cancelPreviewSliceCompiler,
+  canUsePreviewSliceCompiler,
+  compilePreviewSlice,
+} from "./preview-slice-compiler.ts";
 import { LatestCompileScheduler } from "./compiler-scheduler.ts";
 import * as esbuild from "esbuild-wasm";
 
@@ -30,7 +35,10 @@ const scheduler = new LatestCompileScheduler(
     }
   },
   post,
-  cancelCompiler,
+  async () => {
+    cancelPreviewSliceCompiler();
+    await cancelCompiler();
+  },
 );
 
 async function compile(request: CompileRequest): Promise<CompileResponse> {
@@ -38,7 +46,9 @@ async function compile(request: CompileRequest): Promise<CompileResponse> {
     wasmURL: new URL("./esbuild.wasm", globalThis.location.href).href,
     worker: false,
   });
-  return await compileRequest(request);
+  return canUsePreviewSliceCompiler(request)
+    ? await compilePreviewSlice(request, esbuild)
+    : await compileRequest(request);
 }
 
 function post(response: CompileResponse): void {
