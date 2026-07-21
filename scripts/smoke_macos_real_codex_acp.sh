@@ -31,7 +31,7 @@ if [[ $(uname -s) != Darwin ]]; then
   exit 1
 fi
 
-for real_command in codex grep native sed tail; do
+for real_command in codex grep native python3 sed stat tail; do
   if ! command -v "$real_command" >/dev/null 2>&1; then
     echo "required command is unavailable: $real_command" >&2
     exit 1
@@ -165,8 +165,169 @@ real_pid=$!
     grep -q '"type":"artifact_accepted"' "$real_root/state/events.jsonl"
     grep -q '"executor":"hyper-term-mcp","succeeded":true' \
       "$real_root/state/events.jsonl"
+
+    native automate assert --timeout-ms 30000 \
+      'role=button name="Open ACP artifact editor".*enabled=true'
+    real_editor_id=$(real_widget_id \
+      'role=button name="Open ACP artifact editor".*enabled=true')
+    if [[ -z "$real_editor_id" ]]; then
+      echo "real Codex ACP artifact editor control is unavailable" >&2
+      exit 1
+    fi
+    native automate widget-click hyper-term-canvas "$real_editor_id"
+    native automate assert --timeout-ms 30000 \
+      'role=group name="ACP artifact editor"' \
+      'role=button name="Close ACP artifact editor".*enabled=true' \
+      'hyper-term-genui-view.*surface=artifact.*artifact_id=.*token=[0-9a-f]'
+
+    python3 - \
+      .zig-cache/native-sdk-automation/snapshot.txt \
+      "$real_expected" \
+      "$real_root/artifact-editor-e2e.json" <<'PY'
+import html
+import json
+import pathlib
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+snapshot_path, expected, evidence_path = sys.argv[1:]
+snapshot = pathlib.Path(snapshot_path).read_text()
+match = re.search(r'hyper-term-genui-view.*url="([^"]+)"', snapshot)
+if match is None:
+    raise SystemExit("artifact Workbench WebView URL is missing")
+workbench_url = html.unescape(match.group(1))
+parsed = urllib.parse.urlsplit(workbench_url)
+query = urllib.parse.parse_qs(parsed.query)
+if parsed.hostname != "127.0.0.1" or query.get("surface") != ["artifact"]:
+    raise SystemExit("artifact Workbench is not using its token-bound loopback route")
+try:
+    artifact_id = query["artifact_id"][0]
+    session_id = query["session_id"][0]
+    token = query["token"][0]
+except (KeyError, IndexError):
+    raise SystemExit("artifact Workbench route is missing its Rust context")
+if not artifact_id or not session_id.isdigit() or not re.fullmatch(r"[0-9a-f]+", token):
+    raise SystemExit("artifact Workbench route has an invalid Rust context")
+
+with urllib.request.urlopen(workbench_url, timeout=10) as response:
+    workbench_html = response.read().decode()
+    if response.status != 200 or '<div id="root"></div>' not in workbench_html:
+        raise SystemExit("artifact Workbench did not return its built index")
+asset_paths = re.findall(r'(?:src|href)="([^"]+)"', workbench_html)
+if not asset_paths:
+    raise SystemExit("artifact Workbench index has no built assets")
+for asset_path in asset_paths:
+    with urllib.request.urlopen(
+        urllib.parse.urljoin(workbench_url, asset_path), timeout=10
+    ) as response:
+        if response.status != 200 or not response.read(1):
+            raise SystemExit(f"artifact Workbench asset is unavailable: {asset_path}")
+
+origin = f"{parsed.scheme}://{parsed.netloc}"
+auth_query = urllib.parse.urlencode({"token": token, "session_id": session_id})
+artifact_path = urllib.parse.quote(artifact_id, safe="")
+
+def read_json(path, timeout=10):
+    with urllib.request.urlopen(f"{origin}{path}?{auth_query}", timeout=timeout) as response:
+        if response.status != 200:
+            raise SystemExit(f"Rust artifact endpoint returned {response.status}: {path}")
+        return json.load(response)
+
+source = read_json(f"/agent/artifact/{artifact_path}/source")
+files = source.get("files")
+if (
+    source.get("artifact_id") != artifact_id
+    or not isinstance(source.get("source_revision"), int)
+    or source["source_revision"] < 1
+    or not isinstance(files, dict)
+    or not files
+    or source.get("entrypoint") not in files
+    or expected not in "\n".join(files.values())
+):
+    raise SystemExit("Rust artifact source does not match the accepted ACP output")
+
+checkpoint = read_json(f"/agent/artifact/{artifact_path}/editor-state")
+if (
+    checkpoint.get("artifact_id") != artifact_id
+    or checkpoint.get("base_source_revision") != source["source_revision"]
+    or checkpoint.get("entrypoint") != source["entrypoint"]
+    or checkpoint.get("files") != files
+    or checkpoint.get("active_path") not in files
+    or checkpoint.get("view") not in {"code", "diff", "trace"}
+    or not re.fullmatch(r"[0-9a-f]{64}", checkpoint.get("state_digest", ""))
+):
+    raise SystemExit("Rust artifact editor checkpoint is not bound to accepted source")
+
+lsp_body = json.dumps({
+    "source_revision": source["source_revision"],
+    "document_path": checkpoint["active_path"],
+    "draft_files": checkpoint["files"],
+    "kind": "diagnostics",
+}).encode()
+lsp_request = urllib.request.Request(
+    f"{origin}/agent/artifact/{artifact_path}/lsp?{auth_query}",
+    data=lsp_body,
+    headers={"content-type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(lsp_request, timeout=30) as response:
+    lsp = json.load(response)
+if (
+    lsp.get("artifact_id") != artifact_id
+    or lsp.get("source_revision") != source["source_revision"]
+    or lsp.get("document_path") != checkpoint["active_path"]
+    or lsp.get("kind") != "diagnostics"
+    or not isinstance(lsp.get("document_version"), int)
+    or lsp["document_version"] < 1
+    or not isinstance(lsp.get("diagnostics"), list)
+    or not isinstance(lsp.get("completions"), list)
+):
+    raise SystemExit("Rust-managed Deno LSP response does not match the editor context")
+
+try:
+    urllib.request.urlopen(
+        f"{origin}/agent/artifact/{artifact_path}/source"
+        f"?token=wrong&session_id={session_id}",
+        timeout=5,
+    )
+except urllib.error.HTTPError as error:
+    if error.code != 401:
+        raise
+else:
+    raise SystemExit("artifact source endpoint accepted an invalid token")
+
+evidence = {
+    "artifact_id": artifact_id,
+    "source_revision": source["source_revision"],
+    "entrypoint": source["entrypoint"],
+    "checkpoint_revision": checkpoint.get("revision"),
+    "checkpoint_view": checkpoint["view"],
+    "lsp_document_path": lsp["document_path"],
+    "lsp_document_version": lsp["document_version"],
+    "lsp_diagnostic_count": len(lsp["diagnostics"]),
+    "workbench_asset_count": len(asset_paths),
+}
+pathlib.Path(evidence_path).write_text(json.dumps(evidence, indent=2) + "\n")
+print("Native ACP artifact editor: opened on demand")
+print("artifact Workbench: index and built assets returned HTTP 200")
+print("Rust source/checkpoint: bound to the accepted ACP artifact")
+print("Rust-managed Deno LSP: diagnostics response matched editor context")
+PY
   fi
   native automate screenshot hyper-term-canvas
+  real_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png
+  if [[ ! -s "$real_screenshot" ]]; then
+    echo "real Codex ACP screenshot is empty" >&2
+    exit 1
+  fi
+  real_screenshot_bytes=$(stat -f '%z' "$real_screenshot")
+  if (( real_screenshot_bytes < 100000 )); then
+    echo "real Codex ACP screenshot is unexpectedly small: $real_screenshot_bytes bytes" >&2
+    exit 1
+  fi
 )
 
 if [[ -n "$real_artifact_dir" ]]; then
@@ -178,6 +339,11 @@ if [[ -n "$real_artifact_dir" ]]; then
     "$real_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png" \
     "$real_artifact_dir/screenshot-hyper-term-real-codex-acp.png"
   cp "$real_log" "$real_artifact_dir/hyper-term-real-codex-acp.log"
+  if [[ -f "$real_root/artifact-editor-e2e.json" ]]; then
+    cp \
+      "$real_root/artifact-editor-e2e.json" \
+      "$real_artifact_dir/artifact-editor-e2e.json"
+  fi
 fi
 
 if [[ "$real_genui" == 1 ]]; then

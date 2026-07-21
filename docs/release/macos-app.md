@@ -43,8 +43,14 @@ never invokes login. By default it does not authorize a tool call.
 Set `HYPER_TERM_REAL_ACP_GENUI=1` for the stricter path: Codex ACP must call
 `hyper_term.genui.compile`, the Native approval UI must authorize it, and the
 Rust journal must contain an accepted artifact plus a successful MCP receipt.
-The connector stays inside the Agent sandbox while Rust launches the supervised
-Deno compiler outside that process tree, avoiding nested Seatbelt.
+The same run then opens the Native artifact-editor disclosure, verifies the
+token-bound built Workbench and its hashed assets, loads the exact Rust source
+and checkpoint, and requests diagnostics from the Rust-managed Deno LSP. It
+also rejects an invalid gateway token and can retain the snapshot, screenshot,
+supervisor log, and machine-readable editor evidence through
+`HYPER_TERM_REAL_ACP_ARTIFACT_DIR`. The connector stays inside the Agent sandbox
+while Rust launches the supervised Deno compiler outside that process tree,
+avoiding nested Seatbelt.
 
 The final bundle contains:
 
