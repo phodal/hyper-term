@@ -138,7 +138,8 @@ deno task verify:workbench-browser
 Hyper Term uses Deno's frozen lockfile and built-in bundler. There is no Vite or
 pnpm build. The optional browser gate requires `agent-browser`; it edits the
 built Workbench, waits for the esbuild-wasm live preview, opens the editable
-Diff, and verifies that Studio remains reachable at 480 px.
+Diff, enforces a 100 ms warm edit-to-preview p95 with no main-thread long tasks,
+and verifies that Studio remains reachable at 480 px.
 
 ## Project map
 

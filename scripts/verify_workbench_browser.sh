@@ -8,6 +8,13 @@ verify_session="hyper-term-workbench-$$"
 verify_root=$(mktemp -d "${TMPDIR:-/tmp}/hyper-term-workbench-browser.XXXXXX")
 verify_log="$verify_root/server.log"
 verify_pid=""
+verify_warm_p95_budget_ms=${HYPER_TERM_GENUI_WARM_P95_BUDGET_MS:-100}
+
+if ! [[ "$verify_warm_p95_budget_ms" =~ ^[0-9]+$ ]] ||
+  ((verify_warm_p95_budget_ms < 1 || verify_warm_p95_budget_ms > 1000)); then
+  echo "HYPER_TERM_GENUI_WARM_P95_BUDGET_MS must be an integer from 1 to 1000" >&2
+  exit 1
+fi
 
 verify_cleanup() {
   verify_status=$?
@@ -107,6 +114,28 @@ grep -q '"OK"' <<<"$verify_reload"
 verify_reload_snapshot=$(agent-browser --session "$verify_session" snapshot -c)
 grep -q 'heading "实时预览 ✓"' <<<"$verify_reload_snapshot"
 
+# Measure real warm editor-to-iframe latency. Each sample replaces the source
+# through CodeMirror and is complete only after the isolated preview reports
+# the matching accepted revision ready.
+verify_diagnostics=$(agent-browser --session "$verify_session" eval \
+  '(()=>{if(typeof window.__hyperTermGenUiDiagnostics!=="function")return "FAIL";window.__hyperTermWarmBaseline=window.__hyperTermGenUiDiagnostics().samples.length;return "OK"})()')
+grep -q '"OK"' <<<"$verify_diagnostics"
+for verify_iteration in {1..12}; do
+  verify_benchmark_source="export default function App(){return <main data-warm-edit=\"$verify_iteration\"><h1>实时预览 ✓</h1><p>Agentic UI · $verify_iteration</p></main>}"
+  agent-browser --session "$verify_session" focus '.cm-content' >/dev/null
+  agent-browser --session "$verify_session" press Meta+a >/dev/null
+  agent-browser --session "$verify_session" keyboard inserttext \
+    "$verify_benchmark_source" >/dev/null
+  verify_warm_sample=$(agent-browser --session "$verify_session" eval \
+    "new Promise((resolve,reject)=>{const target=window.__hyperTermWarmBaseline+$verify_iteration;const started=performance.now();const poll=setInterval(()=>{const diagnostics=window.__hyperTermGenUiDiagnostics?.();const status=document.querySelector('.compiler-status')?.textContent||'';const runtime=[...document.querySelectorAll('.preview-badges span')].some((item)=>item.textContent?.trim()==='ready');if(diagnostics&&diagnostics.samples.length>=target&&status.includes('Preview ready')&&runtime){clearInterval(poll);resolve('OK');}else if(performance.now()-started>15000){clearInterval(poll);reject(new Error(JSON.stringify({target,samples:diagnostics?.samples.length,status,runtime})));}},10)})")
+  grep -q '"OK"' <<<"$verify_warm_sample"
+done
+
+verify_performance=$(agent-browser --session "$verify_session" eval \
+  "(()=>{const samples=window.__hyperTermGenUiDiagnostics?.().samples.slice(-12)||[];const durations=samples.map((sample)=>sample.editToPreviewMs).sort((left,right)=>left-right);const percentile=(quantile)=>durations[Math.max(0,Math.ceil(durations.length*quantile)-1)];const result={ok:samples.length===12&&samples.every((sample)=>sample.warm)&&percentile(.95)<=$verify_warm_p95_budget_ms&&samples.every((sample)=>sample.mainThreadLongTaskCount===0),sampleCount:samples.length,p50EditToPreviewMs:percentile(.5),p95EditToPreviewMs:percentile(.95),maxEditToPreviewMs:durations.at(-1),mainThreadLongTaskCount:samples.reduce((total,sample)=>total+sample.mainThreadLongTaskCount,0),maxMainThreadLongTaskMs:Math.max(0,...samples.map((sample)=>sample.maxMainThreadLongTaskMs)),budgetMs:$verify_warm_p95_budget_ms};return JSON.stringify(result)})()")
+echo "Workbench warm GenUI performance: $verify_performance"
+grep -q '\\"ok\\":true' <<<"$verify_performance"
+
 # Diff must be the real editable CodeMirror merge view, not a static patch.
 agent-browser --session "$verify_session" find role tab click --name Diff --exact >/dev/null
 agent-browser --session "$verify_session" wait 100 >/dev/null
@@ -132,6 +161,6 @@ if [[ -n "$verify_errors" ]]; then
   exit 1
 fi
 
-echo "Workbench browser verified: CodeMirror edit, esbuild-wasm live reload, isolated preview, editable Diff, and narrow Studio reachability"
+echo "Workbench browser verified: CodeMirror edit, esbuild-wasm live reload, isolated preview, warm p95 budget, editable Diff, and narrow Studio reachability"
 echo "Workbench live Diff screenshot: $verify_artifact_dir/workbench-live-diff.png"
 echo "Workbench narrow screenshot: $verify_artifact_dir/workbench-narrow-studio.png"

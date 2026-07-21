@@ -27,10 +27,13 @@ workflow artifact.
 The release job also serves the exact built Workbench to a pinned headless
 browser. It edits the CodeMirror document with CJK content, waits for the
 esbuild-wasm Worker and isolated preview handshake, opens the editable Diff,
-and scrolls the Studio into view at 480 px without document-level horizontal
-overflow. Wide and narrow screenshots are retained as
-`workbench-browser-smoke`; this complements Native automation because Native
-SDK snapshots deliberately cannot inspect WebView DOM content.
+then repeats twelve warm edits. The gate rejects warm edit-to-preview p95 above
+100 ms or any overlapping main-thread task of at least 50 ms. It also scrolls
+the Studio into view at 480 px without document-level horizontal overflow. The
+timing evidence is printed in the release log, while wide and narrow
+screenshots are retained as `workbench-browser-smoke`; this complements Native
+automation because Native SDK snapshots deliberately cannot inspect WebView
+DOM content.
 
 The pinned Deno runtime is also exercised through three real LSP layers before
 packaging: the driver must initialize and shut down `deno lsp`, the editor

@@ -15,6 +15,7 @@ import {
   type RuntimeTraceInput,
 } from "../runtime-trace-client.ts";
 import { parsePreviewMessage } from "../genui/preview-message.ts";
+import { GenUiPerformanceTracker } from "../genui/performance.ts";
 import { isReplayBoundary } from "../genui/runtime-replay.ts";
 import type { EditorLanguageService } from "../editor-language-service.ts";
 import { GenUiCompiler } from "../genui/compiler-client.ts";
@@ -91,6 +92,7 @@ type StudioView = ArtifactEditorView;
 
 const sampleBaselineFiles = { "/App.tsx": sampleOriginalSource };
 const sampleDraftFiles = { "/App.tsx": sampleInitialSource };
+const LIVE_BUILD_SETTLE_MS = 0;
 
 interface TraceEntry {
   revision: number;
@@ -197,9 +199,12 @@ export function GenUiStudio({
   >("idle");
   const [historyRestoreError, setHistoryRestoreError] = useState<string>();
   const compiler = useRef<GenUiCompiler | null>(null);
+  const performanceTracker = useRef<GenUiPerformanceTracker | null>(null);
+  performanceTracker.current ??= new GenUiPerformanceTracker();
   const historyController = useRef<AbortController | null>(null);
   const filesRef = useRef(files);
   filesRef.current = files;
+  const latestEditStartedAt = useRef(performance.now());
   const previewFrame = useRef<HTMLIFrameElement | null>(null);
   const previewChannel = useRef(crypto.randomUUID()).current;
   const revision = useRef(initialRevision);
@@ -217,6 +222,31 @@ export function GenUiStudio({
     return () => compiler.current?.dispose();
   }, []);
 
+  useEffect(() => {
+    const tracker = performanceTracker.current;
+    if (!tracker) return;
+    const diagnostics = () => tracker.snapshot();
+    globalThis.window.__hyperTermGenUiDiagnostics = diagnostics;
+    let observer: PerformanceObserver | undefined;
+    if (
+      typeof PerformanceObserver !== "undefined" &&
+      PerformanceObserver.supportedEntryTypes.includes("longtask")
+    ) {
+      observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          tracker.recordLongTask(entry.startTime, entry.duration);
+        }
+      });
+      observer.observe({ entryTypes: ["longtask"] });
+    }
+    return () => {
+      observer?.disconnect();
+      if (globalThis.window.__hyperTermGenUiDiagnostics === diagnostics) {
+        delete globalThis.window.__hyperTermGenUiDiagnostics;
+      }
+    };
+  }, []);
+
   useEffect(() => () => historyController.current?.abort(), []);
 
   useEffect(() => {
@@ -232,6 +262,10 @@ export function GenUiStudio({
           (message.artifact_id !== accepted.artifact_id ||
             message.source_revision !== accepted.source_revision)
         ) return;
+        performanceTracker.current?.previewReady(
+          message.source_revision,
+          performance.now(),
+        );
         setRuntimeDiagnostic(undefined);
         setReplayTarget(
           message.replay && Number.isSafeInteger(message.target_event_sequence)
@@ -322,10 +356,16 @@ export function GenUiStudio({
 
   useEffect(() => {
     setRuntimeDiagnostic(undefined);
+    const editStartedAt = latestEditStartedAt.current;
+    const sourceRevision = ++revision.current;
     const timer = globalThis.setTimeout(async () => {
-      const sourceRevision = ++revision.current;
       const activeCompiler = compiler.current;
       if (!activeCompiler) return;
+      performanceTracker.current?.begin(
+        sourceRevision,
+        editStartedAt,
+        performance.now(),
+      );
       setStatus(`Local build r${sourceRevision}`);
       setError(undefined);
       setTrace((entries) =>
@@ -344,8 +384,16 @@ export function GenUiStudio({
           entrypoint,
           files,
         );
+        performanceTracker.current?.candidateReady(
+          sourceRevision,
+          performance.now(),
+        );
         const nextAccepted = await host.acceptArtifact(candidate);
-        if (sourceRevision !== revision.current) return;
+        performanceTracker.current?.accepted(sourceRevision, performance.now());
+        if (sourceRevision !== revision.current) {
+          performanceTracker.current?.cancel(sourceRevision);
+          return;
+        }
         setAccepted(nextAccepted);
         setStatus(
           `Preview ready r${sourceRevision} · ${candidate.bundle.length} B`,
@@ -360,6 +408,7 @@ export function GenUiStudio({
             .slice(0, 8)
         );
       } catch (compileError) {
+        performanceTracker.current?.cancel(sourceRevision);
         if (sourceRevision !== revision.current) return;
         const message = compileError instanceof Error
           ? compileError.message
@@ -376,8 +425,11 @@ export function GenUiStudio({
             .slice(0, 8)
         );
       }
-    }, 260);
-    return () => clearTimeout(timer);
+    }, LIVE_BUILD_SETTLE_MS);
+    return () => {
+      clearTimeout(timer);
+      performanceTracker.current?.cancel(sourceRevision);
+    };
   }, [entrypoint, files, host]);
 
   const runtimeLocation = runtimeDiagnostic?.original;
@@ -409,6 +461,7 @@ export function GenUiStudio({
           "This revision uses a different virtual file tree and cannot be restored into the current fixed-path draft.",
         );
       }
+      latestEditStartedAt.current = performance.now();
       setFiles({ ...historical.files });
       setSelections((current) =>
         normalizeSelections(current, historical.files)
@@ -456,11 +509,9 @@ export function GenUiStudio({
   }, [activePath, files, onCheckpointStateChange, selections, view]);
 
   const updateSource = (nextSource: string) => {
-    setFiles((current) =>
-      current[activePath] === nextSource
-        ? current
-        : { ...current, [activePath]: nextSource }
-    );
+    if (filesRef.current[activePath] === nextSource) return;
+    latestEditStartedAt.current = performance.now();
+    setFiles((current) => ({ ...current, [activePath]: nextSource }));
     setSelections((current) =>
       normalizeSelections(current, {
         ...filesRef.current,

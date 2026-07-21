@@ -195,4 +195,28 @@ artifacts through pinned Deno and `esbuild.wasm`: an initial TSX snapshot, a
 same-inventory rebuild, and a two-file inventory change.
 
 Incremental declaration-slice invalidation, randomized clean-build equivalence,
-hostile-runtime recovery, and the stated p95 benchmarks remain open gates.
+hostile-runtime recovery, and the scale/cold-path benchmarks remain open gates.
+
+## Warm interactive evidence (2026-07-22)
+
+The built Workbench browser gate now drives CodeMirror through its real input
+path and measures every accepted revision across the esbuild-wasm Worker, host
+acceptance, and authenticated preview iframe `ready` message. The diagnostic
+surface retains at most 64 timing-only samples and 128 long-task observations;
+it exposes no source, path, bundle, or diagnostic content. A new edit advances
+the revision immediately, so a cancelled or stale compile cannot satisfy a
+later sample.
+
+On a Mac Studio `Mac16,9` with an Apple M4 Max (16 cores, 64 GB), macOS 26.5.2,
+Chrome 150.0.7871.129, and agent-browser 0.25.4, twelve warm edits of the
+single-module TSX fixture produced 28.3 ms p50 and 33.4 ms p95/max
+edit-to-preview latency. The fixture replaces the complete module on each edit,
+which is more work than the declaration-local target. No overlapping main
+thread task reached 50 ms. The release gate fails when warm p95 exceeds 100 ms,
+when any sample is cold or missing, or when a main-thread long task overlaps a
+sample.
+
+This closes the reference warm single-module p95 and main-thread long-task
+slice. Initial Worker/WASM startup, memory and cache bounds, randomized
+clean-build equivalence, and the 100/500/1,000-module fixtures remain required
+before the broader performance section is complete.
