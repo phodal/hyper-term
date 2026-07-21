@@ -362,7 +362,7 @@ test "session bar exposes direct Terminal and Agent creation" {
     var model = main.initialModel();
     var tree = try buildTree(arena, &model);
     try testing.expectEqualStrings("Agent", findByLabel(tree.root, "New Agent tab").?.text);
-    const terminal_tab = findByText(tree.root, .button, "zsh").?;
+    const terminal_tab = findByText(tree.root, .button, "zsh 1").?;
     const close_from_menu = tree.msgForContextMenu(terminal_tab.id, 0).?;
     switch (close_from_menu) {
         .close_session => |session_id| try testing.expectEqual(@as(u8, 1), session_id),
@@ -415,7 +415,7 @@ test "Rust terminal metadata projects bounded title and cwd into Native tabs" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const tree = try buildTree(arena_state.allocator(), &model);
-    try testing.expect(findByText(tree.root, .button, "cargo test") != null);
+    try testing.expect(findByText(tree.root, .button, "cargo test 1") != null);
     try testing.expect(findByLabel(tree.root, "Close cargo test 1") != null);
 
     const long_title = "phodal@Phodal-Studio:/Users/phodal/ai/hyper-term";
@@ -2207,14 +2207,21 @@ test "tabs expose close controls and close the active session like a desktop ter
     main.update(&model, .choose_terminal, &fx);
     main.update(&model, .choose_agent, &fx);
     try testing.expectEqual(@as(u8, 3), model.active_session_id);
+    try testing.expect(model.hasSessionOverflow());
 
     var tree = try buildTree(arena, &model);
-    try testing.expect(findByLabel(tree.root, "Close zsh 1") != null);
-    try testing.expect(findByLabel(tree.root, "Close zsh 2") != null);
+    try testing.expect(findByLabel(tree.root, "Show all open tabs") != null);
+    try testing.expect(findByLabel(tree.root, "Close zsh 1") == null);
+    try testing.expect(findByLabel(tree.root, "Close zsh 2") == null);
     const close_agent = findByLabel(tree.root, "Close Codex 3").?;
     main.update(&model, tree.msgForPointer(close_agent.id, .up).?, &fx);
     try testing.expectEqual(@as(usize, 2), model.openSessions().len);
     try testing.expectEqual(@as(u8, 2), model.active_session_id);
+    try testing.expect(!model.hasSessionOverflow());
+
+    tree = try buildTree(arena, &model);
+    try testing.expect(findByLabel(tree.root, "Close zsh 1") != null);
+    try testing.expect(findByLabel(tree.root, "Close zsh 2") != null);
     try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
     const close_request = fx.pendingFetchAt(0).?;
     try testing.expectEqual(std.http.Method.POST, close_request.method);
@@ -2231,6 +2238,57 @@ test "tabs expose close controls and close the active session like a desktop ter
     main.update(&model, .close_active_session, &fx);
     try testing.expectEqual(@as(u32, 1), fx.windowActionState().close_count);
     try testing.expectEqualStrings("main", fx.windowActionState().lastLabel());
+}
+
+test "tab overflow keeps the active session and new-session controls reachable at minimum width" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    var model = main.initialModel();
+    model.chrome_leading = 78;
+    while (!model.sessionLimitReached()) main.update(&model, .choose_terminal, &fx);
+
+    try testing.expectEqual(main.max_sessions, model.openSessions().len);
+    try testing.expect(model.hasSessionOverflow());
+    try testing.expectEqual(@as(usize, 1), model.inlineSessions().len);
+    try testing.expectEqual(@as(u8, 8), model.inlineSessions()[0].id);
+
+    var tree = try buildTree(arena, &model);
+    try testing.expect(findByLabel(tree.root, "Close zsh 8") != null);
+    try testing.expect(findByLabel(tree.root, "Close zsh 1") == null);
+    try testing.expect(findByLabel(tree.root, "New Terminal tab").?.state.disabled);
+    try testing.expect(findByLabel(tree.root, "New Agent tab").?.state.disabled);
+
+    const picker = findByLabel(tree.root, "Show all open tabs").?;
+    main.update(&model, tree.msgForPointer(picker.id, .up).?, &fx);
+    try testing.expect(model.session_picker_open);
+
+    tree = try buildTree(arena, &model);
+    const menu = findByLabel(tree.root, "All open tabs").?;
+    try testing.expectEqual(main.max_sessions, menu.children.len);
+    const first = findByLabel(tree.root, "zsh tab 1").?;
+    main.update(&model, tree.msgForPointer(first.id, .up).?, &fx);
+    try testing.expectEqual(@as(u8, 1), model.active_session_id);
+    try testing.expect(!model.session_picker_open);
+
+    tree = try buildTree(arena, &model);
+    const tokens = main.hyperTermTokens(&model);
+    const sweep = canvas.LayoutAuditSweepOptions{
+        .tokens = tokens,
+        .min_size = geometry.SizeF.init(main.window_min_width, main.window_min_height),
+        .default_size = geometry.SizeF.init(main.window_width, main.window_height),
+    };
+    try canvas.expectLayoutAuditSweepClean(testing.allocator, tree.root, sweep);
+    try canvas.expectA11yAuditSweepClean(testing.allocator, tree.root, .{
+        .tokens = tokens,
+        .min_size = sweep.min_size,
+        .default_size = sweep.default_size,
+    });
 }
 
 test "closing an inactive tab preserves the active session" {

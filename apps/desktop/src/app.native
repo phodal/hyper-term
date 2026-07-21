@@ -236,25 +236,13 @@
       <icon name="terminal" width="15" height="15" foreground="accent" />
       <text><span weight="medium">Hyper Term</span></text>
       <separator height="16" />
-      <row gap="4" grow="1" cross="center" label="Open sessions">
-        <for each="openSessions" key="id" as="session">
-          <button-group gap="0" label="{session.tabGroupLabel}">
-            <button size="sm" variant="ghost" icon="{session.tabIcon}" selected="{session.id == active_session_id}" on-press="select_session:{session.id}" label="{session.tabGroupLabel}">
-              {session.displayTitle}
-              <context-menu>
-                <menu-item on-press="close_session:{session.id}">Close Tab</menu-item>
-              </context-menu>
-            </button>
-            <button size="sm" variant="ghost" icon="x" selected="{session.id == active_session_id}" on-press="close_session:{session.id}" label="{session.closeLabel}"></button>
-          </button-group>
-        </for>
-      </row>
+      <row gap="4" grow="1" cross="center" label="Open sessions"></row>
     </row>
     <row gap="4" cross="center" label="New session">
-      <button size="sm" variant="outline" icon="plus" on-press="choose_terminal" label="New Terminal tab">Terminal</button>
+      <button size="sm" variant="outline" icon="plus" on-press="choose_terminal" disabled="{sessionLimitReached}" label="New Terminal tab">Terminal</button>
       <stack>
         <button-group gap="0" label="New Agent session">
-          <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" label="New Agent tab">Agent</button>
+          <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" disabled="{sessionLimitReached}" label="New Agent tab">Agent</button>
           <button size="sm" variant="outline" icon="chevron-down" on-press="toggle_agent_provider_picker" disabled="{agentProviderPickerUnavailable}" label="Choose provider for a new Agent tab"></button>
         </button-group>
         <if test="{agent_provider_picker_open}">

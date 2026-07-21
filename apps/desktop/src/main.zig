@@ -23,6 +23,8 @@ pub const genui_view_label = "hyper-term-genui-view";
 pub const genui_view_anchor = "Agent artifact editor viewport";
 pub const terminal_gateway_origin = "http://127.0.0.1:47437";
 pub const max_sessions: usize = 8;
+const max_inline_session_tabs: usize = 2;
+const max_session_tab_title_bytes: usize = 16;
 const terminal_url_capacity: usize = 256;
 const agent_url_capacity: usize = 256;
 const genui_url_capacity: usize = 512;
@@ -671,6 +673,10 @@ pub const Session = struct {
         return session.title;
     }
 
+    pub fn tabTitle(session: *const Session) []const u8 {
+        return utf8Prefix(session.displayTitle(), max_session_tab_title_bytes);
+    }
+
     pub fn hasUnacknowledgedAttention(session: *const Session) bool {
         const attention = switch (session.agent_attention_status) {
             .waiting_approval, .completed, .failed => true,
@@ -779,6 +785,7 @@ pub const Model = struct {
     desktop_workspace_revision: u64 = 0,
     desktop_workspace_persisted_revision: u64 = 0,
     desktop_workspace_in_flight_revision: u64 = 0,
+    session_picker_open: bool = false,
     agent_provider_picker_open: bool = false,
     agent_provider_refresh_in_flight: bool = false,
     agent_attention_in_flight: bool = false,
@@ -869,7 +876,9 @@ pub const Model = struct {
         "reduce_motion",
         "session_slots",
         "session_count",
+        "active_session_id",
         "next_session_id",
+        "session_picker_open",
         "desktop_workspace_enabled",
         "desktop_workspace_restored",
         "desktop_workspace_revision",
@@ -960,10 +969,29 @@ pub const Model = struct {
         "agentError",
         "agentTier2Results",
         "agentTier2Diff",
+        "openSessions",
+        "inlineSessions",
+        "hasSessionOverflow",
     };
 
     pub fn openSessions(model: *const Model) []const Session {
         return model.session_slots[0..model.session_count];
+    }
+
+    pub fn inlineSessions(model: *const Model) []const Session {
+        if (!model.hasSessionOverflow()) return model.openSessions();
+        for (model.openSessions()) |*session| {
+            if (session.id == model.active_session_id) return session[0..1];
+        }
+        return model.session_slots[0..1];
+    }
+
+    pub fn hasSessionOverflow(model: *const Model) bool {
+        return model.session_count > max_inline_session_tabs;
+    }
+
+    pub fn sessionLimitReached(model: *const Model) bool {
+        return model.session_count >= max_sessions;
     }
 
     pub fn activeSession(model: *const Model) Session {
@@ -1004,7 +1032,7 @@ pub const Model = struct {
     }
 
     pub fn agentProviderPickerUnavailable(model: *const Model) bool {
-        return model.agent_base_url_len == 0;
+        return model.agent_base_url_len == 0 or model.sessionLimitReached();
     }
 
     pub fn agentProviderRefreshLabel(model: *const Model) []const u8 {
@@ -1389,6 +1417,8 @@ fn attentionPriority(kind: AgentAttention.Kind) u8 {
 pub const Msg = union(enum) {
     choose_terminal,
     choose_agent,
+    toggle_session_picker,
+    dismiss_session_picker,
     toggle_agent_provider_picker,
     dismiss_agent_provider_picker,
     refresh_agent_providers,
@@ -1457,7 +1487,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "open_agent_search", "terminal_session_closed", "terminal_metadata_received", "terminal_metadata_poll", "desktop_workspace_persisted", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "toggle_session_picker", "dismiss_session_picker", "select_session", "close_session", "close_active_session", "open_agent_search", "terminal_session_closed", "terminal_metadata_received", "terminal_metadata_poll", "desktop_workspace_persisted", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -1473,6 +1503,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (appendSession(model, .terminal) != null) markDesktopWorkspaceChanged(model, fx);
         },
         .choose_agent => createAgentSession(model, model.selected_agent_provider, fx),
+        .toggle_session_picker => {
+            model.session_picker_open = !model.session_picker_open;
+            if (model.session_picker_open) model.agent_provider_picker_open = false;
+        },
+        .dismiss_session_picker => model.session_picker_open = false,
         .toggle_agent_provider_picker => toggleAgentProviderPicker(model, fx),
         .dismiss_agent_provider_picker => model.agent_provider_picker_open = false,
         .refresh_agent_providers => requestAgentProviderRefresh(model, fx),
@@ -1490,6 +1525,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .choose_claude_acp_agent => createAgentSession(model, .claude_acp, fx),
         .choose_copilot_acp_agent => createAgentSession(model, .copilot_acp, fx),
         .select_session => |session_id| {
+            model.session_picker_open = false;
             const previous = model.active_session_id;
             saveActiveAgentComposer(model);
             selectSession(model, session_id);
@@ -1658,6 +1694,7 @@ fn createAgentSession(model: *Model, provider: AgentProvider, fx: *Effects) void
 }
 
 fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
+    model.session_picker_open = false;
     saveActiveAgentComposer(model);
     var closing_index: ?usize = null;
     for (model.openSessions(), 0..) |session, index| {
@@ -1742,6 +1779,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
 
 fn toggleAgentProviderPicker(model: *Model, fx: *Effects) void {
     model.agent_provider_picker_open = !model.agent_provider_picker_open;
+    if (model.agent_provider_picker_open) model.session_picker_open = false;
     if (model.agent_provider_picker_open) requestAgentProviderRefresh(model, fx);
 }
 
@@ -5122,6 +5160,93 @@ fn agentApprovalNode(ui: *HyperTermUi, model: *const Model, block: *const AgentB
     });
 }
 
+fn sessionTab(ui: *HyperTermUi, model: *const Model, session: *const Session) HyperTermUi.Node {
+    const selected = session.id == model.active_session_id;
+    return ui.el(.button_group, .{
+        .global_key = canvas.uiKey(session.id),
+        .gap = 0,
+        .semantics = .{ .label = session.tabGroupLabel(ui.arena) },
+    }, .{
+        ui.button(.{
+            .size = .sm,
+            .variant = .ghost,
+            .icon = session.tabIcon(),
+            .selected = selected,
+            .on_press = Msg{ .select_session = session.id },
+            .context_menu = &.{.{
+                .label = "Close Tab",
+                .msg = Msg{ .close_session = session.id },
+            }},
+            .semantics = .{ .label = session.tabGroupLabel(ui.arena) },
+        }, ui.fmt("{s} {d}", .{ session.tabTitle(), session.id })),
+        ui.button(.{
+            .size = .sm,
+            .variant = .ghost,
+            .icon = "x",
+            .selected = selected,
+            .on_press = Msg{ .close_session = session.id },
+            .semantics = .{ .label = session.closeLabel(ui.arena) },
+        }, ""),
+    });
+}
+
+fn allTabsPicker(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
+    var children: [2]HyperTermUi.Node = undefined;
+    children[0] = ui.button(.{
+        .size = .sm,
+        .variant = .ghost,
+        .icon = "menu",
+        .selected = model.session_picker_open,
+        .on_press = .toggle_session_picker,
+        .semantics = .{ .label = "Show all open tabs" },
+    }, "All Tabs");
+    var child_count: usize = 1;
+    if (model.session_picker_open) {
+        var items: [max_sessions]HyperTermUi.Node = undefined;
+        for (model.openSessions(), 0..) |*session, index| {
+            var item = ui.el(.menu_item, .{
+                .global_key = canvas.uiKey(session.id),
+                .icon = session.tabIcon(),
+                .selected = session.id == model.active_session_id,
+                .on_press = Msg{ .select_session = session.id },
+                .semantics = .{ .label = session.tabGroupLabel(ui.arena) },
+            }, .{});
+            item.widget.text = ui.fmt("{s} {d}", .{ session.tabTitle(), session.id });
+            items[index] = item;
+        }
+        children[child_count] = ui.el(.dropdown_menu, .{
+            .width = 300,
+            .gap = 2,
+            .anchor = .below,
+            .anchor_alignment = .start,
+            .anchor_offset = 8,
+            .on_dismiss = .dismiss_session_picker,
+            .semantics = .{ .label = "All open tabs" },
+        }, items[0..model.session_count]);
+        child_count += 1;
+    }
+    return ui.stack(.{}, children[0..child_count]);
+}
+
+fn sessionTabs(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
+    var children: [max_inline_session_tabs + 1]HyperTermUi.Node = undefined;
+    var child_count: usize = 0;
+    for (model.inlineSessions()) |*session| {
+        children[child_count] = sessionTab(ui, model, session);
+        child_count += 1;
+    }
+    if (model.hasSessionOverflow()) {
+        children[child_count] = allTabsPicker(ui, model);
+        child_count += 1;
+    }
+    return ui.row(.{
+        .gap = 4,
+        .grow = 1,
+        .cross = .center,
+        .semantics = .{ .label = "Open sessions" },
+    }, children[0..child_count]);
+}
+
 fn replaceNodeByLabel(ui: *HyperTermUi, source: HyperTermUi.Node, label: []const u8, replacement: HyperTermUi.Node) HyperTermUi.Node {
     if (std.mem.eql(u8, source.widget.semantics.label, label)) return replacement;
     if (source.nodes.len == 0) return source;
@@ -5143,8 +5268,9 @@ fn replaceNodeByLabel(ui: *HyperTermUi, source: HyperTermUi.Node, label: []const
 /// without moving the rest of the design system out of `.native` fragments.
 pub fn rootView(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
     const shell = CompiledHyperTermView.build(ui, model);
-    if (model.isTerminal()) return shell;
-    return replaceNodeByLabel(ui, shell, "Agent blocks", agentTimeline(ui, model));
+    const with_tabs = replaceNodeByLabel(ui, shell, "Open sessions", sessionTabs(ui, model));
+    if (model.isTerminal()) return with_tabs;
+    return replaceNodeByLabel(ui, with_tabs, "Agent blocks", agentTimeline(ui, model));
 }
 
 pub fn initialModel() Model {
