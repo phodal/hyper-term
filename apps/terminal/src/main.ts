@@ -32,6 +32,11 @@ import {
   TerminalDiagnostics,
   type TerminalDiagnosticsSnapshot,
 } from "./terminal-diagnostics.ts";
+import {
+  parseTerminalCwdOsc,
+  type TerminalMetadataSnapshot,
+  TerminalMetadataState,
+} from "./terminal-metadata.ts";
 import "./styles.css";
 
 const attachmentStorageKey = terminalAttachmentStorageKey(
@@ -125,6 +130,7 @@ let afterSequence = 0n;
 let attachmentId = readAttachmentId();
 let transientStatusTimer: number | null = null;
 const connectionState = new TerminalConnectionState();
+const terminalMetadata = new TerminalMetadataState();
 
 searchInput.addEventListener("input", () => findNext(true));
 searchInput.addEventListener("focus", () => inputFocus.claimSearch());
@@ -163,6 +169,14 @@ terminal.onData((data) => sendInput(new TextEncoder().encode(data)));
 terminal.onBinary((data) => {
   const bytes = Uint8Array.from(data, (character) => character.charCodeAt(0));
   sendInput(bytes);
+});
+terminal.onTitleChange((title) =>
+  publishMetadata(terminalMetadata.setTitle(title))
+);
+terminal.parser.registerOscHandler(7, (value) => {
+  const cwd = parseTerminalCwdOsc(value);
+  if (cwd !== null) publishMetadata(terminalMetadata.setCwd(cwd));
+  return true;
 });
 
 const resizeObserver = new ResizeObserver(() => {
@@ -258,6 +272,8 @@ function receiveControl(message: TerminalWebServerControl): void {
         message.next_input_sequence,
         message.resize_generation,
       );
+      terminalMetadata.rebase(message.metadata_revision);
+      publishMetadata(terminalMetadata.current());
       setStatus("Connected", false);
       inputFocus.restore();
       break;
@@ -341,6 +357,14 @@ function sendInput(bytes: Uint8Array): void {
 
 function sendControl(message: TerminalWebClientControl): void {
   socket?.send(JSON.stringify(message));
+}
+
+function publishMetadata(snapshot: TerminalMetadataSnapshot | null): void {
+  if (
+    snapshot === null ||
+    !connectionState.canSend(socket?.readyState === WebSocket.OPEN)
+  ) return;
+  sendControl({ type: "metadata", ...snapshot });
 }
 
 function terminalSize() {

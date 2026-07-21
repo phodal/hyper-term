@@ -1,4 +1,4 @@
-export const TERMINAL_WEB_PROTOCOL_VERSION = 2;
+export const TERMINAL_WEB_PROTOCOL_VERSION = 3;
 export const TERMINAL_WEB_HEADER_BYTES = 36;
 export const MAX_TERMINAL_WEB_PAYLOAD_BYTES = 256 * 1024;
 
@@ -28,6 +28,12 @@ export type TerminalWebClientControl =
     cwd: string | null;
   }
   | { type: "resize"; generation: number; size: TerminalSize }
+  | {
+    type: "metadata";
+    revision: number;
+    title: string | null;
+    cwd: string | null;
+  }
   | { type: "close" };
 
 export type TerminalWebServerControl =
@@ -38,6 +44,7 @@ export type TerminalWebServerControl =
     terminal_id: string;
     next_input_sequence: number;
     resize_generation: number;
+    metadata_revision: number;
   }
   | { type: "exited"; exit_code: number | null; signal: string | null }
   | { type: "error"; code: string; message: string };

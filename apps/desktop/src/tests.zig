@@ -362,7 +362,7 @@ test "session bar exposes direct Terminal and Agent creation" {
     var model = main.initialModel();
     var tree = try buildTree(arena, &model);
     try testing.expectEqualStrings("Agent", findByLabel(tree.root, "New Agent tab").?.text);
-    const terminal_tab = findByText(tree.root, .button, "zsh 1").?;
+    const terminal_tab = findByText(tree.root, .button, "zsh").?;
     const close_from_menu = tree.msgForContextMenu(terminal_tab.id, 0).?;
     switch (close_from_menu) {
         .close_session => |session_id| try testing.expectEqual(@as(u8, 1), session_id),
@@ -385,6 +385,73 @@ test "session bar exposes direct Terminal and Agent creation" {
     try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
     try testing.expect(findByLabel(tree.root, main.terminal_view_anchor) == null);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
+}
+
+test "Rust terminal metadata projects bounded title and cwd into Native tabs" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    var model = main.initialModel();
+    main.initializeModelWithDesktopServices(&model, terminal_url, "", "", "", "");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.initEffects(&model, &fx);
+    const fetch = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.terminal_metadata_effect_key).?).?;
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:47437/terminal/sessions/metadata?token=0123456789abcdef0123456789abcdef",
+        fetch.url,
+    );
+    main.update(&model, .{ .terminal_metadata_received = .{
+        .key = main.terminal_metadata_effect_key,
+        .status = 200,
+        .body =
+        \\{"version":1,"sessions":[{"session_id":1,"revision":3,"title":"cargo test","cwd":"/Users/phodal/ai/hyper-term"}]}
+        ,
+    } }, &fx);
+
+    try testing.expectEqualStrings("cargo test", model.session_slots[0].displayTitle());
+    try testing.expectEqualStrings("/Users/phodal/ai/hyper-term", model.terminalStatus());
+    try testing.expectEqual(main.terminal_metadata_poll_timer_key, fx.pendingTimerAt(0).?.key);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByText(tree.root, .button, "cargo test") != null);
+    try testing.expect(findByLabel(tree.root, "Close cargo test 1") != null);
+
+    const long_title = "phodal@Phodal-Studio:/Users/phodal/ai/hyper-term";
+    @memcpy(model.session_slots[0].terminal_title_storage[0..long_title.len], long_title);
+    model.session_slots[0].terminal_title_len = long_title.len;
+    try testing.expectEqualStrings("hyper-term", model.session_slots[0].displayTitle());
+}
+
+test "Native terminal metadata rejects cross-mode and partial malformed updates" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    var model = main.initialModel();
+    main.initializeModelWithDesktopServices(&model, terminal_url, "", "", "", "");
+    model.session_slots[1] = .{ .id = 2, .mode = .agent, .title = "Codex", .icon = "circle-dot" };
+    model.session_count = 2;
+    model.next_session_id = 3;
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .{ .terminal_metadata_received = .{
+        .key = main.terminal_metadata_effect_key,
+        .status = 200,
+        .body =
+        \\{"version":1,"sessions":[{"session_id":1,"revision":1,"title":"must not apply","cwd":"/tmp"},{"session_id":2,"revision":1,"title":"spoofed Agent","cwd":"/tmp"}]}
+        ,
+    } }, &fx);
+    try testing.expectEqualStrings("zsh", model.session_slots[0].displayTitle());
+
+    main.update(&model, .{ .terminal_metadata_received = .{
+        .key = main.terminal_metadata_effect_key,
+        .status = 200,
+        .body =
+        \\{"version":1,"sessions":[{"session_id":1,"revision":2,"title":"bad\\u0007title","cwd":"relative"}]}
+        ,
+    } }, &fx);
+    try testing.expectEqualStrings("zsh", model.session_slots[0].displayTitle());
 }
 
 test "Agent provider picker creates a provider-bound ACP tab" {
@@ -2438,8 +2505,8 @@ test "Rust desktop workspace restores Terminal and Agent tabs with their active 
     defer fx.deinit();
     fx.executor = .fake;
     main.initEffects(&model, &fx);
-    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
-    const reconnect = fx.pendingFetchAt(0).?;
+    try testing.expectEqual(@as(usize, 2), fx.pendingFetchCount());
+    const reconnect = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_start_effect_key_base + 2).?).?;
     try testing.expectEqual(main.agent_start_effect_key_base + 2, reconnect.key);
     try testing.expect(std.mem.endsWith(u8, reconnect.url, "session_id=2&provider=codex-acp"));
 }

@@ -59,6 +59,9 @@ const max_agent_context_id_bytes: usize = 128;
 const agent_context_digest_bytes: usize = 64;
 const max_agent_context_summary_bytes: usize = 64;
 const max_desktop_workspace_bytes: usize = 4 * 1024;
+const max_terminal_metadata_bytes: usize = 8 * 1024;
+const max_terminal_title_bytes: usize = 256;
+const max_terminal_cwd_bytes: usize = 512;
 const ui_font_id: canvas.FontId = canvas.min_registered_font_id;
 const max_ui_font_bytes: usize = 24 * 1024 * 1024;
 const default_macos_ui_font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf";
@@ -82,6 +85,8 @@ pub const deferred_webview_timer_id: u64 = 0x4854_5100;
 pub const agent_attention_effect_key: u64 = 0x4854_5200;
 pub const agent_attention_poll_timer_key: u64 = 0x4854_5300;
 pub const desktop_workspace_effect_key: u64 = 0x4854_5400;
+pub const terminal_metadata_effect_key: u64 = 0x4854_5500;
+pub const terminal_metadata_poll_timer_key: u64 = 0x4854_5600;
 const deferred_webview_delay_ns: u64 = 1_000_000;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
@@ -632,6 +637,39 @@ pub const Session = struct {
     agent_attention_revision: u64 = 0,
     acknowledged_attention_status: AgentTurnStatus = .idle,
     acknowledged_attention_revision: u64 = 0,
+    terminal_metadata_revision: u64 = 0,
+    terminal_title_storage: [max_terminal_title_bytes]u8 = [_]u8{0} ** max_terminal_title_bytes,
+    terminal_title_len: usize = 0,
+    terminal_cwd_storage: [max_terminal_cwd_bytes]u8 = [_]u8{0} ** max_terminal_cwd_bytes,
+    terminal_cwd_len: usize = 0,
+
+    pub fn terminalTitle(session: *const Session) []const u8 {
+        return session.terminal_title_storage[0..session.terminal_title_len];
+    }
+
+    pub fn terminalCwd(session: *const Session) []const u8 {
+        return session.terminal_cwd_storage[0..session.terminal_cwd_len];
+    }
+
+    pub fn displayTitle(session: *const Session) []const u8 {
+        if (session.mode != .terminal) return session.title;
+        const terminal_title = session.terminalTitle();
+        if (terminal_title.len > 0 and terminal_title.len <= 40) return terminal_title;
+        if (terminal_title.len > 40) {
+            if (std.mem.lastIndexOfScalar(u8, terminal_title, '/')) |slash| {
+                const basename = terminal_title[slash + 1 ..];
+                if (basename.len > 0 and basename.len <= 40) return basename;
+            }
+        }
+        const cwd = session.terminalCwd();
+        if (cwd.len > 1) {
+            const basename = std.fs.path.basename(cwd);
+            return if (basename.len <= 40) basename else utf8Prefix(basename, 40);
+        }
+        if (cwd.len == 1) return "/";
+        if (terminal_title.len > 0) return utf8Prefix(terminal_title, 40);
+        return session.title;
+    }
 
     pub fn hasUnacknowledgedAttention(session: *const Session) bool {
         const attention = switch (session.agent_attention_status) {
@@ -653,7 +691,7 @@ pub const Session = struct {
     }
 
     pub fn closeLabel(session: *const Session, arena: std.mem.Allocator) []const u8 {
-        return std.fmt.allocPrint(arena, "Close {s} {d}", .{ session.title, session.id }) catch "Close tab";
+        return std.fmt.allocPrint(arena, "Close {s} {d}", .{ session.displayTitle(), session.id }) catch "Close tab";
     }
 
     pub fn tabGroupLabel(session: *const Session, arena: std.mem.Allocator) []const u8 {
@@ -664,10 +702,28 @@ pub const Session = struct {
                 .failed => "failed",
                 else => "needs attention",
             };
-            return std.fmt.allocPrint(arena, "{s} tab {d}, {s}", .{ session.title, session.id, attention }) catch "Agent tab needs attention";
+            return std.fmt.allocPrint(arena, "{s} tab {d}, {s}", .{ session.displayTitle(), session.id, attention }) catch "Agent tab needs attention";
         }
-        return std.fmt.allocPrint(arena, "{s} tab {d}", .{ session.title, session.id }) catch "Session tab";
+        return std.fmt.allocPrint(arena, "{s} tab {d}", .{ session.displayTitle(), session.id }) catch "Session tab";
     }
+};
+
+fn utf8Prefix(value: []const u8, maximum: usize) []const u8 {
+    var length = @min(value.len, maximum);
+    while (length > 0 and !std.unicode.utf8ValidateSlice(value[0..length])) : (length -= 1) {}
+    return value[0..length];
+}
+
+const TerminalSessionMetadataWire = struct {
+    session_id: u16,
+    revision: u64,
+    title: ?[]const u8,
+    cwd: ?[]const u8,
+};
+
+const TerminalMetadataResponseWire = struct {
+    version: u16,
+    sessions: []const TerminalSessionMetadataWire,
 };
 
 const DesktopWorkspaceWire = struct {
@@ -726,6 +782,7 @@ pub const Model = struct {
     agent_provider_picker_open: bool = false,
     agent_provider_refresh_in_flight: bool = false,
     agent_attention_in_flight: bool = false,
+    terminal_metadata_in_flight: bool = false,
     selected_agent_provider: AgentProvider = .codex,
     available_agent_providers: u8 = 0,
     authenticated_agent_providers: u8 = 0,
@@ -820,6 +877,7 @@ pub const Model = struct {
         "desktop_workspace_in_flight_revision",
         "agentProviderUnavailable",
         "agent_attention_in_flight",
+        "terminal_metadata_in_flight",
         "available_agent_providers",
         "authenticated_agent_providers",
         "session_auth_agent_providers",
@@ -932,10 +990,9 @@ pub const Model = struct {
     }
 
     pub fn terminalStatus(model: *const Model) []const u8 {
-        return if (model.terminalReady())
-            "zsh · ordered Rust PTY plane"
-        else
-            "zsh · hyperd disconnected";
+        if (!model.terminalReady()) return "zsh · hyperd disconnected";
+        const cwd = model.activeSession().terminalCwd();
+        return if (cwd.len > 0) cwd else "zsh · ordered Rust PTY plane";
     }
 
     pub fn terminalUrl(model: *const Model) []const u8 {
@@ -1338,6 +1395,8 @@ pub const Msg = union(enum) {
     agent_providers_refreshed: native_sdk.EffectResponse,
     agent_attention_received: native_sdk.EffectResponse,
     agent_attention_poll: native_sdk.EffectTimer,
+    terminal_metadata_received: native_sdk.EffectResponse,
+    terminal_metadata_poll: native_sdk.EffectTimer,
     choose_codex_agent,
     choose_codex_acp_agent,
     choose_claude_acp_agent,
@@ -1398,7 +1457,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "open_agent_search", "terminal_session_closed", "desktop_workspace_persisted", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "open_agent_search", "terminal_session_closed", "terminal_metadata_received", "terminal_metadata_poll", "desktop_workspace_persisted", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -1421,6 +1480,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .agent_attention_received => |response| applyAgentAttentionResponse(model, response, fx),
         .agent_attention_poll => |timer| {
             if (timer.outcome == .fired) requestAgentAttention(model, fx);
+        },
+        .terminal_metadata_received => |response| applyTerminalMetadataResponse(model, response, fx),
+        .terminal_metadata_poll => |timer| {
+            if (timer.outcome == .fired) requestTerminalMetadata(model, fx);
         },
         .choose_codex_agent => createAgentSession(model, .codex, fx),
         .choose_codex_acp_agent => createAgentSession(model, .codex_acp, fx),
@@ -4093,6 +4156,105 @@ fn requestDesktopWorkspacePersist(model: *Model, fx: *Effects) void {
     model.desktop_workspace_in_flight_revision = model.desktop_workspace_revision;
 }
 
+fn requestTerminalMetadata(model: *Model, fx: *Effects) void {
+    if (!model.desktop_workspace_enabled or model.terminal_metadata_in_flight) return;
+    var storage: [terminal_close_url_capacity]u8 = undefined;
+    const url = writeTerminalMetadataUrl(model, storage[0..]) orelse return;
+    model.terminal_metadata_in_flight = true;
+    fx.fetch(.{
+        .key = terminal_metadata_effect_key,
+        .url = url,
+        .timeout_ms = 2_000,
+        .on_response = Effects.responseMsg(.terminal_metadata_received),
+    });
+}
+
+fn writeTerminalMetadataUrl(model: *const Model, storage: []u8) ?[]const u8 {
+    const prefix = terminal_gateway_origin ++ "/?token=";
+    const base_url = model.terminal_base_url_storage[0..model.terminal_base_url_len];
+    if (!std.mem.startsWith(u8, base_url, prefix)) return null;
+    return std.fmt.bufPrint(
+        storage,
+        terminal_gateway_origin ++ "/terminal/sessions/metadata?token={s}",
+        .{base_url[prefix.len..]},
+    ) catch null;
+}
+
+fn applyTerminalMetadataResponse(
+    model: *Model,
+    response: native_sdk.EffectResponse,
+    fx: *Effects,
+) void {
+    if (response.key != terminal_metadata_effect_key) return;
+    model.terminal_metadata_in_flight = false;
+    defer scheduleTerminalMetadataRefresh(model, fx);
+    if (response.outcome != .ok or response.status != 200 or response.truncated or
+        response.body.len == 0 or response.body.len > max_terminal_metadata_bytes) return;
+    const parsed = std.json.parseFromSlice(
+        TerminalMetadataResponseWire,
+        std.heap.page_allocator,
+        response.body,
+        .{ .ignore_unknown_fields = false },
+    ) catch return;
+    defer parsed.deinit();
+    if (parsed.value.version != 1 or parsed.value.sessions.len > max_sessions) return;
+
+    var seen: [256]bool = @splat(false);
+    for (parsed.value.sessions) |incoming| {
+        if (incoming.session_id == 0 or incoming.session_id > std.math.maxInt(u8)) return;
+        const session_id: u8 = @intCast(incoming.session_id);
+        if (seen[session_id] or incoming.revision == 0 or
+            !validTerminalMetadataText(incoming.title, max_terminal_title_bytes, false) or
+            !validTerminalMetadataText(incoming.cwd, max_terminal_cwd_bytes, true)) return;
+        seen[session_id] = true;
+        const session = findSession(model, session_id) orelse continue;
+        if (session.mode != .terminal) return;
+    }
+    for (parsed.value.sessions) |incoming| {
+        const session_id: u8 = @intCast(incoming.session_id);
+        const session = findSession(model, session_id) orelse continue;
+        if (incoming.revision <= session.terminal_metadata_revision) continue;
+        session.terminal_metadata_revision = incoming.revision;
+        copyTerminalMetadataText(
+            session.terminal_title_storage[0..],
+            &session.terminal_title_len,
+            incoming.title,
+        );
+        copyTerminalMetadataText(
+            session.terminal_cwd_storage[0..],
+            &session.terminal_cwd_len,
+            incoming.cwd,
+        );
+    }
+}
+
+fn validTerminalMetadataText(value: ?[]const u8, maximum: usize, absolute_path: bool) bool {
+    const text = value orelse return true;
+    if (text.len == 0 or text.len > maximum or (absolute_path and text[0] != '/')) return false;
+    for (text) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    return std.unicode.utf8ValidateSlice(text);
+}
+
+fn copyTerminalMetadataText(storage: []u8, length: *usize, value: ?[]const u8) void {
+    const text = value orelse {
+        length.* = 0;
+        return;
+    };
+    @memcpy(storage[0..text.len], text);
+    length.* = text.len;
+}
+
+fn scheduleTerminalMetadataRefresh(model: *const Model, fx: *Effects) void {
+    if (!model.desktop_workspace_enabled) return;
+    fx.startTimer(.{
+        .key = terminal_metadata_poll_timer_key,
+        .interval_ms = 1_000,
+        .on_fire = Effects.timerMsg(.terminal_metadata_poll),
+    });
+}
+
 fn applyDesktopWorkspacePersisted(
     model: *Model,
     response: native_sdk.EffectResponse,
@@ -5401,6 +5563,7 @@ pub fn trustedBugCapsuleUrl(url: []const u8, agent_url: []const u8) bool {
 /// covers both an already-running Agent and a crash between tab creation and
 /// the first ready response.
 pub fn initEffects(model: *Model, fx: *Effects) void {
+    requestTerminalMetadata(model, fx);
     if (!model.desktop_workspace_restored) return;
     for (model.openSessions()) |session| {
         if (session.mode == .agent and model.agentProviderReady(session.agent_provider)) {

@@ -76,6 +76,15 @@ verify_boot=$(agent-browser --session "$verify_session" eval \
   'document.querySelector(".xterm-helper-textarea") === document.activeElement && document.querySelector("#terminal")?.dataset.renderer === "webgl" && !document.querySelector(".xterm-accessibility-tree") ? "OK" : "FAIL"')
 grep -q '"OK"' <<<"$verify_boot"
 
+# Standard OSC title and cwd sequences stay display-only, but must cross the
+# real xterm -> authenticated WebSocket -> Rust projection path.
+agent-browser --session "$verify_session" keyboard type \
+  "printf '\\033]0;Browser Metadata\\007\\033]7;file:///tmp/browser-project\\007'; sleep 2" >/dev/null
+agent-browser --session "$verify_session" press Enter >/dev/null
+verify_metadata=$(agent-browser --session "$verify_session" eval \
+  'new Promise((resolve,reject)=>{const started=performance.now();let last=null;const poll=setInterval(async()=>{try{const value=await fetch(`/terminal/sessions/metadata${location.search}`).then(response=>response.json());last=value;const session=value.sessions?.find(item=>item.session_id===1);if(session?.title==="Browser Metadata"&&session?.cwd==="/tmp/browser-project"){clearInterval(poll);resolve("OK");return}}catch(error){last=String(error)}if(performance.now()-started>3000){clearInterval(poll);reject(new Error(`terminal metadata did not reach Rust: ${JSON.stringify(last)}`))}},50)})')
+grep -q '"OK"' <<<"$verify_metadata"
+
 agent-browser --session "$verify_session" keyboard type "printf '__HYPER_TERM_BROWSER_INPUT__\\n'" >/dev/null
 agent-browser --session "$verify_session" press Enter >/dev/null
 agent-browser --session "$verify_session" wait 200 >/dev/null

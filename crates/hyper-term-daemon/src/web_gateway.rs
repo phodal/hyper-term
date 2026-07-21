@@ -22,9 +22,10 @@ use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
 use hyper_term_core::{TerminalEvent, TerminalReplay, TerminalSubscription};
 use hyper_term_protocol::{
-    ClientId, InputLeaseId, TERMINAL_WEB_PROTOCOL_VERSION, TerminalAttachmentId, TerminalId,
-    TerminalInputFrame, TerminalSize, TerminalWebBinaryFrame, TerminalWebClientControl,
-    TerminalWebServerControl, decode_terminal_web_binary, encode_terminal_web_binary,
+    ClientId, InputLeaseId, MAX_TERMINAL_CWD_BYTES, MAX_TERMINAL_TITLE_BYTES,
+    TERMINAL_WEB_PROTOCOL_VERSION, TerminalAttachmentId, TerminalId, TerminalInputFrame,
+    TerminalSize, TerminalWebBinaryFrame, TerminalWebClientControl, TerminalWebServerControl,
+    decode_terminal_web_binary, encode_terminal_web_binary,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -40,6 +41,7 @@ const OUTBOUND_QUEUE_MESSAGES: usize = 256;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const SUBSCRIPTION_POLL: Duration = Duration::from_millis(50);
 const DESKTOP_WORKSPACE_VERSION: u16 = 1;
+const TERMINAL_METADATA_VERSION: u16 = 1;
 const MAX_DESKTOP_WORKSPACE_BYTES: usize = 4 * 1024;
 const MAX_DESKTOP_SESSIONS: usize = 8;
 pub const DESKTOP_WORKSPACE_STATE_FILE: &str = "desktop-workspace.json";
@@ -332,7 +334,7 @@ struct GatewayRuntime {
     desktop_workspace: DesktopWorkspaceStore,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Attachment {
     session_id: u16,
     terminal_id: TerminalId,
@@ -340,6 +342,23 @@ struct Attachment {
     next_input_sequence: u64,
     resize_generation: u64,
     active_connection: Option<Uuid>,
+    metadata_revision: u64,
+    title: Option<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalMetadataSnapshot {
+    version: u16,
+    sessions: Vec<TerminalSessionMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalSessionMetadata {
+    session_id: u16,
+    revision: u64,
+    title: Option<String>,
+    cwd: Option<String>,
 }
 
 struct ActiveAttachment {
@@ -350,6 +369,7 @@ struct ActiveAttachment {
     lease_id: InputLeaseId,
     next_input_sequence: u64,
     resize_generation: u64,
+    metadata_revision: u64,
 }
 
 #[derive(Debug, Error)]
@@ -368,6 +388,8 @@ enum ConnectionError {
     InputSequence { expected: u64, actual: u64 },
     #[error("terminal resize generation {actual} does not match expected {expected}")]
     ResizeGeneration { expected: u64, actual: u64 },
+    #[error("terminal metadata is invalid")]
+    InvalidMetadata,
     #[error("terminal WebSocket message is invalid: {0}")]
     InvalidMessage(String),
     #[error("terminal attachment state is unavailable")]
@@ -386,6 +408,7 @@ impl ConnectionError {
             Self::InvalidSessionId(_) => "session_id",
             Self::InputSequence { .. } => "input_sequence",
             Self::ResizeGeneration { .. } => "resize_generation",
+            Self::InvalidMetadata => "metadata",
             Self::InvalidMessage(_) => "invalid_message",
             Self::AttachmentState => "attachment_state",
             Self::Daemon(_) => "daemon",
@@ -461,6 +484,7 @@ pub async fn spawn_terminal_gateway(
     let router = Router::new()
         .route("/terminal", get(upgrade_terminal))
         .route("/terminal/session/close", post(close_terminal_session))
+        .route("/terminal/sessions/metadata", get(get_terminal_metadata))
         .route(
             "/desktop/workspace",
             get(get_desktop_workspace).post(update_desktop_workspace),
@@ -481,6 +505,49 @@ pub async fn spawn_terminal_gateway(
         shutdown: Some(shutdown_sender),
         task: Some(task),
     })
+}
+
+async fn get_terminal_metadata(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<AuthQuery>,
+) -> Response {
+    if !authorized(&runtime, query.token.as_deref()) {
+        return status_response(
+            StatusCode::UNAUTHORIZED,
+            "terminal gateway token is invalid",
+        );
+    }
+    let Ok(attachments) = runtime.attachments.lock() else {
+        return status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "terminal metadata is unavailable",
+        );
+    };
+    let mut sessions = attachments
+        .values()
+        .filter(|attachment| attachment.metadata_revision > 0)
+        .map(|attachment| TerminalSessionMetadata {
+            session_id: attachment.session_id,
+            revision: attachment.metadata_revision,
+            title: attachment.title.clone(),
+            cwd: attachment.cwd.clone(),
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_unstable_by_key(|session| session.session_id);
+    let Ok(body) = serde_json::to_vec(&TerminalMetadataSnapshot {
+        version: TERMINAL_METADATA_VERSION,
+        sessions,
+    }) else {
+        return status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "terminal metadata is unavailable",
+        );
+    };
+    secure_response(
+        StatusCode::OK,
+        "application/json; charset=utf-8",
+        Body::from(body),
+    )
 }
 
 async fn get_desktop_workspace(
@@ -692,6 +759,7 @@ async fn terminal_connection(mut socket: WebSocket, runtime: GatewayRuntime) {
         terminal_id: active.terminal_id,
         next_input_sequence: active.next_input_sequence,
         resize_generation: active.resize_generation,
+        metadata_revision: active.metadata_revision,
     };
     if send_control(&mut socket, ready).await.is_err()
         || send_replay(&mut socket, &subscription).await.is_err()
@@ -798,6 +866,7 @@ impl GatewayRuntime {
                 lease_id,
                 next_input_sequence: attachment.next_input_sequence,
                 resize_generation: attachment.resize_generation,
+                metadata_revision: attachment.metadata_revision,
             });
         }
 
@@ -820,8 +889,11 @@ impl GatewayRuntime {
             next_input_sequence: 1,
             resize_generation: 0,
             active_connection: Some(connection_id),
+            metadata_revision: 0,
+            title: None,
+            cwd: None,
         };
-        attachments.insert(attachment_id, attachment);
+        attachments.insert(attachment_id, attachment.clone());
         Ok(ActiveAttachment {
             attachment_id,
             connection_id,
@@ -830,7 +902,32 @@ impl GatewayRuntime {
             lease_id,
             next_input_sequence: attachment.next_input_sequence,
             resize_generation: attachment.resize_generation,
+            metadata_revision: attachment.metadata_revision,
         })
+    }
+
+    fn accept_metadata(
+        &self,
+        active: &ActiveAttachment,
+        revision: u64,
+        title: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<(), ConnectionError> {
+        if revision == 0
+            || !valid_display_metadata(title.as_deref(), MAX_TERMINAL_TITLE_BYTES, false)
+            || !valid_display_metadata(cwd.as_deref(), MAX_TERMINAL_CWD_BYTES, true)
+        {
+            return Err(ConnectionError::InvalidMetadata);
+        }
+        let mut attachments = lock(&self.attachments)?;
+        let attachment = connected_attachment(&mut attachments, active)?;
+        if revision <= attachment.metadata_revision {
+            return Ok(());
+        }
+        attachment.metadata_revision = revision;
+        attachment.title = title;
+        attachment.cwd = cwd;
+        Ok(())
     }
 
     fn accept_input(
@@ -1049,6 +1146,11 @@ async fn read_socket(
                 Ok(TerminalWebClientControl::Resize { generation, size }) => {
                     runtime.accept_resize(active, generation, size)
                 }
+                Ok(TerminalWebClientControl::Metadata {
+                    revision,
+                    title,
+                    cwd,
+                }) => runtime.accept_metadata(active, revision, title, cwd),
                 Ok(TerminalWebClientControl::Close) => {
                     let result = runtime.close_attachment(active);
                     if result.is_ok() {
@@ -1070,6 +1172,14 @@ async fn read_socket(
             return;
         }
     }
+}
+
+fn valid_display_metadata(value: Option<&str>, maximum: usize, absolute_path: bool) -> bool {
+    let Some(value) = value else { return true };
+    !value.is_empty()
+        && value.len() <= maximum
+        && (!absolute_path || value.starts_with('/'))
+        && !value.chars().any(char::is_control)
 }
 
 async fn send_control(
@@ -1234,6 +1344,56 @@ mod tests {
         };
         assert_ne!(active_attachment_id, stale_attachment_id);
         socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&TerminalWebClientControl::Metadata {
+                    revision: 3,
+                    title: Some("cargo test".into()),
+                    cwd: Some("/tmp/hyper-term".into()),
+                })
+                .expect("metadata")
+                .into(),
+            ))
+            .await
+            .expect("send metadata");
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&TerminalWebClientControl::Metadata {
+                    revision: 2,
+                    title: Some("stale title".into()),
+                    cwd: Some("/tmp/stale".into()),
+                })
+                .expect("stale metadata")
+                .into(),
+            ))
+            .await
+            .expect("send stale metadata");
+        assert_eq!(
+            metadata_request(gateway.address(), "wrong-token").await.0,
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        let metadata_body = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (status, body) = metadata_request(gateway.address(), &token).await;
+                assert_eq!(status, StatusCode::OK.as_u16());
+                let value: serde_json::Value =
+                    serde_json::from_slice(&body).expect("metadata JSON");
+                if value["sessions"]
+                    .as_array()
+                    .is_some_and(|sessions| !sessions.is_empty())
+                {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("metadata projection timeout");
+        assert_eq!(metadata_body["version"], 1);
+        assert_eq!(metadata_body["sessions"][0]["session_id"], 7);
+        assert_eq!(metadata_body["sessions"][0]["revision"], 3);
+        assert_eq!(metadata_body["sessions"][0]["title"], "cargo test");
+        assert_eq!(metadata_body["sessions"][0]["cwd"], "/tmp/hyper-term");
+        socket
             .send(ClientMessage::Binary(
                 encode_terminal_web_binary(&TerminalWebBinaryFrame::Input {
                     sequence: next_input_sequence,
@@ -1319,6 +1479,35 @@ mod tests {
             .expect("HTTP status")
             .parse()
             .expect("numeric HTTP status")
+    }
+
+    async fn metadata_request(address: SocketAddr, token: &str) -> (u16, Vec<u8>) {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect terminal metadata HTTP");
+        let request = format!(
+            "GET /terminal/sessions/metadata?token={token} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write metadata request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read metadata response");
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("metadata HTTP response headers");
+        let status = String::from_utf8_lossy(&response[..header_end])
+            .split_whitespace()
+            .nth(1)
+            .expect("metadata HTTP status")
+            .parse()
+            .expect("numeric metadata HTTP status");
+        (status, response[header_end + 4..].to_vec())
     }
 
     async fn assert_websocket_rejected(
@@ -1558,5 +1747,34 @@ mod tests {
         assert!(constant_time_eq(b"0123456789", b"0123456789"));
         assert!(!constant_time_eq(b"0123456788", b"0123456789"));
         assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn terminal_metadata_validation_is_bounded_and_display_only() {
+        assert!(valid_display_metadata(
+            Some("cargo test"),
+            MAX_TERMINAL_TITLE_BYTES,
+            false
+        ));
+        assert!(valid_display_metadata(
+            Some("/tmp/project"),
+            MAX_TERMINAL_CWD_BYTES,
+            true
+        ));
+        assert!(!valid_display_metadata(
+            Some("relative"),
+            MAX_TERMINAL_CWD_BYTES,
+            true
+        ));
+        assert!(!valid_display_metadata(
+            Some("bad\u{7}title"),
+            MAX_TERMINAL_TITLE_BYTES,
+            false
+        ));
+        assert!(!valid_display_metadata(
+            Some(&"x".repeat(MAX_TERMINAL_TITLE_BYTES + 1)),
+            MAX_TERMINAL_TITLE_BYTES,
+            false,
+        ));
     }
 }

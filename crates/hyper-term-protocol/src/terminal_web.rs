@@ -7,8 +7,10 @@ use crate::{TerminalAttachmentId, TerminalId, TerminalSize};
 
 const MAGIC: [u8; 4] = *b"HTWS";
 const HEADER_LEN: usize = 36;
-pub const TERMINAL_WEB_PROTOCOL_VERSION: u16 = 2;
+pub const TERMINAL_WEB_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_TERMINAL_WEB_PAYLOAD_BYTES: usize = 256 * 1024;
+pub const MAX_TERMINAL_TITLE_BYTES: usize = 256;
+pub const MAX_TERMINAL_CWD_BYTES: usize = 512;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -25,6 +27,14 @@ pub enum TerminalWebClientControl {
         generation: u64,
         size: TerminalSize,
     },
+    /// Untrusted, display-only metadata projected from terminal escape
+    /// sequences. The gateway never uses these values to open files, choose a
+    /// process directory, or grant authority.
+    Metadata {
+        revision: u64,
+        title: Option<String>,
+        cwd: Option<String>,
+    },
     Close,
 }
 
@@ -37,6 +47,7 @@ pub enum TerminalWebServerControl {
         terminal_id: TerminalId,
         next_input_sequence: u64,
         resize_generation: u64,
+        metadata_revision: u64,
     },
     Exited {
         exit_code: Option<u32>,
@@ -268,7 +279,7 @@ mod tests {
 
         assert_eq!(
             hex,
-            "4854575300020100000000000000002a0000000000000000000000000000000000000003001bff"
+            "4854575300030100000000000000002a0000000000000000000000000000000000000003001bff"
         );
     }
 
@@ -307,6 +318,22 @@ mod tests {
         assert!(value.get("program").is_none());
         assert!(value.get("args").is_none());
         assert!(value.get("env").is_none());
+    }
+
+    #[test]
+    fn terminal_metadata_is_explicitly_display_only() {
+        let metadata = TerminalWebClientControl::Metadata {
+            revision: 4,
+            title: Some("hyper-term — cargo test".into()),
+            cwd: Some("/Users/example/ai/hyper-term".into()),
+        };
+        let value = serde_json::to_value(metadata).expect("serialize");
+
+        assert_eq!(value["type"], "metadata");
+        assert_eq!(value["revision"], 4);
+        assert!(value.get("program").is_none());
+        assert!(value.get("env").is_none());
+        assert!(value.get("execute").is_none());
     }
 
     #[test]

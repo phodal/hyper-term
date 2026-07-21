@@ -147,7 +147,7 @@ smoke_start_supervisor
     'canvas_frame_budget_ok=true' \
     'role=button name="New Terminal tab"' \
     'role=button name="New Agent tab"' \
-    'role=button name="Close zsh 1"' \
+    'role=button name="Close .* 1"' \
     'hyper-term-terminal-view.*focused=true.*url="http://127.0.0.1:47437/.*tab=1"'
   native automate assert --absent \
     'view @w1/hyper-term-genui-view' \
@@ -175,8 +175,8 @@ PY
 
   native automate widget-key hyper-term-canvas cmd+t
   native automate assert \
-    'role=button name="Close zsh 1"' \
-    'role=button name="Close zsh 2"' \
+    'role=button name="Close .* 1"' \
+    'role=button name="Close .* 2"' \
     'hyper-term-terminal-view.*focused=true.*tab=2"'
 
   native automate widget-key hyper-term-canvas cmd+w
@@ -185,7 +185,7 @@ PY
     'error event=' \
     'dispatch_errors=[1-9]'
   native automate assert \
-    'role=button name="Close zsh 1"' \
+    'role=button name="Close .* 1"' \
     'hyper-term-terminal-view.*tab=1"'
 
   native automate screenshot hyper-term-canvas
@@ -239,8 +239,8 @@ PY
   native automate widget-key hyper-term-canvas cmd+t
   native automate shortcut hyper-term.new-codex-agent
   native automate assert \
-    'role=button name="Close zsh 1"' \
-    'role=button name="Close zsh 3"' \
+    'role=button name="Close .* 1"' \
+    'role=button name="Close .* 3"' \
     'role=button name="Close Codex 4"' \
     'role=group name="Agent conversation"' \
     'role=textbox name="Agent prompt".*enabled=true' \
@@ -310,26 +310,26 @@ PY
     "publisher_pid=$smoke_restarted_renderer_pid" \
     'ready=true' \
     'gpu_nonblank=true' \
-    'role=button name="Close zsh 1"' \
-    'role=button name="Close zsh 3"' \
+    'role=button name="Close .* 1"' \
+    'role=button name="Close .* 3"' \
     'role=button name="Close Codex 4"' \
     'role=group name="Agent conversation"' \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
-  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name="zsh 3"')
+  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name=".* tab 3"')
   native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
   native automate assert \
-    'role=button name="zsh 3".*state=.*selected' \
+    'role=button name=".* tab 3".*state=.*selected' \
     'hyper-term-terminal-view.*focused=true.*tab=3"'
   smoke_terminal_url_after_restart=$(smoke_terminal_url)
   if [[ "${smoke_terminal_url_after_restart%&tab=*}" != "${smoke_terminal_url_before_restart%&tab=*}" ]]; then
     echo "renderer restart replaced the Rust terminal gateway identity" >&2
     exit 1
   fi
-  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Codex 4"')
+  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Codex tab 4.*"')
   native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
   native automate assert \
-    'role=button name="Codex 4".*state=.*selected' \
+    'role=button name="Codex tab 4.*".*state=.*selected' \
     'role=group name="Agent conversation"' \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
@@ -514,16 +514,16 @@ PY
   cp "$smoke_screenshot" "$smoke_agent_screenshot"
   cp "$smoke_terminal_screenshot" "$smoke_screenshot"
 
-  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name="zsh 3"')
+  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name=".* tab 3"')
   native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
   native automate assert \
-    'role=button name="zsh 3".*state=.*selected' \
+    'role=button name=".* tab 3".*state=.*selected' \
     'hyper-term-terminal-view.*tab=3"'
   smoke_terminal_url_before_application_restart=$(smoke_terminal_url)
-  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Claude ACP 6"')
+  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Claude ACP tab 6.*"')
   native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
   native automate assert \
-    'role=button name="Claude ACP 6".*state=.*selected' \
+    'role=button name="Claude ACP tab 6.*".*state=.*selected' \
     'role=group name="Agent conversation"'
   python3 \
     - "$smoke_root/state/desktop-workspace.json" \
@@ -631,11 +631,11 @@ PY
     "publisher_pid=$smoke_renderer_after_application_restart" \
     'ready=true' \
     'gpu_nonblank=true' \
-    'role=button name="Close zsh 1"' \
-    'role=button name="Close zsh 3"' \
+    'role=button name="Close .* 1"' \
+    'role=button name="Close .* 3"' \
     'role=button name="Close Codex ACP 5"' \
     'role=button name="Close Claude ACP 6"' \
-    'role=button name="Claude ACP 6".*state=.*selected' \
+    'role=button name="Claude ACP tab 6.*".*state=.*selected' \
     'role=group name="Agent conversation"' \
     'role=group name="Recovered Agent history"' \
     'History restored' \
@@ -648,20 +648,20 @@ PY
   smoke_restored_agent_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-agent-restored.png
   cp "$smoke_screenshot" "$smoke_restored_agent_screenshot"
 
-  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name="zsh 3"')
+  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name=".* tab 3"')
   native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
   native automate assert \
-    'role=button name="zsh 3".*state=.*selected' \
+    'role=button name=".* tab 3".*state=.*selected' \
     'hyper-term-terminal-view.*tab=3"'
   smoke_terminal_url_after_application_restart=$(smoke_terminal_url)
   if [[ "$smoke_terminal_url_after_application_restart" == "$smoke_terminal_url_before_application_restart" ]]; then
     echo "application restart reused the previous terminal gateway token" >&2
     exit 1
   fi
-  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Claude ACP 6"')
+  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Claude ACP tab 6.*"')
   native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
   native automate assert \
-    'role=button name="Claude ACP 6".*state=.*selected' \
+    'role=button name="Claude ACP tab 6.*".*state=.*selected' \
     'role=group name="Agent conversation"' \
     'role=group name="Recovered Agent history"' \
     'Run the bounded terminal' \
