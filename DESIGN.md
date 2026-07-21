@@ -255,7 +255,9 @@ shape language must remain engineered and native, not bubbly or card-heavy.
   destructive authorization stays red.
 - Attention uses progressive disclosure: passive status, badge, native
   notification, then urgent system attention. Repeated animation is never the
-  sole signal.
+  sole signal. Native notifications are background-only, deduplicated by the
+  Rust-projected Agent state, and limited to approval, review-ready, and failure
+  transitions; Terminal output and provider prose are never notification input.
 - Generated React UI is isolated in a bounded WebView Block with explicit
   origin, capability, focus, and lifetime leases.
 

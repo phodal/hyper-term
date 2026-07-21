@@ -86,6 +86,7 @@ pub const titlebar_natural_height: f32 = 44;
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
     native_sdk.security.permission_network,
+    native_sdk.security.permission_notifications,
     native_sdk.security.permission_view,
 };
 const shell_views = [_]native_sdk.ShellView{
@@ -171,6 +172,38 @@ pub const AgentTurnStatus = enum {
     completed,
     waiting_approval,
     failed,
+};
+
+/// A bounded, semantic request for the native shell to get the user's
+/// attention. The source fields are Rust-authenticated Agent projection
+/// state; provider prose and WebView content never enter this contract.
+pub const AgentAttention = struct {
+    kind: Kind,
+    session_id: u8,
+    document_revision: u64,
+    stream_sequence: u64,
+
+    pub const Kind = enum {
+        approval,
+        review_ready,
+        failed,
+    };
+
+    pub fn title(attention: AgentAttention) []const u8 {
+        return switch (attention.kind) {
+            .approval => "Agent needs approval",
+            .review_ready => "Agent finished",
+            .failed => "Agent needs attention",
+        };
+    }
+
+    pub fn body(attention: AgentAttention) []const u8 {
+        return switch (attention.kind) {
+            .approval => "Review the requested action in Hyper Term.",
+            .review_ready => "The result is ready to review in Hyper Term.",
+            .failed => "Open Hyper Term to review the failed Agent turn.",
+        };
+    }
 };
 
 pub const AgentMessageRole = enum { user, agent, system, thought };
@@ -1113,6 +1146,26 @@ pub const Model = struct {
         return model.genui_workbench_url_storage[0..model.genui_workbench_url_len];
     }
 };
+
+/// Derive desktop attention from the currently authenticated Rust projection.
+/// Ordinary terminals, stale projections, and non-terminal Agent states never
+/// produce a system notification.
+pub fn agentAttention(model: *const Model) ?AgentAttention {
+    const session = model.activeSession();
+    if (session.mode != .agent or model.agent_projection_session_id != session.id) return null;
+    const kind: AgentAttention.Kind = switch (model.agent_turn_status) {
+        .waiting_approval => .approval,
+        .completed => .review_ready,
+        .failed => .failed,
+        else => return null,
+    };
+    return .{
+        .kind = kind,
+        .session_id = session.id,
+        .document_revision = model.agent_document_revision,
+        .stream_sequence = model.agent_stream_sequence,
+    };
+}
 
 pub const Msg = union(enum) {
     choose_terminal,
@@ -4737,6 +4790,8 @@ pub const DeferredWebViewApp = struct {
     primary_window_id: native_sdk.WindowId = 0,
     mount_timer_armed: bool = false,
     mounting_enabled: bool = false,
+    app_active: bool = true,
+    acknowledged_attention: ?AgentAttention = null,
 
     pub fn init(app_state: *HyperTermApp) DeferredWebViewApp {
         return .{
@@ -4773,6 +4828,11 @@ pub const DeferredWebViewApp = struct {
         try self.inner.event(runtime, event_value);
 
         switch (event_value) {
+            .lifecycle => |lifecycle| switch (lifecycle) {
+                .activate => self.app_active = true,
+                .deactivate => self.app_active = false,
+                else => {},
+            },
             .gpu_surface_frame => |frame| {
                 if (!std.mem.eql(u8, frame.label, canvas_label)) return;
                 self.primary_window_id = frame.window_id;
@@ -4790,6 +4850,8 @@ pub const DeferredWebViewApp = struct {
             else => {},
         }
 
+        self.projectAttention(runtime);
+
         if (!self.mounting_enabled or self.primary_window_id == 0) return;
         try self.mountTerminal(runtime);
         if (self.model.isCapsule() or self.model.hasAgentEditor()) {
@@ -4805,6 +4867,35 @@ pub const DeferredWebViewApp = struct {
     fn replay(context: *anyopaque, control: native_sdk.runtime.ReplayControl) anyerror!void {
         const self: *DeferredWebViewApp = @ptrCast(@alignCast(context));
         try self.inner.replayControl(control);
+    }
+
+    /// Foreground attention is acknowledged by the visible Agent surface.
+    /// Background attention is emitted once per semantic transition. Returning
+    /// to a non-alert state clears the fingerprint so a later turn with the
+    /// same document revision can still notify.
+    fn projectAttention(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) void {
+        const attention = agentAttention(self.model);
+        if (self.app_active) {
+            self.acknowledged_attention = attention;
+            return;
+        }
+        const next = attention orelse {
+            self.acknowledged_attention = null;
+            return;
+        };
+        if (self.acknowledged_attention) |previous| {
+            if (std.meta.eql(previous, next)) return;
+        }
+        runtime.showNotification(.{
+            .title = next.title(),
+            .subtitle = self.model.activeSession().agent_provider.label(),
+            .body = next.body(),
+        }) catch |err| {
+            std.log.warn("native Agent attention notification failed: {s}", .{@errorName(err)});
+        };
+        // A platform failure must not become a notification storm on every
+        // stream frame; the UI remains the durable source of the alert.
+        self.acknowledged_attention = next;
     }
 
     fn mountTerminal(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) !void {

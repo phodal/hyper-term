@@ -6,8 +6,8 @@
     .version = "0.1.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
-    .permissions = .{ "view", "command", "network" },
-    .capabilities = .{ "native_views", "gpu_surfaces", "webview", "menus", "shortcuts", "network" },
+    .permissions = .{ "view", "command", "network", "notifications" },
+    .capabilities = .{ "native_views", "gpu_surfaces", "webview", "menus", "shortcuts", "network", "notifications" },
     .shortcuts = .{
         .{ .id = "hyper-term.new-terminal", .key = "t", .modifiers = .{"primary"} },
         .{ .id = "hyper-term.new-agent", .key = "n", .modifiers = .{ "primary", "shift" } },

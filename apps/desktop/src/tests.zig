@@ -141,6 +141,79 @@ test "desktop defers WebViews until native glass and mounts GenUI on demand" {
     try testing.expectEqualStrings(main.genui_view_label, mounted_views[2].label);
 }
 
+test "desktop attention is background-only semantic and deduplicated" {
+    const notification_permissions = [_][]const u8{
+        native_sdk.security.permission_notifications,
+    };
+    const app_state = try main.HyperTermApp.create(std.heap.page_allocator, .{
+        .name = "hyper-term-attention-test",
+        .scene = main.shell_scene,
+        .canvas_label = main.canvas_label,
+        .update_fx = main.update,
+        .tokens_fn = main.hyperTermTokens,
+        .view = main.rootView,
+        .web_panes = main.desktopPanes,
+    });
+    defer app_state.destroy();
+
+    var deferred = main.DeferredWebViewApp.init(app_state);
+    const app = deferred.app();
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{
+        .size = geometry.SizeF.init(main.window_width, main.window_height),
+    });
+    defer harness.destroy(testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.permissions = &notification_permissions;
+    try harness.start(app);
+
+    // A terminal never becomes an Agent notification source.
+    app_state.model.agent_turn_status = .failed;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try testing.expect(main.agentAttention(&app_state.model) == null);
+    try testing.expectEqual(@as(usize, 0), harness.null_platform.notificationCount());
+
+    app_state.model.session_slots[0].mode = .agent;
+    app_state.model.session_slots[0].agent_provider = .codex_acp;
+    app_state.model.agent_projection_session_id = 1;
+    app_state.model.agent_turn_status = .running;
+    app_state.model.agent_document_revision = 4;
+    app_state.model.agent_stream_sequence = 4;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try harness.runtime.dispatchPlatformEvent(app, .app_deactivated);
+    try testing.expectEqual(@as(usize, 0), harness.null_platform.notificationCount());
+
+    // The Rust-projected completion is announced once while backgrounded.
+    app_state.model.agent_turn_status = .completed;
+    app_state.model.agent_document_revision = 5;
+    app_state.model.agent_stream_sequence = 5;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try testing.expectEqual(@as(usize, 1), harness.null_platform.notificationCount());
+    try testing.expectEqualStrings("Agent finished", harness.null_platform.lastNotificationTitle());
+    try testing.expectEqualStrings("Codex ACP", harness.null_platform.lastNotificationSubtitle());
+    try testing.expectEqualStrings(
+        "The result is ready to review in Hyper Term.",
+        harness.null_platform.lastNotificationBody(),
+    );
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try testing.expectEqual(@as(usize, 1), harness.null_platform.notificationCount());
+
+    // A new semantic transition can notify even when the document revision
+    // does not move (for example, a second turn that only returns prose).
+    app_state.model.agent_turn_status = .running;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    app_state.model.agent_turn_status = .waiting_approval;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try testing.expectEqual(@as(usize, 2), harness.null_platform.notificationCount());
+    try testing.expectEqualStrings("Agent needs approval", harness.null_platform.lastNotificationTitle());
+
+    // Once foregrounded, the visible Agent surface acknowledges attention.
+    try harness.runtime.dispatchPlatformEvent(app, .app_activated);
+    app_state.model.agent_turn_status = .failed;
+    app_state.model.agent_document_revision = 6;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try testing.expectEqual(@as(usize, 2), harness.null_platform.notificationCount());
+}
+
 test "Native typography uses the registered broad-coverage face when available" {
     try testing.expectEqualStrings(
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
