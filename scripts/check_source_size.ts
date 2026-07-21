@@ -20,7 +20,7 @@ export const defaultSourceLineLimit = 2_000;
 export const legacySourceLineLimits: Readonly<Record<string, number>> = {
   "apps/desktop/src/main.zig": 5_470,
   "apps/desktop/src/tests.zig": 2_644,
-  "crates/hyper-term-daemon/src/agent_gateway.rs": 9_873,
+  "crates/hyper-term-daemon/src/agent_gateway.rs": 9_271,
   "crates/hyper-term-daemon/src/desktop.rs": 2_351,
   "crates/hyper-term-daemon/src/lib.rs": 3_951,
   "crates/hyper-term-daemon/src/workspace_apply.rs": 2_924,
