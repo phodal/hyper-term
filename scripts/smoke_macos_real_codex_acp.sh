@@ -10,6 +10,7 @@ real_renderer=${2:-"$real_repo_root/apps/desktop/zig-out/bin/hyper-term"}
 real_expected=${HYPER_TERM_REAL_ACP_EXPECTED_TEXT:-HYPER_TERM_REAL_DESKTOP_ACP_OK}
 real_artifact_dir=${HYPER_TERM_REAL_ACP_ARTIFACT_DIR:-}
 real_genui=${HYPER_TERM_REAL_ACP_GENUI:-0}
+real_hostile=${HYPER_TERM_REAL_ACP_HOSTILE:-0}
 real_provider=${HYPER_TERM_REAL_ACP_PROVIDER:-codex}
 
 if [[ "$real_app" != /* ]]; then
@@ -24,6 +25,14 @@ if [[ ! "$real_expected" =~ ^[A-Za-z0-9_:-]{1,64}$ ]]; then
 fi
 if [[ "$real_genui" != 0 && "$real_genui" != 1 ]]; then
   echo "HYPER_TERM_REAL_ACP_GENUI must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$real_hostile" != 0 && "$real_hostile" != 1 ]]; then
+  echo "HYPER_TERM_REAL_ACP_HOSTILE must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$real_hostile" == 1 && "$real_genui" != 1 ]]; then
+  echo "HYPER_TERM_REAL_ACP_HOSTILE requires HYPER_TERM_REAL_ACP_GENUI=1" >&2
   exit 1
 fi
 case "$real_provider" in
@@ -195,7 +204,10 @@ real_pid=$!
     echo "real $real_provider_label composer widget is unavailable" >&2
     exit 1
   fi
-  if [[ "$real_genui" == 1 ]]; then
+  if [[ "$real_hostile" == 1 ]]; then
+    real_source='import React, { useEffect } from "react"; import { traceCheckpoint } from "@hyper/runtime"; export default function App(){ useEffect(() => { const host = globalThis as typeof globalThis & { zero?: unknown; webkit?: { messageHandlers?: unknown } }; const denied = host.zero === undefined && !host.webkit?.messageHandlers; traceCheckpoint(denied ? "security.native_denied" : "security.native_exposed", { denied }); }, []); return React.createElement("main", null, "Native bridge isolation probe"); }'
+    real_prompt="Use hyper_term.genui.compile exactly once to compile this exact source with entry App.tsx: $real_source Do not run shell commands or modify workspace files. After the tool succeeds, reply exactly $real_expected."
+  elif [[ "$real_genui" == 1 ]]; then
     real_prompt="Use hyper_term.genui.compile exactly once to compile this source with entry App.tsx: export default function App(){ return <main data-hyper-term=\"real-mcp\">$real_expected</main>; }. Do not run shell commands or modify workspace files. After the tool succeeds, reply exactly $real_expected."
   else
     real_prompt="Reply with exactly $real_expected. Do not use tools or modify files."
@@ -256,17 +268,19 @@ real_pid=$!
     python3 - \
       .zig-cache/native-sdk-automation/snapshot.txt \
       "$real_expected" \
+      "$real_hostile" \
       "$real_root/artifact-editor-e2e.json" <<'PY'
 import html
 import json
 import pathlib
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-snapshot_path, expected, evidence_path = sys.argv[1:]
+snapshot_path, expected, hostile, evidence_path = sys.argv[1:]
 snapshot = pathlib.Path(snapshot_path).read_text()
 match = re.search(r'hyper-term-genui-view.*url="([^"]+)"', snapshot)
 if match is None:
@@ -311,6 +325,7 @@ def read_json(path, timeout=10):
 
 source = read_json(f"/agent/artifact/{artifact_path}/source")
 files = source.get("files")
+source_marker = "security.native_denied" if hostile == "1" else expected
 if (
     source.get("artifact_id") != artifact_id
     or not isinstance(source.get("source_revision"), int)
@@ -318,7 +333,7 @@ if (
     or not isinstance(files, dict)
     or not files
     or source.get("entrypoint") not in files
-    or expected not in "\n".join(files.values())
+    or source_marker not in "\n".join(files.values())
 ):
     raise SystemExit("Rust artifact source does not match the accepted ACP output")
 
@@ -360,6 +375,21 @@ if (
 ):
     raise SystemExit("Rust-managed Deno LSP response does not match the editor context")
 
+native_preview_denied = None
+if hostile == "1":
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        runtime_trace = read_json(f"/agent/artifact/{artifact_path}/runtime-trace")
+        names = [event.get("name") for event in runtime_trace.get("events", [])]
+        if "security.native_exposed" in names:
+            raise SystemExit("isolated Artifact preview received the Native bridge")
+        if "security.native_denied" in names:
+            native_preview_denied = True
+            break
+        time.sleep(0.1)
+    if native_preview_denied is not True:
+        raise SystemExit("isolated Artifact preview did not journal Native bridge denial")
+
 try:
     urllib.request.urlopen(
         f"{origin}/agent/artifact/{artifact_path}/source"
@@ -382,12 +412,15 @@ evidence = {
     "lsp_document_version": lsp["document_version"],
     "lsp_diagnostic_count": len(lsp["diagnostics"]),
     "workbench_asset_count": len(asset_paths),
+    "native_preview_denied": native_preview_denied,
 }
 pathlib.Path(evidence_path).write_text(json.dumps(evidence, indent=2) + "\n")
 print("Native ACP artifact editor: opened on demand")
 print("artifact Workbench: index and built assets returned HTTP 200")
 print("Rust source/checkpoint: bound to the accepted ACP artifact")
 print("Rust-managed Deno LSP: diagnostics response matched editor context")
+if native_preview_denied:
+    print("Native bridge: denied inside the isolated Artifact iframe and journaled by Rust")
 PY
   fi
   native automate screenshot hyper-term-canvas

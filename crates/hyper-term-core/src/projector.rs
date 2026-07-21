@@ -517,20 +517,20 @@ impl BlockProjector {
         })
     }
 
-    /// Returns the newest operation that still needs a human decision.
+    /// Returns the newest rendered approval that still needs a human decision.
     ///
     /// Brokered MCP tools create their operation directly through the Rust
     /// authority, so an Agent driver does not necessarily retain a matching
-    /// pending effect. The projector remains the task-scoped source of truth
-    /// for that approval without requiring a full document clone on every
-    /// low-latency Agent stream refresh.
+    /// pending effect. WaitingHuman is recorded before PermissionRequested, so
+    /// the approval block is the task-scoped source of truth for what the UI
+    /// can actually render and decide.
     pub fn latest_waiting_operation_id(&self) -> Option<OperationId> {
         self.blocks
             .values()
             .filter_map(|block| match &block.payload {
-                BlockPayload::Operation {
+                BlockPayload::Approval {
                     operation_id,
-                    state: OperationState::WaitingHuman,
+                    decision: None,
                     ..
                 } => Some((block.document_revision, *operation_id)),
                 _ => None,
@@ -917,6 +917,56 @@ mod tests {
                 ..
             } if *id == operation_id && options.contains(&PermissionDecision::AllowOnce)
         )));
+    }
+
+    #[test]
+    fn waiting_operation_is_exposed_only_after_its_approval_is_renderable() {
+        let task_id = TaskId::new();
+        let operation_id = OperationId::new();
+        let proposed = event(
+            1,
+            task_id,
+            Some(operation_id),
+            DomainEvent::OperationProposed {
+                revision: 1,
+                kind: OperationKind::Other("fixture".into()),
+                action: hyper_term_protocol::OperationAction::Opaque {
+                    kind: "fixture".into(),
+                    payload_digest: "a".repeat(64),
+                },
+                summary: "Fixture operation".into(),
+                risk: RiskClass::ExternalEffect,
+                required_capabilities: Vec::new(),
+            },
+        );
+        let waiting = event(
+            2,
+            task_id,
+            Some(operation_id),
+            DomainEvent::OperationStateChanged {
+                revision: 2,
+                from: OperationState::Proposed,
+                to: OperationState::WaitingHuman,
+                actor: hyper_term_protocol::Actor::Policy,
+                reason: None,
+            },
+        );
+        let mut projector = BlockProjector::replay(task_id, [&proposed, &waiting]).unwrap();
+        assert_eq!(projector.latest_waiting_operation_id(), None);
+
+        projector
+            .apply(&event(
+                3,
+                task_id,
+                Some(operation_id),
+                DomainEvent::PermissionRequested {
+                    operation_revision: 2,
+                    prompt: "Allow once?".into(),
+                    options: vec![PermissionDecision::AllowOnce],
+                },
+            ))
+            .unwrap();
+        assert_eq!(projector.latest_waiting_operation_id(), Some(operation_id));
     }
 
     #[test]

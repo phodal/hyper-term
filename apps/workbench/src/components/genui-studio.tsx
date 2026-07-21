@@ -11,10 +11,10 @@ import type {
 import type { HyperTermHost } from "../host.ts";
 import type { AcceptedArtifact } from "../protocol.ts";
 import {
-  isRuntimeTraceMessage,
   type RuntimeTraceEvent,
   type RuntimeTraceInput,
 } from "../runtime-trace-client.ts";
+import { parsePreviewMessage } from "../genui/preview-message.ts";
 import { isReplayBoundary } from "../genui/runtime-replay.ts";
 import type { EditorLanguageService } from "../editor-language-service.ts";
 import { GenUiCompiler } from "../genui/compiler-client.ts";
@@ -222,20 +222,8 @@ export function GenUiStudio({
   useEffect(() => {
     function receivePreviewEvent(event: MessageEvent) {
       if (event.source !== previewFrame.current?.contentWindow) return;
-      const message = event.data as {
-        type?: string;
-        message?: string;
-        stack?: string;
-        channel_token?: string;
-        artifact_id?: string;
-        source_revision?: number;
-        replay?: boolean;
-        target_event_sequence?: number;
-        generated_line?: number;
-        generated_column?: number;
-        event?: unknown;
-      };
-      if (message.channel_token !== previewChannel) return;
+      const message = parsePreviewMessage(event.data, previewChannel);
+      if (!message) return;
       if (message.type === "hyper_term_preview_boot") {
         setPreviewRuntime("booting runtime");
       } else if (message.type === "hyper_term_preview_ready") {
@@ -290,8 +278,7 @@ export function GenUiStudio({
       } else if (message.type === "hyper_term_preview_trace") {
         if (
           !accepted || message.artifact_id !== accepted.artifact_id ||
-          message.source_revision !== accepted.source_revision ||
-          !isRuntimeTraceMessage(message.event)
+          message.source_revision !== accepted.source_revision
         ) return;
         const runtimeEvent = message.event;
         const isAcceptedSource = sameFiles(filesRef.current, baselineFiles);

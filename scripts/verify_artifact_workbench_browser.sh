@@ -132,11 +132,30 @@ agent-browser --session "$verify_session" focus '.cm-content' >/dev/null
 agent-browser --session "$verify_session" press Meta+a >/dev/null
 agent-browser --session "$verify_session" keyboard inserttext "$verify_completion_source" >/dev/null
 agent-browser --session "$verify_session" keyboard inserttext '.' >/dev/null
+agent-browser --session "$verify_session" wait 300 >/dev/null
+agent-browser --session "$verify_session" press Control+Space >/dev/null
 verify_completion=$(agent-browser --session "$verify_session" eval \
   'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const labels=[...document.querySelectorAll(".cm-completionLabel")].map((item)=>item.textContent||"");const visible=Boolean(document.querySelector(".cm-tooltip-autocomplete"));if(visible&&labels.includes("length")&&labels.includes("toUpperCase")){clearInterval(poll);resolve("OK");}else if(performance.now()-started>10000){clearInterval(poll);reject(new Error(JSON.stringify({visible,labels:labels.slice(0,40)})));}},50)})')
 grep -q '"OK"' <<<"$verify_completion"
 agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-deno-completion.png" >/dev/null
+
+# Replace the draft with a hostile component that probes the real sandbox.
+# The iframe reports only the denial booleans to the test harness; it also
+# sends an oversized, channel-matching fake boot message that the trusted
+# Workbench must ignore without losing its ready state.
+agent-browser --session "$verify_session" eval \
+  'globalThis.__hyperTermHostileProbe=null;globalThis.addEventListener("message",event=>{if(event.data?.type==="hyper_term_hostile_probe")globalThis.__hyperTermHostileProbe=event.data.result});"OK"' \
+  | grep -q '"OK"'
+verify_hostile_source=$'import React, { useEffect } from "react";\n\nexport default function App() {\n  useEffect(() => {\n    void (async () => {\n      const denied = {\n        native: typeof globalThis.zero === "undefined" && !(globalThis).webkit?.messageHandlers,\n        cross_origin: false,\n        popup: false,\n        clipboard: false,\n        network: false,\n      };\n      try { void parent.document.body; } catch { denied.cross_origin = true; }\n      const popup = window.open("about:blank", "_blank");\n      denied.popup = popup === null;\n      popup?.close();\n      try {\n        if (!navigator.clipboard) denied.clipboard = true;\n        else await navigator.clipboard.writeText("blocked");\n      } catch { denied.clipboard = true; }\n      try { await fetch("https://example.invalid/hyper-term-probe"); }\n      catch { denied.network = true; }\n      parent.postMessage({\n        type: "hyper_term_preview_boot",\n        schema_version: 1,\n        channel_token: location.hash.slice(1),\n        padding: "x".repeat(70 * 1024),\n      }, "*");\n      parent.postMessage({ type: "hyper_term_hostile_probe", result: denied }, "*");\n    })();\n  }, []);\n  return React.createElement("main", null, "Hostile artifact probe");\n}\n'
+agent-browser --session "$verify_session" focus '.cm-content' >/dev/null
+agent-browser --session "$verify_session" press Meta+a >/dev/null
+agent-browser --session "$verify_session" keyboard inserttext "$verify_hostile_source" >/dev/null
+verify_hostile=$(agent-browser --session "$verify_session" eval \
+  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const denied=globalThis.__hyperTermHostileProbe;const runtime=document.querySelector(".preview-badges")?.textContent||"";if(denied&&Object.values(denied).every(value=>value===true)&&runtime.includes("ready")&&!runtime.includes("booting")){clearInterval(poll);resolve("OK");}else if(performance.now()-started>15000){clearInterval(poll);reject(new Error(JSON.stringify({denied,runtime})));}},50)})')
+grep -q '"OK"' <<<"$verify_hostile"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/artifact-workbench-hostile-denied.png" >/dev/null
 
 verify_errors=$(agent-browser --session "$verify_session" errors)
 if [[ -n "$verify_errors" ]]; then
@@ -147,3 +166,5 @@ fi
 echo "Artifact Workbench browser verified: authenticated Rust Gateway, real Deno LSP diagnostics, and visible CodeMirror completion"
 echo "Artifact Workbench diagnostic screenshot: $verify_artifact_dir/artifact-workbench-deno-diagnostic.png"
 echo "Artifact Workbench completion screenshot: $verify_artifact_dir/artifact-workbench-deno-completion.png"
+echo "Artifact Workbench hostile preview denied native, cross-origin, popup, clipboard, network, and oversized status injection"
+echo "Artifact Workbench hostile screenshot: $verify_artifact_dir/artifact-workbench-hostile-denied.png"

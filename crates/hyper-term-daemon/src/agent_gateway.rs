@@ -85,6 +85,8 @@ use agent_turn::{
 #[cfg(test)]
 use agent_turn::{agent_error_summary, retain_terminal_output};
 mod startup;
+#[cfg(test)]
+mod test_support;
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
@@ -5572,8 +5574,10 @@ mod tests {
         WorkspaceContextSpec,
     };
     use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    use super::test_support::{
+        request, request_path, request_path_raw, wait_for_provider_readiness,
+    };
     use super::*;
 
     #[test]
@@ -5886,9 +5890,7 @@ done
         .await
         .expect("gateway");
         let path = format!("/agent/providers?token={token}");
-        let (status, body) = request_path(gateway.address(), &path, "POST", b"{}").await;
-        assert_eq!(status, 200);
-        assert!(String::from_utf8_lossy(&body).contains("\"readiness\":\"login_required\""));
+        wait_for_provider_readiness(gateway.address(), &path, "login_required").await;
         let session_path = format!("/agent/session?token={token}&session_id=1&provider=codex");
         assert_eq!(
             request_path(gateway.address(), &session_path, "POST", b"{}")
@@ -5898,9 +5900,7 @@ done
         );
 
         std::fs::write(&marker, "ready").expect("complete login");
-        let (status, body) = request_path(gateway.address(), &path, "POST", b"{}").await;
-        assert_eq!(status, 200);
-        assert!(String::from_utf8_lossy(&body).contains("\"readiness\":\"authenticated\""));
+        wait_for_provider_readiness(gateway.address(), &path, "authenticated").await;
         let (status, body) = request_path(gateway.address(), &session_path, "POST", b"{}").await;
         assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
         assert_eq!(
@@ -6878,12 +6878,13 @@ done
                 "must not cross the session boundary".into(),
             )
             .expect("append unrelated message");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(150), updates.next())
-                .await
-                .is_err(),
-            "Agent stream must filter another task's block patches"
-        );
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+        while let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, updates.next()).await {
+            assert!(
+                !String::from_utf8_lossy(&frame).contains("must not cross the session boundary"),
+                "Agent stream leaked another task's block patch"
+            );
+        }
 
         let (status, body) = request_path(
             gateway.address(),
@@ -9197,74 +9198,5 @@ done
             agent_start_error_response(StartError::Capacity).status(),
             StatusCode::TOO_MANY_REQUESTS
         );
-    }
-
-    async fn request(
-        address: SocketAddr,
-        token: &str,
-        session_id: u16,
-        method: &str,
-    ) -> (u16, Vec<u8>) {
-        request_path(
-            address,
-            &format!("/agent/session?token={token}&session_id={session_id}"),
-            method,
-            b"",
-        )
-        .await
-    }
-
-    async fn request_path(
-        address: SocketAddr,
-        path: &str,
-        method: &str,
-        body: &[u8],
-    ) -> (u16, Vec<u8>) {
-        let (status, _, body) = request_path_raw(address, path, method, body).await;
-        (status, body)
-    }
-
-    async fn request_path_raw(
-        address: SocketAddr,
-        path: &str,
-        method: &str,
-        body: &[u8],
-    ) -> (u16, Vec<u8>, Vec<u8>) {
-        let mut stream = tokio::net::TcpStream::connect(address)
-            .await
-            .expect("connect agent gateway");
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("write agent request");
-        stream
-            .write_all(body)
-            .await
-            .expect("write agent request body");
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("read agent response");
-        let header_end = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|index| index + 4)
-            .expect("HTTP response headers");
-        let status = String::from_utf8_lossy(&response[..header_end])
-            .split_whitespace()
-            .nth(1)
-            .expect("HTTP status")
-            .parse()
-            .expect("numeric HTTP status");
-        (
-            status,
-            response[..header_end].to_vec(),
-            response[header_end..].to_vec(),
-        )
     }
 }

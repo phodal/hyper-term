@@ -139,6 +139,19 @@ while Native layout tests prove Terminal/Agent tab switching, a full-width
 default Agent conversation, and conditional mounting of the bounded editor
 pane only for ACP sessions with a current artifact.
 
+The hostile-artifact matrix now has executable browser and macOS evidence. The
+browser gate types a hostile component through CodeMirror, waits for the real
+`esbuild-wasm` rebuild, and proves that the opaque `allow-scripts` iframe cannot
+reach its parent document, open a popup, write the clipboard, connect to the
+network, or obtain a host API. It also sends a channel-matching message over
+the 64 KiB envelope budget; the trusted Workbench rejects it without leaving
+the ready state. A separate credential-using Claude ACP gate compiles the same
+kind of probe through the approved MCP path inside the packaged Native SDK
+application. The iframe observes no `window.zero` bridge, emits only the
+bounded `security.native_denied` checkpoint, and the authenticated Rust runtime
+trace endpoint journals that denial. The gate fails if
+`security.native_exposed` ever appears.
+
 New acceptance now also requires the exact bounded virtual source tree passed
 to the supervised compiler. Rust attaches that snapshot after the Deno child
 returns, validates its entrypoint, normalized paths, file count, and byte
@@ -185,9 +198,8 @@ recovered from the journal and private Artifact store.
 
 This closes the first accepted-artifact, last-known-good delivery, initial
 runtime-error mapping, source-recovery, fixed-file-tree editor navigation,
-accepted-revision replay, and workspace hunk-selection slices. It does not yet
-close the complete hostile-artifact matrix, durable reducer/action trace
-protocol, crash-recoverable workspace transactions, resource budgets, or
+accepted-revision replay, workspace hunk-selection, and hostile-artifact
+isolation slices. It does not yet close the complete resource-budget or
 accessibility gates below.
 
 ## Validation gates
