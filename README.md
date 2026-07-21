@@ -37,8 +37,10 @@ structured messages, approvals, diffs, and generated interfaces.
   artifacts stay under the local Rust core. WebViews only render trusted data.
 
 Agent tabs can connect to locally installed Codex, Claude, and GitHub Copilot
-CLIs. They present plans and tool calls as structured blocks, and can open
-generated React/TypeScript artifacts in an isolated editor and preview.
+CLIs. They present plans and tool calls as structured, searchable blocks, and
+can open generated React/TypeScript artifacts in an isolated editor and
+preview. Press `Command-F` in an Agent tab to filter its retained messages,
+tools, files, and approvals; ordinary Terminal tabs keep terminal-native find.
 
 ## How it works
 

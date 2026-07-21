@@ -50,15 +50,26 @@
 <template name="agent-thread">
   <column min-width="400" grow="1" background="surface" label="Agent conversation">
     <if test="{hasAgentThreadToolbar}">
-      <row gap="5" padding="3" cross="center">
-        <if test="{hasAgentExecutionContext}">
-          <button size="sm" variant="ghost" icon="circle-dot" on-press="toggle_agent_execution_context" label="Inspect Agent execution context">{agentExecutionContextSummary}</button>
-        </if>
-        <spacer grow="1" />
-        <if test="{canOpenAgentEditor}">
-          <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open ACP artifact editor">Edit</button>
-        </if>
-      </row>
+      <if test="{agentSearchOpen}">
+        <row gap="6" padding="3" cross="center" label="Agent history search">
+          <search-field size="sm" grow="1" text="{agentSearchText}" placeholder="Search messages, tools, files, and approvals" on-input="agent_search_changed" autofocus="true" label="Search Agent history" />
+          <if test="{hasAgentSearchQuery}">
+            <text foreground="text_muted">{agentSearchResultCount} matches</text>
+          </if>
+          <button size="icon" variant="ghost" icon="x" on-press="close_agent_search" label="Close Agent history search"></button>
+        </row>
+      </if>
+      <if test="{hasAgentThreadActions}">
+        <row gap="5" padding="3" cross="center">
+          <if test="{hasAgentExecutionContext}">
+            <button size="sm" variant="ghost" icon="circle-dot" on-press="toggle_agent_execution_context" label="Inspect Agent execution context">{agentExecutionContextSummary}</button>
+          </if>
+          <spacer grow="1" />
+          <if test="{canOpenAgentEditor}">
+            <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open ACP artifact editor">Edit</button>
+          </if>
+        </row>
+      </if>
       <if test="{agent_execution_context_expanded}">
         <column gap="4" padding="6" background="surface_subtle" label="Agent execution context details">
           <for each="agentExecutionContexts" key="contextId" as="context">

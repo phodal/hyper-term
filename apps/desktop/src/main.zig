@@ -32,6 +32,7 @@ const max_agent_attention_status_bytes: usize = 4 * 1024;
 const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
 const agent_effect_url_capacity: usize = agent_url_capacity + 64;
 pub const max_agent_blocks: usize = 128;
+const max_agent_search_bytes: usize = 256;
 const max_agent_block_bytes: usize = 8 * 1024;
 const max_agent_operation_id_bytes: usize = 36;
 const max_agent_operation_kind_bytes: usize = 96;
@@ -726,6 +727,8 @@ pub const Model = struct {
     terminal_webview_mounted: bool = false,
     genui_webview_mounted: bool = false,
     agent_composer_buffer: canvas.TextBuffer(max_agent_prompt_bytes) = .{},
+    agent_search_buffer: canvas.TextBuffer(max_agent_search_bytes) = .{},
+    agent_search_open: bool = false,
     agent_pending_prompts: [max_sessions]PendingAgentPrompt = [_]PendingAgentPrompt{.{}} ** max_sessions,
     ui_font_registered: bool = false,
     agent_blocks: [max_agent_blocks]AgentBlockView = [_]AgentBlockView{.{}} ** max_agent_blocks,
@@ -804,6 +807,8 @@ pub const Model = struct {
         "genui_source_revision",
         "agent_editor_open_session_id",
         "agent_composer_buffer",
+        "agent_search_buffer",
+        "agent_search_open",
         "agent_pending_prompts",
         "terminal_webview_mounted",
         "genui_webview_mounted",
@@ -1160,7 +1165,27 @@ pub const Model = struct {
     }
 
     pub fn hasAgentThreadToolbar(model: *const Model) bool {
+        return model.agentSearchOpen() or model.hasAgentThreadActions();
+    }
+
+    pub fn hasAgentThreadActions(model: *const Model) bool {
         return model.hasAgentExecutionContext() or model.canOpenAgentEditor();
+    }
+
+    pub fn agentSearchOpen(model: *const Model) bool {
+        return model.activeSession().mode == .agent and model.agent_search_open;
+    }
+
+    pub fn agentSearchText(model: *const Model) []const u8 {
+        return model.agent_search_buffer.text();
+    }
+
+    pub fn hasAgentSearchQuery(model: *const Model) bool {
+        return agentSearchQuery(model).len > 0;
+    }
+
+    pub fn agentSearchResultCount(model: *const Model) usize {
+        return agentSearchMatchCount(model);
     }
 
     pub fn agentExecutionContextSummary(model: *const Model) []const u8 {
@@ -1261,6 +1286,9 @@ pub const Msg = union(enum) {
     agent_session_started: native_sdk.EffectResponse,
     agent_session_closed: native_sdk.EffectResponse,
     agent_composer_changed: canvas.TextInputEvent,
+    open_agent_search,
+    close_agent_search,
+    agent_search_changed: canvas.TextInputEvent,
     send_agent_prompt,
     agent_turn_started: native_sdk.EffectResponse,
     cancel_agent_turn,
@@ -1306,7 +1334,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "open_agent_search", "terminal_session_closed", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -1338,6 +1366,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const previous = model.active_session_id;
             selectSession(model, session_id);
             if (previous != model.active_session_id) {
+                clearAgentSearch(model);
                 acknowledgeSessionAttention(model, model.active_session_id);
                 cancelAgentStream(model, previous, fx);
                 resetAgentProjection(model, model.active_session_id);
@@ -1355,6 +1384,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .agent_composer_changed => |edit| {
             model.agent_goal_editing = false;
             model.agent_composer_buffer.apply(edit);
+        },
+        .open_agent_search => {
+            if (model.activeSession().mode == .agent) model.agent_search_open = true;
+        },
+        .close_agent_search => {
+            model.agent_search_open = false;
+            model.agent_search_buffer.clear();
+        },
+        .agent_search_changed => |edit| {
+            if (model.activeSession().mode == .agent and model.agent_search_open) {
+                model.agent_search_buffer.apply(edit);
+            }
         },
         .send_agent_prompt => requestAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
@@ -1455,6 +1496,7 @@ fn appendSession(model: *Model, mode: SessionMode) ?u8 {
     model.agent_pending_prompts[model.session_count] = .{};
     model.session_count += 1;
     model.active_session_id = session_id;
+    clearAgentSearch(model);
     model.next_session_id +%= 1;
     if (model.next_session_id == 0) model.next_session_id = 1;
     refreshTerminalUrl(model);
@@ -1543,6 +1585,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     }
     refreshTerminalUrl(model);
     if (was_active) {
+        clearAgentSearch(model);
         resetAgentProjection(model, model.active_session_id);
         requestActiveAgentStream(model, fx);
     }
@@ -3930,6 +3973,11 @@ fn selectSession(model: *Model, session_id: u8) void {
     }
 }
 
+fn clearAgentSearch(model: *Model) void {
+    model.agent_search_open = false;
+    model.agent_search_buffer.clear();
+}
+
 pub fn command(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "hyper-term.new-terminal")) return .choose_terminal;
     if (std.mem.eql(u8, name, "hyper-term.new-agent")) return .choose_agent;
@@ -3960,6 +4008,7 @@ pub fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
     }
     if (std.ascii.eqlIgnoreCase(keyboard.key, "t")) return .choose_terminal;
     if (std.ascii.eqlIgnoreCase(keyboard.key, "w")) return .close_active_session;
+    if (std.ascii.eqlIgnoreCase(keyboard.key, "f")) return .open_agent_search;
     return null;
 }
 
@@ -4087,13 +4136,83 @@ const agent_timeline_id = "agent-blocks";
 const agent_timeline_estimated_width: usize = 84;
 const agent_timeline_line_height: f32 = 19;
 const agent_timeline_viewport_fallback: f32 = 480;
+
+fn containsAsciiInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var offset: usize = 0;
+        while (offset < needle.len and
+            std.ascii.toLower(haystack[start + offset]) == std.ascii.toLower(needle[offset])) : (offset += 1)
+        {}
+        if (offset == needle.len) return true;
+    }
+    return false;
+}
+
+fn agentBlockMatchesQuery(block: *const AgentBlockView, query: []const u8) bool {
+    if (containsAsciiInsensitive(block.content(), query)) return true;
+    switch (block.kind) {
+        .message => if (containsAsciiInsensitive(block.roleLabel(), query)) return true,
+        .tool_call, .plan => if (containsAsciiInsensitive(block.activityTitle(), query) or
+            containsAsciiInsensitive(block.activityMeta(), query)) return true,
+        .operation => if (containsAsciiInsensitive(block.operationKindLabel(), query) or
+            containsAsciiInsensitive(block.operationId(), query) or
+            containsAsciiInsensitive(block.riskLabel(), query) or
+            containsAsciiInsensitive(block.stateLabel(), query)) return true,
+        .approval => if (containsAsciiInsensitive(block.approvalTitle(), query) or
+            containsAsciiInsensitive(block.operationKindLabel(), query) or
+            containsAsciiInsensitive(block.operationId(), query) or
+            containsAsciiInsensitive(block.riskLabel(), query) or
+            containsAsciiInsensitive(block.stateLabel(), query)) return true,
+    }
+    for (block.diffFiles()) |*file| {
+        if (containsAsciiInsensitive(file.path(), query)) return true;
+    }
+    return false;
+}
+
+fn agentSearchQuery(model: *const Model) []const u8 {
+    return std.mem.trim(u8, model.agent_search_buffer.text(), " \t\r\n");
+}
+
+fn agentSearchFiltering(model: *const Model) bool {
+    return model.agentSearchOpen() and agentSearchQuery(model).len > 0;
+}
+
+fn agentSearchMatchCount(model: *const Model) usize {
+    if (!agentSearchFiltering(model)) return model.agent_block_count;
+    const query = agentSearchQuery(model);
+    var count: usize = 0;
+    for (model.agent_blocks[0..model.agent_block_count]) |*block| {
+        if (agentBlockMatchesQuery(block, query)) count += 1;
+    }
+    return count;
+}
+
+fn agentTimelineBlockIndex(model: *const Model, list_index: u64) ?usize {
+    if (!agentSearchFiltering(model)) {
+        if (list_index < model.agent_block_index_base) return null;
+        const physical = list_index - model.agent_block_index_base;
+        if (physical >= model.agent_block_count) return null;
+        return @intCast(physical);
+    }
+    const query = agentSearchQuery(model);
+    var match_index: u64 = 0;
+    for (model.agent_blocks[0..model.agent_block_count], 0..) |*block, physical| {
+        if (!agentBlockMatchesQuery(block, query)) continue;
+        if (match_index == list_index) return physical;
+        match_index += 1;
+    }
+    return null;
+}
+
 fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 {
     const pointer = context orelse return 36;
     const model: *const Model = @ptrCast(@alignCast(pointer));
-    if (logical_index < model.agent_block_index_base) return 36;
-    const physical_u64 = logical_index - model.agent_block_index_base;
-    if (physical_u64 >= model.agent_block_count) return 36;
-    const block = &model.agent_blocks[@intCast(physical_u64)];
+    const physical = agentTimelineBlockIndex(model, logical_index) orelse return 36;
+    const block = &model.agent_blocks[physical];
     const lines = @max(@as(usize, 1), (block.content_len + agent_timeline_estimated_width - 1) / agent_timeline_estimated_width);
     const text_extent = @as(f32, @floatFromInt(@min(lines, 96))) * agent_timeline_line_height;
     const diff_extent = if (block.expanded and block.diff_file_count > 0)
@@ -4120,10 +4239,11 @@ fn agentBlockExtentEstimate(context: ?*const anyopaque, logical_index: u64) f32 
 }
 
 pub fn agentTimelineOptions(model: *const Model) HyperTermUi.VirtualListOptions {
+    const filtering = agentSearchFiltering(model);
     return .{
         .id = agent_timeline_id,
-        .item_count = model.agent_block_count,
-        .index_base = model.agent_block_index_base,
+        .item_count = agentSearchMatchCount(model),
+        .index_base = if (filtering) 0 else model.agent_block_index_base,
         .item_extent = 36,
         .extent_estimate = agentBlockExtentEstimate,
         .extent_context = model,
@@ -4131,20 +4251,34 @@ pub fn agentTimelineOptions(model: *const Model) HyperTermUi.VirtualListOptions 
         .overscan = 4,
         .grow = 1,
         .viewport_fallback = agent_timeline_viewport_fallback,
-        .anchor = .trailing,
+        .anchor = if (filtering) .leading else .trailing,
         .semantics = .{ .label = "Agent blocks" },
     };
 }
 
 fn agentTimeline(ui: *HyperTermUi, model: *const Model) HyperTermUi.Node {
     const options = agentTimelineOptions(model);
+    if (options.item_count == 0 and agentSearchFiltering(model)) {
+        return ui.column(.{
+            .grow = 1,
+            .cross = .center,
+            .main = .center,
+            .semantics = .{ .label = "No Agent history results" },
+        }, .{
+            ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "No matching Agent activity"),
+        });
+    }
     const window = ui.virtualWindow(options);
     const rows = ui.arena.alloc(HyperTermUi.Node, window.itemCount()) catch {
         ui.failed = true;
         return ui.column(.{ .grow = 1 }, .{});
     };
     for (rows, 0..) |*row, offset| {
-        const physical = window.start_index + offset;
+        const list_index: u64 = @intCast(window.start_index + offset);
+        const physical = agentTimelineBlockIndex(model, list_index + options.index_base) orelse {
+            ui.failed = true;
+            return ui.column(.{ .grow = 1 }, .{});
+        };
         var node = agentBlockNode(ui, model, &model.agent_blocks[physical]);
         node.key = .{ .int = model.agent_blocks[physical].id };
         row.* = node;

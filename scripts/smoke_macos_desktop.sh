@@ -307,6 +307,31 @@ PY
     'AI Terminal'
   native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
 
+  native automate widget-key hyper-term-canvas cmd+f
+  native automate assert \
+    'role=group name="Agent history search"' \
+    'role=textbox name="Search Agent history".*focused=true' \
+    'role=button name="Close Agent history search"'
+  smoke_search_id=$(smoke_widget_id 'role=textbox name="Search Agent history"')
+  native automate widget-action hyper-term-canvas "$smoke_search_id" set-text 'README'
+  native automate assert \
+    'role=textbox name="Search Agent history".*text="README"' \
+    '1 matches' \
+    'name="Changed file README.md, plus 1, minus 0"'
+  native automate assert --absent \
+    'The proposed file change is ready to review\.' \
+    'error event=' \
+    'dispatch_errors=[1-9]'
+  native automate screenshot hyper-term-canvas
+  smoke_search_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-search.png
+  cp "$smoke_screenshot" "$smoke_search_screenshot"
+  smoke_close_search_id=$(smoke_widget_id 'role=button name="Close Agent history search"')
+  native automate widget-click hyper-term-canvas "$smoke_close_search_id"
+  native automate assert --absent \
+    'role=group name="Agent history search"' \
+    'role=textbox name="Search Agent history"'
+  native automate assert 'The proposed file change is ready to review\.'
+
   native automate shortcut hyper-term.new-claude-acp-agent
   native automate assert \
     'role=textbox name="Agent prompt".*enabled=true' \
@@ -369,6 +394,9 @@ if [[ -n "$smoke_artifact_dir" ]]; then
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png" \
     "$smoke_artifact_dir/screenshot-hyper-term-agent.png"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-search.png" \
+    "$smoke_artifact_dir/screenshot-hyper-term-search.png"
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-goal.png" \
     "$smoke_artifact_dir/screenshot-hyper-term-goal.png"

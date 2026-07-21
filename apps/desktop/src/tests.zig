@@ -1551,6 +1551,57 @@ test "Agent timeline mounts only a tail window at the full retained block bound"
     try testing.expect(widgetCount(tree.root) < 220);
 }
 
+test "Agent history search filters the virtual transcript without copying blocks" {
+    var model = main.initialModel();
+    model.session_slots[0].mode = .agent;
+    model.session_slots[0].title = "Agent";
+    model.agent_search_open = true;
+    model.agent_search_buffer.set("readme");
+    model.agent_block_count = 3;
+    const messages = [_][]const u8{
+        "Updated README.md release notes",
+        "Ran the complete test suite",
+        "Reviewed docs/README-design.md",
+    };
+    for (model.agent_blocks[0..model.agent_block_count], messages, 0..) |*block, message, index| {
+        block.id = @intCast(index + 1);
+        block.kind = .message;
+        block.role = .agent;
+        @memcpy(block.content_storage[0..message.len], message);
+        block.content_len = message.len;
+    }
+
+    const options = main.agentTimelineOptions(&model);
+    try testing.expectEqual(@as(usize, 2), model.agentSearchResultCount());
+    try testing.expectEqual(@as(usize, 2), options.item_count);
+    try testing.expectEqual(@as(u64, 0), options.index_base);
+    try testing.expectEqual(@as(@TypeOf(options.anchor), .leading), options.anchor);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(tree.root, "Agent history search") != null);
+    try testing.expect(containsText(tree.root, "Updated README.md release notes"));
+    try testing.expect(containsText(tree.root, "Reviewed docs/README-design.md"));
+    try testing.expect(!containsText(tree.root, "Ran the complete test suite"));
+}
+
+test "closing Agent history search restores the complete transcript" {
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    var model = main.initialModel();
+    model.session_slots[0].mode = .agent;
+    main.update(&model, .open_agent_search, &fx);
+    model.agent_search_buffer.set("README");
+    try testing.expect(model.agentSearchOpen());
+
+    main.update(&model, .close_agent_search, &fx);
+    try testing.expect(!model.agentSearchOpen());
+    try testing.expectEqualStrings("", model.agentSearchText());
+}
+
 test "Agent conversation uses responsive reading and composer rails" {
     var model = main.initialModel();
     model.session_slots[0].mode = .agent;
@@ -1980,12 +2031,26 @@ test "macOS canvas shortcuts preserve terminal and Agent tab lifecycles" {
         return error.TestUnexpectedResult;
     const close = main.onKey(.{ .phase = .key_down, .key = "w", .modifiers = command }) orelse
         return error.TestUnexpectedResult;
+    const find = main.onKey(.{ .phase = .key_down, .key = "f", .modifiers = command }) orelse
+        return error.TestUnexpectedResult;
 
     try testing.expect(terminal == .choose_terminal);
     try testing.expect(agent == .choose_agent);
     try testing.expect(close == .close_active_session);
+    try testing.expect(find == .open_agent_search);
     try testing.expect(main.onKey(.{ .phase = .key_down, .key = "w", .modifiers = .{ .control = true } }) == null);
     try testing.expect(main.onKey(.{ .phase = .key_up, .key = "w", .modifiers = command }) == null);
+}
+
+test "Agent find shortcut is a no-op for an ordinary Terminal canvas" {
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    var model = main.initialModel();
+    main.update(&model, .open_agent_search, &fx);
+    try testing.expect(!model.agentSearchOpen());
+    try testing.expect(!model.agent_search_open);
 }
 
 test "compiled and hot-reload markup produce the same root" {
