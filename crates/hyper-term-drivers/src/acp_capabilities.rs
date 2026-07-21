@@ -34,7 +34,7 @@ pub(super) fn apply_session_capability_update(
             Ok(Some("current_mode_update"))
         }
         v1::SessionUpdate::SessionInfoUpdate(update) => {
-            apply_optional_text(
+            apply_optional_display_text(
                 &mut capabilities.session_info.title,
                 &update.title,
                 MAX_SESSION_TITLE_BYTES,
@@ -84,6 +84,36 @@ fn apply_optional_text(
                 None
             } else {
                 Some(bounded(value.to_owned(), maximum)?)
+            };
+        }
+    }
+    Ok(())
+}
+
+fn apply_optional_display_text(
+    target: &mut Option<String>,
+    update: &MaybeUndefined<String>,
+    maximum: usize,
+    label: &str,
+) -> Result<(), AcpAdapterError> {
+    match update {
+        MaybeUndefined::Undefined => {}
+        MaybeUndefined::Null => *target = None,
+        MaybeUndefined::Value(value) => {
+            let value = value.trim();
+            if value.chars().any(char::is_control) {
+                return Err(AcpAdapterError::InvalidMessage(format!(
+                    "{label} contains control characters"
+                )));
+            }
+            let mut end = value.len().min(maximum);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            *target = if end == 0 {
+                None
+            } else {
+                Some(value[..end].to_owned())
             };
         }
     }
@@ -453,6 +483,18 @@ mod tests {
         }))
         .unwrap();
         assert!(apply_session_capability_update(&mut capabilities, &hostile).is_err());
+
+        let long_title = "界".repeat(MAX_SESSION_TITLE_BYTES);
+        let truncated: v1::SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "session_info_update",
+            "title": long_title
+        }))
+        .unwrap();
+        apply_session_capability_update(&mut capabilities, &truncated).unwrap();
+        let title = capabilities.session_info.title.as_deref().unwrap();
+        assert!(title.len() <= MAX_SESSION_TITLE_BYTES);
+        assert!(title.len() > MAX_SESSION_TITLE_BYTES - 3);
+        assert!(title.chars().all(|character| character == '界'));
     }
 
     #[test]

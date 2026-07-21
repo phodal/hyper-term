@@ -230,6 +230,7 @@ real_pid=$!
     'role=button name="Send prompt".*enabled=true'
   native automate assert --absent \
     'role=button name="Stop Agent turn"' \
+    'invalid ACP message:' \
     'error event=' \
     'dispatch_errors=[1-9]'
   if [[ "$real_genui" == 1 ]]; then
