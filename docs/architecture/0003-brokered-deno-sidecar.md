@@ -158,12 +158,25 @@ The ACP/Codex MCP tool plane now enables the same Deno LSP for workspace
 queries without mounting the live workspace into the sidecar. At Agent-session
 creation, Rust copies only bounded text/source files into a private snapshot,
 skips symlinks and dependency/build trees, rejects file/count/byte/depth limit
-violations, and passes that exact root to `hyper-term-mcp`. The LSP sidecar has
-read-only sandbox access to the snapshot plus write access only to its private
-cache and scratch roots. Closing the Agent removes the complete session runtime
-root. A real integration test starts the configured MCP server through an ACP
-`mcpServers` entry, obtains the Diff/GenUI/LSP catalog, authorizes an LSP query
-through the Rust operation ledger, and returns the result to the ACP turn.
+violations, and registers that exact root with the outer Rust daemon. The
+`hyper-term-mcp` process inside the Agent sandbox receives only tool-availability
+flags and the broker control socket; it receives no Deno, compiler, WASM,
+snapshot, cache, or scratch path. After approval it sends an operation-bound
+execution request back to Rust. Rust validates task, operation, revision, tool
+name, proposal digest, and argument digest before launching the Deno Seatbelt
+outside the Agent process tree. Identical retries return the cached result;
+different-input replays fail closed.
+
+This split is required on macOS because a child inherits the provider's
+Seatbelt and cannot apply another `sandbox-exec` profile. Running Deno in the
+connector produced `sandbox_apply: Operation not permitted`; dropping the
+inner profile would have weakened the boundary. Keeping the connector as a
+proposal/proxy process avoids nested Seatbelt while retaining the narrower
+Deno filesystem and process policy. Closing the Agent waits for an in-flight
+authorized executor, unregisters it, and removes the private runtime root. A
+contained ACP integration test obtains the Diff/GenUI/LSP catalog, authorizes
+an LSP query through the Rust operation ledger, and returns the result to the
+ACP turn.
 If the selected directory exceeds or violates the snapshot contract, the
 partial snapshot is removed and the session starts with the narrower
 Diff/GenUI catalog instead of failing or exposing the live directory. Deno LSP

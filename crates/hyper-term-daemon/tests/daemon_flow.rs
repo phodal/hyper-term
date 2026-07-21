@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hyper_term_core::{TerminalEvent, TerminalReplay};
-use hyper_term_daemon::{DaemonError, DaemonState, spawn_unix_server};
+use hyper_term_daemon::{BrokeredMcpRuntimeConfig, DaemonError, DaemonState, spawn_unix_server};
 use hyper_term_protocol::{
     BlockPayload, ClientId, ContextDigest, ContextReceipt, ControlRequest, ControlRequestEnvelope,
     ControlResponse, DomainEvent, EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest,
@@ -94,6 +94,88 @@ fn local_mcp_runtime_receipt(launch: LocalMcpServerLaunch) -> LocalMcpServerRunt
         tools,
         per_call_isolation: false,
     }
+}
+
+#[test]
+fn brokered_mcp_execution_is_operation_bound_and_idempotent() {
+    let temporary = tempdir().unwrap();
+    let state = DaemonState::open(temporary.path().join("state")).unwrap();
+    let task_id = state.create_task("brokered MCP execution".into()).unwrap();
+    state
+        .register_brokered_mcp_runtime(task_id, BrokeredMcpRuntimeConfig::default())
+        .unwrap();
+    let arguments = serde_json::json!({
+        "method": "textDocument/documentSymbol",
+        "documentPath": "src/main.ts"
+    });
+    let proposal_digest = json_sha256(&serde_json::json!({
+        "name": "hyper_term.lsp.query",
+        "arguments": arguments,
+    }));
+    let operation = state
+        .propose_operation(
+            task_id,
+            OperationKind::McpTool,
+            OperationAction::Opaque {
+                kind: "hyper_term.lsp.query".into(),
+                payload_digest: proposal_digest.clone(),
+            },
+            "Query a bounded Deno workspace snapshot".into(),
+            RiskClass::ReadOnly,
+            vec!["workspace.read".into()],
+        )
+        .unwrap();
+    let authorized = state
+        .decide_permission(
+            task_id,
+            operation.operation_id,
+            operation.revision,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let dispatching = state
+        .begin_operation(task_id, operation.operation_id, authorized.revision)
+        .unwrap();
+    let first = state
+        .execute_brokered_mcp_tool(
+            task_id,
+            operation.operation_id,
+            dispatching.revision,
+            "hyper_term.lsp.query".into(),
+            proposal_digest.clone(),
+            arguments.clone(),
+        )
+        .unwrap();
+    assert!(first.is_error);
+    assert_eq!(first.outcome, OperationOutcome::Failed);
+    assert!(first.text.contains("not configured"));
+
+    let replay = state
+        .execute_brokered_mcp_tool(
+            task_id,
+            operation.operation_id,
+            dispatching.revision,
+            "hyper_term.lsp.query".into(),
+            proposal_digest.clone(),
+            arguments,
+        )
+        .unwrap();
+    assert_eq!(replay, first);
+
+    assert!(matches!(
+        state.execute_brokered_mcp_tool(
+            task_id,
+            operation.operation_id,
+            dispatching.revision,
+            "hyper_term.lsp.query".into(),
+            proposal_digest,
+            serde_json::json!({
+                "method": "textDocument/documentSymbol",
+                "documentPath": "src/other.ts"
+            }),
+        ),
+        Err(DaemonError::BrokeredMcpBindingMismatch)
+    ));
 }
 
 #[test]

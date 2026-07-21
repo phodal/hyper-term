@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hyper_term_daemon::{
-    DaemonState, DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig, McpStdioConfig, run_mcp_stdio,
-    spawn_unix_server,
+    BrokeredMcpRuntimeConfig, DaemonState, DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig,
+    McpStdioConfig, run_mcp_stdio, spawn_unix_server,
 };
 use hyper_term_drivers::{DriverFraming, sha256_file};
 use hyper_term_protocol::{
@@ -144,29 +144,39 @@ fn approved_lsp_tool_queries_the_pinned_deno_snapshot() {
     )
     .unwrap();
     let state = DaemonState::open(&state_directory).unwrap();
+    let agent_task_id = state.create_task("Codex Agent LSP".into()).unwrap();
+    let deno = std::path::PathBuf::from(
+        std::env::var_os("HYPER_TERM_DENO_PATH").expect("HYPER_TERM_DENO_PATH"),
+    )
+    .canonicalize()
+    .unwrap();
+    state
+        .register_brokered_mcp_runtime(
+            agent_task_id,
+            BrokeredMcpRuntimeConfig {
+                deno_lsp: Some(DenoMcpExecutorConfig {
+                    executable: deno,
+                    executable_sha256: std::env::var("HYPER_TERM_DENO_SHA256")
+                        .expect("HYPER_TERM_DENO_SHA256"),
+                    runtime_version: "2.9.3".into(),
+                    workspace_snapshot: snapshot.canonicalize().unwrap(),
+                    cache_directory: cache.canonicalize().unwrap(),
+                    scratch_directory: scratch.canonicalize().unwrap(),
+                }),
+                deno_genui: None,
+            },
+        )
+        .unwrap();
     let _server = spawn_unix_server(&socket, state.clone()).unwrap();
     let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
     client_io
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
     let gateway_input = gateway_io.try_clone().unwrap();
-    let deno = std::path::PathBuf::from(
-        std::env::var_os("HYPER_TERM_DENO_PATH").expect("HYPER_TERM_DENO_PATH"),
-    )
-    .canonicalize()
-    .unwrap();
     let config = McpStdioConfig::new(socket.canonicalize().unwrap(), true)
         .unwrap()
-        .with_deno_lsp(DenoMcpExecutorConfig {
-            executable: deno,
-            executable_sha256: std::env::var("HYPER_TERM_DENO_SHA256")
-                .expect("HYPER_TERM_DENO_SHA256"),
-            runtime_version: "2.9.3".into(),
-            workspace_snapshot: snapshot.canonicalize().unwrap(),
-            cache_directory: cache.canonicalize().unwrap(),
-            scratch_directory: scratch.canonicalize().unwrap(),
-        })
-        .unwrap();
+        .with_task(agent_task_id)
+        .with_deno_lsp_enabled();
     let gateway = thread::spawn(move || run_mcp_stdio(config, gateway_input, &mut gateway_io));
     let mut output = BufReader::new(client_io.try_clone().unwrap());
 
@@ -265,34 +275,42 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
     let compiler_wasm = root.join("dist/runtime/esbuild.wasm");
     let state = DaemonState::open(&state_directory).unwrap();
     let agent_task_id = state.create_task("Codex Agent GenUI".into()).unwrap();
+    let deno = std::path::PathBuf::from(
+        std::env::var_os("HYPER_TERM_DENO_PATH").expect("HYPER_TERM_DENO_PATH"),
+    )
+    .canonicalize()
+    .unwrap();
+    state
+        .register_brokered_mcp_runtime(
+            agent_task_id,
+            BrokeredMcpRuntimeConfig {
+                deno_lsp: None,
+                deno_genui: Some(DenoGenUiMcpExecutorConfig {
+                    executable: deno,
+                    executable_sha256: std::env::var("HYPER_TERM_DENO_SHA256")
+                        .expect("HYPER_TERM_DENO_SHA256"),
+                    runtime_version: "2.9.3".into(),
+                    compiler_script_sha256: sha256_file(&compiler_script).unwrap(),
+                    compiler_script,
+                    compiler_wasm_sha256: sha256_file(&compiler_wasm).unwrap(),
+                    compiler_wasm,
+                    compiler_version: "0.28.1".into(),
+                    cache_directory: cache,
+                    scratch_directory: scratch,
+                }),
+            },
+        )
+        .unwrap();
     let _server = spawn_unix_server(&socket, state.clone()).unwrap();
     let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
     client_io
         .set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
     let gateway_input = gateway_io.try_clone().unwrap();
-    let deno = std::path::PathBuf::from(
-        std::env::var_os("HYPER_TERM_DENO_PATH").expect("HYPER_TERM_DENO_PATH"),
-    )
-    .canonicalize()
-    .unwrap();
     let config = McpStdioConfig::new(socket.canonicalize().unwrap(), true)
         .unwrap()
         .with_task(agent_task_id)
-        .with_deno_genui(DenoGenUiMcpExecutorConfig {
-            executable: deno,
-            executable_sha256: std::env::var("HYPER_TERM_DENO_SHA256")
-                .expect("HYPER_TERM_DENO_SHA256"),
-            runtime_version: "2.9.3".into(),
-            compiler_script_sha256: sha256_file(&compiler_script).unwrap(),
-            compiler_script,
-            compiler_wasm_sha256: sha256_file(&compiler_wasm).unwrap(),
-            compiler_wasm,
-            compiler_version: "0.28.1".into(),
-            cache_directory: cache,
-            scratch_directory: scratch,
-        })
-        .unwrap();
+        .with_deno_genui_enabled();
     let gateway = thread::spawn(move || run_mcp_stdio(config, gateway_input, &mut gateway_io));
     let mut output = BufReader::new(client_io.try_clone().unwrap());
 

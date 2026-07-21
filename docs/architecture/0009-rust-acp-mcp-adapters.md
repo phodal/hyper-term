@@ -220,9 +220,13 @@ set is enabled per release.
   digest-pinned `hyper-term-mcp` stdio server. Its enabled catalog is derived
   from the exact runtime configuration: Diff is always bounded and read-only;
   GenUI uses the signed Deno/esbuild assets; Deno LSP uses a Rust-created
-  private workspace snapshot. A real-Deno integration test proves an ACP Agent
-  can discover all three tools, propose and authorize `hyper_term.lsp.query`,
-  and receive the real LSP result through the Agent turn.
+  private workspace snapshot. Those runtime paths stay in the outer Rust
+  daemon, not in the connector's arguments or Agent Seatbelt. The connector
+  proxies the authorized, digest-bound invocation over the control socket, so
+  Rust can apply the narrower Deno Seatbelt without attempting a forbidden
+  nested sandbox. A real-Deno integration test proves a contained ACP Agent can
+  discover all three tools, propose and authorize `hyper_term.lsp.query`, and
+  receive the real LSP result through the Agent turn.
 - Codex ACP emits a transport-level MCP consent request before forwarding the
   actual `tools/call`. Rust correlates that request with the preceding ACP
   `tool_call` by session and tool-call ID, requires the `hyper_term` server,

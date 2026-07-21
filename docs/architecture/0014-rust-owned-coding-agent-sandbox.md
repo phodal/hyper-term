@@ -539,6 +539,10 @@ managed-network policy to direct Codex and every configured ACP adapter:
   credentials into logs or persisted policy;
 - optional MCP access is limited to the broker control socket and the
   digest-pinned MCP executable;
+- the MCP connector is proposal/proxy-only inside this process tree. Pinned
+  Deno, compiler, WASM, workspace snapshot, cache, and scratch paths remain in
+  the outer Rust daemon, which applies their separate narrow Seatbelt after an
+  operation-bound execution request;
 - outbound sockets are denied except for an authenticated loopback CONNECT
   proxy with a provider-specific hostname allowlist and port 443;
 - RFC 2544 `198.18.0.0/15` results are accepted only after the CONNECT hostname

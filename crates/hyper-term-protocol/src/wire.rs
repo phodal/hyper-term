@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AcceptedGenUiArtifact, BlockDocument, BlockPatch, ClientId, EventEnvelope,
-    GenUiArtifactCandidate, InputLeaseId, OperationAction, OperationCompletion, OperationId,
-    OperationKind, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass,
-    TaskId, TerminalId, TerminalSize,
+    AcceptedGenUiArtifact, BlockDocument, BlockPatch, BrokeredMcpToolExecution, ClientId,
+    EventEnvelope, GenUiArtifactCandidate, InputLeaseId, OperationAction, OperationCompletion,
+    OperationId, OperationKind, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId,
+    RiskClass, TaskId, TerminalId, TerminalSize,
 };
 
 const MAGIC: [u8; 4] = *b"HTRM";
@@ -72,6 +72,14 @@ pub enum ControlRequest {
         task_id: TaskId,
         operation_id: OperationId,
         expected_revision: u64,
+    },
+    ExecuteBrokeredMcpTool {
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        tool_name: String,
+        proposal_digest: String,
+        arguments: serde_json::Value,
     },
     CompleteOperation {
         task_id: TaskId,
@@ -143,6 +151,9 @@ pub enum ControlResponse {
     },
     GenUiArtifactAccepted {
         artifact: AcceptedGenUiArtifact,
+    },
+    BrokeredMcpToolExecuted {
+        execution: BrokeredMcpToolExecution,
     },
     TerminalCreated {
         terminal_id: TerminalId,
@@ -461,6 +472,27 @@ mod tests {
                     summary: "diff ready".into(),
                     result_digest: Some("a".repeat(64)),
                 },
+            },
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &original).expect("encode");
+        assert_eq!(read_frame(bytes.as_slice()).expect("decode"), original);
+    }
+
+    #[test]
+    fn brokered_mcp_execution_request_round_trips_with_operation_binding() {
+        let original = WireFrame::Request(ControlRequestEnvelope {
+            request_id: RequestId::new(),
+            request: ControlRequest::ExecuteBrokeredMcpTool {
+                task_id: TaskId::new(),
+                operation_id: OperationId::new(),
+                expected_revision: 4,
+                tool_name: "hyper_term.genui.compile".into(),
+                proposal_digest: "a".repeat(64),
+                arguments: serde_json::json!({
+                    "source": "export default function App(){ return <main />; }",
+                    "entry": "App.tsx"
+                }),
             },
         });
         let mut bytes = Vec::new();

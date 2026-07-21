@@ -38,7 +38,13 @@ it launches the assembled app with an automation-enabled Native renderer and
 proves Native composer input reaches the bundled Codex ACP adapter, enters the
 streaming/stop state, and returns to an enabled composer with the expected
 Agent Block. This account-using gate is intentionally excluded from CI and
-never invokes login or authorizes a tool call.
+never invokes login. By default it does not authorize a tool call.
+
+Set `HYPER_TERM_REAL_ACP_GENUI=1` for the stricter path: Codex ACP must call
+`hyper_term.genui.compile`, the Native approval UI must authorize it, and the
+Rust journal must contain an accepted artifact plus a successful MCP receipt.
+The connector stays inside the Agent sandbox while Rust launches the supervised
+Deno compiler outside that process tree, avoiding nested Seatbelt.
 
 The final bundle contains:
 

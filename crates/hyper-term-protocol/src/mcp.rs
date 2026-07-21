@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     ContextDigest, McpArgumentsDigest, McpCapabilitiesDigest, McpCatalogDigest,
@@ -9,6 +10,18 @@ use crate::{
 
 pub const LOCAL_MCP_LAUNCH_SCHEMA_VERSION: u16 = 1;
 pub const LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION: u16 = 1;
+
+/// Live, operation-bound result returned by the Rust authority after it runs a
+/// bundled MCP tool outside the Agent process tree. Only the final receipt is
+/// journaled; structured content remains on the bounded control connection.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BrokeredMcpToolExecution {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
+    pub is_error: bool,
+    pub outcome: crate::OperationOutcome,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

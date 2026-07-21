@@ -22,17 +22,17 @@ use hyper_term_core::{
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, Actor, AgentExecutionContextReceiptSet, BlockDocument, BlockId,
-    BlockPatch, CapabilityLease, ClientId, CompiledSandboxProfile, ContextReceipt, ControlRequest,
-    ControlRequestEnvelope, ControlResponse, ControlResponseEnvelope, DomainEvent,
-    EXECUTION_CONTEXT_SCHEMA_VERSION, EventEnvelope, GenUiArtifactCandidate, InputLeaseId,
-    LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt, MessageRole, NewEvent,
-    OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
-    OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, SandboxEnforcement,
-    SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime,
-    SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy,
-    SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId,
-    TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame, read_frame,
-    write_frame,
+    BlockPatch, BrokeredMcpToolExecution, CapabilityLease, ClientId, CompiledSandboxProfile,
+    ContextReceipt, ControlRequest, ControlRequestEnvelope, ControlResponse,
+    ControlResponseEnvelope, DomainEvent, EXECUTION_CONTEXT_SCHEMA_VERSION, EventEnvelope,
+    GenUiArtifactCandidate, InputLeaseId, LocalMcpServerRuntimeReceipt, LocalMcpToolCall,
+    LocalMcpToolCallReceipt, MessageRole, NewEvent, OperationAction, OperationCompletion,
+    OperationId, OperationKind, OperationOutcome, OperationState, PROTOCOL_VERSION,
+    PermissionDecision, RequestId, RiskClass, SandboxEnforcement, SandboxEnvironmentPolicy,
+    SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime, SandboxNetworkPolicy, SandboxOutcome,
+    SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy, SandboxReceipt,
+    SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId, TerminalInputFrame, TerminalSize,
+    TerminalSnapshotFrame, WireError, WireFrame, read_frame, write_frame,
 };
 use hyper_term_sandbox::{
     IsolatedTaskReceipt, IsolatedTaskRequest, IsolatedTaskTermination, IsolatedWorktree,
@@ -84,8 +84,8 @@ pub use local_mcp_runtime::{
 };
 #[cfg(unix)]
 pub use mcp_gateway::{
-    DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig, McpGatewayError, McpStdioConfig,
-    run_mcp_stdio,
+    BrokeredMcpRuntimeConfig, DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig, McpGatewayError,
+    McpStdioConfig, run_mcp_stdio,
 };
 pub use web_gateway::{
     TerminalGatewayConfig, TerminalGatewayError, TerminalGatewayHandle, spawn_terminal_gateway,
@@ -140,6 +140,10 @@ struct DaemonInner {
     artifacts: ArtifactStore,
     artifact_acceptance: Mutex<()>,
     scratch_root: PathBuf,
+    #[cfg(unix)]
+    brokered_mcp_runtimes: Mutex<HashMap<TaskId, Arc<Mutex<mcp_gateway::BrokeredMcpExecutor>>>>,
+    #[cfg(unix)]
+    brokered_mcp_executions: Mutex<HashMap<OperationId, CachedBrokeredMcpExecution>>,
 }
 
 impl Drop for DaemonInner {
@@ -204,6 +208,17 @@ struct PreparedIsolatedAcceptance {
     workspace: PathBuf,
     plan: WorkspaceApplySetPlan,
     binding_digest: String,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct CachedBrokeredMcpExecution {
+    task_id: TaskId,
+    operation_revision: u64,
+    tool_name: String,
+    proposal_digest: String,
+    arguments_digest: String,
+    execution: BrokeredMcpToolExecution,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -344,6 +359,10 @@ impl DaemonState {
                 artifacts,
                 artifact_acceptance: Mutex::new(()),
                 scratch_root,
+                #[cfg(unix)]
+                brokered_mcp_runtimes: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                brokered_mcp_executions: Mutex::new(HashMap::new()),
             }),
         };
         daemon.reconcile_interrupted_dispatches()?;
@@ -370,6 +389,132 @@ impl DaemonState {
             payload: DomainEvent::TaskCreated { title },
         })?;
         Ok(task_id)
+    }
+
+    #[cfg(unix)]
+    pub fn register_brokered_mcp_runtime(
+        &self,
+        task_id: TaskId,
+        config: BrokeredMcpRuntimeConfig,
+    ) -> Result<(), DaemonError> {
+        self.require_task(task_id)?;
+        let executor = mcp_gateway::BrokeredMcpExecutor::new(config)
+            .map_err(|error| DaemonError::BrokeredMcpRuntime(error.to_string()))?;
+        let mut runtimes = lock(&self.inner.brokered_mcp_runtimes)?;
+        if runtimes.contains_key(&task_id) {
+            return Err(DaemonError::BrokeredMcpRuntimeAlreadyRegistered(task_id));
+        }
+        runtimes.insert(task_id, Arc::new(Mutex::new(executor)));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub fn unregister_brokered_mcp_runtime(&self, task_id: TaskId) -> Result<(), DaemonError> {
+        let executor = lock(&self.inner.brokered_mcp_runtimes)?.remove(&task_id);
+        if let Some(executor) = executor {
+            // Session shutdown must not delete the private runtime root while
+            // an already-authorized Deno call is still using it.
+            drop(lock(&executor)?);
+        }
+        lock(&self.inner.brokered_mcp_executions)?.retain(|_, cached| cached.task_id != task_id);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub fn execute_brokered_mcp_tool(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        tool_name: String,
+        proposal_digest: String,
+        arguments: serde_json::Value,
+    ) -> Result<BrokeredMcpToolExecution, DaemonError> {
+        let tool_name = bounded_nonempty(tool_name, 256, "brokered MCP tool name")?;
+        if !is_sha256(&proposal_digest) {
+            return Err(DaemonError::InvalidBrokeredMcpDigest);
+        }
+        let arguments_bytes = serde_json::to_vec(&arguments)
+            .map_err(|error| DaemonError::BrokeredMcpRuntime(error.to_string()))?;
+        if arguments_bytes.len() > 1024 * 1024 {
+            return Err(DaemonError::BrokeredMcpArgumentsTooLarge(
+                arguments_bytes.len(),
+            ));
+        }
+        let recomputed_proposal_digest = Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "name": tool_name,
+                "arguments": arguments,
+            }))
+            .map_err(|error| DaemonError::BrokeredMcpRuntime(error.to_string()))?,
+        )
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+        if recomputed_proposal_digest != proposal_digest {
+            return Err(DaemonError::BrokeredMcpBindingMismatch);
+        }
+        let arguments_digest = Sha256::digest(&arguments_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let record = self.operation(operation_id)?;
+        validate_operation_scope(&record, task_id, expected_revision)?;
+        if record.state != OperationState::Dispatching {
+            return Err(DaemonError::OperationNotDispatching(record.state));
+        }
+        match &record.action {
+            OperationAction::Opaque {
+                kind,
+                payload_digest,
+            } if kind == &tool_name && payload_digest == &proposal_digest => {}
+            _ => return Err(DaemonError::BrokeredMcpBindingMismatch),
+        }
+        let cached_matches = |cached: &CachedBrokeredMcpExecution| {
+            cached.task_id == task_id
+                && cached.operation_revision == expected_revision
+                && cached.tool_name == tool_name
+                && cached.proposal_digest == proposal_digest
+                && cached.arguments_digest == arguments_digest
+        };
+        if let Some(cached) = lock(&self.inner.brokered_mcp_executions)?
+            .get(&operation_id)
+            .cloned()
+        {
+            return if cached_matches(&cached) {
+                Ok(cached.execution)
+            } else {
+                Err(DaemonError::BrokeredMcpReplayMismatch)
+            };
+        }
+        let executor = lock(&self.inner.brokered_mcp_runtimes)?
+            .get(&task_id)
+            .cloned()
+            .ok_or(DaemonError::BrokeredMcpRuntimeMissing(task_id))?;
+        let mut executor = lock(&executor)?;
+        if let Some(cached) = lock(&self.inner.brokered_mcp_executions)?
+            .get(&operation_id)
+            .cloned()
+        {
+            return if cached_matches(&cached) {
+                Ok(cached.execution)
+            } else {
+                Err(DaemonError::BrokeredMcpReplayMismatch)
+            };
+        }
+        let execution = executor.execute(&tool_name, &arguments);
+        lock(&self.inner.brokered_mcp_executions)?.insert(
+            operation_id,
+            CachedBrokeredMcpExecution {
+                task_id,
+                operation_revision: expected_revision,
+                tool_name,
+                proposal_digest,
+                arguments_digest,
+                execution: execution.clone(),
+            },
+        );
+        Ok(execution)
     }
 
     pub fn append_message(
@@ -3751,6 +3896,23 @@ mod unix_server {
                     revision: record.revision,
                     state: record.state,
                 }),
+            ControlRequest::ExecuteBrokeredMcpTool {
+                task_id,
+                operation_id,
+                expected_revision,
+                tool_name,
+                proposal_digest,
+                arguments,
+            } => state
+                .execute_brokered_mcp_tool(
+                    task_id,
+                    operation_id,
+                    expected_revision,
+                    tool_name,
+                    proposal_digest,
+                    arguments,
+                )
+                .map(|execution| ControlResponse::BrokeredMcpToolExecuted { execution }),
             ControlRequest::CompleteOperation {
                 task_id,
                 operation_id,
@@ -3996,6 +4158,20 @@ pub enum DaemonError {
     InvalidLocalMcpToolCall,
     #[error("local MCP tool call receipt is invalid")]
     InvalidLocalMcpToolCallReceipt,
+    #[error("brokered MCP runtime failed: {0}")]
+    BrokeredMcpRuntime(String),
+    #[error("task {0} already has a brokered MCP runtime")]
+    BrokeredMcpRuntimeAlreadyRegistered(TaskId),
+    #[error("task {0} has no brokered MCP runtime")]
+    BrokeredMcpRuntimeMissing(TaskId),
+    #[error("brokered MCP proposal digest must be a lowercase SHA-256 value")]
+    InvalidBrokeredMcpDigest,
+    #[error("brokered MCP arguments contain {0} bytes and exceed the 1 MiB bound")]
+    BrokeredMcpArgumentsTooLarge(usize),
+    #[error("brokered MCP request does not match the dispatching operation")]
+    BrokeredMcpBindingMismatch,
+    #[error("brokered MCP operation was replayed with different inputs")]
+    BrokeredMcpReplayMismatch,
     #[error("the negotiated local MCP runtime for this call is not recorded")]
     LocalMcpRuntimeNotRecorded,
     #[error("terminal dispatch only supports an exact shell action")]
@@ -4118,6 +4294,10 @@ impl DaemonError {
             Self::InvalidBoundedText { .. }
             | Self::InvalidResultDigest
             | Self::InconsistentOperationOutcome
+            | Self::InvalidBrokeredMcpDigest
+            | Self::BrokeredMcpArgumentsTooLarge(_)
+            | Self::BrokeredMcpBindingMismatch
+            | Self::BrokeredMcpReplayMismatch
             | Self::InvalidLocalMcpRuntimeReceipt
             | Self::InvalidLocalMcpToolCallReceipt
             | Self::LocalMcpRuntimeNotRecorded

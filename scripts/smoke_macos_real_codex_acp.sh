@@ -9,6 +9,7 @@ real_app=${1:-"$real_repo_root/dist/macos/Hyper Term.app"}
 real_renderer=${2:-"$real_repo_root/apps/desktop/zig-out/bin/hyper-term"}
 real_expected=${HYPER_TERM_REAL_ACP_EXPECTED_TEXT:-HYPER_TERM_REAL_DESKTOP_ACP_OK}
 real_artifact_dir=${HYPER_TERM_REAL_ACP_ARTIFACT_DIR:-}
+real_genui=${HYPER_TERM_REAL_ACP_GENUI:-0}
 
 if [[ "$real_app" != /* ]]; then
   real_app="$PWD/$real_app"
@@ -18,6 +19,10 @@ if [[ "$real_renderer" != /* ]]; then
 fi
 if [[ ! "$real_expected" =~ ^[A-Za-z0-9_:-]{1,64}$ ]]; then
   echo "HYPER_TERM_REAL_ACP_EXPECTED_TEXT must be a 1-64 byte marker" >&2
+  exit 1
+fi
+if [[ "$real_genui" != 0 && "$real_genui" != 1 ]]; then
+  echo "HYPER_TERM_REAL_ACP_GENUI must be 0 or 1" >&2
   exit 1
 fi
 
@@ -118,8 +123,13 @@ real_pid=$!
     echo "real Codex ACP composer widget is unavailable" >&2
     exit 1
   fi
+  if [[ "$real_genui" == 1 ]]; then
+    real_prompt="Use hyper_term.genui.compile exactly once to compile this source with entry App.tsx: export default function App(){ return <main data-hyper-term=\"real-mcp\">$real_expected</main>; }. Do not run shell commands or modify workspace files. After the tool succeeds, reply exactly $real_expected."
+  else
+    real_prompt="Reply with exactly $real_expected. Do not use tools or modify files."
+  fi
   native automate widget-action hyper-term-canvas "$real_composer_id" set-text \
-    "Reply with exactly $real_expected. Do not use tools or modify files."
+    "$real_prompt"
   native automate assert \
     "role=textbox name=\"Agent prompt\".*$real_expected" \
     'role=button name="Send prompt".*enabled=true'
@@ -131,6 +141,17 @@ real_pid=$!
   fi
   native automate widget-click hyper-term-canvas "$real_send_id"
   native automate assert --timeout-ms 30000 'role=button name="Stop Agent turn"'
+  if [[ "$real_genui" == 1 ]]; then
+    native automate assert --timeout-ms 120000 \
+      'Approval required' \
+      'role=button name="Allow once".*enabled=true'
+    real_allow_id=$(real_widget_id 'role=button name="Allow once".*enabled=true')
+    if [[ -z "$real_allow_id" ]]; then
+      echo "real Codex ACP GenUI approval button is unavailable" >&2
+      exit 1
+    fi
+    native automate widget-click hyper-term-canvas "$real_allow_id"
+  fi
   native automate assert --timeout-ms 150000 \
     "$real_expected" \
     'role=textbox name="Agent prompt".*enabled=true' \
@@ -139,6 +160,12 @@ real_pid=$!
     'role=button name="Stop Agent turn"' \
     'error event=' \
     'dispatch_errors=[1-9]'
+  if [[ "$real_genui" == 1 ]]; then
+    native automate assert 'succeeded' 'Allowed once'
+    grep -q '"type":"artifact_accepted"' "$real_root/state/events.jsonl"
+    grep -q '"executor":"hyper-term-mcp","succeeded":true' \
+      "$real_root/state/events.jsonl"
+  fi
   native automate screenshot hyper-term-canvas
 )
 
@@ -153,4 +180,8 @@ if [[ -n "$real_artifact_dir" ]]; then
   cp "$real_log" "$real_artifact_dir/hyper-term-real-codex-acp.log"
 fi
 
-echo "real Codex ACP desktop smoke passed: $real_expected"
+if [[ "$real_genui" == 1 ]]; then
+  echo "real Codex ACP GenUI desktop smoke passed: $real_expected"
+else
+  echo "real Codex ACP desktop smoke passed: $real_expected"
+fi

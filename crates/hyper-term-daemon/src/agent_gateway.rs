@@ -66,7 +66,8 @@ use crate::workspace_diff::{
 };
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
 use crate::{
-    DaemonError, DaemonState, IsolatedAcceptancePreview, IsolatedAcceptanceReview,
+    BrokeredMcpRuntimeConfig, DaemonError, DaemonState, DenoGenUiMcpExecutorConfig,
+    DenoMcpExecutorConfig, IsolatedAcceptancePreview, IsolatedAcceptanceReview,
     LocalMcpRuntimeError, LocalMcpRuntimeManager, RegisteredLocalMcpServer,
 };
 
@@ -3099,6 +3100,7 @@ impl AgentGatewayRuntime {
         let launched = match self.launch_provider(provider_id, &session_root, mcp) {
             Ok(launched) => launched,
             Err(error) => {
+                self.cleanup_brokered_mcp_runtime(task_id);
                 let _ = std::fs::remove_dir_all(&session_root);
                 return Err(error);
             }
@@ -3108,6 +3110,7 @@ impl AgentGatewayRuntime {
             Ok(thread_id) => thread_id,
             Err(_) => {
                 let _ = launched.client.close();
+                self.cleanup_brokered_mcp_runtime(task_id);
                 let _ = std::fs::remove_dir_all(&session_root);
                 return Err(StartError::Driver);
             }
@@ -3127,6 +3130,7 @@ impl AgentGatewayRuntime {
                 .is_err()
         {
             let _ = launched.client.close();
+            self.cleanup_brokered_mcp_runtime(task_id);
             let _ = std::fs::remove_dir_all(&session_root);
             return Err(StartError::Driver);
         }
@@ -3177,14 +3181,7 @@ impl AgentGatewayRuntime {
                 .as_ref()
                 .map(|_| vec![self.config.control_socket.clone()])
                 .unwrap_or_default();
-            let mut read_paths = Vec::new();
-            if let Some(runtime) = &self.config.genui_runtime {
-                read_paths.extend([
-                    runtime.deno_executable.clone(),
-                    runtime.compiler_script.clone(),
-                    runtime.compiler_wasm.clone(),
-                ]);
-            }
+            let read_paths = Vec::new();
             let auth_file = self
                 .config
                 .codex_auth_file
@@ -5140,40 +5137,60 @@ impl AgentGatewayRuntime {
                 Ok(digest) => digest,
                 Err(_) => return Some(Err(StartError::Driver)),
             };
-            let deno_root = session_root.join("deno-tools");
-            arguments.extend([
-                "--deno".into(),
-                runtime.deno_executable.clone().into_os_string(),
-                "--deno-sha256".into(),
-                deno_sha256.into(),
-                "--deno-version".into(),
-                runtime.runtime_version.clone().into(),
-                "--deno-cache".into(),
-                deno_root.join("cache").into_os_string(),
-                "--deno-scratch".into(),
-                deno_root.join("scratch").into_os_string(),
-            ]);
-            if let Ok(snapshot) = create_workspace_snapshot(
+            let deno_root = self.brokered_mcp_root(task_id);
+            if create_private_runtime_root(&deno_root).is_err() {
+                return Some(Err(StartError::Driver));
+            }
+            let snapshot = create_workspace_snapshot(
                 &self.config.workspace,
                 &deno_root.join("workspace-snapshot"),
-            ) {
-                arguments.extend([
-                    "--workspace-snapshot".into(),
-                    snapshot.root.into_os_string(),
-                ]);
+            )
+            .ok();
+            let lsp_cache = deno_root.join("lsp-cache");
+            let lsp_scratch = deno_root.join("lsp-scratch");
+            let genui_cache = deno_root.join("genui-cache");
+            let genui_scratch = deno_root.join("genui-scratch");
+            for directory in [&lsp_cache, &lsp_scratch, &genui_cache, &genui_scratch] {
+                if create_private_runtime_root(directory).is_err() {
+                    return Some(Err(StartError::Driver));
+                }
             }
-            arguments.extend([
-                "--genui-script".into(),
-                runtime.compiler_script.clone().into_os_string(),
-                "--genui-script-sha256".into(),
-                script_sha256.into(),
-                "--genui-wasm".into(),
-                runtime.compiler_wasm.clone().into_os_string(),
-                "--genui-wasm-sha256".into(),
-                wasm_sha256.into(),
-                "--genui-compiler-version".into(),
-                runtime.compiler_version.clone().into(),
-            ]);
+            let registration = BrokeredMcpRuntimeConfig {
+                deno_lsp: snapshot.map(|snapshot| DenoMcpExecutorConfig {
+                    executable: runtime.deno_executable.clone(),
+                    executable_sha256: deno_sha256.clone(),
+                    runtime_version: runtime.runtime_version.clone(),
+                    workspace_snapshot: snapshot.root,
+                    cache_directory: lsp_cache,
+                    scratch_directory: lsp_scratch,
+                }),
+                deno_genui: Some(DenoGenUiMcpExecutorConfig {
+                    executable: runtime.deno_executable.clone(),
+                    executable_sha256: deno_sha256,
+                    runtime_version: runtime.runtime_version.clone(),
+                    compiler_script: runtime.compiler_script.clone(),
+                    compiler_script_sha256: script_sha256,
+                    compiler_wasm: runtime.compiler_wasm.clone(),
+                    compiler_wasm_sha256: wasm_sha256,
+                    compiler_version: runtime.compiler_version.clone(),
+                    cache_directory: genui_cache,
+                    scratch_directory: genui_scratch,
+                }),
+            };
+            let lsp_enabled = registration.deno_lsp.is_some();
+            if self
+                .config
+                .daemon
+                .register_brokered_mcp_runtime(task_id, registration)
+                .is_err()
+            {
+                let _ = std::fs::remove_dir_all(&deno_root);
+                return Some(Err(StartError::Driver));
+            }
+            if lsp_enabled {
+                arguments.push("--enable-deno-lsp".into());
+            }
+            arguments.push("--enable-genui".into());
         }
         Some(Ok(BrokeredMcpLaunch {
             executable,
@@ -5194,6 +5211,7 @@ impl AgentGatewayRuntime {
             .and_then(|mut sessions| sessions.remove(&session_id));
         if let Some(session) = session {
             let _ = session.client.close();
+            self.cleanup_brokered_mcp_runtime(session.task_id);
             let _ = std::fs::remove_dir_all(&session.runtime_root);
         }
         if let Some(editor_lsp) = &self.editor_lsp {
@@ -5218,6 +5236,7 @@ impl AgentGatewayRuntime {
         };
         for session in sessions {
             let _ = session.client.close();
+            self.cleanup_brokered_mcp_runtime(session.task_id);
             let _ = std::fs::remove_dir_all(&session.runtime_root);
         }
         if let Some(editor_lsp) = &self.editor_lsp {
@@ -5226,6 +5245,18 @@ impl AgentGatewayRuntime {
         if let Some(compiler) = &self.artifact_draft_compiler {
             compiler.close();
         }
+    }
+
+    fn brokered_mcp_root(&self, task_id: TaskId) -> PathBuf {
+        self.config
+            .state_directory
+            .join("brokered-mcp")
+            .join(task_id.to_string())
+    }
+
+    fn cleanup_brokered_mcp_runtime(&self, task_id: TaskId) {
+        let _ = self.config.daemon.unregister_brokered_mcp_runtime(task_id);
+        let _ = std::fs::remove_dir_all(self.brokered_mcp_root(task_id));
     }
 
     fn close_artifact_drafts(&self, session_id: u16) {
@@ -9763,7 +9794,7 @@ done
     }
 
     #[test]
-    fn brokered_mcp_receives_pinned_deno_tools_and_a_private_workspace_snapshot() {
+    fn brokered_mcp_keeps_deno_paths_outside_the_agent_process_tree() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
         let state_directory = temporary.path().join("gateway-state");
@@ -9821,7 +9852,7 @@ done
                 tier2_runner: None,
                 control_socket: temporary.path().join("hyperd.sock"),
             }),
-            local_mcp: Arc::new(LocalMcpRuntimeManager::new(daemon, Vec::new()).unwrap()),
+            local_mcp: Arc::new(LocalMcpRuntimeManager::new(daemon.clone(), Vec::new()).unwrap()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             preview_shell: None,
             workbench_assets: None,
@@ -9838,8 +9869,9 @@ done
             workspace_recovery_block: Arc::new(Mutex::new(None)),
         };
         let session_root = state_directory.join("agents/session-7");
+        let task_id = daemon.create_task("Agent MCP boundary".into()).unwrap();
         let config = runtime
-            .mcp_launch(TaskId::new(), &session_root)
+            .mcp_launch(task_id, &session_root)
             .expect("MCP configured")
             .expect("valid MCP config");
         let arguments = config
@@ -9847,29 +9879,37 @@ done
             .iter()
             .map(|argument| argument.to_string_lossy())
             .collect::<Vec<_>>();
-        assert!(arguments.contains(&std::borrow::Cow::Borrowed("--genui-script")));
-        assert!(arguments.contains(&std::borrow::Cow::Borrowed("--genui-wasm")));
-        assert!(arguments.contains(&std::borrow::Cow::Borrowed("--deno-sha256")));
-        let snapshot = arguments
-            .windows(2)
-            .find(|pair| pair[0] == "--workspace-snapshot")
-            .map(|pair| PathBuf::from(pair[1].as_ref()))
-            .expect("workspace snapshot argument");
+        assert!(arguments.contains(&std::borrow::Cow::Borrowed("--enable-genui")));
+        assert!(arguments.contains(&std::borrow::Cow::Borrowed("--enable-deno-lsp")));
+        for forbidden in [
+            "--deno",
+            "--deno-sha256",
+            "--workspace-snapshot",
+            "--genui-script",
+            "--genui-wasm",
+        ] {
+            assert!(!arguments.contains(&std::borrow::Cow::Borrowed(forbidden)));
+        }
+        assert!(!arguments.iter().any(|argument| argument.len() == 64));
+        let snapshot = state_directory
+            .join("brokered-mcp")
+            .join(task_id.to_string())
+            .join("workspace-snapshot");
         assert_eq!(
             std::fs::read_to_string(snapshot.join("src/main.ts")).unwrap(),
             "export const answer: number = 42;\n"
         );
         assert!(!snapshot.join("node_modules").exists());
-        assert!(arguments.iter().any(|argument| argument.len() == 64));
-        assert!(config.arguments.len() <= 32);
+        assert!(config.arguments.len() <= 8);
 
         std::fs::write(
             workspace.join("oversized.ts"),
             vec![b'x'; 2 * 1024 * 1024 + 1],
         )
         .expect("oversized source fixture");
+        let degraded_task = daemon.create_task("Agent MCP degraded".into()).unwrap();
         let degraded = runtime
-            .mcp_launch(TaskId::new(), &state_directory.join("agents/session-8"))
+            .mcp_launch(degraded_task, &state_directory.join("agents/session-8"))
             .expect("MCP configured")
             .expect("GenUI-only MCP config");
         let degraded_arguments = degraded
@@ -9877,11 +9917,13 @@ done
             .iter()
             .map(|argument| argument.to_string_lossy())
             .collect::<Vec<_>>();
-        assert!(degraded_arguments.contains(&std::borrow::Cow::Borrowed("--genui-script")));
-        assert!(!degraded_arguments.contains(&std::borrow::Cow::Borrowed("--workspace-snapshot")));
+        assert!(degraded_arguments.contains(&std::borrow::Cow::Borrowed("--enable-genui")));
+        assert!(!degraded_arguments.contains(&std::borrow::Cow::Borrowed("--enable-deno-lsp")));
         assert!(
             !state_directory
-                .join("agents/session-8/deno-tools/workspace-snapshot")
+                .join("brokered-mcp")
+                .join(degraded_task.to_string())
+                .join("workspace-snapshot")
                 .exists()
         );
     }

@@ -16,9 +16,9 @@ use hyper_term_drivers::{
     path_to_file_uri,
 };
 use hyper_term_protocol::{
-    ControlRequest, ControlResponse, DomainEvent, GenUiArtifactCandidate, OperationAction,
-    OperationCompletion, OperationId, OperationKind, OperationOutcome, OperationState,
-    PermissionDecision, RiskClass, TaskId, WireFrame,
+    BrokeredMcpToolExecution, ControlRequest, ControlResponse, DomainEvent, GenUiArtifactCandidate,
+    OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
+    OperationState, PermissionDecision, RiskClass, TaskId, WireFrame,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -58,12 +58,18 @@ pub struct DenoGenUiMcpExecutorConfig {
     pub scratch_directory: PathBuf,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BrokeredMcpRuntimeConfig {
+    pub deno_lsp: Option<DenoMcpExecutorConfig>,
+    pub deno_genui: Option<DenoGenUiMcpExecutorConfig>,
+}
+
 #[derive(Clone, Debug)]
 pub struct McpStdioConfig {
     socket: PathBuf,
     task_id: Option<TaskId>,
-    deno_lsp: Option<DenoMcpExecutorConfig>,
-    deno_genui: Option<DenoGenUiMcpExecutorConfig>,
+    deno_lsp_enabled: bool,
+    deno_genui_enabled: bool,
 }
 
 impl McpStdioConfig {
@@ -77,8 +83,8 @@ impl McpStdioConfig {
         Ok(Self {
             socket,
             task_id: None,
-            deno_lsp: None,
-            deno_genui: None,
+            deno_lsp_enabled: false,
+            deno_genui_enabled: false,
         })
     }
 
@@ -87,43 +93,14 @@ impl McpStdioConfig {
         self
     }
 
-    pub fn with_deno_lsp(mut self, config: DenoMcpExecutorConfig) -> Result<Self, McpGatewayError> {
-        if !config.executable.is_absolute()
-            || !config.workspace_snapshot.is_absolute()
-            || !config.cache_directory.is_absolute()
-            || !config.scratch_directory.is_absolute()
-        {
-            return Err(McpGatewayError::DenoPathsMustBeAbsolute);
-        }
-        if config.runtime_version.is_empty() || !is_sha256(&config.executable_sha256) {
-            return Err(McpGatewayError::InvalidDenoManifest);
-        }
-        self.deno_lsp = Some(config);
-        Ok(self)
+    pub fn with_deno_lsp_enabled(mut self) -> Self {
+        self.deno_lsp_enabled = true;
+        self
     }
 
-    pub fn with_deno_genui(
-        mut self,
-        config: DenoGenUiMcpExecutorConfig,
-    ) -> Result<Self, McpGatewayError> {
-        if !config.executable.is_absolute()
-            || !config.compiler_script.is_absolute()
-            || !config.compiler_wasm.is_absolute()
-            || !config.cache_directory.is_absolute()
-            || !config.scratch_directory.is_absolute()
-        {
-            return Err(McpGatewayError::DenoPathsMustBeAbsolute);
-        }
-        if config.runtime_version.is_empty()
-            || config.compiler_version.is_empty()
-            || !is_sha256(&config.executable_sha256)
-            || !is_sha256(&config.compiler_script_sha256)
-            || !is_sha256(&config.compiler_wasm_sha256)
-        {
-            return Err(McpGatewayError::InvalidDenoManifest);
-        }
-        self.deno_genui = Some(config);
-        Ok(self)
+    pub fn with_deno_genui_enabled(mut self) -> Self {
+        self.deno_genui_enabled = true;
+        self
     }
 }
 
@@ -175,10 +152,6 @@ struct McpGateway<'a, W> {
     socket: PathBuf,
     output: &'a mut W,
     server: McpAgentServer,
-    deno_lsp_config: Option<DenoMcpExecutorConfig>,
-    deno_lsp: Option<DenoLspExecutor>,
-    deno_genui_config: Option<DenoGenUiMcpExecutorConfig>,
-    deno_genui: Option<DenoGenUiExecutor>,
     task_id: Option<TaskId>,
     pending: HashMap<OperationId, PendingAuthorityCall>,
 }
@@ -186,20 +159,16 @@ struct McpGateway<'a, W> {
 impl<'a, W: Write> McpGateway<'a, W> {
     fn new(config: McpStdioConfig, output: &'a mut W) -> Self {
         let mut tools = vec![McpToolClass::DiffReview];
-        if config.deno_lsp.is_some() {
+        if config.deno_lsp_enabled {
             tools.push(McpToolClass::DenoLspQuery);
         }
-        if config.deno_genui.is_some() {
+        if config.deno_genui_enabled {
             tools.push(McpToolClass::GenUiCompile);
         }
         Self {
             socket: config.socket,
             output,
             server: McpAgentServer::with_tools(Uuid::new_v4(), tools),
-            deno_lsp_config: config.deno_lsp,
-            deno_lsp: None,
-            deno_genui_config: config.deno_genui,
-            deno_genui: None,
             task_id: config.task_id,
             pending: HashMap::new(),
         }
@@ -360,7 +329,7 @@ impl<'a, W: Write> McpGateway<'a, W> {
                 );
             }
         };
-        let mut execution = self.execute_tool(&call);
+        let mut execution = self.execute_tool(task_id, operation_id, dispatching_revision, &call);
         if call.class == McpToolClass::GenUiCompile
             && execution.outcome == OperationOutcome::Succeeded
         {
@@ -542,66 +511,55 @@ impl<'a, W: Write> McpGateway<'a, W> {
         Ok(())
     }
 
-    fn execute_tool(&mut self, call: &McpToolCall) -> ToolExecution {
+    fn execute_tool(
+        &mut self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        dispatching_revision: u64,
+        call: &McpToolCall,
+    ) -> ToolExecution {
         match call.class {
             McpToolClass::DiffReview => ToolExecution::definitive(diff_review(&call.arguments)),
-            McpToolClass::DenoLspQuery => {
-                if self.deno_lsp.is_none() {
-                    let Some(config) = self.deno_lsp_config.clone() else {
-                        return ToolExecution::failed("Deno LSP executor is not configured");
-                    };
-                    match DenoLspExecutor::launch(config) {
-                        Ok(executor) => self.deno_lsp = Some(executor),
-                        Err(error) => {
-                            return ToolExecution::failed(format!(
-                                "Deno LSP could not start: {error}"
-                            ));
-                        }
-                    }
-                }
-                let (result, state) = {
-                    let executor = self.deno_lsp.as_mut().expect("executor was initialized");
-                    let result = executor.query(&call.arguments);
-                    let state = executor.client.state().unwrap_or(DriverState::Failed);
-                    (result, state)
-                };
-                if state.is_terminal() {
-                    self.deno_lsp = None;
-                }
-                ToolExecution::from_driver_result(result, state, "Deno LSP query")
-            }
-            McpToolClass::GenUiCompile => {
-                if self.deno_genui.is_none() {
-                    let Some(config) = self.deno_genui_config.clone() else {
-                        return ToolExecution::failed("GenUI compiler executor is not configured");
-                    };
-                    match DenoGenUiExecutor::launch(config) {
-                        Ok(executor) => self.deno_genui = Some(executor),
-                        Err(error) => {
-                            return ToolExecution::failed(format!(
-                                "GenUI compiler could not start: {error}"
-                            ));
-                        }
-                    }
-                }
-                let (result, state) = {
-                    let executor = self.deno_genui.as_mut().expect("executor was initialized");
-                    let result = executor.compile(&call.arguments);
-                    let state = executor.compiler.state().unwrap_or(DriverState::Failed);
-                    (result, state)
-                };
-                if state.is_terminal() {
-                    self.deno_genui = None;
-                }
-                ToolExecution::from_driver_result(result, state, "GenUI compile")
-            }
+            McpToolClass::DenoLspQuery | McpToolClass::GenUiCompile => match authority_request(
+                &self.socket,
+                ControlRequest::ExecuteBrokeredMcpTool {
+                    task_id,
+                    operation_id,
+                    expected_revision: dispatching_revision,
+                    tool_name: call.name.clone(),
+                    proposal_digest: call.proposal.payload_sha256.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            ) {
+                Ok(ControlResponse::BrokeredMcpToolExecuted { execution }) => execution.into(),
+                Ok(response) => ToolExecution::failed(format!(
+                    "Rust MCP executor returned an unexpected response: {response:?}"
+                )),
+                Err(error) => ToolExecution::failed(format!(
+                    "Rust MCP executor rejected the operation: {error}"
+                )),
+            },
         }
     }
 }
 
+#[derive(Clone)]
 struct ToolExecution {
     result: McpToolResult,
     outcome: OperationOutcome,
+}
+
+impl From<BrokeredMcpToolExecution> for ToolExecution {
+    fn from(execution: BrokeredMcpToolExecution) -> Self {
+        Self {
+            result: McpToolResult {
+                text: execution.text,
+                structured_content: execution.structured_content,
+                is_error: execution.is_error,
+            },
+            outcome: execution.outcome,
+        }
+    }
 }
 
 impl ToolExecution {
@@ -675,6 +633,122 @@ fn tool_failure(message: impl Into<String>) -> McpToolResult {
         text: message.into(),
         structured_content: None,
         is_error: true,
+    }
+}
+
+pub(crate) struct BrokeredMcpExecutor {
+    deno_lsp_config: Option<DenoMcpExecutorConfig>,
+    deno_lsp: Option<DenoLspExecutor>,
+    deno_genui_config: Option<DenoGenUiMcpExecutorConfig>,
+    deno_genui: Option<DenoGenUiExecutor>,
+}
+
+impl BrokeredMcpExecutor {
+    pub(crate) fn new(config: BrokeredMcpRuntimeConfig) -> Result<Self, McpGatewayError> {
+        if let Some(config) = &config.deno_lsp {
+            if !config.executable.is_absolute()
+                || !config.workspace_snapshot.is_absolute()
+                || !config.cache_directory.is_absolute()
+                || !config.scratch_directory.is_absolute()
+            {
+                return Err(McpGatewayError::DenoPathsMustBeAbsolute);
+            }
+            if config.runtime_version.is_empty() || !is_sha256(&config.executable_sha256) {
+                return Err(McpGatewayError::InvalidDenoManifest);
+            }
+        }
+        if let Some(config) = &config.deno_genui {
+            if !config.executable.is_absolute()
+                || !config.compiler_script.is_absolute()
+                || !config.compiler_wasm.is_absolute()
+                || !config.cache_directory.is_absolute()
+                || !config.scratch_directory.is_absolute()
+            {
+                return Err(McpGatewayError::DenoPathsMustBeAbsolute);
+            }
+            if config.runtime_version.is_empty()
+                || config.compiler_version.is_empty()
+                || !is_sha256(&config.executable_sha256)
+                || !is_sha256(&config.compiler_script_sha256)
+                || !is_sha256(&config.compiler_wasm_sha256)
+            {
+                return Err(McpGatewayError::InvalidDenoManifest);
+            }
+        }
+        Ok(Self {
+            deno_lsp_config: config.deno_lsp,
+            deno_lsp: None,
+            deno_genui_config: config.deno_genui,
+            deno_genui: None,
+        })
+    }
+
+    pub(crate) fn execute(
+        &mut self,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> BrokeredMcpToolExecution {
+        let execution = match tool_name {
+            "hyper_term.lsp.query" => self.execute_lsp(arguments),
+            "hyper_term.genui.compile" => self.execute_genui(arguments),
+            _ => ToolExecution::failed("tool is not a brokered Deno executor"),
+        };
+        BrokeredMcpToolExecution {
+            text: execution.result.text,
+            structured_content: execution.result.structured_content,
+            is_error: execution.result.is_error,
+            outcome: execution.outcome,
+        }
+    }
+
+    fn execute_lsp(&mut self, arguments: &Value) -> ToolExecution {
+        if self.deno_lsp.is_none() {
+            let Some(config) = self.deno_lsp_config.clone() else {
+                return ToolExecution::failed("Deno LSP executor is not configured");
+            };
+            match DenoLspExecutor::launch(config) {
+                Ok(executor) => self.deno_lsp = Some(executor),
+                Err(error) => {
+                    return ToolExecution::failed(format!("Deno LSP could not start: {error}"));
+                }
+            }
+        }
+        let (result, state) = {
+            let executor = self.deno_lsp.as_mut().expect("executor was initialized");
+            let result = executor.query(arguments);
+            let state = executor.client.state().unwrap_or(DriverState::Failed);
+            (result, state)
+        };
+        if state.is_terminal() {
+            self.deno_lsp = None;
+        }
+        ToolExecution::from_driver_result(result, state, "Deno LSP query")
+    }
+
+    fn execute_genui(&mut self, arguments: &Value) -> ToolExecution {
+        if self.deno_genui.is_none() {
+            let Some(config) = self.deno_genui_config.clone() else {
+                return ToolExecution::failed("GenUI compiler executor is not configured");
+            };
+            match DenoGenUiExecutor::launch(config) {
+                Ok(executor) => self.deno_genui = Some(executor),
+                Err(error) => {
+                    return ToolExecution::failed(format!(
+                        "GenUI compiler could not start: {error}"
+                    ));
+                }
+            }
+        }
+        let (result, state) = {
+            let executor = self.deno_genui.as_mut().expect("executor was initialized");
+            let result = executor.compile(arguments);
+            let state = executor.compiler.state().unwrap_or(DriverState::Failed);
+            (result, state)
+        };
+        if state.is_terminal() {
+            self.deno_genui = None;
+        }
+        ToolExecution::from_driver_result(result, state, "GenUI compile")
     }
 }
 
