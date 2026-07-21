@@ -106,8 +106,6 @@ const WORKBENCH_PREVIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inli
 const MAX_PREVIEW_SHELL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_WORKBENCH_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EDITOR_LSP_BODY_BYTES: usize = 1024 * 1024 + 64 * 1024;
-const MAX_ARTIFACT_DRAFT_FILES: usize = 100;
-const MAX_ARTIFACT_DRAFT_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_TIER2_PREVIEW_CHANGES: usize = 32;
 const MAX_TIER2_PREVIEW_PATCH_BYTES: usize = 64 * 1024;
 const MAX_ACP_SHEBANG_BYTES: usize = 512;
@@ -5047,7 +5045,7 @@ fn validate_artifact_draft(
     }
     if draft.entrypoint != artifact.metadata.entrypoint
         || draft.files.is_empty()
-        || draft.files.len() > MAX_ARTIFACT_DRAFT_FILES
+        || draft.files.len() > hyper_term_protocol::MAX_GENUI_SOURCE_FILES
         || !draft.files.contains_key(&draft.entrypoint)
         || !draft.files.keys().eq(artifact.source_files.keys())
     {
@@ -5055,9 +5053,11 @@ fn validate_artifact_draft(
     }
     let source_bytes = draft
         .files
-        .values()
-        .try_fold(0_usize, |total, source| total.checked_add(source.len()));
-    if source_bytes.is_none_or(|bytes| bytes > MAX_ARTIFACT_DRAFT_SOURCE_BYTES) {
+        .iter()
+        .try_fold(0_usize, |total, (path, source)| {
+            total.checked_add(path.len())?.checked_add(source.len())
+        });
+    if source_bytes.is_none_or(|bytes| bytes > hyper_term_protocol::MAX_GENUI_SOURCE_BYTES) {
         return Err(ArtifactDraftError::InvalidRequest);
     }
     if draft.files == artifact.source_files {

@@ -208,7 +208,7 @@ the revision immediately, so a cancelled or stale compile cannot satisfy a
 later sample.
 
 On a Mac Studio `Mac16,9` with an Apple M4 Max (16 cores, 64 GB), macOS 26.5.2,
-Chrome 150.0.7871.129, and agent-browser 0.25.4, twelve warm edits of the
+Chrome for Testing 147.0.7727.56, and agent-browser 0.25.4, twelve warm edits of the
 single-module TSX fixture produced 28.3 ms p50 and 33.4 ms p95/max
 edit-to-preview latency. The fixture replaces the complete module on each edit,
 which is more work than the declaration-local target. No overlapping main
@@ -218,5 +218,38 @@ sample.
 
 This closes the reference warm single-module p95 and main-thread long-task
 slice. Initial Worker/WASM startup, memory and cache bounds, randomized
-clean-build equivalence, and the 100/500/1,000-module fixtures remain required
-before the broader performance section is complete.
+clean-build equivalence, and acceptable 100/500/1,000-module rebuild latency
+remain required before the broader performance section is complete.
+
+## Scale evidence (2026-07-22)
+
+The bounded source contract now accepts at most 1,000 virtual files while
+retaining the 1 MiB aggregate budget. UTF-8 virtual paths count toward that
+budget and each path remains independently bounded. Browser validation, the
+Rust Deno compiler, Artifact persistence, editor checkpoints, draft publishing,
+and Deno LSP use the same Rust protocol constants; 1,001 files fail before
+compiler or persistence work begins.
+
+The release browser gate creates the exact production `compiler.worker.js` and
+builds complete linked graphs with external source maps. The first 100-module
+sample includes Worker and WASM initialization; the later initial samples create
+new esbuild contexts in the already-warm Worker. Five same-inventory leaf edits
+then exercise `context.rebuild()` at each scale.
+
+Two consecutive successful runs produced these ranges:
+
+| Modules | Initial | Rebuild p50 | Rebuild p95/max | Source map |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 1,081.8–1,105.1 ms | 1,046.8–1,055.6 ms | 1,090.0–1,973.3 ms | 15,615 B |
+| 500 | 5,130.2–5,169.3 ms | 5,018.7–5,063.1 ms | 5,087.6–5,194.1 ms | 74,414 B |
+| 1,000 | 10,272.6–10,278.7 ms | 10,171.9–10,205.8 ms | 10,275.3–11,041.7 ms | 147,914 B |
+
+All source maps contained every requested module and no main-thread long task
+was observed. In twelve-revision 1,000-module bursts, nine to ten queued
+revisions were reported as `compile_superseded` and the final revision compiled
+successfully.
+
+This benchmark closes the missing scale measurement, but it also disproves that
+the current full-graph esbuild-wasm rebuild is interactive at 500 or 1,000
+modules. Declaration-slice invalidation or a faster replaceable compiler backend
+is therefore a release-performance requirement, not an optional optimization.

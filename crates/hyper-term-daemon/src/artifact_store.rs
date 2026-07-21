@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, GenUiArtifactCandidate, GenUiCompileDiagnostic,
+    MAX_GENUI_SOURCE_BYTES, MAX_GENUI_SOURCE_FILES, MAX_GENUI_VIRTUAL_PATH_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,8 +21,6 @@ const STORED_ARTIFACT_SCHEMA_VERSION: u16 = 2;
 const MAX_BUNDLE_BYTES: usize = 768 * 1024;
 const MAX_CSS_BYTES: usize = 256 * 1024;
 const MAX_SOURCE_MAP_BYTES: usize = 768 * 1024;
-const MAX_SOURCE_FILES: usize = 100;
-const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_STORED_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIAGNOSTICS: usize = 256;
 
@@ -286,7 +285,7 @@ fn validate_source_files(
             Ok(())
         };
     }
-    if candidate.source_files.len() > MAX_SOURCE_FILES
+    if candidate.source_files.len() > MAX_GENUI_SOURCE_FILES
         || !candidate.source_files.contains_key(&candidate.entrypoint)
     {
         return Err(ArtifactStoreError::InvalidSourceSnapshot);
@@ -296,9 +295,11 @@ fn validate_source_files(
         if !valid_virtual_source_path(path) {
             return Err(ArtifactStoreError::InvalidSourceSnapshot);
         }
-        bytes = bytes.saturating_add(source.len());
+        bytes = bytes
+            .saturating_add(path.len())
+            .saturating_add(source.len());
     }
-    if bytes > MAX_SOURCE_BYTES {
+    if bytes > MAX_GENUI_SOURCE_BYTES {
         return Err(ArtifactStoreError::InvalidSourceSnapshot);
     }
     Ok(())
@@ -312,7 +313,10 @@ fn valid_virtual_entrypoint(value: &str) -> bool {
 }
 
 fn valid_virtual_source_path(value: &str) -> bool {
-    value.starts_with('/') && !value.contains("..") && !value.contains('\\') && value.len() <= 4096
+    value.starts_with('/')
+        && !value.contains("..")
+        && !value.contains('\\')
+        && value.len() <= MAX_GENUI_VIRTUAL_PATH_BYTES
 }
 
 fn validate_diagnostics(diagnostics: &[GenUiCompileDiagnostic]) -> Result<(), ArtifactStoreError> {
@@ -435,6 +439,36 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn artifact_store_accepts_one_thousand_bounded_files_but_not_one_more() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::open(temporary.path()).unwrap();
+        let mut maximum = candidate("thousand-file-bundle");
+        for index in 1..MAX_GENUI_SOURCE_FILES {
+            maximum.source_files.insert(
+                format!("/module-{index}.ts"),
+                format!("export const value{index}={index};"),
+            );
+        }
+        let accepted = store.persist(maximum).unwrap();
+        assert_eq!(
+            store.read(&accepted).unwrap().source_files.len(),
+            MAX_GENUI_SOURCE_FILES
+        );
+
+        let mut overflow = candidate("overflow-bundle");
+        for index in 1..=MAX_GENUI_SOURCE_FILES {
+            overflow.source_files.insert(
+                format!("/module-{index}.ts"),
+                format!("export const value{index}={index};"),
+            );
+        }
+        assert!(matches!(
+            store.persist(overflow),
+            Err(ArtifactStoreError::InvalidSourceSnapshot)
+        ));
     }
 
     #[test]

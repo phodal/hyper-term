@@ -136,6 +136,181 @@ verify_performance=$(agent-browser --session "$verify_session" eval \
 echo "Workbench warm GenUI performance: $verify_performance"
 grep -q '\\"ok\\":true' <<<"$verify_performance"
 
+# Exercise the exact production Worker with dependency graphs at every scale
+# required by ADR 0005. This stays outside the product API and logs timing-only
+# evidence while checking source maps and real latest-revision cancellation.
+verify_scale_program=""
+IFS= read -r -d '' verify_scale_program <<'JAVASCRIPT' || true
+(() => {
+const benchmark = { status: "running" };
+window.__hyperTermGenUiScaleBenchmark = benchmark;
+void new Promise((resolve, reject) => {
+  const worker = new Worker(new URL("compiler.worker.js", document.baseURI), {
+    type: "module",
+    name: "hyper-term-genui-scale-verifier",
+  });
+  const waiting = new Map();
+  const buffered = new Map();
+  const longTasks = [];
+  let revision = 10000;
+  let observer;
+  if (typeof PerformanceObserver !== "undefined" && PerformanceObserver.supportedEntryTypes.includes("longtask")) {
+    observer = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) longTasks.push(entry.duration);
+    });
+    observer.observe({ entryTypes: ["longtask"] });
+  }
+  const finish = (callback, value) => {
+    observer?.disconnect();
+    worker.terminate();
+    callback(value);
+  };
+  const timeout = setTimeout(() => finish(reject, new Error("GenUI scale benchmark timed out")), 240000);
+  const receive = (response) => {
+    const waiter = waiting.get(response.request_id);
+    if (waiter) {
+      waiting.delete(response.request_id);
+      waiter(response);
+    } else {
+      buffered.set(response.request_id, response);
+    }
+  };
+  worker.onmessage = (event) => receive(event.data);
+  worker.onerror = (event) => {
+    clearTimeout(timeout);
+    finish(reject, new Error(event.message || "GenUI scale Worker failed"));
+  };
+  const waitFor = (requestId) => new Promise((accept) => {
+    const response = buffered.get(requestId);
+    if (response) {
+      buffered.delete(requestId);
+      accept(response);
+    } else {
+      waiting.set(requestId, accept);
+    }
+  });
+  const modulePath = (index) => `/module-${String(index).padStart(4, "0")}.ts`;
+  const filesAtScale = (count, marker) => {
+    const files = {};
+    files["/App.tsx"] = `import { value } from "./module-0001.ts"; export default function App(){return <main>${marker}:{value}</main>}`;
+    for (let index = 1; index < count; index += 1) {
+      files[modulePath(index)] = index === count - 1
+        ? `export const value=${marker};`
+        : `import { value as next } from "./module-${String(index + 1).padStart(4, "0")}.ts"; export const value=next+${index};`;
+    }
+    return files;
+  };
+  const post = (files, label) => {
+    const requestId = `${label}-${crypto.randomUUID()}`;
+    worker.postMessage({
+      type: "compile",
+      request_id: requestId,
+      source_revision: ++revision,
+      entrypoint: "/App.tsx",
+      files,
+    });
+    return { requestId, response: waitFor(requestId) };
+  };
+  const compile = async (files, count, label) => {
+    const started = performance.now();
+    const sent = post(files, label);
+    const response = await sent.response;
+    const durationMs = Math.round((performance.now() - started) * 100) / 100;
+    if (response.type !== "compiled") {
+      throw new Error(`${label} returned ${response.type}`);
+    }
+    const candidate = response.candidate;
+    const sourceMap = JSON.parse(candidate.source_map);
+    const mappedModules = sourceMap.sources.filter((source) =>
+      source.includes("/App.tsx") || source.includes("/module-")
+    ).length;
+    if (mappedModules < count || !/^[0-9a-f]{64}$/.test(candidate.content_digest)) {
+      throw new Error(`${label} emitted an incomplete source map or digest`);
+    }
+    return {
+      durationMs,
+      bundleBytes: new TextEncoder().encode(candidate.bundle).byteLength,
+      sourceMapBytes: new TextEncoder().encode(candidate.source_map).byteLength,
+      mappedModules,
+    };
+  };
+  const percentile = (values, quantile) => {
+    const sorted = [...values].sort((left, right) => left - right);
+    return sorted[Math.max(0, Math.ceil(sorted.length * quantile) - 1)];
+  };
+  (async () => {
+    const scales = [];
+    for (const count of [100, 500, 1000]) {
+      const files = filesAtScale(count, 0);
+      const initial = await compile(files, count, `scale-${count}-initial`);
+      const rebuilds = [];
+      for (let iteration = 1; iteration <= 5; iteration += 1) {
+        files[modulePath(count - 1)] = `export const value=${iteration};`;
+        rebuilds.push(await compile(files, count, `scale-${count}-rebuild-${iteration}`));
+      }
+      const rebuildTimes = rebuilds.map((sample) => sample.durationMs);
+      scales.push({
+        modules: count,
+        initialMs: initial.durationMs,
+        rebuildP50Ms: percentile(rebuildTimes, 0.5),
+        rebuildP95Ms: percentile(rebuildTimes, 0.95),
+        bundleBytes: rebuilds.at(-1).bundleBytes,
+        sourceMapBytes: rebuilds.at(-1).sourceMapBytes,
+        mappedModules: rebuilds.at(-1).mappedModules,
+      });
+    }
+
+    const burstFiles = filesAtScale(1000, 100);
+    const burst = [];
+    for (let iteration = 0; iteration < 12; iteration += 1) {
+      burstFiles[modulePath(999)] = `export const value=${100 + iteration};`;
+      burst.push(post({ ...burstFiles }, `scale-cancel-${iteration}`));
+    }
+    const burstResponses = await Promise.all(burst.map((entry) => entry.response));
+    const superseded = burstResponses.filter((response) => response.type === "compile_superseded").length;
+    const last = burstResponses.at(-1);
+    if (last.type !== "compiled" || superseded === 0) {
+      throw new Error(`latest-revision cancellation failed: last=${last.type} superseded=${superseded}`);
+    }
+
+    clearTimeout(timeout);
+    finish(resolve, JSON.stringify({
+      ok: true,
+      scales,
+      cancellation: { requests: burst.length, superseded, last: last.type },
+      mainThreadLongTaskCount: longTasks.length,
+      maxMainThreadLongTaskMs: Math.round(Math.max(0, ...longTasks) * 100) / 100,
+    }));
+  })().catch((error) => {
+    clearTimeout(timeout);
+    finish(reject, error);
+  });
+}).then((value) => {
+  benchmark.status = "complete";
+  benchmark.result = JSON.parse(value);
+}).catch((error) => {
+  benchmark.status = "failed";
+  benchmark.error = String(error?.message || error).slice(0, 4096);
+});
+return "STARTED";
+})()
+JAVASCRIPT
+verify_scale_start=$(agent-browser --session "$verify_session" eval "$verify_scale_program")
+grep -q '"STARTED"' <<<"$verify_scale_start"
+verify_scale=""
+for _ in {1..120}; do
+  verify_scale=$(agent-browser --session "$verify_session" eval \
+    'JSON.stringify(window.__hyperTermGenUiScaleBenchmark||{status:"missing"})')
+  if grep -q '\\"status\\":\\"complete\\"' <<<"$verify_scale" ||
+    grep -q '\\"status\\":\\"failed\\"' <<<"$verify_scale"; then
+    break
+  fi
+  sleep 2
+done
+echo "Workbench GenUI scale benchmark: $verify_scale"
+grep -q '\\"status\\":\\"complete\\"' <<<"$verify_scale"
+grep -q '\\"ok\\":true' <<<"$verify_scale"
+
 # Diff must be the real editable CodeMirror merge view, not a static patch.
 agent-browser --session "$verify_session" find role tab click --name Diff --exact >/dev/null
 agent-browser --session "$verify_session" wait 100 >/dev/null
@@ -161,6 +336,6 @@ if [[ -n "$verify_errors" ]]; then
   exit 1
 fi
 
-echo "Workbench browser verified: CodeMirror edit, esbuild-wasm live reload, isolated preview, warm p95 budget, editable Diff, and narrow Studio reachability"
+echo "Workbench browser verified: CodeMirror edit, esbuild-wasm live reload, 100/500/1000-module rebuilds, cancellation, isolated preview, warm p95 budget, editable Diff, and narrow Studio reachability"
 echo "Workbench live Diff screenshot: $verify_artifact_dir/workbench-live-diff.png"
 echo "Workbench narrow screenshot: $verify_artifact_dir/workbench-narrow-studio.png"

@@ -1,7 +1,8 @@
 import type { ArtifactCandidate, CompileDiagnostic } from "../protocol.ts";
 
-export const MAX_SOURCE_FILES = 100;
+export const MAX_SOURCE_FILES = 1_000;
 export const MAX_SOURCE_BYTES = 1024 * 1024;
+export const MAX_VIRTUAL_PATH_BYTES = 4 * 1024;
 
 export interface CompileRequest {
   type: "compile";
@@ -63,11 +64,16 @@ export function validateCompileRequest(request: CompileRequest): void {
     throw new Error(`source snapshot must contain 1-${MAX_SOURCE_FILES} files`);
   }
   let bytes = 0;
+  const encoder = new TextEncoder();
   for (const [path, source] of entries) {
-    if (!path.startsWith("/") || path.includes("..") || path.includes("\\")) {
+    if (
+      !path.startsWith("/") || path.includes("..") || path.includes("\\") ||
+      encoder.encode(path).byteLength > MAX_VIRTUAL_PATH_BYTES
+    ) {
       throw new Error(`invalid virtual source path: ${path}`);
     }
-    bytes += new TextEncoder().encode(source).byteLength;
+    bytes += encoder.encode(path).byteLength;
+    bytes += encoder.encode(source).byteLength;
   }
   if (bytes > MAX_SOURCE_BYTES) {
     throw new Error(`source snapshot exceeds ${MAX_SOURCE_BYTES} bytes`);

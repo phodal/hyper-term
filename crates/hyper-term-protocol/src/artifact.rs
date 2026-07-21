@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::ArtifactId;
 use uuid::Uuid;
 
+pub const MAX_GENUI_SOURCE_FILES: usize = 1_000;
+pub const MAX_GENUI_SOURCE_BYTES: usize = 1024 * 1024;
+pub const MAX_GENUI_VIRTUAL_PATH_BYTES: usize = 4 * 1024;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenUiCompilerIdentity {
     pub name: String,

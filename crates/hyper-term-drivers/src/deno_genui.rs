@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use hyper_term_protocol::{
+    MAX_GENUI_SOURCE_BYTES, MAX_GENUI_SOURCE_FILES, MAX_GENUI_VIRTUAL_PATH_BYTES,
+};
+
 use crate::{
     DEFAULT_MAX_DRIVER_FRAME_BYTES, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError,
     DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
@@ -18,8 +22,6 @@ use crate::{
 };
 
 const GENUI_PROTOCOL_VERSION: u64 = 1;
-const MAX_GENUI_FILES: usize = 100;
-const MAX_GENUI_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_GENUI_BUNDLE_BYTES: usize = 768 * 1024;
 const MAX_GENUI_CSS_BYTES: usize = 256 * 1024;
 const MAX_GENUI_SOURCE_MAP_BYTES: usize = 768 * 1024;
@@ -370,9 +372,9 @@ fn validate_request(request: &GenUiCompileRequest) -> Result<(), DenoGenUiError>
             "source revision must be positive".into(),
         ));
     }
-    if request.files.is_empty() || request.files.len() > MAX_GENUI_FILES {
+    if request.files.is_empty() || request.files.len() > MAX_GENUI_SOURCE_FILES {
         return Err(DenoGenUiError::InvalidRequest(format!(
-            "source snapshot must contain 1-{MAX_GENUI_FILES} files"
+            "source snapshot must contain 1-{MAX_GENUI_SOURCE_FILES} files"
         )));
     }
     if !request.files.contains_key(&request.entrypoint) {
@@ -387,7 +389,9 @@ fn validate_request(request: &GenUiCompileRequest) -> Result<(), DenoGenUiError>
                 "invalid virtual source path: {path}"
             )));
         }
-        source_bytes = source_bytes.saturating_add(source.len());
+        source_bytes = source_bytes
+            .saturating_add(path.len())
+            .saturating_add(source.len());
     }
     if source_bytes > MAX_GENUI_SOURCE_BYTES {
         return Err(DenoGenUiError::InvalidRequest(format!(
@@ -473,7 +477,10 @@ fn sha256_text_pair(left: &str, right: &str) -> String {
 }
 
 fn valid_virtual_path(path: &str) -> bool {
-    path.starts_with('/') && !path.contains('\\') && !path.contains("..")
+    path.starts_with('/')
+        && path.len() <= MAX_GENUI_VIRTUAL_PATH_BYTES
+        && !path.contains('\\')
+        && !path.contains("..")
 }
 
 fn path_text(path: &Path) -> Result<&str, DenoGenUiError> {
@@ -555,6 +562,27 @@ mod tests {
         assert!(matches!(
             validate_request(&oversized),
             Err(DenoGenUiError::InvalidRequest(message)) if message.contains("exceeds")
+        ));
+    }
+
+    #[test]
+    fn request_accepts_one_thousand_bounded_files_but_not_one_more() {
+        let mut maximum = request();
+        for index in 1..MAX_GENUI_SOURCE_FILES {
+            maximum.files.insert(
+                format!("/module-{index}.ts"),
+                format!("export const value{index}={index};"),
+            );
+        }
+        validate_request(&maximum).unwrap();
+
+        maximum
+            .files
+            .insert("/overflow.ts".into(), "export default true;".into());
+        assert!(matches!(
+            validate_request(&maximum),
+            Err(DenoGenUiError::InvalidRequest(message))
+                if message.contains(&format!("1-{MAX_GENUI_SOURCE_FILES} files"))
         ));
     }
 

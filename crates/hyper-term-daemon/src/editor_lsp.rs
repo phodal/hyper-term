@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use hyper_term_drivers::{DenoLspClient, DenoLspConfig, path_to_file_uri};
-use hyper_term_protocol::ArtifactId;
+use hyper_term_protocol::{
+    ArtifactId, MAX_GENUI_SOURCE_BYTES, MAX_GENUI_SOURCE_FILES, MAX_GENUI_VIRTUAL_PATH_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -21,9 +23,9 @@ const LSP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LSP_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 const LSP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_EDITOR_DRAFT_FILES: usize = 100;
-const MAX_EDITOR_DRAFT_BYTES: usize = 1024 * 1024;
-const MAX_EDITOR_DOCUMENT_PATH_BYTES: usize = 256;
+const MAX_EDITOR_DRAFT_FILES: usize = MAX_GENUI_SOURCE_FILES;
+const MAX_EDITOR_DRAFT_BYTES: usize = MAX_GENUI_SOURCE_BYTES;
+const MAX_EDITOR_DOCUMENT_PATH_BYTES: usize = MAX_GENUI_VIRTUAL_PATH_BYTES;
 const MAX_EDITOR_COMPLETIONS: usize = 128;
 const MAX_EDITOR_DIAGNOSTICS: usize = 256;
 const MAX_EDITOR_LABEL_BYTES: usize = 512;

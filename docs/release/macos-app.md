@@ -28,7 +28,10 @@ The release job also serves the exact built Workbench to a pinned headless
 browser. It edits the CodeMirror document with CJK content, waits for the
 esbuild-wasm Worker and isolated preview handshake, opens the editable Diff,
 then repeats twelve warm edits. The gate rejects warm edit-to-preview p95 above
-100 ms or any overlapping main-thread task of at least 50 ms. It also scrolls
+100 ms or any overlapping main-thread task of at least 50 ms. A separate
+production Worker builds 100, 500, and 1,000-module dependency graphs, verifies
+complete source maps, records initial/rebuild timings, and proves a burst keeps
+only its latest queued revision. It also scrolls
 the Studio into view at 480 px without document-level horizontal overflow. The
 timing evidence is printed in the release log, while wide and narrow
 screenshots are retained as `workbench-browser-smoke`; this complements Native

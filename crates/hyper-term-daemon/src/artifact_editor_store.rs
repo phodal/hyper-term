@@ -4,7 +4,10 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use hyper_term_protocol::{ArtifactId, TaskId};
+use hyper_term_protocol::{
+    ArtifactId, MAX_GENUI_SOURCE_BYTES, MAX_GENUI_SOURCE_FILES, MAX_GENUI_VIRTUAL_PATH_BYTES,
+    TaskId,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -12,8 +15,8 @@ use uuid::Uuid;
 
 const LEGACY_EDITOR_STATE_SCHEMA_VERSION: u32 = 1;
 const EDITOR_STATE_SCHEMA_VERSION: u32 = 2;
-const MAX_EDITOR_FILES: usize = 100;
-const MAX_EDITOR_SOURCE_BYTES: usize = 1024 * 1024;
+const MAX_EDITOR_FILES: usize = MAX_GENUI_SOURCE_FILES;
+const MAX_EDITOR_SOURCE_BYTES: usize = MAX_GENUI_SOURCE_BYTES;
 const MAX_EDITOR_SELECTIONS: usize = 100;
 const MAX_EDITOR_STATE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EDITOR_JOURNAL_BYTES: u64 = 10 * 1024 * 1024;
@@ -440,9 +443,11 @@ fn validate_editor_state(
     {
         return Err(ArtifactEditorStoreError::InvalidEditorState);
     }
-    let source_bytes = files
-        .values()
-        .try_fold(0_usize, |total, source| total.checked_add(source.len()));
+    let source_bytes = files.iter().try_fold(0_usize, |total, (path, source)| {
+        total
+            .checked_add(path.len())
+            .and_then(|bytes| bytes.checked_add(source.len()))
+    });
     if source_bytes.is_none_or(|bytes| bytes > MAX_EDITOR_SOURCE_BYTES)
         || selections.values().any(|selection| {
             selection.anchor as usize > MAX_EDITOR_SOURCE_BYTES
@@ -456,7 +461,7 @@ fn validate_editor_state(
 
 fn valid_virtual_path(path: &str) -> bool {
     path.starts_with('/')
-        && path.len() <= 4096
+        && path.len() <= MAX_GENUI_VIRTUAL_PATH_BYTES
         && !path.contains('\0')
         && !path.contains('\\')
         && !path.split('/').any(|segment| segment == "..")

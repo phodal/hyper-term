@@ -198,8 +198,8 @@ Diff layout, action visibility, and zero horizontal page overflow.
 The editor no longer collapses an Artifact to its entrypoint. One Studio owns
 the complete Rust-returned virtual file map, keeps per-file CodeMirror drafts
 alive across tab switches and workspace-review overlays, marks changed paths,
-and binds Deno LSP to the selected document. The 260 ms live build snapshots all
-files and the declared entrypoint, so editing an imported module immediately
+and binds Deno LSP to the selected document. The revision-fenced live build
+snapshots all files and the declared entrypoint, so editing an imported module immediately
 updates the isolated preview. Publishing sends the complete fixed path set;
 local additions or removals are rejected before the request. A 480-pixel
 browser flow proves a two-file relative import, per-file LSP readiness, draft
@@ -208,7 +208,8 @@ Apply mapping without page overflow.
 
 The editor LSP consumes that same complete in-memory draft rather than only
 the selected document. Every diagnostics or completion request carries the
-fixed virtual file inventory, bounded to 100 files and 1 MiB. Rust rejects
+fixed virtual file inventory, bounded to 1,000 files and 1 MiB including virtual
+path bytes. Rust rejects
 missing, additional, invalid, or stale paths before the private Deno session is
 touched. The session synchronizes imported files before the selected document;
 when any dependency changes it advances the selected document version and

@@ -44,7 +44,26 @@ the viewport. The test retains wide Diff and narrow Studio screenshots.
 | Document-level horizontal overflow | none |
 | Browser page errors | none |
 
+## Scale result — 2026-07-22
+
+The same built Worker now accepts the bounded 1,000-file contract and records
+initial plus five consecutive rebuilds for complete linked graphs:
+
+Two consecutive successful runs produced these ranges:
+
+| Modules | Initial | Rebuild p50 | Rebuild p95/max |
+| ---: | ---: | ---: | ---: |
+| 100 | 1,081.8–1,105.1 ms | 1,046.8–1,055.6 ms | 1,090.0–1,973.3 ms |
+| 500 | 5,130.2–5,169.3 ms | 5,018.7–5,063.1 ms | 5,087.6–5,194.1 ms |
+| 1,000 | 10,272.6–10,278.7 ms | 10,171.9–10,205.8 ms | 10,275.3–11,041.7 ms |
+
+Every source map retained the full module inventory, twelve-edit bursts
+superseded nine to ten intermediate revisions and compiled the last, and no
+main-thread task reached 50 ms. The data is intentionally a failing product signal: the
+current full-graph WASM rebuild is not interactive for large graphs and requires
+slice invalidation or a faster backend before scale performance is complete.
+
 This is a same-build correctness alarm, not a general browser compatibility or
-performance benchmark. The macOS release pairs it with Native SDK automation
+cross-machine performance guarantee. The macOS release pairs it with Native SDK automation
 and Rust-owned artifact and permission tests. The separate Terminal browser
 gate exercises the real zsh-to-xterm path during local release qualification.
