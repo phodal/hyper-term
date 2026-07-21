@@ -48,14 +48,22 @@ Native view/sizing snapshot with HTTP and Rust projection checks instead of
 claiming unsupported DOM screenshot coverage.
 
 The repository also provides `scripts/smoke_macos_real_codex_acp.sh` as an
-explicit developer-only post-package gate for authenticated Codex and Claude
-accounts. It launches the assembled app with an automation-enabled Native
-renderer and proves Native composer input reaches the selected bundled ACP
-adapter, enters the streaming/stop state, and returns to an enabled composer
-with the expected Agent Block. This account-using gate is intentionally
-excluded from CI and never invokes login. By default it does not authorize a
-tool call. Select Claude with `HYPER_TERM_REAL_ACP_PROVIDER=claude`; Codex is
-the default.
+explicit developer-only post-package gate for authenticated Codex, Claude, and
+GitHub Copilot accounts. It launches the assembled app with an
+automation-enabled Native renderer and proves Native composer input reaches
+the selected ACP provider, enters the streaming/stop state, and returns to an
+enabled composer with the expected Agent Block. This account-using gate is
+intentionally excluded from CI and never invokes login. By default it does not
+authorize a tool call. Select Claude with
+`HYPER_TERM_REAL_ACP_PROVIDER=claude`, or the installed
+`copilot --acp --stdio` provider with
+`HYPER_TERM_REAL_ACP_PROVIDER=copilot`; Codex is the default.
+
+Copilot receives the digest-pinned local MCP connector through its documented
+launch-time `--additional-mcp-config` option. Current Copilot builds reject a
+client-provided stdio MCP entry during ACP `session/new`; the launch-time
+configuration keeps the same Rust-owned executable, arguments, environment,
+and approval boundary while avoiding that provider-specific rejection.
 
 Set `HYPER_TERM_REAL_ACP_GENUI=1` for the stricter path: the selected ACP must
 call `hyper_term.genui.compile`, the Native approval UI must authorize it, and

@@ -190,6 +190,7 @@ pub struct AcpAgentClient {
     provider_id: String,
     workspace: PathBuf,
     mcp_servers: Vec<v1::McpServer>,
+    brokered_mcp: bool,
     terminal_client: bool,
     context_receipt: Option<ContextReceipt>,
     mcp_context_receipt: Option<ContextReceipt>,
@@ -224,6 +225,14 @@ impl AcpAgentClient {
         }
         let workspace = config.workspace.canonicalize()?;
         let driver_id = Uuid::new_v4();
+        let brokered_mcp = config.brokered_mcp_server.is_some();
+        let copilot_launch_mcp = config.provider_id == "copilot-acp" && brokered_mcp;
+        let mut arguments = config.arguments;
+        if copilot_launch_mcp {
+            let mcp = config.brokered_mcp_server.as_ref().unwrap();
+            let mcp_environment = copilot_mcp_environment(mcp, &config.environment)?;
+            arguments.extend(copilot_mcp_arguments(mcp, &mcp_environment)?);
+        }
         let mut environment = config.environment;
         let mut context_receipt = None;
         let mut mcp_context_receipt = None;
@@ -277,7 +286,7 @@ impl AcpAgentClient {
                 let sandbox = compile_agent_task_sandbox_from_profile(
                     driver_id,
                     &config.executable,
-                    &config.arguments,
+                    &arguments,
                     &workspace,
                     &environment,
                     profile,
@@ -287,13 +296,17 @@ impl AcpAgentClient {
             }
             None => None,
         };
-        let mcp_servers = config
-            .brokered_mcp_server
-            .as_ref()
-            .map(|config| acp_mcp_server(config, &mcp_environment))
-            .transpose()?
-            .into_iter()
-            .collect();
+        let mcp_servers = if copilot_launch_mcp {
+            Vec::new()
+        } else {
+            config
+                .brokered_mcp_server
+                .as_ref()
+                .map(|config| acp_mcp_server(config, &mcp_environment))
+                .transpose()?
+                .into_iter()
+                .collect()
+        };
         let permission_profile = sandbox
             .as_ref()
             .map(crate::sandbox_permission_profile)
@@ -316,7 +329,7 @@ impl AcpAgentClient {
                 permission_profile,
             },
             executable: config.executable,
-            arguments: config.arguments,
+            arguments,
             working_directory: workspace.clone(),
             environment,
             sandbox,
@@ -341,6 +354,7 @@ impl AcpAgentClient {
             provider_id: config.provider_id,
             workspace,
             mcp_servers,
+            brokered_mcp,
             terminal_client: config.terminal_client,
             context_receipt,
             mcp_context_receipt,
@@ -973,7 +987,7 @@ impl AcpAgentClient {
         // allowlisted Hyper Term tool.
         // The digest-pinned MCP server still validates the exact arguments and
         // creates the user-visible Rust broker operation before executing it.
-        if self.mcp_servers.is_empty() {
+        if !self.brokered_mcp {
             return Ok(false);
         }
         let tool_call_id = request.tool_call.tool_call_id.to_string();
@@ -1039,6 +1053,77 @@ fn acp_mcp_server(
     config: &AcpMcpServerConfig,
     environment: &BTreeMap<String, String>,
 ) -> Result<v1::McpServer, AcpAdapterError> {
+    let (executable, arguments, environment) = validated_mcp_stdio(config, environment.clone())?;
+    let environment = environment
+        .iter()
+        .map(|(name, value)| v1::EnvVariable::new(name, value))
+        .collect();
+    Ok(v1::McpServer::Stdio(
+        v1::McpServerStdio::new("hyper_term", executable)
+            .args(arguments)
+            .env(environment),
+    ))
+}
+
+fn copilot_mcp_environment(
+    config: &AcpMcpServerConfig,
+    provider_environment: &BTreeMap<String, OsString>,
+) -> Result<BTreeMap<String, String>, AcpAdapterError> {
+    let mut environment = BTreeMap::new();
+    for (name, path) in [
+        ("HOME", config.runtime_home.as_path()),
+        ("TMPDIR", config.runtime_temp.as_path()),
+    ] {
+        let value = path.to_str().ok_or_else(|| {
+            AcpAdapterError::InvalidConfig(format!("brokered MCP {name} path is not UTF-8"))
+        })?;
+        environment.insert(name.into(), value.into());
+    }
+    for (name, default) in [
+        ("PATH", "/usr/bin:/bin"),
+        ("LANG", "C.UTF-8"),
+        ("TZ", "UTC"),
+        ("TERM", "dumb"),
+    ] {
+        let value = provider_environment
+            .get(name)
+            .map(|value| {
+                value.to_str().ok_or_else(|| {
+                    AcpAdapterError::InvalidConfig(format!(
+                        "brokered MCP {name} environment is not UTF-8"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(default);
+        environment.insert(name.into(), value.into());
+    }
+    Ok(environment)
+}
+
+fn copilot_mcp_arguments(
+    config: &AcpMcpServerConfig,
+    environment: &BTreeMap<String, String>,
+) -> Result<Vec<OsString>, AcpAdapterError> {
+    let (executable, arguments, environment) = validated_mcp_stdio(config, environment.clone())?;
+    let launch_config = serde_json::to_string(&json!({
+        "mcpServers": {
+            "hyper_term": {
+                "type": "local",
+                "command": executable,
+                "args": arguments,
+                "env": environment,
+                "tools": ["*"],
+            }
+        }
+    }))?;
+    Ok(vec!["--additional-mcp-config".into(), launch_config.into()])
+}
+
+fn validated_mcp_stdio(
+    config: &AcpMcpServerConfig,
+    environment: BTreeMap<String, String>,
+) -> Result<(PathBuf, Vec<String>, BTreeMap<String, String>), AcpAdapterError> {
     if !config.executable.is_absolute() || config.arguments.len() > 32 {
         return Err(AcpAdapterError::InvalidConfig(
             "brokered MCP executable or arguments are invalid".into(),
@@ -1062,15 +1147,7 @@ fn acp_mcp_server(
             bounded(value.to_owned(), 16 * 1024)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let environment = environment
-        .iter()
-        .map(|(name, value)| v1::EnvVariable::new(name, value))
-        .collect();
-    Ok(v1::McpServer::Stdio(
-        v1::McpServerStdio::new("hyper_term", executable)
-            .args(arguments)
-            .env(environment),
-    ))
+    Ok((executable, arguments, environment))
 }
 
 fn normalize_permission(
@@ -1356,17 +1433,20 @@ fn brokered_mcp_tool<'a>(provider_id: &str, call: &'a v1::ToolCall) -> Option<&'
         .then_some(tool_name);
     }
 
-    // Claude ACP exposes MCP calls with a flattened, provider-specific title
-    // and the actual MCP arguments as rawInput. Correlation to the observed
-    // tool-call id is still mandatory before transport consent is returned;
-    // the digest-pinned Rust MCP broker performs the enforceable approval.
-    if provider_id != "claude-acp" {
-        return None;
-    }
     call.raw_input.as_ref()?.as_object()?;
-    HYPER_TERM_MCP_TOOLS.iter().copied().find(|tool_name| {
-        call.title == format!("mcp__hyper_term__{}", tool_name.replace(['.', '-'], "_"))
-    })
+    match provider_id {
+        // Claude ACP exposes MCP calls with a flattened title.
+        "claude-acp" => HYPER_TERM_MCP_TOOLS.iter().copied().find(|tool_name| {
+            call.title == format!("mcp__hyper_term__{}", tool_name.replace(['.', '-'], "_"))
+        }),
+        // Copilot ACP uses the configured server name followed by a second,
+        // hyphen-flattened tool name. Match only names derived from the
+        // explicit allowlist; never trust an arbitrary title transformation.
+        "copilot-acp" => HYPER_TERM_MCP_TOOLS.iter().copied().find(|tool_name| {
+            call.title == format!("hyper_term-{}", tool_name.replace(['.', '-'], "-"))
+        }),
+        _ => None,
+    }
 }
 
 fn content_text(content: v1::ContentBlock) -> Result<String, AcpAdapterError> {
@@ -1976,6 +2056,37 @@ mod tests {
     }
 
     #[test]
+    fn copilot_brokered_mcp_uses_trusted_launch_configuration() {
+        let (_temporary, executable) = fake_agent("#!/bin/sh\nexit 0\n");
+        let runtime = TempDir::new().unwrap();
+        let config = AcpMcpServerConfig {
+            executable_sha256: sha256_file(&executable).unwrap(),
+            executable: executable.canonicalize().unwrap(),
+            arguments: vec!["--agent-mode".into(), "--task-id".into(), "task-1".into()],
+            runtime_home: runtime.path().join("home"),
+            runtime_temp: runtime.path().join("tmp"),
+        };
+        let environment = copilot_mcp_environment(
+            &config,
+            &BTreeMap::from([("PATH".into(), OsString::from("/usr/bin:/bin"))]),
+        )
+        .unwrap();
+        let arguments = copilot_mcp_arguments(&config, &environment).unwrap();
+
+        assert_eq!(arguments[0], "--additional-mcp-config");
+        let payload: Value = serde_json::from_str(arguments[1].to_str().unwrap()).unwrap();
+        let server = &payload["mcpServers"]["hyper_term"];
+        assert_eq!(server["type"], "local");
+        assert_eq!(server["command"], config.executable.to_str().unwrap());
+        assert_eq!(server["args"][0], "--agent-mode");
+        assert_eq!(
+            server["env"]["HOME"],
+            runtime.path().join("home").to_str().unwrap()
+        );
+        assert_eq!(server["tools"][0], "*");
+    }
+
+    #[test]
     fn acp_v1_streams_message_and_completion_with_official_schema() {
         let (_temporary, executable) = fake_agent(
             "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-1\"}}' ;;\n    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"ACP is live.\"}}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}' ;;\n  esac\ndone\n",
@@ -2475,8 +2586,8 @@ done
     }
 
     #[test]
-    fn claude_mcp_shape_is_not_trusted_for_other_providers() {
-        let call: v1::ToolCall = serde_json::from_value(json!({
+    fn provider_specific_mcp_shapes_are_bound_to_their_provider() {
+        let claude_call: v1::ToolCall = serde_json::from_value(json!({
             "toolCallId": "provider-bound-call",
             "kind": "other",
             "title": "mcp__hyper_term__hyper_term_genui_compile",
@@ -2486,10 +2597,25 @@ done
         .unwrap();
 
         assert_eq!(
-            brokered_mcp_tool("claude-acp", &call),
+            brokered_mcp_tool("claude-acp", &claude_call),
             Some("hyper_term.genui.compile")
         );
-        assert_eq!(brokered_mcp_tool("fixture-acp", &call), None);
+        assert_eq!(brokered_mcp_tool("copilot-acp", &claude_call), None);
+
+        let copilot_call: v1::ToolCall = serde_json::from_value(json!({
+            "toolCallId": "copilot-provider-bound-call",
+            "kind": "other",
+            "title": "hyper_term-hyper_term-genui-compile",
+            "status": "pending",
+            "rawInput": {"entry": "App.tsx", "source": "export default null"}
+        }))
+        .unwrap();
+        assert_eq!(
+            brokered_mcp_tool("copilot-acp", &copilot_call),
+            Some("hyper_term.genui.compile")
+        );
+        assert_eq!(brokered_mcp_tool("claude-acp", &copilot_call), None);
+        assert_eq!(brokered_mcp_tool("fixture-acp", &copilot_call), None);
     }
 
     #[test]

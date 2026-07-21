@@ -41,8 +41,15 @@ case "$real_provider" in
     real_agent_command="claude"
     real_adapter_package="@agentclientprotocol/claude-agent-acp"
     ;;
+  copilot)
+    real_provider_label="Copilot ACP"
+    real_provider_shortcut="hyper-term.new-copilot-acp-agent"
+    real_provider_flag="--copilot"
+    real_agent_command="copilot"
+    real_adapter_package=""
+    ;;
   *)
-    echo "HYPER_TERM_REAL_ACP_PROVIDER must be codex or claude" >&2
+    echo "HYPER_TERM_REAL_ACP_PROVIDER must be codex, claude, or copilot" >&2
     exit 1
     ;;
 esac
@@ -65,21 +72,30 @@ if [[ "$real_provider" == codex ]]; then
     echo "Codex is not authenticated; run 'codex login' before this opt-in smoke" >&2
     exit 1
   fi
-elif ! "$real_agent" auth status 2>&1 | grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'; then
+elif [[ "$real_provider" == claude ]] &&
+  ! "$real_agent" auth status 2>&1 | grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'; then
   echo "Claude is not authenticated; run 'claude auth login' before this opt-in smoke" >&2
+  exit 1
+elif [[ "$real_provider" == copilot ]] &&
+  ! "$real_agent" --version 2>&1 | grep -q '^GitHub Copilot CLI '; then
+  echo "GitHub Copilot CLI is unavailable or invalid" >&2
   exit 1
 fi
 
 real_supervisor="$real_app/Contents/MacOS/hyper-term"
 real_runtime="$real_app/Contents/Resources/runtime"
-real_adapter="$real_runtime/acp/node_modules/$real_adapter_package/dist/index.js"
-for real_path in \
-  "$real_supervisor" \
-  "$real_renderer" \
-  "$real_runtime/deno" \
-  "$real_adapter" \
-  "$real_repo_root/dist/terminal/index.html" \
-  "$real_repo_root/dist/workbench/index.html"; do
+real_inputs=(
+  "$real_supervisor"
+  "$real_renderer"
+  "$real_runtime/deno"
+  "$real_repo_root/dist/terminal/index.html"
+  "$real_repo_root/dist/workbench/index.html"
+)
+if [[ -n "$real_adapter_package" ]]; then
+  real_adapter="$real_runtime/acp/node_modules/$real_adapter_package/dist/index.js"
+  real_inputs+=("$real_adapter")
+fi
+for real_path in "${real_inputs[@]}"; do
   if [[ ! -e "$real_path" ]]; then
     echo "real $real_provider_label desktop input is unavailable: $real_path" >&2
     exit 1
