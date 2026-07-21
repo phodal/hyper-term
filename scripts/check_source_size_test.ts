@@ -17,5 +17,5 @@ Deno.test("new files use the default budget while legacy hotspots are frozen", (
     sourceLineLimit("apps/desktop/src/new_view.zig"),
     defaultSourceLineLimit,
   );
-  assertEquals(sourceLineLimit("apps/desktop/src/main.zig"), 5_772);
+  assertEquals(sourceLineLimit("apps/desktop/src/main.zig"), 5_550);
 });

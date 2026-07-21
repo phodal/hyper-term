@@ -11,6 +11,23 @@ const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const agent_block_view = @import("agent_block_view.zig");
+const agent_wire = @import("agent_wire.zig");
+
+const AgentAttentionResponseWire = agent_wire.AttentionResponse;
+const AgentBlockWire = agent_wire.Block;
+const AgentCapabilitiesResponseWire = agent_wire.CapabilitiesResponse;
+const AgentCapabilitiesWire = agent_wire.Capabilities;
+const AgentExecutionContextEventWire = agent_wire.ExecutionContextEvent;
+const AgentGoalWire = agent_wire.Goal;
+const AgentPatchWire = agent_wire.Patch;
+const AgentPlanEntryWire = agent_wire.PlanEntry;
+const AgentProviderStatusWire = agent_wire.ProviderStatus;
+const AgentSnapshotWire = agent_wire.Snapshot;
+const AgentStreamFrameWire = agent_wire.StreamFrame;
+const AgentTier2PreviewWire = agent_wire.Tier2Preview;
+const AgentTier2ResultWire = agent_wire.Tier2Result;
+const AgentTier2ResultsWire = agent_wire.Tier2Results;
+const AgentToolCallWire = agent_wire.ToolCall;
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -1616,17 +1633,6 @@ fn applyAgentProviderRefresh(model: *Model, response: native_sdk.EffectResponse)
     }
 }
 
-const AgentAttentionSessionWire = struct {
-    session_id: u16,
-    provider: []const u8,
-    status: []const u8,
-    document_revision: u64,
-};
-
-const AgentAttentionResponseWire = struct {
-    sessions: []const AgentAttentionSessionWire,
-};
-
 fn hasAgentSessions(model: *const Model) bool {
     for (model.openSessions()) |session| {
         if (session.mode == .agent) return true;
@@ -2299,155 +2305,6 @@ fn requestAgentSnapshot(model: *Model, session_id: u8, fx: *Effects) void {
     });
 }
 
-const AgentSnapshotWire = struct {
-    session_id: ?u8 = null,
-    status: []const u8,
-    @"error": ?[]const u8 = null,
-    history_restored: bool = false,
-    pending_operation_id: ?[]const u8 = null,
-    capabilities: AgentCapabilitiesWire = .{},
-    goal: ?AgentGoalWire = null,
-    context: ?AgentExecutionContextEventWire = null,
-    document: struct {
-        revision: u64 = 0,
-        blocks: []const AgentBlockWire,
-    },
-};
-
-const AgentExecutionContextReceiptWire = struct {
-    schema_version: u16,
-    context_id: []const u8,
-    context_revision: u64,
-    mode: []const u8,
-    context_digest: []const u8,
-    environment_digest: []const u8,
-    clear_inherited: bool,
-    bindings: []const std.json.Value = &.{},
-    credential_bindings: []const std.json.Value = &.{},
-};
-
-const AgentExecutionContextEventWire = struct {
-    event_id: []const u8,
-    causation_id: ?[]const u8 = null,
-    correlation_id: ?[]const u8 = null,
-    payload: struct {
-        type: []const u8,
-        context: struct {
-            provider_id: []const u8,
-            protocol: []const u8,
-            thread_id: []const u8,
-            receipts: []const AgentExecutionContextReceiptWire,
-        },
-    },
-};
-
-const AgentConfigChoiceWire = struct {
-    value: []const u8,
-    name: []const u8,
-};
-
-const AgentConfigOptionWire = struct {
-    id: []const u8,
-    name: []const u8,
-    kind: std.json.Value,
-    choices: []const AgentConfigChoiceWire = &.{},
-};
-
-const AgentCommandWire = struct {
-    name: []const u8,
-    description: ?[]const u8 = null,
-};
-
-const AgentCapabilitiesWire = struct {
-    config_options: []const AgentConfigOptionWire = &.{},
-    available_commands: []const AgentCommandWire = &.{},
-};
-
-const AgentPatchOperationWire = struct {
-    type: []const u8,
-    block_id: ?[]const u8 = null,
-    text: ?[]const u8 = null,
-};
-
-const AgentPatchWire = struct {
-    stream_sequence: u64,
-    base_revision: u64,
-    target_revision: u64,
-    operations: []const AgentPatchOperationWire,
-};
-
-const AgentStreamFrameWire = struct {
-    type: []const u8,
-    status: ?[]const u8 = null,
-    @"error": ?[]const u8 = null,
-    history_restored: ?bool = null,
-    pending_operation_id: ?[]const u8 = null,
-    document_revision: ?u64 = null,
-    capabilities: AgentCapabilitiesWire = .{},
-    goal: ?AgentGoalWire = null,
-    patch: ?AgentPatchWire = null,
-    target_revision: ?u64 = null,
-    reason: ?[]const u8 = null,
-};
-
-const AgentGoalWire = struct {
-    objective: []const u8,
-    status: []const u8,
-    token_budget: ?i64 = null,
-    tokens_used: i64 = 0,
-    time_used_seconds: i64 = 0,
-};
-
-const AgentCapabilitiesResponseWire = struct {
-    session_id: u8,
-    capabilities: AgentCapabilitiesWire,
-};
-
-const AgentTier2FileWire = struct {
-    kind: []const u8,
-    path: []const u8,
-    bytes: u64,
-};
-
-const AgentTier2AcceptanceWire = struct {
-    operation_id: []const u8,
-    operation_revision: u64,
-    state: []const u8,
-};
-
-const AgentTier2ResultWire = struct {
-    source_operation_id: []const u8,
-    changed_bytes: u64,
-    changed_files: []const AgentTier2FileWire,
-    acceptance: ?AgentTier2AcceptanceWire = null,
-};
-
-const AgentTier2ResultsWire = struct {
-    results: []const AgentTier2ResultWire,
-};
-
-const AgentTier2PreviewHunkWire = struct {
-    patch: []const u8,
-    truncated: bool = false,
-};
-
-const AgentTier2PreviewChangeWire = struct {
-    target_path: []const u8,
-    deleted: bool = false,
-    binary: bool = false,
-    base_bytes: u64 = 0,
-    proposed_bytes: u64 = 0,
-    proposed_digest: []const u8 = "",
-    hunks: []const AgentTier2PreviewHunkWire,
-    truncated: bool = false,
-};
-
-const AgentTier2PreviewWire = struct {
-    source_operation_id: []const u8,
-    changes: []const AgentTier2PreviewChangeWire,
-    truncated: bool = false,
-};
-
 fn applyAgentTier2ResultsResponse(model: *Model, response: native_sdk.EffectResponse) void {
     const session_id = effectSessionId(response.key, agent_tier2_results_effect_key_base) orelse return;
     if (model.agent_tier2_results_in_flight_session_id == session_id) {
@@ -2655,78 +2512,6 @@ fn copyTier2Text(storage: anytype, length: *usize, value: []const u8) void {
     @memcpy(storage[0..retained], value[0..retained]);
     length.* = retained;
 }
-
-const AgentToolContentWire = struct {
-    type: []const u8,
-    text: ?[]const u8 = null,
-    path: ?[]const u8 = null,
-    patch: ?[]const u8 = null,
-    added_lines: ?u32 = null,
-    removed_lines: ?u32 = null,
-    terminal_id: ?[]const u8 = null,
-    kind: ?[]const u8 = null,
-    mime_type: ?[]const u8 = null,
-    uri: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-    byte_count: ?u64 = null,
-    encoded_bytes: ?u64 = null,
-};
-
-const AgentToolLocationWire = struct {
-    path: []const u8,
-    line: ?u32 = null,
-};
-
-const AgentToolCallWire = struct {
-    tool_call_id: []const u8,
-    title: []const u8,
-    kind: []const u8,
-    status: []const u8,
-    content: []const AgentToolContentWire,
-    locations: []const AgentToolLocationWire,
-    raw_input: ?[]const u8 = null,
-    raw_output: ?[]const u8 = null,
-};
-
-const AgentPlanEntryWire = struct {
-    content: []const u8,
-    priority: []const u8,
-    status: []const u8,
-};
-
-const AgentBlockWire = struct {
-    block_id: ?[]const u8 = null,
-    block_revision: u64 = 0,
-    kind: []const u8,
-    trust_class: ?[]const u8 = null,
-    payload: struct {
-        type: []const u8,
-        role: ?[]const u8 = null,
-        text: ?[]const u8 = null,
-        operation_id: ?[]const u8 = null,
-        operation_revision: ?u64 = null,
-        kind: ?std.json.Value = null,
-        summary: ?[]const u8 = null,
-        risk: ?[]const u8 = null,
-        state: ?[]const u8 = null,
-        required_capabilities: ?[]const []const u8 = null,
-        prompt: ?[]const u8 = null,
-        options: ?[]const []const u8 = null,
-        decision: ?[]const u8 = null,
-        artifact: ?struct {
-            artifact_id: []const u8,
-            source_revision: u64,
-            entrypoint: []const u8,
-            content_digest: []const u8,
-            compiler: struct {
-                name: []const u8,
-                version: []const u8,
-            },
-        } = null,
-        call: ?AgentToolCallWire = null,
-        entries: ?[]const AgentPlanEntryWire = null,
-    },
-};
 
 fn applyAgentSnapshotResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
     const session_id = effectSessionId(response.key, agent_snapshot_effect_key_base) orelse return;
@@ -5248,13 +5033,6 @@ fn firstAvailableAgentProvider(providers: u8) ?AgentProvider {
     }
     return null;
 }
-
-const AgentProviderStatusWire = struct {
-    id: []const u8,
-    protocol: []const u8,
-    readiness: []const u8,
-    containment: []const u8,
-};
 
 fn applyAgentProviderStatus(model: *Model, source: []const u8) bool {
     if (source.len == 0 or source.len > max_agent_provider_status_bytes) return false;
