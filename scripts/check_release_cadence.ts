@@ -32,12 +32,11 @@ function localDay(date: Date, timeZone: string): string {
   return `${value("year")}-${value("month")}-${value("day")}`;
 }
 
-function parseArguments(arguments_: string[]) {
+export function parseArguments(arguments_: string[]) {
   let releaseTag = "";
   let releasesPath = "";
   let timeZone = "Asia/Shanghai";
   let now = new Date();
-  let allowSameDay = false;
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -62,9 +61,6 @@ function parseArguments(arguments_: string[]) {
         if (Number.isNaN(now.valueOf())) throw new Error("--now is invalid");
         break;
       }
-      case "--allow-same-day":
-        allowSameDay = true;
-        break;
       default:
         throw new Error(`unknown release cadence argument: ${argument}`);
     }
@@ -72,7 +68,7 @@ function parseArguments(arguments_: string[]) {
   if (!releaseTag || !releasesPath) {
     throw new Error("--tag and --releases are required");
   }
-  return { releaseTag, releasesPath, timeZone, now, allowSameDay };
+  return { releaseTag, releasesPath, timeZone, now };
 }
 
 function decodeReleases(value: unknown): PublishedRelease[] {
@@ -105,16 +101,11 @@ if (import.meta.main) {
     options.now,
     options.timeZone,
   );
-  if (existing && !options.allowSameDay) {
+  if (existing) {
     throw new Error(
       `release cadence allows at most one release per ${options.timeZone} day; ` +
-        `${existing.tagName} was already published today. Use the explicit ` +
-        "workflow_dispatch emergency override only when another release cannot wait.",
+        `${existing.tagName} was already published today.`,
     );
   }
-  console.log(
-    existing
-      ? `same-day release override accepted after ${existing.tagName}`
-      : `release cadence accepted for ${options.releaseTag}`,
-  );
+  console.log(`release cadence accepted for ${options.releaseTag}`);
 }

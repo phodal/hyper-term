@@ -1,5 +1,5 @@
-import { assertEquals } from "@std/assert";
-import { sameDayRelease } from "./check_release_cadence.ts";
+import { assertEquals, assertThrows } from "@std/assert";
+import { parseArguments, sameDayRelease } from "./check_release_cadence.ts";
 
 const releases = [
   {
@@ -34,5 +34,20 @@ Deno.test("release cadence resets at the Shanghai day boundary", () => {
   assertEquals(
     sameDayRelease(releases, "v0.1.0-rc.26", now, "Asia/Shanghai"),
     undefined,
+  );
+});
+
+Deno.test("release cadence has no same-day bypass", () => {
+  assertThrows(
+    () =>
+      parseArguments([
+        "--tag",
+        "v0.1.0-rc.26",
+        "--releases",
+        "releases.json",
+        "--allow-same-day",
+      ]),
+    Error,
+    "unknown release cadence argument: --allow-same-day",
   );
 });
