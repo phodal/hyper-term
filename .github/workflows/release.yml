@@ -200,6 +200,14 @@ jobs:
             target/debug/hyper-term-desktop \
             apps/desktop/zig-out/bin/hyper-term
 
+      - name: Run the dynamic GenUI Capsule smoke
+        env:
+          HYPER_TERM_CAPSULE_SMOKE_ARTIFACT_DIR: ${{ github.workspace }}/dist/smoke/macos/capsule
+        run: |
+          ./scripts/smoke_macos_capsule.sh \
+            target/debug/hyper-term-desktop \
+            apps/desktop/zig-out/bin/hyper-term
+
       - name: Upload macOS desktop smoke evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

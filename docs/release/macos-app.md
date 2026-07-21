@@ -24,6 +24,14 @@ WebView, exposes accessible Terminal and Agent creation controls, and handles
 screenshot, and supervisor log are retained as the `macos-desktop-smoke`
 workflow artifact.
 
+A second macOS smoke opens a Rust-verified offline Bug Capsule. It asserts that
+the cold-path GenUI WebView is mounted only for that Capsule, fetches the real
+built Workbench index and hashed assets through its token-bound loopback URL,
+and verifies the migrated replay-only Capsule projection. Native automation
+cannot capture system WebView pixels, so this gate deliberately pairs the
+Native view/sizing snapshot with HTTP and Rust projection checks instead of
+claiming unsupported DOM screenshot coverage.
+
 The final bundle contains:
 
 - `Contents/MacOS/hyper-term`: the Rust desktop supervisor and PTY authority;

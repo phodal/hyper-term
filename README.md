@@ -288,6 +288,7 @@ debug supervisor, and an automation-enabled Native renderer:
 cargo build -p hyper-term-daemon --bin hyper-term-desktop
 (cd apps/desktop && native build --release=fast -Dautomation=true)
 ./scripts/smoke_macos_desktop.sh
+./scripts/smoke_macos_capsule.sh
 ```
 
 The smoke starts the complete Rust supervisor and Native application in an
@@ -300,6 +301,9 @@ Agent/Goal interactions, and a non-empty retained-canvas screenshot. The separat
 unmounted until an ACP artifact editor or verified Capsule needs it. The release
 workflow uploads the snapshot, screenshot, and supervisor log as evidence
 instead of treating a successful compile as desktop-runtime proof.
+The Capsule smoke then opens a verified offline fixture, proves the dynamic
+GenUI WebView receives the built Workbench rather than an HTTP error, verifies
+its token-bound replay-only projection, and retains a second Native snapshot.
 
 Regenerate and test the README's vector UI preview:
 
