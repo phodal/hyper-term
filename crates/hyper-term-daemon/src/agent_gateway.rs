@@ -21,22 +21,20 @@ use hyper_term_core::OperationRecord;
 use hyper_term_drivers::{
     AcpAgentClient, AcpAgentConfig, AcpMcpServerConfig, AgentContainmentConfig, AgentDriverEvent,
     AgentEffectAuthorization, AgentEffectKind, AgentGoalStatus, AgentHostOperation,
-    AgentHostRequest, AgentHostResponse, AgentSessionCapabilities, AgentSessionConfigValue,
-    AgentThreadGoal, CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig,
-    DenoGenUiCompiler, DenoGenUiConfig, DriverState, ExternalRequestId, GenUiCompileRequest,
-    LocalMcpServerConfig, StructuredAgentClient, StructuredAgentProtocol, sha256_file,
-    stage_codex_auth_file,
+    AgentHostRequest, AgentHostResponse, AgentSessionCapabilities, AgentThreadGoal,
+    CodexAppServerClient, CodexAppServerConfig, CodexMcpServerConfig, DenoGenUiCompiler,
+    DenoGenUiConfig, DriverState, ExternalRequestId, GenUiCompileRequest, LocalMcpServerConfig,
+    StructuredAgentClient, StructuredAgentProtocol, sha256_file, stage_codex_auth_file,
 };
 use hyper_term_protocol::{
-    AcceptedGenUiArtifact, ArtifactId, BlockDocument, BlockId, BlockKind, BlockPatch,
-    EventEnvelope, GenUiArtifactCandidate, GenUiBugCapsule, GenUiBugCapsuleEnvironment,
-    GenUiRuntimeTraceAppendRequest, GenUiRuntimeTraceProjection, LocalMcpServerRuntimeReceipt,
-    LocalMcpToolCallReceipt, MessageRole, OperationAction, OperationCompletion, OperationId,
-    OperationKind, OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId,
-    TerminalCommand,
+    AcceptedGenUiArtifact, ArtifactId, BlockId, BlockKind, BlockPatch, GenUiArtifactCandidate,
+    GenUiBugCapsule, GenUiBugCapsuleEnvironment, GenUiRuntimeTraceAppendRequest,
+    GenUiRuntimeTraceProjection, LocalMcpServerRuntimeReceipt, LocalMcpToolCallReceipt,
+    MessageRole, OperationAction, OperationCompletion, OperationId, OperationKind,
+    OperationOutcome, OperationState, PermissionDecision, RiskClass, TaskId, TerminalCommand,
 };
-use hyper_term_sandbox::{IsolatedChange, IsolatedTaskTermination, LimaTaskRunner};
-use serde::{Deserialize, Serialize};
+use hyper_term_sandbox::{IsolatedTaskTermination, LimaTaskRunner};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -67,15 +65,18 @@ use crate::workspace_apply::{
     select_workspace_apply_set,
 };
 use crate::workspace_diff::{
-    MAX_WORKSPACE_HUNKS_PER_FILE, WorkspaceDiffHunk, WorkspaceDiffReview, review_workspace_diff,
+    MAX_WORKSPACE_HUNKS_PER_FILE, WorkspaceDiffReview, review_workspace_diff,
     select_workspace_hunks,
 };
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
 use crate::{
     BrokeredMcpRuntimeConfig, DaemonError, DaemonState, DenoGenUiMcpExecutorConfig,
     DenoMcpExecutorConfig, IsolatedAcceptancePreview, IsolatedAcceptanceReview,
-    LocalMcpRuntimeError, LocalMcpRuntimeManager, RegisteredLocalMcpServer,
+    LocalMcpRuntimeError, LocalMcpRuntimeManager,
 };
+
+mod view_model;
+use view_model::*;
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
@@ -343,335 +344,10 @@ struct BrokeredMcpLaunch {
     runtime_temp: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum AgentStatus {
-    Ready,
-    Running,
-    Cancelling,
-    Completed,
-    WaitingApproval,
-    Failed,
-}
-
 struct AgentProgress {
     status: AgentStatus,
     turn_id: Option<String>,
     error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AgentSessionQuery {
-    token: Option<String>,
-    session_id: Option<u16>,
-    provider: Option<String>,
-}
-
-#[derive(Serialize)]
-struct AgentSessionResponse {
-    session_id: u16,
-    provider: String,
-    protocol: String,
-    status: &'static str,
-    task_id: TaskId,
-    thread_id: String,
-    history_restored: bool,
-}
-
-#[derive(Serialize)]
-struct AgentSnapshotResponse {
-    session_id: u16,
-    status: AgentStatus,
-    turn_id: Option<String>,
-    error: Option<String>,
-    history_restored: bool,
-    pending_operation_id: Option<OperationId>,
-    capabilities: AgentSessionCapabilities,
-    goal: Option<AgentThreadGoal>,
-    context: Option<EventEnvelope>,
-    document: BlockDocument,
-}
-
-/// Low-bandwidth desktop attention projection. This intentionally excludes
-/// transcript content, errors, capabilities, and operation payloads: the
-/// Native shell only needs authenticated lifecycle identity for background
-/// tabs, while full state stays on the per-session snapshot/stream routes.
-#[derive(Serialize)]
-struct AgentAttentionResponse {
-    sessions: Vec<AgentAttentionSession>,
-}
-
-#[derive(Serialize)]
-struct AgentAttentionSession {
-    session_id: u16,
-    provider: String,
-    status: AgentStatus,
-    document_revision: u64,
-}
-
-#[derive(Deserialize)]
-struct AgentConfigRequest {
-    config_id: String,
-    value: AgentSessionConfigValue,
-}
-
-#[derive(Serialize)]
-struct AgentCapabilitiesResponse {
-    session_id: u16,
-    capabilities: AgentSessionCapabilities,
-}
-
-#[derive(Serialize)]
-struct AgentTurnResponse {
-    session_id: u16,
-    status: AgentStatus,
-}
-
-#[derive(Serialize)]
-struct AgentArtifactSourceResponse {
-    artifact_id: ArtifactId,
-    source_revision: u64,
-    entrypoint: String,
-    files: BTreeMap<String, String>,
-}
-
-#[derive(Serialize)]
-struct AgentArtifactHistoryResponse {
-    active_artifact_id: ArtifactId,
-    entries: Vec<AgentArtifactHistoryEntry>,
-}
-
-#[derive(Serialize)]
-struct AgentArtifactHistoryEntry {
-    event_sequence: u64,
-    recorded_at_ms: u64,
-    operation_id: Option<OperationId>,
-    artifact: AcceptedGenUiArtifact,
-}
-
-#[derive(Deserialize)]
-struct AgentArtifactDraftRequest {
-    base_source_revision: u64,
-    entrypoint: String,
-    files: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
-struct AgentArtifactDraftStatusQuery {
-    token: Option<String>,
-    session_id: Option<u16>,
-    operation_id: Option<OperationId>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ArtifactDraftStatus {
-    WaitingApproval,
-    Compiling,
-    Accepted,
-    Rejected,
-    Failed,
-}
-
-#[derive(Serialize)]
-struct AgentArtifactDraftResponse {
-    operation_id: OperationId,
-    operation_revision: u64,
-    status: ArtifactDraftStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    artifact: Option<AcceptedGenUiArtifact>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AgentWorkspaceApplyRequest {
-    artifact_source_revision: u64,
-    #[serde(default)]
-    review_digest: Option<String>,
-    #[serde(default)]
-    source_path: Option<String>,
-    #[serde(default)]
-    target_path: Option<String>,
-    #[serde(default)]
-    mappings: Vec<AgentWorkspaceApplyMapping>,
-}
-
-#[derive(Deserialize)]
-struct AgentWorkspaceApplyMapping {
-    source_path: String,
-    target_path: String,
-    #[serde(default)]
-    hunk_ids: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct AgentWorkspacePreviewResponse {
-    artifact_source_revision: u64,
-    review_digest: String,
-    changes: Vec<AgentWorkspacePreviewChangeResponse>,
-}
-
-#[derive(Serialize)]
-struct AgentWorkspacePreviewChangeResponse {
-    source_path: String,
-    target_path: String,
-    base_digest: Option<String>,
-    artifact_digest: String,
-    before: String,
-    artifact_after: String,
-    hunks: Vec<WorkspaceDiffHunk>,
-}
-
-#[derive(Deserialize)]
-struct AgentWorkspaceApplyStatusQuery {
-    token: Option<String>,
-    session_id: Option<u16>,
-    operation_id: Option<OperationId>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WorkspaceApplyStatus {
-    WaitingApproval,
-    Applying,
-    Applied,
-    Rejected,
-    Failed,
-    UnknownExecution,
-}
-
-#[derive(Serialize)]
-struct AgentWorkspaceApplyResponse {
-    operation_id: OperationId,
-    operation_revision: u64,
-    status: WorkspaceApplyStatus,
-    artifact_source_revision: u64,
-    source_path: String,
-    target_path: String,
-    base_digest: Option<String>,
-    proposed_digest: String,
-    before: String,
-    after: String,
-    transaction_digest: String,
-    changes: Vec<AgentWorkspaceApplyChangeResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Serialize)]
-struct AgentWorkspaceApplyChangeResponse {
-    source_path: String,
-    target_path: String,
-    base_digest: Option<String>,
-    proposed_digest: String,
-    before: String,
-    after: String,
-}
-
-#[derive(Deserialize)]
-struct AgentPermissionRequest {
-    operation_id: OperationId,
-    expected_revision: u64,
-    decision: PermissionDecision,
-}
-
-#[derive(Deserialize)]
-struct AgentLocalMcpLaunchRequest {
-    server_id: String,
-}
-
-#[derive(Deserialize)]
-struct AgentLocalMcpCallRequest {
-    server_id: String,
-    tool_name: String,
-    #[serde(default)]
-    arguments: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct AgentLocalMcpStatusResponse {
-    registered: Vec<RegisteredLocalMcpServer>,
-    active: Vec<LocalMcpServerRuntimeReceipt>,
-}
-
-#[derive(Serialize)]
-struct AgentLocalMcpOperationResponse {
-    operation_id: OperationId,
-    operation_revision: u64,
-    state: OperationState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    runtime: Option<LocalMcpServerRuntimeReceipt>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    receipt: Option<LocalMcpToolCallReceipt>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct AgentTier2SourceRequest {
-    source_operation_id: OperationId,
-}
-
-#[derive(Serialize)]
-struct AgentTier2ResultsResponse {
-    results: Vec<AgentTier2ResultResponse>,
-}
-
-#[derive(Serialize)]
-struct AgentTier2ResultResponse {
-    source_operation_id: OperationId,
-    source_revision: String,
-    finished_at_ms: u64,
-    termination: IsolatedTaskTermination,
-    exit_code: Option<i32>,
-    changed_bytes: u64,
-    inventory_sha256: String,
-    changed_files: Vec<IsolatedChange>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    acceptance: Option<AgentTier2ReviewResponse>,
-}
-
-#[derive(Clone, Serialize)]
-struct AgentTier2ReviewResponse {
-    source_operation_id: OperationId,
-    operation_id: OperationId,
-    operation_revision: u64,
-    state: OperationState,
-    result_digest: String,
-    changed_file_count: usize,
-}
-
-#[derive(Serialize)]
-struct AgentTier2PreviewResponse {
-    source_operation_id: OperationId,
-    result_digest: String,
-    changes: Vec<AgentTier2PreviewChangeResponse>,
-    truncated: bool,
-}
-
-#[derive(Serialize)]
-struct AgentTier2PreviewChangeResponse {
-    target_path: String,
-    base_digest: Option<String>,
-    proposed_digest: String,
-    deleted: bool,
-    binary: bool,
-    base_bytes: u64,
-    proposed_bytes: u64,
-    hunks: Vec<AgentTier2PreviewHunkResponse>,
-    truncated: bool,
-}
-
-#[derive(Serialize)]
-struct AgentTier2PreviewHunkResponse {
-    id: String,
-    base_start: usize,
-    base_lines: usize,
-    proposed_start: usize,
-    proposed_lines: usize,
-    patch: String,
-    truncated: bool,
 }
 
 fn provider_probe_config(config: &AgentGatewayConfig) -> AgentProviderProbeConfig<'_> {
