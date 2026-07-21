@@ -1,6 +1,7 @@
 //! Rust-owned supervision and bounded transports for external tooling.
 
 mod acp;
+mod acp_capabilities;
 mod agent;
 mod codec;
 mod codex;

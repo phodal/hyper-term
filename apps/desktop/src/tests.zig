@@ -1078,7 +1078,7 @@ test "ACP composer renders provider capabilities and routes configuration throug
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"ready","error":null,"capabilities":{"config_options":[{"id":"model","name":"Model","description":null,"category":"model","kind":{"type":"select","current_value":"fast"},"choices":[{"value":"fast","name":"Fast","description":null,"group":null},{"value":"deep","name":"Deep","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]},"document":{"blocks":[]}}
+        \\{"status":"ready","error":null,"capabilities":{"config_options":[{"id":"acp.session_mode","name":"Mode","description":null,"category":"mode","kind":{"type":"select","current_value":"ask"},"choices":[{"value":"ask","name":"Ask","description":null,"group":null},{"value":"code","name":"Code","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]},"document":{"blocks":[]}}
         ,
     } }, &fx);
 
@@ -1086,7 +1086,7 @@ test "ACP composer renders provider capabilities and routes configuration throug
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var tree = try buildTree(arena, &model);
-    try testing.expect(findAnyByText(tree.root, "Fast") != null);
+    try testing.expect(findAnyByText(tree.root, "Ask") != null);
     const command_trigger = findByLabel(tree.root, "Agent commands").?;
     main.update(&model, tree.msgForPointer(command_trigger.id, .up).?, &fx);
     tree = try buildTree(arena, &model);
@@ -1095,16 +1095,16 @@ test "ACP composer renders provider capabilities and routes configuration throug
     main.update(&model, .dismiss_agent_command_picker, &fx);
     tree = try buildTree(arena, &model);
 
-    const selector = findByLabel(tree.root, "Model").?;
+    const selector = findByLabel(tree.root, "Mode").?;
     main.update(&model, tree.msgForPointer(selector.id, .up).?, &fx);
     tree = try buildTree(arena, &model);
-    const deep = findAnyByText(tree.root, "Deep").?;
-    main.update(&model, tree.msgForPointer(deep.id, .up).?, &fx);
+    const code = findAnyByText(tree.root, "Code").?;
+    main.update(&model, tree.msgForPointer(code.id, .up).?, &fx);
     const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_config_effect_key_base + 2).?).?;
     try testing.expectEqual(std.http.Method.POST, request.method);
     try testing.expect(std.mem.endsWith(u8, request.url, "/agent/session/config?token=abcdef0123456789abcdef0123456789&session_id=2"));
     try testing.expectEqualStrings(
-        "{\"config_id\":\"model\",\"value\":{\"type\":\"id\",\"value\":\"deep\"}}",
+        "{\"config_id\":\"acp.session_mode\",\"value\":{\"type\":\"id\",\"value\":\"code\"}}",
         request.body,
     );
 
@@ -1112,10 +1112,10 @@ test "ACP composer renders provider capabilities and routes configuration throug
         .key = main.agent_config_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"session_id":2,"capabilities":{"config_options":[{"id":"model","name":"Model","description":null,"category":"model","kind":{"type":"select","current_value":"deep"},"choices":[{"value":"fast","name":"Fast","description":null,"group":null},{"value":"deep","name":"Deep","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]}}
+        \\{"session_id":2,"capabilities":{"config_options":[{"id":"acp.session_mode","name":"Mode","description":null,"category":"mode","kind":{"type":"select","current_value":"code"},"choices":[{"value":"ask","name":"Ask","description":null,"group":null},{"value":"code","name":"Code","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]}}
         ,
     } }, &fx);
-    try testing.expectEqualStrings("Deep", model.agentConfigOptions()[0].currentLabel());
+    try testing.expectEqualStrings("Code", model.agentConfigOptions()[0].currentLabel());
     try testing.expectEqual(@as(f32, 76), model.agentConfigOptions()[0].compactWidth());
 
     tree = try buildTree(arena, &model);

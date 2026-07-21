@@ -29,6 +29,6 @@ Deno.test("new files use the default budget while legacy hotspots are frozen", (
   );
   assertEquals(
     sourceLineLimit("crates/hyper-term-drivers/src/acp.rs"),
-    2_843,
+    2_702,
   );
 });

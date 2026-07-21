@@ -149,6 +149,12 @@ set is enabled per release.
   composer, while ACP `available_commands_update` entries remain provider
   commands such as `/skills`. Unsupported discovery remains additive: an older
   app-server can still start a thread with an empty capability projection.
+- ACP session modes are first-class composer controls. Rust projects the
+  bounded `modes` returned by `session/new` ahead of ordinary configuration,
+  routes a Native selection through the real `session/set_mode` request, and
+  applies later `current_mode_update` notifications back to the same control.
+  Ask/Architect/Code labels are provider data; the renderer cannot invent a
+  mode or change one without the ACP adapter validating the advertised ID.
 - The ignored installed-Codex integration gate now covers the authenticated,
   isolated `initialize -> model/list -> skills/list -> thread/start` path and
   requires non-empty model and reasoning choices. Native projection tests prove

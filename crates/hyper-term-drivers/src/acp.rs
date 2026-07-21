@@ -20,6 +20,11 @@ use similar::{ChangeTag, TextDiff};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::acp_capabilities::{
+    ACP_SESSION_MODE_CONFIG_ID, MAX_CAPABILITY_ID_BYTES, normalize_available_commands,
+    normalize_session_capabilities, replace_config_options_preserving_mode, update_session_mode,
+    validate_config_value,
+};
 use crate::codex_containment::{
     agent_task_sandbox_profile, apply_managed_proxy_environment,
     compile_agent_task_sandbox_from_profile,
@@ -28,14 +33,12 @@ use crate::execution_context::{
     compile_agent_execution_context, compile_mcp_execution_context, os_environment,
 };
 use crate::{
-    AgentAvailableCommand, AgentClientError, AgentContainmentConfig, AgentDriverEvent,
-    AgentEffectAuthorization, AgentEffectKind, AgentEffectProposal, AgentHostOperation,
-    AgentHostRequest, AgentHostResponse, AgentSessionCapabilities, AgentSessionConfigChoice,
-    AgentSessionConfigKind, AgentSessionConfigOption, AgentSessionConfigValue,
-    AgentTerminalEnvironmentVariable, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError,
-    DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
-    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox,
-    sha256_file,
+    AgentClientError, AgentContainmentConfig, AgentDriverEvent, AgentEffectAuthorization,
+    AgentEffectKind, AgentEffectProposal, AgentHostOperation, AgentHostRequest, AgentHostResponse,
+    AgentSessionCapabilities, AgentSessionConfigValue, AgentTerminalEnvironmentVariable,
+    DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
+    DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
+    StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
 };
 
 const ACP_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -43,12 +46,6 @@ const MAX_BUFFERED_MESSAGES: usize = 512;
 const MAX_BUFFERED_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PENDING_APPROVALS: usize = 128;
 const MAX_PROVIDER_ID_BYTES: usize = 64;
-const MAX_SESSION_CONFIG_OPTIONS: usize = 24;
-const MAX_SESSION_CONFIG_CHOICES: usize = 96;
-const MAX_AVAILABLE_COMMANDS: usize = 96;
-const MAX_CAPABILITY_ID_BYTES: usize = 128;
-const MAX_CAPABILITY_LABEL_BYTES: usize = 256;
-const MAX_CAPABILITY_DESCRIPTION_BYTES: usize = 2048;
 const MAX_PENDING_HOST_REQUESTS: usize = 128;
 const MAX_TERMINAL_ARGUMENTS: usize = 256;
 const MAX_TERMINAL_ARGUMENT_BYTES: usize = 64 * 1024;
@@ -392,7 +389,10 @@ impl AcpAgentClient {
         let request = v1::NewSessionRequest::new(self.workspace.clone())
             .mcp_servers(self.mcp_servers.clone());
         let response: v1::NewSessionResponse = self.request(&request, timeout)?;
-        let config_options = normalize_config_options(response.config_options.unwrap_or_default())?;
+        let config_options = normalize_session_capabilities(
+            response.modes,
+            response.config_options.unwrap_or_default(),
+        )?;
         lock(&self.session_capabilities)?.config_options = config_options;
         bounded(response.session_id.to_string(), 4096)
     }
@@ -422,6 +422,18 @@ impl AcpAgentClient {
             let capabilities = lock(&self.session_capabilities)?;
             validate_config_value(&capabilities, &config_id, &normalized_value)?;
         }
+        if config_id == ACP_SESSION_MODE_CONFIG_ID {
+            let AgentSessionConfigValue::Id { value } = normalized_value else {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP session mode requires an ID value".into(),
+                ));
+            };
+            let request = v1::SetSessionModeRequest::new(session_id, value.clone());
+            let _: v1::SetSessionModeResponse = self.request_idle(&request, timeout)?;
+            let mut capabilities = lock(&self.session_capabilities)?;
+            update_session_mode(&mut capabilities, value)?;
+            return Ok(capabilities.clone());
+        }
         let value = match normalized_value {
             AgentSessionConfigValue::Id { value } => v1::SessionConfigOptionValue::value_id(value),
             AgentSessionConfigValue::Boolean { value } => {
@@ -430,9 +442,8 @@ impl AcpAgentClient {
         };
         let request = v1::SetSessionConfigOptionRequest::new(session_id, config_id, value);
         let response: v1::SetSessionConfigOptionResponse = self.request_idle(&request, timeout)?;
-        let config_options = normalize_config_options(response.config_options)?;
         let mut capabilities = lock(&self.session_capabilities)?;
-        capabilities.config_options = config_options;
+        replace_config_options_preserving_mode(&mut capabilities, response.config_options)?;
         Ok(capabilities.clone())
     }
 
@@ -885,12 +896,21 @@ impl AcpAgentClient {
                 )
             }
             v1::SessionUpdate::ConfigOptionUpdate(update) => {
-                lock(&self.session_capabilities)?.config_options =
-                    normalize_config_options(update.config_options)?;
+                let mut capabilities = lock(&self.session_capabilities)?;
+                replace_config_options_preserving_mode(&mut capabilities, update.config_options)?;
                 protocol_notice(
                     sequence,
                     Some("session/update"),
                     &serde_json::to_value("config_option_update")?,
+                )
+            }
+            v1::SessionUpdate::CurrentModeUpdate(update) => {
+                let mut capabilities = lock(&self.session_capabilities)?;
+                update_session_mode(&mut capabilities, update.current_mode_id.to_string())?;
+                protocol_notice(
+                    sequence,
+                    Some("session/update"),
+                    &serde_json::to_value("current_mode_update")?,
                 )
             }
             update => protocol_notice(
@@ -1120,10 +1140,12 @@ fn copilot_mcp_arguments(
     Ok(vec!["--additional-mcp-config".into(), launch_config.into()])
 }
 
+type ValidatedMcpStdio = (PathBuf, Vec<String>, BTreeMap<String, String>);
+
 fn validated_mcp_stdio(
     config: &AcpMcpServerConfig,
     environment: BTreeMap<String, String>,
-) -> Result<(PathBuf, Vec<String>, BTreeMap<String, String>), AcpAdapterError> {
+) -> Result<ValidatedMcpStdio, AcpAdapterError> {
     if !config.executable.is_absolute() || config.arguments.len() > 32 {
         return Err(AcpAdapterError::InvalidConfig(
             "brokered MCP executable or arguments are invalid".into(),
@@ -1655,213 +1677,6 @@ fn protocol_notice(
     })
 }
 
-fn normalize_config_options(
-    options: Vec<v1::SessionConfigOption>,
-) -> Result<Vec<AgentSessionConfigOption>, AcpAdapterError> {
-    if options.len() > MAX_SESSION_CONFIG_OPTIONS {
-        return Err(AcpAdapterError::InvalidMessage(
-            "ACP session configuration exceeded its option bound".into(),
-        ));
-    }
-    options.into_iter().map(normalize_config_option).collect()
-}
-
-fn normalize_config_option(
-    option: v1::SessionConfigOption,
-) -> Result<AgentSessionConfigOption, AcpAdapterError> {
-    let id = bounded(option.id.to_string(), MAX_CAPABILITY_ID_BYTES)?;
-    let name = bounded(option.name, MAX_CAPABILITY_LABEL_BYTES)?;
-    let description = option
-        .description
-        .map(|value| bounded(value, MAX_CAPABILITY_DESCRIPTION_BYTES))
-        .transpose()?;
-    let category = option.category.and_then(|category| match category {
-        v1::SessionConfigOptionCategory::Mode => Some("mode".to_owned()),
-        v1::SessionConfigOptionCategory::Model => Some("model".to_owned()),
-        v1::SessionConfigOptionCategory::ModelConfig => Some("model_config".to_owned()),
-        v1::SessionConfigOptionCategory::ThoughtLevel => Some("thought_level".to_owned()),
-        v1::SessionConfigOptionCategory::Other(value) => {
-            bounded(value, MAX_CAPABILITY_ID_BYTES).ok()
-        }
-        _ => None,
-    });
-    let (kind, choices) = match option.kind {
-        v1::SessionConfigKind::Select(select) => {
-            let current_value = bounded(select.current_value.to_string(), MAX_CAPABILITY_ID_BYTES)?;
-            let choices = normalize_config_choices(select.options)?;
-            if !choices.iter().any(|choice| choice.value == current_value) {
-                return Err(AcpAdapterError::InvalidMessage(format!(
-                    "ACP session configuration {id} selected an unavailable value"
-                )));
-            }
-            (AgentSessionConfigKind::Select { current_value }, choices)
-        }
-        v1::SessionConfigKind::Boolean(boolean) => (
-            AgentSessionConfigKind::Boolean {
-                current_value: boolean.current_value,
-            },
-            Vec::new(),
-        ),
-        _ => {
-            return Err(AcpAdapterError::InvalidMessage(format!(
-                "ACP session configuration {id} has an unsupported kind"
-            )));
-        }
-    };
-    Ok(AgentSessionConfigOption {
-        id,
-        name,
-        description,
-        category,
-        kind,
-        choices,
-    })
-}
-
-fn normalize_config_choices(
-    options: v1::SessionConfigSelectOptions,
-) -> Result<Vec<AgentSessionConfigChoice>, AcpAdapterError> {
-    let mut choices = Vec::new();
-    match options {
-        v1::SessionConfigSelectOptions::Ungrouped(options) => {
-            for option in options {
-                choices.push(normalize_config_choice(option, None)?);
-            }
-        }
-        v1::SessionConfigSelectOptions::Grouped(groups) => {
-            for group in groups {
-                let group_name = bounded(group.name, MAX_CAPABILITY_LABEL_BYTES)?;
-                for option in group.options {
-                    choices.push(normalize_config_choice(option, Some(group_name.clone()))?);
-                }
-            }
-        }
-        _ => {
-            return Err(AcpAdapterError::InvalidMessage(
-                "ACP session configuration uses unsupported choice grouping".into(),
-            ));
-        }
-    }
-    if choices.len() > MAX_SESSION_CONFIG_CHOICES {
-        return Err(AcpAdapterError::InvalidMessage(
-            "ACP session configuration exceeded its choice bound".into(),
-        ));
-    }
-    Ok(choices)
-}
-
-fn normalize_config_choice(
-    option: v1::SessionConfigSelectOption,
-    group: Option<String>,
-) -> Result<AgentSessionConfigChoice, AcpAdapterError> {
-    Ok(AgentSessionConfigChoice {
-        value: bounded(option.value.to_string(), MAX_CAPABILITY_ID_BYTES)?,
-        name: bounded(option.name, MAX_CAPABILITY_LABEL_BYTES)?,
-        description: option
-            .description
-            .map(|value| bounded(value, MAX_CAPABILITY_DESCRIPTION_BYTES))
-            .transpose()?,
-        group,
-    })
-}
-
-struct NormalizedAvailableCommands {
-    commands: Vec<AgentAvailableCommand>,
-    truncated: bool,
-}
-
-fn normalize_available_commands(
-    mut commands: Vec<v1::AvailableCommand>,
-) -> NormalizedAvailableCommands {
-    let received = commands.len();
-    // ACP command catalogs are optional composer metadata. Current Codex ACP
-    // versions can publish one entry per installed skill, so rejecting a
-    // catalog larger than our UI budget must not abort the active turn. Keep
-    // the provider's order within each group, but make the skills entry and
-    // explicit skill mentions reachable before ordinary slash commands.
-    commands.sort_by_key(|command| available_command_priority(&command.name));
-
-    let mut normalized = Vec::with_capacity(received.min(MAX_AVAILABLE_COMMANDS));
-    let mut seen = HashSet::with_capacity(received.min(MAX_AVAILABLE_COMMANDS));
-    let mut truncated = false;
-    for command in commands {
-        if normalized.len() == MAX_AVAILABLE_COMMANDS {
-            truncated = true;
-            break;
-        }
-        let command = match normalize_available_command(command) {
-            Ok(command) => command,
-            Err(_) => {
-                truncated = true;
-                continue;
-            }
-        };
-        if !seen.insert(command.name.clone()) {
-            truncated = true;
-            continue;
-        }
-        normalized.push(command);
-    }
-    truncated |= normalized.len() < received;
-    NormalizedAvailableCommands {
-        commands: normalized,
-        truncated,
-    }
-}
-
-fn available_command_priority(name: &str) -> u8 {
-    if name == "skills" {
-        0
-    } else if name.starts_with('$') {
-        1
-    } else {
-        2
-    }
-}
-
-fn normalize_available_command(
-    command: v1::AvailableCommand,
-) -> Result<AgentAvailableCommand, AcpAdapterError> {
-    let input_hint = match command.input {
-        Some(v1::AvailableCommandInput::Unstructured(input)) => {
-            Some(bounded(input.hint, MAX_CAPABILITY_DESCRIPTION_BYTES)?)
-        }
-        _ => None,
-    };
-    Ok(AgentAvailableCommand {
-        name: bounded(command.name, MAX_CAPABILITY_ID_BYTES)?,
-        description: bounded(command.description, MAX_CAPABILITY_DESCRIPTION_BYTES)?,
-        input_hint,
-    })
-}
-
-fn validate_config_value(
-    capabilities: &AgentSessionCapabilities,
-    config_id: &str,
-    value: &AgentSessionConfigValue,
-) -> Result<(), AcpAdapterError> {
-    let option = capabilities
-        .config_options
-        .iter()
-        .find(|option| option.id == config_id)
-        .ok_or_else(|| {
-            AcpAdapterError::InvalidMessage(format!(
-                "ACP session configuration {config_id} is unavailable"
-            ))
-        })?;
-    match (&option.kind, value) {
-        (AgentSessionConfigKind::Select { .. }, AgentSessionConfigValue::Id { value })
-            if option.choices.iter().any(|choice| choice.value == *value) =>
-        {
-            Ok(())
-        }
-        (AgentSessionConfigKind::Boolean { .. }, AgentSessionConfigValue::Boolean { .. }) => Ok(()),
-        _ => Err(AcpAdapterError::InvalidMessage(format!(
-            "ACP session configuration {config_id} rejected the requested value"
-        ))),
-    }
-}
-
 fn json_rpc_request(
     id: u64,
     request: &(impl JsonRpcMessage + Serialize),
@@ -1940,7 +1755,7 @@ fn request_id_value(id: &ExternalRequestId) -> Value {
     }
 }
 
-fn bounded(value: String, maximum: usize) -> Result<String, AcpAdapterError> {
+pub(super) fn bounded(value: String, maximum: usize) -> Result<String, AcpAdapterError> {
     if value.len() > maximum {
         Err(AcpAdapterError::InvalidMessage(format!(
             "text exceeds {maximum} bytes"
@@ -2028,6 +1843,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::AgentSessionConfigKind;
+    use crate::acp_capabilities::MAX_AVAILABLE_COMMANDS;
 
     fn fake_agent(script: &str) -> (TempDir, PathBuf) {
         let temporary = TempDir::new().unwrap();
@@ -2299,6 +2116,48 @@ mod tests {
         let capabilities = client.session_capabilities().unwrap();
         assert_eq!(capabilities.available_commands[0].name, "skills");
         assert_eq!(capabilities.config_options[0].id, "thought");
+    }
+
+    #[test]
+    fn acp_session_modes_round_trip_through_the_native_config_projection() {
+        let (temporary, executable) = fake_agent(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[]}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-modes\",\"modes\":{\"currentModeId\":\"ask\",\"availableModes\":[{\"id\":\"ask\",\"name\":\"Ask\",\"description\":\"Answer without editing\"},{\"id\":\"code\",\"name\":\"Code\",\"description\":\"Edit the workspace\"}]},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"type\":\"select\",\"currentValue\":\"fast\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"}]}]}}' ;;\n    *'\"method\":\"session/set_mode\"'*'\"modeId\":\"code\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-modes\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"ask\"}}}' ;;\n  esac\ndone\n",
+        );
+        let client = launch(&executable, temporary.path());
+        client.initialize(Duration::from_secs(10)).unwrap();
+        let session_id = client.start_session(Duration::from_secs(10)).unwrap();
+
+        let initial = client.session_capabilities().unwrap();
+        assert_eq!(initial.config_options[0].id, ACP_SESSION_MODE_CONFIG_ID);
+        assert!(matches!(
+            &initial.config_options[0].kind,
+            AgentSessionConfigKind::Select { current_value } if current_value == "ask"
+        ));
+
+        let selected = client
+            .set_session_config_option(
+                &session_id,
+                ACP_SESSION_MODE_CONFIG_ID,
+                AgentSessionConfigValue::Id {
+                    value: "code".into(),
+                },
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(matches!(
+            &selected.config_options[0].kind,
+            AgentSessionConfigKind::Select { current_value } if current_value == "code"
+        ));
+        assert!(matches!(
+            client.next_event(Duration::from_secs(2)).unwrap(),
+            AgentDriverEvent::ProtocolNotice { .. }
+        ));
+        let autonomously_updated = client.session_capabilities().unwrap();
+        assert!(matches!(
+            &autonomously_updated.config_options[0].kind,
+            AgentSessionConfigKind::Select { current_value } if current_value == "ask"
+        ));
+        assert_eq!(autonomously_updated.config_options[1].id, "model");
     }
 
     #[test]

@@ -24,7 +24,7 @@ export const legacySourceLineLimits: Readonly<Record<string, number>> = {
   "crates/hyper-term-daemon/src/desktop.rs": 2_351,
   "crates/hyper-term-daemon/src/lib.rs": 3_951,
   "crates/hyper-term-daemon/src/workspace_apply.rs": 2_924,
-  "crates/hyper-term-drivers/src/acp.rs": 2_843,
+  "crates/hyper-term-drivers/src/acp.rs": 2_702,
 };
 
 export function sourceLineLimit(path: string): number {
