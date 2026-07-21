@@ -232,6 +232,52 @@ PY
   }
 
   smoke_terminal_url_before_restart=$(smoke_terminal_url)
+  native automate widget-key hyper-term-canvas cmd+t
+  native automate shortcut hyper-term.new-codex-agent
+  native automate assert \
+    'role=button name="Close zsh 1"' \
+    'role=button name="Close zsh 3"' \
+    'role=button name="Close Codex 4"' \
+    'role=group name="Agent conversation"' \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Send prompt".*enabled=true'
+  python3 - "$smoke_terminal_url_before_restart" .zig-cache/native-sdk-automation/workspace-before-restart.json <<'PY'
+import json
+import pathlib
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+terminal_url = urllib.parse.urlsplit(sys.argv[1])
+token = urllib.parse.parse_qs(terminal_url.query)["token"][0]
+workspace_url = urllib.parse.urlunsplit(
+    (terminal_url.scheme, terminal_url.netloc, "/desktop/workspace", f"token={token}", "")
+)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+last = None
+for _ in range(100):
+    with opener.open(workspace_url, timeout=2) as response:
+        last = json.load(response)
+    sessions = [
+        (entry["id"], entry["mode"], entry.get("agent_provider"))
+        for entry in last.get("sessions", [])
+    ]
+    if (
+        last.get("active_session_id") == 4
+        and sessions
+        == [
+            (1, "terminal", None),
+            (3, "terminal", None),
+            (4, "agent", "codex"),
+        ]
+    ):
+        pathlib.Path(sys.argv[2]).write_text(json.dumps(last, sort_keys=True) + "\n")
+        break
+    time.sleep(0.05)
+else:
+    raise SystemExit(f"Rust workspace did not retain the desktop tabs: {last!r}")
+PY
   smoke_renderer_pid=$(pgrep -P "$smoke_pid" -f "$smoke_renderer" | head -n 1)
   if [[ ! "$smoke_renderer_pid" =~ ^[0-9]+$ ]]; then
     echo "cannot resolve supervised Native renderer pid" >&2
@@ -261,12 +307,28 @@ PY
     'ready=true' \
     'gpu_nonblank=true' \
     'role=button name="Close zsh 1"' \
-    'hyper-term-terminal-view.*tab=1"'
+    'role=button name="Close zsh 3"' \
+    'role=button name="Close Codex 4"' \
+    'role=group name="Agent conversation"' \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Send prompt".*enabled=true'
+  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name="zsh 3"')
+  native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
+  native automate assert \
+    'role=button name="zsh 3".*state=.*selected' \
+    'hyper-term-terminal-view.*tab=3"'
   smoke_terminal_url_after_restart=$(smoke_terminal_url)
-  if [[ "$smoke_terminal_url_after_restart" != "$smoke_terminal_url_before_restart" ]]; then
+  if [[ "${smoke_terminal_url_after_restart%&tab=*}" != "${smoke_terminal_url_before_restart%&tab=*}" ]]; then
     echo "renderer restart replaced the Rust terminal gateway identity" >&2
     exit 1
   fi
+  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Codex 4"')
+  native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
+  native automate assert \
+    'role=button name="Codex 4".*state=.*selected' \
+    'role=group name="Agent conversation"' \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Send prompt".*enabled=true'
   if ! grep -Fq 'native renderer exited with signal: 9' "$smoke_log"; then
     echo "Rust supervisor did not record the bounded renderer restart" >&2
     exit 1
@@ -277,13 +339,10 @@ PY
     "renderer_before=$smoke_renderer_pid" \
     "renderer_after=$smoke_restarted_renderer_pid" \
     'terminal_gateway_identity_preserved=true' \
+    'workspace_tabs_restored=true' \
+    'agent_session_rebound=true' \
     > "$smoke_restart_evidence"
 
-  native automate shortcut hyper-term.new-codex-agent
-  native automate assert \
-    'role=group name="Agent conversation"' \
-    'role=textbox name="Agent prompt".*enabled=true' \
-    'role=button name="Send prompt".*enabled=true'
   smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
   native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text '/goal Ship the compact Agent UI'
   smoke_send_id=$(smoke_widget_id 'role=button name="Send prompt".*enabled=true')
@@ -465,6 +524,9 @@ if [[ -n "$smoke_artifact_dir" ]]; then
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/renderer-restart.txt" \
     "$smoke_artifact_dir/renderer-restart.txt"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/workspace-before-restart.json" \
+    "$smoke_artifact_dir/workspace-before-restart.json"
   cp "$smoke_log" "$smoke_artifact_dir/hyper-term-smoke.log"
 fi
 

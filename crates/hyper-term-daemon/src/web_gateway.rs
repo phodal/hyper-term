@@ -419,7 +419,9 @@ fn validate_desktop_workspace(
             _ => return Err(DesktopWorkspaceUpdateError::Invalid),
         }
     }
-    if !session_ids.contains(&snapshot.active_session_id) {
+    if !session_ids.contains(&snapshot.active_session_id)
+        || session_ids.contains(&snapshot.next_session_id)
+    {
         return Err(DesktopWorkspaceUpdateError::Invalid);
     }
     Ok(())
@@ -1255,6 +1257,13 @@ mod tests {
         invalid.sessions[1].agent_provider = Some("unknown-agent".into());
         let invalid = serde_json::to_vec(&invalid).expect("encode invalid snapshot");
         let (status, _) = workspace_request(gateway.address(), "POST", &token, &invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST.as_u16());
+
+        let mut colliding = snapshot.clone();
+        colliding.revision = 4;
+        colliding.next_session_id = colliding.active_session_id;
+        let colliding = serde_json::to_vec(&colliding).expect("encode colliding snapshot");
+        let (status, _) = workspace_request(gateway.address(), "POST", &token, &colliding).await;
         assert_eq!(status, StatusCode::BAD_REQUEST.as_u16());
 
         let oversized = vec![b'x'; MAX_DESKTOP_WORKSPACE_BYTES + 1];

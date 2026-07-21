@@ -58,6 +58,7 @@ const max_agent_execution_contexts: usize = 4;
 const max_agent_context_id_bytes: usize = 128;
 const agent_context_digest_bytes: usize = 64;
 const max_agent_context_summary_bytes: usize = 64;
+const max_desktop_workspace_bytes: usize = 4 * 1024;
 const ui_font_id: canvas.FontId = canvas.min_registered_font_id;
 const max_ui_font_bytes: usize = 24 * 1024 * 1024;
 const default_macos_ui_font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf";
@@ -80,6 +81,7 @@ pub const agent_goal_effect_key_base: u64 = 0x4854_5000;
 pub const deferred_webview_timer_id: u64 = 0x4854_5100;
 pub const agent_attention_effect_key: u64 = 0x4854_5200;
 pub const agent_attention_poll_timer_key: u64 = 0x4854_5300;
+pub const desktop_workspace_effect_key: u64 = 0x4854_5400;
 const deferred_webview_delay_ns: u64 = 1_000_000;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
@@ -668,6 +670,21 @@ pub const Session = struct {
     }
 };
 
+const DesktopWorkspaceWire = struct {
+    version: u16,
+    revision: u64,
+    active_session_id: u8,
+    next_session_id: u8,
+    selected_agent_provider: []const u8,
+    sessions: []const DesktopSessionWire,
+};
+
+const DesktopSessionWire = struct {
+    id: u8,
+    mode: []const u8,
+    agent_provider: ?[]const u8 = null,
+};
+
 const PendingAgentPrompt = struct {
     storage: [max_agent_prompt_bytes]u8 = [_]u8{0} ** max_agent_prompt_bytes,
     len: usize = 0,
@@ -701,6 +718,11 @@ pub const Model = struct {
     session_count: usize = 1,
     active_session_id: u8 = 1,
     next_session_id: u8 = 2,
+    desktop_workspace_enabled: bool = false,
+    desktop_workspace_restored: bool = false,
+    desktop_workspace_revision: u64 = 0,
+    desktop_workspace_persisted_revision: u64 = 0,
+    desktop_workspace_in_flight_revision: u64 = 0,
     agent_provider_picker_open: bool = false,
     agent_provider_refresh_in_flight: bool = false,
     agent_attention_in_flight: bool = false,
@@ -785,6 +807,11 @@ pub const Model = struct {
         "session_slots",
         "session_count",
         "next_session_id",
+        "desktop_workspace_enabled",
+        "desktop_workspace_restored",
+        "desktop_workspace_revision",
+        "desktop_workspace_persisted_revision",
+        "desktop_workspace_in_flight_revision",
         "agentProviderUnavailable",
         "agent_attention_in_flight",
         "available_agent_providers",
@@ -1283,6 +1310,7 @@ pub const Msg = union(enum) {
     close_session: u8,
     close_active_session,
     terminal_session_closed: native_sdk.EffectResponse,
+    desktop_workspace_persisted: native_sdk.EffectResponse,
     agent_session_started: native_sdk.EffectResponse,
     agent_session_closed: native_sdk.EffectResponse,
     agent_composer_changed: canvas.TextInputEvent,
@@ -1334,7 +1362,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "open_agent_search", "terminal_session_closed", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "open_agent_search", "terminal_session_closed", "desktop_workspace_persisted", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -1347,7 +1375,7 @@ pub const Effects = HyperTermApp.Effects;
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .choose_terminal => {
-            _ = appendSession(model, .terminal);
+            if (appendSession(model, .terminal) != null) markDesktopWorkspaceChanged(model, fx);
         },
         .choose_agent => createAgentSession(model, model.selected_agent_provider, fx),
         .toggle_agent_provider_picker => toggleAgentProviderPicker(model, fx),
@@ -1366,6 +1394,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const previous = model.active_session_id;
             selectSession(model, session_id);
             if (previous != model.active_session_id) {
+                markDesktopWorkspaceChanged(model, fx);
                 clearAgentSearch(model);
                 acknowledgeSessionAttention(model, model.active_session_id);
                 cancelAgentStream(model, previous, fx);
@@ -1379,6 +1408,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_session => |session_id| closeSession(model, session_id, fx),
         .close_active_session => closeSession(model, model.active_session_id, fx),
         .terminal_session_closed => {},
+        .desktop_workspace_persisted => |response| applyDesktopWorkspacePersisted(model, response, fx),
         .agent_session_started => |response| applyAgentStartResponse(model, response, fx),
         .agent_session_closed => {},
         .agent_composer_changed => |edit| {
@@ -1511,6 +1541,7 @@ fn createAgentSession(model: *Model, provider: AgentProvider, fx: *Effects) void
         if (model.agent_base_url_len > 0 and model.agentProviderReady(provider)) {
             requestAgentStart(model, session_id, fx);
         }
+        markDesktopWorkspaceChanged(model, fx);
     }
 }
 
@@ -1584,6 +1615,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         model.agent_attention_in_flight = false;
     }
     refreshTerminalUrl(model);
+    markDesktopWorkspaceChanged(model, fx);
     if (was_active) {
         clearAgentSearch(model);
         resetAgentProjection(model, model.active_session_id);
@@ -1966,7 +1998,9 @@ fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse, f
             setAgentError(model, agentStartFailureMessage(response));
         }
     }
-    if (agentSessionCount(model) > 1) requestAgentAttention(model, fx);
+    if (agentSessionCount(model) > 1 or model.activeSession().mode != .agent) {
+        requestAgentAttention(model, fx);
+    }
 }
 
 fn agentStartFailureMessage(response: native_sdk.EffectResponse) []const u8 {
@@ -3942,6 +3976,80 @@ fn setAgentConnection(model: *Model, session_id: u8, connection: AgentConnection
     }
 }
 
+fn markDesktopWorkspaceChanged(model: *Model, fx: *Effects) void {
+    if (!model.desktop_workspace_enabled or
+        model.desktop_workspace_revision == std.math.maxInt(u64)) return;
+    model.desktop_workspace_revision += 1;
+    requestDesktopWorkspacePersist(model, fx);
+}
+
+fn requestDesktopWorkspacePersist(model: *Model, fx: *Effects) void {
+    if (!model.desktop_workspace_enabled or
+        model.desktop_workspace_in_flight_revision != 0 or
+        model.desktop_workspace_revision <= model.desktop_workspace_persisted_revision) return;
+    var url_storage: [terminal_close_url_capacity]u8 = undefined;
+    const url = writeDesktopWorkspaceUrl(model, url_storage[0..]) orelse return;
+    var session_wires: [max_sessions]DesktopSessionWire = undefined;
+    for (model.openSessions(), 0..) |session, index| {
+        session_wires[index] = .{
+            .id = session.id,
+            .mode = if (session.mode == .agent) "agent" else "terminal",
+            .agent_provider = if (session.mode == .agent) session.agent_provider.id() else null,
+        };
+    }
+    const snapshot = DesktopWorkspaceWire{
+        .version = 1,
+        .revision = model.desktop_workspace_revision,
+        .active_session_id = model.active_session_id,
+        .next_session_id = model.next_session_id,
+        .selected_agent_provider = model.selected_agent_provider.id(),
+        .sessions = session_wires[0..model.session_count],
+    };
+    const body = std.json.Stringify.valueAlloc(std.heap.page_allocator, snapshot, .{}) catch return;
+    defer std.heap.page_allocator.free(body);
+    if (body.len > max_desktop_workspace_bytes) return;
+    fx.fetch(.{
+        .key = desktop_workspace_effect_key,
+        .method = .POST,
+        .url = url,
+        .body = body,
+        .timeout_ms = 2_000,
+        .on_response = Effects.responseMsg(.desktop_workspace_persisted),
+    });
+    model.desktop_workspace_in_flight_revision = model.desktop_workspace_revision;
+}
+
+fn applyDesktopWorkspacePersisted(
+    model: *Model,
+    response: native_sdk.EffectResponse,
+    fx: *Effects,
+) void {
+    if (response.key != desktop_workspace_effect_key or
+        model.desktop_workspace_in_flight_revision == 0) return;
+    const submitted_revision = model.desktop_workspace_in_flight_revision;
+    model.desktop_workspace_in_flight_revision = 0;
+    if (response.outcome == .ok and response.status == 204) {
+        model.desktop_workspace_persisted_revision = @max(
+            model.desktop_workspace_persisted_revision,
+            submitted_revision,
+        );
+    }
+    if (model.desktop_workspace_revision > submitted_revision) {
+        requestDesktopWorkspacePersist(model, fx);
+    }
+}
+
+fn writeDesktopWorkspaceUrl(model: *const Model, storage: []u8) ?[]const u8 {
+    const prefix = terminal_gateway_origin ++ "/?token=";
+    const base_url = model.terminal_base_url_storage[0..model.terminal_base_url_len];
+    if (!std.mem.startsWith(u8, base_url, prefix)) return null;
+    return std.fmt.bufPrint(
+        storage,
+        terminal_gateway_origin ++ "/desktop/workspace?token={s}",
+        .{base_url[prefix.len..]},
+    ) catch null;
+}
+
 fn requestTerminalClose(model: *const Model, session_id: u8, fx: *Effects) void {
     const prefix = terminal_gateway_origin ++ "/?token=";
     const base_url = model.terminal_base_url_storage[0..model.terminal_base_url_len];
@@ -4795,11 +4903,23 @@ pub fn initialModelWithProviderStatus(
     providers: []const u8,
     provider_status: []const u8,
 ) Model {
-    var model = initialModel();
+    var model: Model = undefined;
+    initializeModelWithProviderStatus(&model, terminal_url, agent_url, providers, provider_status);
+    return model;
+}
+
+fn initializeModelWithProviderStatus(
+    model: *Model,
+    terminal_url: []const u8,
+    agent_url: []const u8,
+    providers: []const u8,
+    provider_status: []const u8,
+) void {
+    model.* = .{};
     if (trustedTerminalUrl(terminal_url)) {
         @memcpy(model.terminal_base_url_storage[0..terminal_url.len], terminal_url);
         model.terminal_base_url_len = terminal_url.len;
-        refreshTerminalUrl(&model);
+        refreshTerminalUrl(model);
     }
     if (trustedAgentUrl(agent_url)) {
         @memcpy(model.agent_base_url_storage[0..agent_url.len], agent_url);
@@ -4808,26 +4928,27 @@ pub fn initialModelWithProviderStatus(
         if (provider_status.len == 0) {
             model.available_agent_providers = legacy_providers;
             model.authenticated_agent_providers = legacy_providers;
-        } else if (!applyAgentProviderStatus(&model, provider_status)) {
+        } else if (!applyAgentProviderStatus(model, provider_status)) {
             // The status document crosses a process boundary. Fail closed if
             // it is malformed instead of trusting the legacy ready list.
-            clearAgentProviderStatus(&model);
+            clearAgentProviderStatus(model);
         }
         const ready = model.authenticated_agent_providers | model.session_auth_agent_providers;
         model.selected_agent_provider = firstAvailableAgentProvider(ready) orelse
             firstAvailableAgentProvider(model.available_agent_providers) orelse .codex;
     }
-    return model;
 }
 
-pub fn initialModelWithDesktopServices(
+pub fn initializeModelWithDesktopServices(
+    model: *Model,
     terminal_url: []const u8,
     agent_url: []const u8,
     providers: []const u8,
     provider_status: []const u8,
     bug_capsule_url: []const u8,
-) Model {
-    var model = initialModelWithProviderStatus(
+) void {
+    initializeModelWithProviderStatus(
+        model,
         terminal_url,
         agent_url,
         providers,
@@ -4845,8 +4966,64 @@ pub fn initialModelWithDesktopServices(
             bug_capsule_url,
         );
         model.genui_workbench_url_len = bug_capsule_url.len;
+        return;
     }
-    return model;
+    model.desktop_workspace_enabled = model.terminal_base_url_len > 0;
+}
+
+pub fn restoreDesktopWorkspace(model: *Model, document: []const u8) bool {
+    if (!model.desktop_workspace_enabled or document.len == 0 or
+        document.len > max_desktop_workspace_bytes or model.isCapsule()) return false;
+    const parsed = std.json.parseFromSlice(
+        DesktopWorkspaceWire,
+        std.heap.page_allocator,
+        document,
+        .{},
+    ) catch return false;
+    defer parsed.deinit();
+    const wire = parsed.value;
+    if (wire.version != 1 or wire.sessions.len == 0 or wire.sessions.len > max_sessions or
+        wire.active_session_id == 0 or wire.next_session_id == 0) return false;
+    const selected_provider = agentProviderFromId(wire.selected_agent_provider) orelse return false;
+    var seen = [_]bool{false} ** 256;
+    var sessions = [_]Session{.{}} ** max_sessions;
+    var active_found = false;
+    for (wire.sessions, 0..) |session, index| {
+        if (session.id == 0 or seen[session.id]) return false;
+        seen[session.id] = true;
+        active_found = active_found or session.id == wire.active_session_id;
+        if (std.mem.eql(u8, session.mode, "terminal")) {
+            if (session.agent_provider != null) return false;
+            sessions[index] = .{ .id = session.id };
+            continue;
+        }
+        if (!std.mem.eql(u8, session.mode, "agent")) return false;
+        const provider = agentProviderFromId(session.agent_provider orelse return false) orelse return false;
+        sessions[index] = .{
+            .id = session.id,
+            .mode = .agent,
+            .title = provider.label(),
+            .icon = "circle-dot",
+            .agent_provider = provider,
+            .agent_connection = if (model.agent_base_url_len > 0 and model.agentProviderReady(provider))
+                .connecting
+            else
+                .unavailable,
+        };
+    }
+    if (!active_found or seen[wire.next_session_id]) return false;
+    model.session_slots = sessions;
+    for (&model.agent_pending_prompts) |*pending| pending.* = .{};
+    model.session_count = wire.sessions.len;
+    model.active_session_id = wire.active_session_id;
+    model.next_session_id = wire.next_session_id;
+    model.selected_agent_provider = selected_provider;
+    model.desktop_workspace_restored = true;
+    model.desktop_workspace_revision = wire.revision;
+    model.desktop_workspace_persisted_revision = wire.revision;
+    model.desktop_workspace_in_flight_revision = 0;
+    refreshTerminalUrl(model);
+    return true;
 }
 
 fn providerBit(provider: AgentProvider) u8 {
@@ -4868,6 +5045,14 @@ fn parseAgentProviders(value: []const u8) u8 {
         if (std.mem.eql(u8, provider, "copilot-acp")) providers |= providerBit(.copilot_acp);
     }
     return providers;
+}
+
+fn agentProviderFromId(value: []const u8) ?AgentProvider {
+    if (std.mem.eql(u8, value, "codex")) return .codex;
+    if (std.mem.eql(u8, value, "codex-acp")) return .codex_acp;
+    if (std.mem.eql(u8, value, "claude-acp")) return .claude_acp;
+    if (std.mem.eql(u8, value, "copilot-acp")) return .copilot_acp;
+    return null;
 }
 
 fn firstAvailableAgentProvider(providers: u8) ?AgentProvider {
@@ -5105,6 +5290,19 @@ pub fn trustedBugCapsuleUrl(url: []const u8, agent_url: []const u8) bool {
     return std.mem.eql(u8, url, expected);
 }
 
+/// Rebinds Rust-owned Agent sessions after a Native renderer replacement.
+/// Session creation is idempotent at the gateway, so the same boot path
+/// covers both an already-running Agent and a crash between tab creation and
+/// the first ready response.
+pub fn initEffects(model: *Model, fx: *Effects) void {
+    if (!model.desktop_workspace_restored) return;
+    for (model.openSessions()) |session| {
+        if (session.mode == .agent and model.agentProviderReady(session.agent_provider)) {
+            requestAgentStart(model, session.id, fx);
+        }
+    }
+}
+
 fn trustedGatewayToken(token: []const u8) bool {
     if (token.len < 32 or token.len > max_gateway_token_bytes) return false;
     for (token) |character| {
@@ -5268,6 +5466,7 @@ pub fn main(init: std.process.Init) !void {
     const agent_providers = init.environ_map.get("HYPER_TERM_AGENT_PROVIDERS") orelse "";
     const agent_provider_status = init.environ_map.get("HYPER_TERM_AGENT_PROVIDER_STATUS") orelse "";
     const bug_capsule_url = init.environ_map.get("HYPER_TERM_BUG_CAPSULE_URL") orelse "";
+    const desktop_workspace = init.environ_map.get("HYPER_TERM_DESKTOP_WORKSPACE") orelse "";
     const ui_font_path = preferredUiFontPath(init.environ_map.get("HYPER_TERM_UI_FONT_PATH"));
     const ui_font_bytes = std.Io.Dir.cwd().readFileAlloc(
         init.io,
@@ -5301,6 +5500,7 @@ pub fn main(init: std.process.Init) !void {
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .update_fx = update,
+        .init_fx = initEffects,
         .tokens_fn = hyperTermTokens,
         .fonts = app_fonts,
         .on_command = command,
@@ -5319,13 +5519,15 @@ pub fn main(init: std.process.Init) !void {
             null,
     });
     defer app_state.destroy();
-    app_state.model = initialModelWithDesktopServices(
+    initializeModelWithDesktopServices(
+        &app_state.model,
         terminal_url,
         agent_url,
         agent_providers,
         agent_provider_status,
         bug_capsule_url,
     );
+    _ = restoreDesktopWorkspace(&app_state.model, desktop_workspace);
     app_state.model.ui_font_registered = app_fonts.len > 0;
 
     var deferred_webview_app = DeferredWebViewApp.init(app_state);

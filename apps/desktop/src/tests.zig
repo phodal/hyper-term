@@ -2135,7 +2135,9 @@ test "Rust-verified Bug Capsule opens as a dedicated read-only Native tab" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     const capsule_url = "http://127.0.0.1:55321/agent/workbench/?surface=capsule&token=abcdef0123456789abcdef0123456789";
-    var model = main.initialModelWithDesktopServices(
+    var model = main.initialModel();
+    main.initializeModelWithDesktopServices(
+        &model,
         terminal_url,
         agent_url,
         "codex",
@@ -2165,7 +2167,8 @@ test "Rust-verified Bug Capsule opens as a dedicated read-only Native tab" {
     try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
     try testing.expectEqualStrings(capsule_url, panes[1].url);
 
-    model = main.initialModelWithDesktopServices(
+    main.initializeModelWithDesktopServices(
+        &model,
         terminal_url,
         agent_url,
         "codex",
@@ -2211,4 +2214,116 @@ test "new terminal tabs switch reconnect namespaces without exceeding the bound"
 
     for (0..main.max_sessions + 2) |_| main.update(&model, .choose_terminal, &fx);
     try testing.expectEqual(main.max_sessions, model.openSessions().len);
+}
+
+test "Rust desktop workspace restores Terminal and Agent tabs with their active selection" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    const workspace =
+        \\{"version":1,"revision":7,"active_session_id":2,"next_session_id":3,"selected_agent_provider":"codex-acp","sessions":[
+        \\  {"id":1,"mode":"terminal","agent_provider":null},
+        \\  {"id":2,"mode":"agent","agent_provider":"codex-acp"}
+        \\]}
+    ;
+    var model = main.initialModel();
+    main.initializeModelWithDesktopServices(
+        &model,
+        terminal_url,
+        agent_url,
+        "codex,codex-acp",
+        "",
+        "",
+    );
+    try testing.expect(main.restoreDesktopWorkspace(&model, workspace));
+    try testing.expect(model.desktop_workspace_enabled);
+    try testing.expect(model.desktop_workspace_restored);
+    try testing.expectEqual(@as(u64, 7), model.desktop_workspace_revision);
+    try testing.expectEqual(@as(usize, 2), model.openSessions().len);
+    try testing.expectEqual(@as(u8, 2), model.active_session_id);
+    try testing.expectEqual(main.SessionMode.agent, model.activeSession().mode);
+    try testing.expectEqual(main.AgentProvider.codex_acp, model.activeSession().agent_provider);
+    try testing.expectEqual(main.AgentConnection.connecting, model.activeSession().agent_connection);
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.initEffects(&model, &fx);
+    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
+    const reconnect = fx.pendingFetchAt(0).?;
+    try testing.expectEqual(main.agent_start_effect_key_base + 2, reconnect.key);
+    try testing.expect(std.mem.endsWith(u8, reconnect.url, "session_id=2&provider=codex-acp"));
+}
+
+test "desktop workspace persistence coalesces rapid tab mutations by revision" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const workspace =
+        \\{"version":1,"revision":0,"active_session_id":1,"next_session_id":2,"selected_agent_provider":"codex","sessions":[{"id":1,"mode":"terminal","agent_provider":null}]}
+    ;
+    var model = main.initialModel();
+    main.initializeModelWithDesktopServices(
+        &model,
+        terminal_url,
+        "",
+        "",
+        "",
+        "",
+    );
+    try testing.expect(main.restoreDesktopWorkspace(&model, workspace));
+    var first_fx = main.Effects.init(testing.allocator);
+    defer first_fx.deinit();
+    first_fx.executor = .fake;
+
+    main.update(&model, .choose_terminal, &first_fx);
+    try testing.expectEqual(@as(u64, 1), model.desktop_workspace_revision);
+    try testing.expectEqual(@as(usize, 1), first_fx.pendingFetchCount());
+    const first = first_fx.pendingFetchAt(0).?;
+    try testing.expectEqual(main.desktop_workspace_effect_key, first.key);
+    try testing.expectEqual(std.http.Method.POST, first.method);
+    try testing.expect(std.mem.indexOf(u8, first.body, "\"revision\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, first.body, "\"active_session_id\":2") != null);
+
+    main.update(&model, .choose_terminal, &first_fx);
+    try testing.expectEqual(@as(u64, 2), model.desktop_workspace_revision);
+    try testing.expectEqual(@as(usize, 1), first_fx.pendingFetchCount());
+
+    var second_fx = main.Effects.init(testing.allocator);
+    defer second_fx.deinit();
+    second_fx.executor = .fake;
+    main.update(&model, .{ .desktop_workspace_persisted = .{
+        .key = main.desktop_workspace_effect_key,
+        .status = 204,
+        .body = "",
+    } }, &second_fx);
+    try testing.expectEqual(@as(u64, 1), model.desktop_workspace_persisted_revision);
+    try testing.expectEqual(@as(usize, 1), second_fx.pendingFetchCount());
+    const coalesced = second_fx.pendingFetchAt(0).?;
+    try testing.expect(std.mem.indexOf(u8, coalesced.body, "\"revision\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, coalesced.body, "\"active_session_id\":3") != null);
+}
+
+test "invalid desktop workspace fails closed to the ordinary terminal" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const invalid =
+        \\{"version":1,"revision":4,"active_session_id":2,"next_session_id":3,"selected_agent_provider":"codex","sessions":[{"id":2,"mode":"agent","agent_provider":"unknown"}]}
+    ;
+    var model = main.initialModel();
+    main.initializeModelWithDesktopServices(
+        &model,
+        terminal_url,
+        "",
+        "",
+        "",
+        "",
+    );
+    try testing.expect(!main.restoreDesktopWorkspace(&model, invalid));
+    try testing.expect(model.desktop_workspace_enabled);
+    try testing.expect(!model.desktop_workspace_restored);
+    try testing.expectEqual(@as(usize, 1), model.openSessions().len);
+    try testing.expectEqual(main.SessionMode.terminal, model.activeSession().mode);
+
+    const colliding_next_id =
+        \\{"version":1,"revision":4,"active_session_id":2,"next_session_id":2,"selected_agent_provider":"codex","sessions":[{"id":2,"mode":"agent","agent_provider":"codex"}]}
+    ;
+    try testing.expect(!main.restoreDesktopWorkspace(&model, colliding_next_id));
+    try testing.expectEqual(@as(usize, 1), model.openSessions().len);
 }
