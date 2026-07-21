@@ -64,6 +64,9 @@ fn run() -> Result<(), String> {
                 assets,
                 token,
                 default_cwd: None,
+                desktop_workspace_state: Some(
+                    state_directory.join(hyper_term_daemon::DESKTOP_WORKSPACE_STATE_FILE),
+                ),
             },
             state,
         )

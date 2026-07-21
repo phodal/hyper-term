@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -39,6 +42,7 @@ const SUBSCRIPTION_POLL: Duration = Duration::from_millis(50);
 const DESKTOP_WORKSPACE_VERSION: u16 = 1;
 const MAX_DESKTOP_WORKSPACE_BYTES: usize = 4 * 1024;
 const MAX_DESKTOP_SESSIONS: usize = 8;
+pub const DESKTOP_WORKSPACE_STATE_FILE: &str = "desktop-workspace.json";
 const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:* ws://[::1]:*; img-src 'self' data:; font-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 #[derive(Clone, Debug)]
@@ -49,6 +53,10 @@ pub struct TerminalGatewayConfig {
     /// Authority-owned starting directory used when a trusted renderer does
     /// not request an explicit directory for a new human shell.
     pub default_cwd: Option<PathBuf>,
+    /// Optional Rust-owned durable state. The snapshot deliberately contains
+    /// only desktop tab intent, never gateway tokens, prompts, paths, or
+    /// provider credentials.
+    pub desktop_workspace_state: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -85,14 +93,62 @@ pub struct DesktopSessionSnapshot {
     pub agent_provider: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
+struct DesktopWorkspaceStoreInner {
+    snapshot: Mutex<DesktopWorkspaceSnapshot>,
+    durable_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
 pub struct DesktopWorkspaceStore {
-    snapshot: Arc<Mutex<DesktopWorkspaceSnapshot>>,
+    inner: Arc<DesktopWorkspaceStoreInner>,
+}
+
+impl Default for DesktopWorkspaceStore {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(DesktopWorkspaceStoreInner {
+                snapshot: Mutex::new(DesktopWorkspaceSnapshot::default()),
+                durable_path: None,
+            }),
+        }
+    }
 }
 
 impl DesktopWorkspaceStore {
+    fn open(path: PathBuf) -> Result<Self, TerminalGatewayError> {
+        let snapshot = match load_desktop_workspace(&path)
+            .map_err(TerminalGatewayError::WorkspaceIo)?
+        {
+            DesktopWorkspaceLoad::Snapshot(snapshot) => snapshot,
+            DesktopWorkspaceLoad::Missing => {
+                let snapshot = DesktopWorkspaceSnapshot::default();
+                replace_desktop_workspace(&path, &snapshot)
+                    .map_err(TerminalGatewayError::WorkspaceIo)?;
+                snapshot
+            }
+            DesktopWorkspaceLoad::Invalid => {
+                eprintln!(
+                    "hyper-term: invalid desktop workspace state at {}; restoring the default Terminal layout",
+                    path.display()
+                );
+                let snapshot = DesktopWorkspaceSnapshot::default();
+                replace_desktop_workspace(&path, &snapshot)
+                    .map_err(TerminalGatewayError::WorkspaceIo)?;
+                snapshot
+            }
+        };
+        Ok(Self {
+            inner: Arc::new(DesktopWorkspaceStoreInner {
+                snapshot: Mutex::new(snapshot),
+                durable_path: Some(path),
+            }),
+        })
+    }
+
     pub fn snapshot_json(&self) -> Result<String, TerminalGatewayError> {
         let snapshot = self
+            .inner
             .snapshot
             .lock()
             .map_err(|_| TerminalGatewayError::WorkspaceState)?;
@@ -102,6 +158,7 @@ impl DesktopWorkspaceStore {
     fn update(&self, next: DesktopWorkspaceSnapshot) -> Result<(), DesktopWorkspaceUpdateError> {
         validate_desktop_workspace(&next)?;
         let mut current = self
+            .inner
             .snapshot
             .lock()
             .map_err(|_| DesktopWorkspaceUpdateError::Unavailable)?;
@@ -111,9 +168,103 @@ impl DesktopWorkspaceStore {
         if next.revision == current.revision && next != *current {
             return Err(DesktopWorkspaceUpdateError::Conflict);
         }
+        if next == *current {
+            return Ok(());
+        }
+        if let Some(path) = &self.inner.durable_path {
+            replace_desktop_workspace(path, &next)
+                .map_err(|_| DesktopWorkspaceUpdateError::Unavailable)?;
+        }
         *current = next;
         Ok(())
     }
+}
+
+enum DesktopWorkspaceLoad {
+    Missing,
+    Invalid,
+    Snapshot(DesktopWorkspaceSnapshot),
+}
+
+fn load_desktop_workspace(path: &Path) -> Result<DesktopWorkspaceLoad, std::io::Error> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DesktopWorkspaceLoad::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_DESKTOP_WORKSPACE_BYTES as u64
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Ok(DesktopWorkspaceLoad::Invalid);
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let mut encoded = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_DESKTOP_WORKSPACE_BYTES as u64 + 1)
+        .read_to_end(&mut encoded)?;
+    if encoded.len() > MAX_DESKTOP_WORKSPACE_BYTES {
+        return Ok(DesktopWorkspaceLoad::Invalid);
+    }
+    let Ok(snapshot) = serde_json::from_slice::<DesktopWorkspaceSnapshot>(&encoded) else {
+        return Ok(DesktopWorkspaceLoad::Invalid);
+    };
+    if validate_desktop_workspace(&snapshot).is_err() {
+        return Ok(DesktopWorkspaceLoad::Invalid);
+    }
+    Ok(DesktopWorkspaceLoad::Snapshot(snapshot))
+}
+
+fn replace_desktop_workspace(
+    path: &Path,
+    snapshot: &DesktopWorkspaceSnapshot,
+) -> Result<(), std::io::Error> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "desktop workspace state requires a parent directory",
+        )
+    })?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "desktop workspace parent is not a regular directory",
+        ));
+    }
+    let mut encoded = serde_json::to_vec(snapshot)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    encoded.push(b'\n');
+    if encoded.len() > MAX_DESKTOP_WORKSPACE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "desktop workspace state exceeds its byte budget",
+        ));
+    }
+    let temporary = parent.join(format!(".desktop-workspace-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -166,6 +317,8 @@ pub enum TerminalGatewayError {
     Join(#[from] tokio::task::JoinError),
     #[error("terminal gateway desktop workspace state is unavailable")]
     WorkspaceState,
+    #[error("terminal gateway desktop workspace I/O error: {0}")]
+    WorkspaceIo(std::io::Error),
 }
 
 #[derive(Clone)]
@@ -292,7 +445,10 @@ pub async fn spawn_terminal_gateway(
 
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
-    let desktop_workspace_store = DesktopWorkspaceStore::default();
+    let desktop_workspace_store = match config.desktop_workspace_state {
+        Some(path) => DesktopWorkspaceStore::open(path)?,
+        None => DesktopWorkspaceStore::default(),
+    };
     let runtime = GatewayRuntime {
         daemon,
         assets: Arc::new(assets),
@@ -1015,6 +1171,7 @@ mod tests {
                 assets,
                 token: token.clone(),
                 default_cwd: Some(temporary.path().to_owned()),
+                desktop_workspace_state: None,
             },
             daemon,
         )
@@ -1190,14 +1347,17 @@ mod tests {
         let assets = temporary.path().join("assets");
         std::fs::create_dir(&assets).expect("create assets");
         std::fs::write(assets.join("index.html"), "terminal").expect("write asset");
-        let daemon = DaemonState::open(temporary.path().join("state")).expect("daemon");
+        let daemon_state = temporary.path().join("state");
+        let workspace_state = daemon_state.join(DESKTOP_WORKSPACE_STATE_FILE);
+        let daemon = DaemonState::open(&daemon_state).expect("daemon");
         let token = "0123456789abcdef0123456789abcdef".to_owned();
         let gateway = spawn_terminal_gateway(
             TerminalGatewayConfig {
                 bind: "127.0.0.1:0".parse().expect("socket"),
-                assets,
+                assets: assets.clone(),
                 token: token.clone(),
                 default_cwd: None,
+                desktop_workspace_state: Some(workspace_state.clone()),
             },
             daemon,
         )
@@ -1270,6 +1430,72 @@ mod tests {
         let (status, _) = workspace_request(gateway.address(), "POST", &token, &oversized).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE.as_u16());
         gateway.shutdown().await.expect("shutdown gateway");
+
+        let metadata = std::fs::metadata(&workspace_state).expect("workspace state metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let durable_bytes = std::fs::read(&workspace_state).expect("read durable workspace");
+        assert!(
+            !durable_bytes
+                .windows(token.len())
+                .any(|window| window == token.as_bytes())
+        );
+        let reopened = spawn_terminal_gateway(
+            TerminalGatewayConfig {
+                bind: "127.0.0.1:0".parse().expect("socket"),
+                assets: assets.clone(),
+                token: token.clone(),
+                default_cwd: None,
+                desktop_workspace_state: Some(workspace_state.clone()),
+            },
+            DaemonState::open(&daemon_state).expect("reopened daemon"),
+        )
+        .await
+        .expect("reopened gateway");
+        let (status, body) = workspace_request(reopened.address(), "GET", &token, &[]).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(
+            serde_json::from_slice::<DesktopWorkspaceSnapshot>(&body)
+                .expect("reopened workspace snapshot"),
+            snapshot
+        );
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened gateway");
+
+        std::fs::write(&workspace_state, b"{truncated").expect("corrupt workspace state");
+        std::fs::set_permissions(&workspace_state, std::fs::Permissions::from_mode(0o600))
+            .expect("private corrupt state");
+        let recovered = spawn_terminal_gateway(
+            TerminalGatewayConfig {
+                bind: "127.0.0.1:0".parse().expect("socket"),
+                assets,
+                token: token.clone(),
+                default_cwd: None,
+                desktop_workspace_state: Some(workspace_state.clone()),
+            },
+            DaemonState::open(&daemon_state).expect("recovered daemon"),
+        )
+        .await
+        .expect("recovered gateway");
+        let (status, body) = workspace_request(recovered.address(), "GET", &token, &[]).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(
+            serde_json::from_slice::<DesktopWorkspaceSnapshot>(&body)
+                .expect("recovered workspace snapshot"),
+            DesktopWorkspaceSnapshot::default()
+        );
+        recovered
+            .shutdown()
+            .await
+            .expect("shutdown recovered gateway");
+        assert_eq!(
+            serde_json::from_slice::<DesktopWorkspaceSnapshot>(
+                &std::fs::read(&workspace_state).expect("read recovered state"),
+            )
+            .expect("decode recovered state"),
+            DesktopWorkspaceSnapshot::default()
+        );
     }
 
     async fn workspace_request(
@@ -1318,6 +1544,7 @@ mod tests {
                 assets: PathBuf::new(),
                 token: "short".into(),
                 default_cwd: None,
+                desktop_workspace_state: None,
             },
             daemon,
         )

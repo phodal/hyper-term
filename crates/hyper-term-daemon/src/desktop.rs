@@ -16,9 +16,10 @@ use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
 use hyper_term_daemon::{
-    AcpAgentProviderConfig, AgentGatewayConfig, AgentGenUiRuntimeConfig, DaemonState,
-    DesktopWorkspaceStore, TerminalGatewayConfig, load_bug_capsule, probe_agent_provider_statuses,
-    spawn_agent_gateway, spawn_terminal_gateway, spawn_unix_server,
+    AcpAgentProviderConfig, AgentGatewayConfig, AgentGenUiRuntimeConfig,
+    DESKTOP_WORKSPACE_STATE_FILE, DaemonState, DesktopWorkspaceStore, TerminalGatewayConfig,
+    load_bug_capsule, probe_agent_provider_statuses, spawn_agent_gateway, spawn_terminal_gateway,
+    spawn_unix_server,
 };
 use uuid::Uuid;
 
@@ -145,6 +146,9 @@ fn run() -> Result<i32, String> {
                 assets: resolved.terminal_assets.clone(),
                 token: terminal_token.clone(),
                 default_cwd: Some(resolved.shell_cwd.clone()),
+                desktop_workspace_state: Some(
+                    resolved.state_directory.join(DESKTOP_WORKSPACE_STATE_FILE),
+                ),
             },
             daemon.clone(),
         )

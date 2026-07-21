@@ -88,8 +88,9 @@ pub use mcp_gateway::{
     McpStdioConfig, run_mcp_stdio,
 };
 pub use web_gateway::{
-    DesktopSessionSnapshot, DesktopWorkspaceSnapshot, DesktopWorkspaceStore, TerminalGatewayConfig,
-    TerminalGatewayError, TerminalGatewayHandle, spawn_terminal_gateway,
+    DESKTOP_WORKSPACE_STATE_FILE, DesktopSessionSnapshot, DesktopWorkspaceSnapshot,
+    DesktopWorkspaceStore, TerminalGatewayConfig, TerminalGatewayError, TerminalGatewayHandle,
+    spawn_terminal_gateway,
 };
 
 const CONTROL_SUBSCRIBER_CAPACITY: usize = 512;

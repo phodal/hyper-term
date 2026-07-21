@@ -98,6 +98,26 @@ chmod 700 "$smoke_lima"
 printf 'local pinned smoke image' > "$smoke_lima_image"
 smoke_lima_image_sha256=$(shasum -a 256 "$smoke_lima_image" | awk '{print $1}')
 
+smoke_start_supervisor() {
+  (
+    cd "$smoke_root"
+    exec "$smoke_supervisor" \
+      --ui "$smoke_renderer" \
+      --state-dir "$smoke_root/state" \
+      --terminal-assets "$smoke_repo_root/dist/terminal" \
+      --workbench-assets "$smoke_repo_root/dist/workbench" \
+      --shell-cwd "$smoke_workspace" \
+      --codex "$smoke_codex_goal" \
+      --codex-acp "$smoke_acp" \
+      --claude-agent-acp "$smoke_terminal_acp" \
+      --claude "$smoke_terminal_acp" \
+      --lima "$smoke_lima" \
+      --lima-image "$smoke_lima_image" \
+      --lima-image-sha256 "$smoke_lima_image_sha256"
+  ) >>"$smoke_log" 2>&1 &
+  smoke_pid=$!
+}
+
 smoke_cleanup() {
   smoke_status=$?
   trap - EXIT INT TERM
@@ -116,23 +136,7 @@ trap smoke_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-(
-  cd "$smoke_root"
-  exec "$smoke_supervisor" \
-    --ui "$smoke_renderer" \
-    --state-dir "$smoke_root/state" \
-    --terminal-assets "$smoke_repo_root/dist/terminal" \
-    --workbench-assets "$smoke_repo_root/dist/workbench" \
-    --shell-cwd "$smoke_workspace" \
-    --codex "$smoke_codex_goal" \
-    --codex-acp "$smoke_acp" \
-    --claude-agent-acp "$smoke_terminal_acp" \
-    --claude "$smoke_terminal_acp" \
-    --lima "$smoke_lima" \
-    --lima-image "$smoke_lima_image" \
-    --lima-image-sha256 "$smoke_lima_image_sha256"
-) >"$smoke_log" 2>&1 &
-smoke_pid=$!
+smoke_start_supervisor
 
 (
   cd "$smoke_root"
@@ -499,6 +503,145 @@ PY
   smoke_agent_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-agent.png
   cp "$smoke_screenshot" "$smoke_agent_screenshot"
   cp "$smoke_terminal_screenshot" "$smoke_screenshot"
+
+  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name="zsh 3"')
+  native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
+  native automate assert \
+    'role=button name="zsh 3".*state=.*selected' \
+    'hyper-term-terminal-view.*tab=3"'
+  smoke_terminal_url_before_application_restart=$(smoke_terminal_url)
+  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Claude ACP 6"')
+  native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
+  native automate assert \
+    'role=button name="Claude ACP 6".*state=.*selected' \
+    'role=group name="Agent conversation"'
+  python3 - "$smoke_root/state/desktop-workspace.json" .zig-cache/native-sdk-automation/workspace-before-application-restart.json <<'PY'
+import json
+import pathlib
+import stat
+import sys
+import time
+
+state_path = pathlib.Path(sys.argv[1])
+evidence_path = pathlib.Path(sys.argv[2])
+last = None
+for _ in range(100):
+    try:
+        last = json.loads(state_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        time.sleep(0.05)
+        continue
+    sessions = [
+        (entry["id"], entry["mode"], entry.get("agent_provider"))
+        for entry in last.get("sessions", [])
+    ]
+    if (
+        last.get("active_session_id") == 6
+        and sessions
+        == [
+            (1, "terminal", None),
+            (3, "terminal", None),
+            (5, "agent", "codex-acp"),
+            (6, "agent", "claude-acp"),
+        ]
+    ):
+        break
+    time.sleep(0.05)
+else:
+    raise SystemExit(f"durable desktop workspace did not settle: {last!r}")
+
+mode = stat.S_IMODE(state_path.stat().st_mode)
+if mode != 0o600:
+    raise SystemExit(f"desktop workspace mode is {mode:o}, expected 600")
+evidence_path.write_text(json.dumps(last, sort_keys=True) + "\n")
+PY
+
+  smoke_supervisor_before_application_restart=$smoke_pid
+  smoke_renderer_before_application_restart=$(pgrep -P "$smoke_pid" -f "$smoke_renderer" | head -n 1)
+  kill -INT "$smoke_pid"
+  for _ in {1..100}; do
+    smoke_supervisor_state=$(ps -o stat= -p "$smoke_pid" 2>/dev/null | tr -d ' ' || true)
+    if [[ -z "$smoke_supervisor_state" || "$smoke_supervisor_state" == Z* ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  if [[ -n "$smoke_supervisor_state" && "$smoke_supervisor_state" != Z* ]]; then
+    echo "desktop supervisor did not stop for the application restart" >&2
+    exit 1
+  fi
+
+  smoke_start_supervisor
+  smoke_supervisor_after_application_restart=$smoke_pid
+  smoke_renderer_after_application_restart=""
+  for _ in {1..100}; do
+    smoke_renderer_after_application_restart=$(pgrep -P "$smoke_pid" -f "$smoke_renderer" | head -n 1 || true)
+    if [[ "$smoke_renderer_after_application_restart" =~ ^[0-9]+$ ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  if [[ ! "$smoke_renderer_after_application_restart" =~ ^[0-9]+$ ]]; then
+    echo "restarted desktop supervisor did not launch the Native renderer" >&2
+    exit 1
+  fi
+  native automate assert --timeout-ms 30000 \
+    "publisher_pid=$smoke_renderer_after_application_restart" \
+    'ready=true' \
+    'gpu_nonblank=true' \
+    'role=button name="Close zsh 1"' \
+    'role=button name="Close zsh 3"' \
+    'role=button name="Close Codex ACP 5"' \
+    'role=button name="Close Claude ACP 6"' \
+    'role=button name="Claude ACP 6".*state=.*selected' \
+    'role=group name="Agent conversation"' \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Send prompt".*enabled=true'
+
+  smoke_terminal_tab_id=$(smoke_widget_id 'role=button name="zsh 3"')
+  native automate widget-click hyper-term-canvas "$smoke_terminal_tab_id"
+  native automate assert \
+    'role=button name="zsh 3".*state=.*selected' \
+    'hyper-term-terminal-view.*tab=3"'
+  smoke_terminal_url_after_application_restart=$(smoke_terminal_url)
+  if [[ "$smoke_terminal_url_after_application_restart" == "$smoke_terminal_url_before_application_restart" ]]; then
+    echo "application restart reused the previous terminal gateway token" >&2
+    exit 1
+  fi
+  smoke_agent_tab_id=$(smoke_widget_id 'role=button name="Claude ACP 6"')
+  native automate widget-click hyper-term-canvas "$smoke_agent_tab_id"
+  native automate assert \
+    'role=button name="Claude ACP 6".*state=.*selected' \
+    'role=group name="Agent conversation"' \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    'role=button name="Send prompt".*enabled=true'
+  smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text 'Run after application restart'
+  smoke_send_id=$(smoke_widget_id 'role=button name="Send prompt".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_send_id"
+  native automate assert \
+    'Approval required' \
+    'Shell command · external effect' \
+    'role=button name="Allow once".*enabled=true'
+  smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_allow_id"
+  native automate assert \
+    'Tier 2 terminal completed.' \
+    'role=button name="Plan complete"' \
+    'role=button name="Allowed once"'
+  printf '%s\n' \
+    "supervisor_before=$smoke_supervisor_before_application_restart" \
+    "supervisor_after=$smoke_supervisor_after_application_restart" \
+    "renderer_before=$smoke_renderer_before_application_restart" \
+    "renderer_after=$smoke_renderer_after_application_restart" \
+    'durable_workspace_mode=0600' \
+    'workspace_tabs_restored=true' \
+    'active_agent_restored=true' \
+    'terminal_gateway_token_rotated=true' \
+    'agent_session_recreated_and_prompted=true' \
+    > .zig-cache/native-sdk-automation/application-restart.txt
+  kill -INT "$smoke_pid" 2>/dev/null || true
+  wait "$smoke_pid" 2>/dev/null || true
 )
 
 if [[ -n "$smoke_artifact_dir" ]]; then
@@ -527,6 +670,12 @@ if [[ -n "$smoke_artifact_dir" ]]; then
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/workspace-before-restart.json" \
     "$smoke_artifact_dir/workspace-before-restart.json"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/workspace-before-application-restart.json" \
+    "$smoke_artifact_dir/workspace-before-application-restart.json"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/application-restart.txt" \
+    "$smoke_artifact_dir/application-restart.txt"
   cp "$smoke_log" "$smoke_artifact_dir/hyper-term-smoke.log"
 fi
 
