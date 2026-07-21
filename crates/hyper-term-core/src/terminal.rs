@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use hyper_term_protocol::{SandboxBackendKind, TerminalCommand, TerminalId, TerminalSize};
@@ -11,6 +13,12 @@ use thiserror::Error;
 
 const READER_CHUNK_BYTES: usize = 16 * 1024;
 const SUBSCRIBER_QUEUE_CHUNKS: usize = 256;
+#[cfg(unix)]
+const BURST_COALESCE_WINDOW: Duration = Duration::from_millis(2);
+#[cfg(unix)]
+const BURST_COALESCE_POLL_MS: i32 = 1;
+#[cfg(unix)]
+const BURST_COALESCE_MIN_BYTES: usize = 512;
 
 const USER_SHELL_TERM: &str = "xterm-256color";
 const USER_SHELL_COLORTERM: &str = "truecolor";
@@ -312,6 +320,8 @@ impl TerminalSupervisor {
             .spawn(move || {
                 let mut buffer = vec![0_u8; READER_CHUNK_BYTES];
                 let mut buffered = 0;
+                #[cfg(unix)]
+                let mut last_publish: Option<(Instant, usize)> = None;
                 loop {
                     match reader.read(&mut buffer[buffered..]) {
                         Ok(0) => {
@@ -323,13 +333,25 @@ impl TerminalSupervisor {
                         Ok(length) => {
                             buffered += length;
                             #[cfg(unix)]
-                            let can_coalesce =
-                                buffered < buffer.len() && pty_has_pending_output(reader_poll_fd);
+                            let can_coalesce = buffered < buffer.len()
+                                && pty_has_pending_output(
+                                    reader_poll_fd,
+                                    last_publish.is_some_and(|(published_at, published_bytes)| {
+                                        published_bytes >= BURST_COALESCE_MIN_BYTES
+                                            && published_at.elapsed() <= BURST_COALESCE_WINDOW
+                                    }),
+                                );
                             #[cfg(not(unix))]
                             let can_coalesce = false;
                             if buffered == buffer.len() || !can_coalesce {
+                                #[cfg(unix)]
+                                let published_bytes = buffered;
                                 reader_replay.publish_output(&buffer[..buffered]);
                                 buffered = 0;
+                                #[cfg(unix)]
+                                {
+                                    last_publish = Some((Instant::now(), published_bytes));
+                                }
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -453,7 +475,10 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn pty_has_pending_output(file_descriptor: Option<portable_pty::unix::RawFd>) -> bool {
+fn pty_has_pending_output(
+    file_descriptor: Option<portable_pty::unix::RawFd>,
+    rapid_follow_up: bool,
+) -> bool {
     let Some(file_descriptor) = file_descriptor else {
         return false;
     };
@@ -462,10 +487,19 @@ fn pty_has_pending_output(file_descriptor: Option<portable_pty::unix::RawFd>) ->
         events: libc::POLLIN,
         revents: 0,
     };
-    // The descriptor belongs to the master PTY retained by TerminalSession
-    // for at least as long as this reader thread. A zero-timeout poll only
-    // asks whether another read can be coalesced without adding input latency.
-    unsafe { libc::poll(&mut descriptor, 1, 0) > 0 && descriptor.revents & libc::POLLIN != 0 }
+    // The first isolated output is published immediately. Once reads arrive
+    // in a rapid stream, allow one millisecond for the producer to refill the
+    // PTY so sustained output reaches the ordered channel in bounded chunks.
+    // This preserves first-byte latency while avoiding thousands of tiny
+    // publications when the reader temporarily outruns the child process.
+    let timeout_ms = if rapid_follow_up {
+        BURST_COALESCE_POLL_MS
+    } else {
+        0
+    };
+    unsafe {
+        libc::poll(&mut descriptor, 1, timeout_ms) > 0 && descriptor.revents & libc::POLLIN != 0
+    }
 }
 
 struct TerminalReplayBuffer {
@@ -521,10 +555,11 @@ impl TerminalReplayBuffer {
                 state.replay_size = state.replay_size.saturating_sub(removed.bytes.len());
             }
         }
-        state.transcript_tail.extend(bytes);
-        while state.transcript_tail.len() > self.transcript_tail_bytes {
-            state.transcript_tail.pop_front();
-        }
+        append_transcript_tail(
+            &mut state.transcript_tail,
+            bytes,
+            self.transcript_tail_bytes,
+        );
         publish(&mut state.subscribers, TerminalEvent::Output(chunk));
     }
 
@@ -580,6 +615,19 @@ impl TerminalReplayBuffer {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         snapshot_from_state(self.terminal_id, &state)
     }
+}
+
+fn append_transcript_tail(tail: &mut VecDeque<u8>, bytes: &[u8], limit: usize) {
+    if bytes.len() >= limit {
+        tail.clear();
+        tail.extend(&bytes[bytes.len() - limit..]);
+        return;
+    }
+    let overflow = tail.len().saturating_add(bytes.len()).saturating_sub(limit);
+    if overflow > 0 {
+        tail.drain(..overflow);
+    }
+    tail.extend(bytes);
 }
 
 fn snapshot_from_state(terminal_id: TerminalId, state: &ReplayState) -> TerminalSnapshot {
@@ -948,5 +996,18 @@ mod tests {
             relative_shell.resolved_profile(),
             Err(TerminalError::ShellPathNotAbsolute(_))
         ));
+    }
+
+    #[test]
+    fn transcript_tail_trims_overflow_in_bounded_batches() {
+        let mut tail = VecDeque::from(b"abcd".to_vec());
+        append_transcript_tail(&mut tail, b"ef", 5);
+        assert_eq!(tail.iter().copied().collect::<Vec<_>>(), b"bcdef");
+
+        append_transcript_tail(&mut tail, b"0123456789", 5);
+        assert_eq!(tail.iter().copied().collect::<Vec<_>>(), b"56789");
+
+        append_transcript_tail(&mut tail, b"XY", 5);
+        assert_eq!(tail.iter().copied().collect::<Vec<_>>(), b"789XY");
     }
 }
