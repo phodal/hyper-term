@@ -73,7 +73,7 @@ agent-browser --session "$verify_session" open "$verify_url" >/dev/null
 agent-browser --session "$verify_session" wait 500 >/dev/null
 
 verify_boot=$(agent-browser --session "$verify_session" eval \
-  'document.querySelector(".xterm-helper-textarea") === document.activeElement && document.querySelector("#terminal")?.dataset.renderer === "webgl" ? "OK" : "FAIL"')
+  'document.querySelector(".xterm-helper-textarea") === document.activeElement && document.querySelector("#terminal")?.dataset.renderer === "webgl" && !document.querySelector(".xterm-accessibility-tree") ? "OK" : "FAIL"')
 grep -q '"OK"' <<<"$verify_boot"
 
 agent-browser --session "$verify_session" keyboard type "printf '__HYPER_TERM_BROWSER_INPUT__\\n'" >/dev/null
@@ -128,11 +128,22 @@ verify_cjk=$(agent-browser --session "$verify_session" eval \
 grep -q '"OK"' <<<"$verify_cjk"
 agent-browser --session "$verify_session" press Escape >/dev/null
 
+# Accessibility stays off on the high-throughput default path. The discoverable
+# focus-only control enables xterm's real row list and live region on demand.
+agent-browser --session "$verify_session" focus '#terminal-screen-reader-toggle' >/dev/null
+agent-browser --session "$verify_session" press Enter >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+verify_accessibility=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const button=document.querySelector("#terminal-screen-reader-toggle");const tree=document.querySelector(".xterm-accessibility-tree");return button?.getAttribute("aria-pressed")==="true"&&tree?.getAttribute("role")==="list"&&tree.querySelectorAll("[role=listitem]").length>0&&tree.textContent.includes("中文输入")?"OK":"FAIL"})()')
+grep -q '"OK"' <<<"$verify_accessibility"
+agent-browser --session "$verify_session" screenshot "$verify_artifact_dir/terminal-screen-reader-toggle.png" >/dev/null
+
 verify_errors=$(agent-browser --session "$verify_session" errors)
 if [[ -n "$verify_errors" ]]; then
   echo "$verify_errors" >&2
   exit 1
 fi
 
-echo "Terminal browser verified: WebGL xterm, zsh input, selection, search focus, and IME composition"
+echo "Terminal browser verified: WebGL xterm, zsh input, selection, search focus, IME, and opt-in accessibility tree"
 echo "Terminal browser screenshot: $verify_artifact_dir/terminal-input.png"
+echo "Terminal accessibility screenshot: $verify_artifact_dir/terminal-screen-reader-toggle.png"

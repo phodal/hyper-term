@@ -28,6 +28,33 @@ input {
   font: inherit;
 }
 
+#terminal-screen-reader-toggle {
+  position: absolute;
+  z-index: 3;
+  top: 8px;
+  right: 12px;
+  overflow: hidden;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+#terminal-screen-reader-toggle:focus-visible {
+  width: auto;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid #a8d558;
+  border-radius: 5px;
+  clip-path: none;
+  outline: none;
+  background: #181c15;
+  color: #e6e9dd;
+  font: 600 12px/1 Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
 #terminal {
   padding: 8px 10px 10px;
 }

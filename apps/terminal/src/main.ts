@@ -20,7 +20,9 @@ import {
 import {
   nextTerminalFontSize,
   parseTerminalFontSize,
+  parseTerminalScreenReaderMode,
   TERMINAL_FONT_SIZE_STORAGE_KEY,
+  TERMINAL_SCREEN_READER_STORAGE_KEY,
   type TerminalShortcut,
   terminalShortcut,
 } from "./terminal-preferences.ts";
@@ -33,6 +35,9 @@ const attachmentStorageKey = terminalAttachmentStorageKey(
 );
 const sessionId = terminalSessionId(globalThis.location.href);
 const terminalElement = requiredElement("#terminal");
+const screenReaderToggle = requiredElement<HTMLButtonElement>(
+  "#terminal-screen-reader-toggle",
+);
 const statusElement = requiredElement("#connection-status");
 const searchForm = requiredElement<HTMLFormElement>("#terminal-search");
 const searchInput = requiredElement<HTMLInputElement>("#terminal-search-input");
@@ -64,6 +69,7 @@ const terminal = new Terminal({
   macOptionIsMeta: true,
   minimumContrastRatio: 4.5,
   rightClickSelectsWord: true,
+  screenReaderMode: readScreenReaderMode(),
   scrollback: 20_000,
   smoothScrollDuration: 0,
   theme: {
@@ -104,6 +110,7 @@ installGpuRenderer(
 );
 fitTerminal();
 inputFocus.claimTerminal();
+updateScreenReaderToggle(terminal.options.screenReaderMode ?? false);
 
 let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;
@@ -115,6 +122,15 @@ const connectionState = new TerminalConnectionState();
 
 searchInput.addEventListener("input", () => findNext(true));
 searchInput.addEventListener("focus", () => inputFocus.claimSearch());
+terminal.textarea?.addEventListener(
+  "focus",
+  () => inputFocus.observeTerminalFocus(),
+);
+screenReaderToggle.addEventListener(
+  "focus",
+  () => inputFocus.claimAuxiliary(),
+);
+screenReaderToggle.addEventListener("click", toggleScreenReaderMode);
 terminalElement.addEventListener("pointerdown", () => {
   if (searchForm.hidden) inputFocus.claimTerminal();
 });
@@ -401,6 +417,23 @@ function applyZoom(
   showTransientStatus(`Font ${fontSize} px`);
 }
 
+function toggleScreenReaderMode(): void {
+  const enabled = !(terminal.options.screenReaderMode ?? false);
+  terminal.options.screenReaderMode = enabled;
+  writeScreenReaderMode(enabled);
+  updateScreenReaderToggle(enabled);
+  showTransientStatus(
+    `Screen reader mode ${enabled ? "enabled" : "disabled"}`,
+  );
+}
+
+function updateScreenReaderToggle(enabled: boolean): void {
+  screenReaderToggle.setAttribute("aria-pressed", String(enabled));
+  screenReaderToggle.textContent = enabled
+    ? "Disable screen reader mode"
+    : "Enable screen reader mode";
+}
+
 function showTransientStatus(message: string): void {
   if (transientStatusTimer !== null) {
     globalThis.clearTimeout(transientStatusTimer);
@@ -460,6 +493,27 @@ function writeFontSize(value: number): void {
     );
   } catch {
     // Zoom remains active for the lifetime of this terminal renderer.
+  }
+}
+
+function readScreenReaderMode(): boolean {
+  try {
+    return parseTerminalScreenReaderMode(
+      globalThis.localStorage.getItem(TERMINAL_SCREEN_READER_STORAGE_KEY),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function writeScreenReaderMode(enabled: boolean): void {
+  try {
+    globalThis.localStorage.setItem(
+      TERMINAL_SCREEN_READER_STORAGE_KEY,
+      enabled ? "enabled" : "disabled",
+    );
+  } catch {
+    // The accessibility mode remains active for the current document.
   }
 }
 

@@ -1,12 +1,12 @@
 <div align="center">
   <img src="apps/desktop/assets/icon.png" width="112" alt="Hyper Term icon" />
 
-  <h1>Hyper Term</h1>
+<h1>Hyper Term</h1>
 
-  <p><strong>A local-first terminal for humans and coding agents.</strong></p>
+<p><strong>A local-first terminal for humans and coding agents.</strong></p>
   <p>A normal terminal by default. An Agent workspace only when you choose it.</p>
 
-  <p>
+<p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0 license" /></a>
     <img src="https://img.shields.io/badge/platform-macOS-black.svg" alt="macOS" />
     <img src="https://img.shields.io/badge/status-alpha-orange.svg" alt="Alpha status" />
@@ -22,8 +22,8 @@ structured messages, approvals, diffs, and generated interfaces.
 </p>
 
 > [!IMPORTANT]
-> Hyper Term is in active development. You can build and run it from source,
-> but it is not ready for production use or general distribution.
+> Hyper Term is in active development. You can build and run it from source, but
+> it is not ready for production use or general distribution.
 
 ## Why Hyper Term?
 
@@ -38,9 +38,13 @@ structured messages, approvals, diffs, and generated interfaces.
 
 Agent tabs can connect to locally installed Codex, Claude, and GitHub Copilot
 CLIs. They present plans and tool calls as structured, searchable blocks, and
-can open generated React/TypeScript artifacts in an isolated editor and
-preview. Press `Command-F` in an Agent tab to filter its retained messages,
-tools, files, and approvals; ordinary Terminal tabs keep terminal-native find.
+can open generated React/TypeScript artifacts in an isolated editor and preview.
+Press `Command-F` in an Agent tab to filter its retained messages, tools, files,
+and approvals; ordinary Terminal tabs keep terminal-native find. Terminal
+rendering stays on the fast WebGL path by default. Screen-reader users can press
+`Shift-Tab` from Terminal input to reveal **Enable screen reader mode**, then
+press `Enter`; the preference is local and adds xterm's navigable row list and
+live output region without slowing every terminal session.
 
 ## How it works
 
@@ -57,8 +61,8 @@ flowchart LR
     RUST --> RESULT["Review result or diff"]
 ```
 
-The key boundary is simple: the UI and agent may propose an action, but only
-the Rust permission broker can execute it. Terminal output is always treated as
+The key boundary is simple: the UI and agent may propose an action, but only the
+Rust permission broker can execute it. Terminal output is always treated as
 untrusted data.
 
 ## Get started
@@ -173,10 +177,11 @@ containment, and signed macOS distribution.
 
 Issues and focused pull requests are welcome. Read [AGENTS.md](AGENTS.md) before
 changing protocols or process lifecycle behavior, and add a regression test for
-every such change. Keep `hyper-term-core` independent from the renderer and
-keep command and filesystem authority out of WebViews.
+every such change. Keep `hyper-term-core` independent from the renderer and keep
+command and filesystem authority out of WebViews.
 
 ## License
 
 Hyper Term is licensed under the [Apache License 2.0](LICENSE). Third-party
-components and notices are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+components and notices are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

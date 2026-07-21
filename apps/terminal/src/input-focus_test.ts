@@ -17,6 +17,16 @@ Deno.test("terminal focus lease restores only the current input owner", () => {
   lease.claimTerminal();
   assertEquals(lease.owner, "terminal");
   assertEquals(terminalFocuses, 2);
+
+  lease.claimAuxiliary();
+  assertEquals(lease.owner, "auxiliary");
+  assertEquals(lease.restore(), false);
+  assertEquals(terminalFocuses, 2);
+
+  lease.observeTerminalFocus();
+  assertEquals(lease.owner, "terminal");
+  assertEquals(lease.restore(), true);
+  assertEquals(terminalFocuses, 3);
 });
 
 Deno.test("repeated search claims never leak focus back to the terminal", () => {

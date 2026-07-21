@@ -1,4 +1,4 @@
-export type TerminalInputOwner = "terminal" | "search";
+export type TerminalInputOwner = "terminal" | "search" | "auxiliary";
 
 /**
  * Keeps the terminal grid and its local search field from competing for the
@@ -22,8 +22,16 @@ export class TerminalInputFocusLease {
     this.#focusTerminal();
   }
 
+  observeTerminalFocus(): void {
+    this.#owner = "terminal";
+  }
+
   claimSearch(): void {
     this.#owner = "search";
+  }
+
+  claimAuxiliary(): void {
+    this.#owner = "auxiliary";
   }
 
   restore(): boolean {

@@ -3,6 +3,8 @@ export const MIN_TERMINAL_FONT_SIZE = 9;
 export const MAX_TERMINAL_FONT_SIZE = 24;
 export const TERMINAL_FONT_SIZE_STORAGE_KEY =
   "hyper-term.terminal-font-size.v1";
+export const TERMINAL_SCREEN_READER_STORAGE_KEY =
+  "hyper-term.terminal-screen-reader.v1";
 
 export type TerminalShortcut =
   | "find"
@@ -38,6 +40,10 @@ export function parseTerminalFontSize(value: string | null): number {
   return parsed >= MIN_TERMINAL_FONT_SIZE && parsed <= MAX_TERMINAL_FONT_SIZE
     ? parsed
     : DEFAULT_TERMINAL_FONT_SIZE;
+}
+
+export function parseTerminalScreenReaderMode(value: string | null): boolean {
+  return value === "enabled";
 }
 
 export function nextTerminalFontSize(

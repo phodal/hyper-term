@@ -5,6 +5,7 @@ import {
   MIN_TERMINAL_FONT_SIZE,
   nextTerminalFontSize,
   parseTerminalFontSize,
+  parseTerminalScreenReaderMode,
   type TerminalKeyDescriptor,
   terminalShortcut,
 } from "./terminal-preferences.ts";
@@ -56,4 +57,11 @@ Deno.test("terminal zoom steps clamp and reset deterministically", () => {
     nextTerminalFontSize(21, "zoom_reset"),
     DEFAULT_TERMINAL_FONT_SIZE,
   );
+});
+
+Deno.test("terminal screen reader preference is explicit and fail closed", () => {
+  assertEquals(parseTerminalScreenReaderMode("enabled"), true);
+  assertEquals(parseTerminalScreenReaderMode("disabled"), false);
+  assertEquals(parseTerminalScreenReaderMode("true"), false);
+  assertEquals(parseTerminalScreenReaderMode(null), false);
 });

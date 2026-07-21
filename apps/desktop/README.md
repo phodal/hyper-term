@@ -6,7 +6,11 @@ Terminal. `New` creates another ordinary Terminal tab, while the adjacent
 own close control and context-menu action; Command-W closes the active tab
 through the same Rust-owned session lifecycle. The terminal surface adds
 Command-F scrollback search and persistent Command-Plus / Command-Minus zoom
-without claiming Ctrl-C or other shell input.
+without claiming Ctrl-C or other shell input. The high-throughput WebGL path
+keeps screen-reader projection off by default. `Shift-Tab` from Terminal input
+reveals the keyboard-accessible screen-reader toggle; enabling it persists
+locally and exposes xterm's row list and live output region for assistive
+navigation.
 
 Agent tabs are single-pane by default, matching the disclosure behavior of a
 modern coding-agent client rather than reserving a permanent sidebar. When an

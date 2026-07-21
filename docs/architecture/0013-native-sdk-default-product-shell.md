@@ -11,8 +11,8 @@
 
 ## Context
 
-ADR 0012 kept Tauri as the reference adapter while Native SDK was evaluated.
-The evaluation established that Native SDK `v0.5.3` can provide a small native
+ADR 0012 kept Tauri as the reference adapter while Native SDK was evaluated. The
+evaluation established that Native SDK `v0.5.3` can provide a small native
 window host, Metal-backed canvas presentation on macOS, compiled declarative
 views, deterministic widget identity, virtualized lists, native scrolling,
 system menus, accessibility snapshots, and bounded WebView panes.
@@ -25,16 +25,15 @@ select a terminal renderer and does not move process authority into Zig.
 The product requirement has also become clearer. Hyper Term opens as a normal,
 fast Terminal. `New` always opens another ordinary Terminal tab; `Agent` is a
 separate, explicit tab action. Agent mode composes ACP, MCP, generated UI,
-Computer Use evidence, approvals, editors, and diffs around the terminal
-without making a WebView the application shell.
+Computer Use evidence, approvals, editors, and diffs around the terminal without
+making a WebView the application shell.
 
 ## Decision
 
-Native SDK `v0.5.3` at commit
-`57bf56bc58058768d436099c1005bfc66bd55ac3` is the default macOS product shell.
-The dependency remains pinned while it is pre-1.0. Tauri is no longer the
-default implementation target; it remains a comparison adapter until the
-Native path passes the release gates retained from ADR 0012.
+Native SDK `v0.5.3` at commit `57bf56bc58058768d436099c1005bfc66bd55ac3` is the
+default macOS product shell. The dependency remains pinned while it is pre-1.0.
+Tauri is no longer the default implementation target; it remains a comparison
+adapter until the Native path passes the release gates retained from ADR 0012.
 
 ```text
 Native SDK / Zig desktop host
@@ -50,27 +49,26 @@ Rust hyperd
 ```
 
 The desktop host is a zero-config Native SDK project. It does not commit a
-developer-machine absolute SDK path. CI and release acquisition pin the CLI,
-SDK commit, and Zig 0.16 toolchain.
+developer-machine absolute SDK path. CI and release acquisition pin the CLI, SDK
+commit, and Zig 0.16 toolchain.
 
 ## Session modes
 
 The initial state is always `Terminal`. It exposes ordinary terminal behavior
 and minimal session chrome. The session bar exposes two unambiguous actions:
 
-- `New`: direct user-owned zsh session; no AI operation approval is
-  required merely to type or run a shell command.
+- `New`: direct user-owned zsh session; no AI operation approval is required
+  merely to type or run a shell command.
 - `Agent`: an explicit Agent tab containing a terminal plus a native Block
-  surface for agent messages, plans,
-  tools, approvals, diffs, artifacts, and Computer Use evidence.
+  surface for agent messages, plans, tools, approvals, diffs, artifacts, and
+  Computer Use evidence.
 
 Sessions use native tab semantics. Each tab has an exact close target and a
 context-menu Close action; Command-W closes the active tab. All three paths
 enter the same Rust-owned PTY and Agent cleanup lifecycle.
 
-Changing the visible mode never changes operation authority. A model can
-propose an action, but only the Rust permission broker can authorize and
-dispatch it.
+Changing the visible mode never changes operation authority. A model can propose
+an action, but only the Rust permission broker can authorize and dispatch it.
 
 ## Rendering planes
 
@@ -138,8 +136,8 @@ at about 367 ms from GPU-surface creation to its first frame and about 417 ms
 from window creation to visible presentation. Reading the 22 MiB UI font was
 disabled in an A/B run and left the first-frame result at about 370 ms, ruling
 it out as the dominant cost. With the canvas-first deferred mounts, the same
-ReleaseFast smokes measured 0.2-0.3 ms for the SDK first-frame metric and
-11-12 ms from window creation to first presentation; the complete Terminal, Agent,
+ReleaseFast smokes measured 0.2-0.3 ms for the SDK first-frame metric and 11-12
+ms from window creation to first presentation; the complete Terminal, Agent,
 Goal, and ACP smoke plus the lazy-pane lifecycle tests remained green.
 
 Debug authoring uses Native SDK's hybrid fragment watcher rather than its
@@ -150,8 +148,8 @@ builds retain only the ahead-of-time compiled document and no source watcher.
 
 ## Compact Agent interaction evidence (2026-07-20)
 
-The compact hierarchy is based on two local reference implementations, not on
-a screenshot-only imitation. The installed Codex desktop bundle is
+The compact hierarchy is based on two local reference implementations, not on a
+screenshot-only imitation. The installed Codex desktop bundle is
 `/Applications/ChatGPT.app` (signed and presented as Codex); its visible task
 surface uses a bounded reading column, collapsed activity summaries, and a
 bottom composer with adjacent goal state. The local Codex checkout's
@@ -159,8 +157,8 @@ bottom composer with adjacent goal state. The local Codex checkout's
 `bottom_pane/chat_composer.rs` owns command, file, Skill, history, paste, and
 popup routing; `goal_display.rs`, `chatwidget/goal_status.rs`, and
 `bottom_pane/footer.rs` reduce goal status to compact elapsed or budget usage.
-Hyper Term adopts those information-density rules while retaining its own
-Native SDK widget system and Rust-owned ACP/Block model.
+Hyper Term adopts those information-density rules while retaining its own Native
+SDK widget system and Rust-owned ACP/Block model.
 
 The Native Agent transcript now follows the Codex-style disclosure hierarchy
 without copying its application structure. Consecutive reasoning and tool-call
@@ -168,28 +166,27 @@ Blocks project into one collapsed `Processed` activity row; final Agent prose
 remains first-class transcript content. Activity and reasoning disclosures use
 single-line, chrome-free chevron rows; detail content is not mounted until the
 row opens. Provider/system notices also project into a one-line `Session notice`
-disclosure so protocol diagnostics remain inspectable without competing with
-the conversation. The active `PlanBlock` renders as a bounded, centered Goal
-capsule directly above the composer instead of a full-width panel or permanent
-side pane. The session tab is the provider identity, so a healthy Agent thread
-does not repeat provider and connection state in a second header; only an
-available ACP artifact adds a compact editor action, while failures remain in
-the trusted status notice.
+disclosure so protocol diagnostics remain inspectable without competing with the
+conversation. The active `PlanBlock` renders as a bounded, centered Goal capsule
+directly above the composer instead of a full-width panel or permanent side
+pane. The session tab is the provider identity, so a healthy Agent thread does
+not repeat provider and connection state in a second header; only an available
+ACP artifact adds a compact editor action, while failures remain in the trusted
+status notice.
 
 The composer stays at 66 points for a one-line prompt and grows with four
 bounded additional visual lines while retaining its bottom action row. Provider
-capabilities
-remain behind compact controls: Direct Codex Skills insert real `$skill`
-mentions, ACP commands insert their slash form, and model/reasoning choices
-remain anchored selectors in that row. Direct Codex selections are sent through
-the Rust adapter on the next `turn/start`; Native state is only the projection.
-An active turn disables dispatch and configuration changes but leaves the text
-area editable, so the next prompt can be prepared while streaming continues.
-Provider selection follows the same disclosure rule: readiness detail and its
-manual refresh action live only inside the compact Agent menu. Opening it asks
-the authenticated Rust gateway to re-probe installed providers, allowing a
-login completed in a Terminal tab to enable Codex or Claude immediately without
-adding persistent status chrome to the workspace.
+capabilities remain behind compact controls: Direct Codex Skills insert real
+`$skill` mentions, ACP commands insert their slash form, and model/reasoning
+choices remain anchored selectors in that row. Direct Codex selections are sent
+through the Rust adapter on the next `turn/start`; Native state is only the
+projection. An active turn disables dispatch and configuration changes but
+leaves the text area editable, so the next prompt can be prepared while
+streaming continues. Provider selection follows the same disclosure rule:
+readiness detail and its manual refresh action live only inside the compact
+Agent menu. Opening it asks the authenticated Rust gateway to re-probe installed
+providers, allowing a login completed in a Terminal tab to enable Codex or
+Claude immediately without adding persistent status chrome to the workspace.
 
 Outside ACP artifact editing, transcript, Goal, and composer share one centered
 760-point reading rail. Activity labels take only their intrinsic width; their
@@ -199,11 +196,11 @@ that fixed rail so the Agent/editor split can consume the available width. The
 composer is one reusable Native template in both states, preventing Skills,
 commands, model, reasoning, send, and multiline behavior from drifting.
 
-Native automation exercised both disclosures, opened the Skills and model
-menus, entered a four-line Chinese prompt through the real text-input path, and
+Native automation exercised both disclosures, opened the Skills and model menus,
+entered a four-line Chinese prompt through the real text-input path, and
 captured a nonblank Metal/reference-renderer screenshot without dispatch or
-widget-budget errors. A second minimum-window automation run measured both
-rails at exactly 760 points inside an 840-point window, with 40-point symmetric
+widget-budget errors. A second minimum-window automation run measured both rails
+at exactly 760 points inside an 840-point window, with 40-point symmetric
 gutters, an accessible 66-point one-line composer, and no frame-budget or
 dispatch errors. A structural layout test locks those widths for both the Zig
 transcript projection and compiled Native composer.
@@ -258,6 +255,17 @@ text reaches a real zsh PTY, terminal selection seeds Command-F, search retains
 focus across a window activation, xterm displays and dismisses a CJK composition
 preedit, and committed CJK input reaches the shell. Browser console errors and
 the rendered Terminal screenshot are retained as release evidence.
+
+The default WebGL path does not pay xterm's screen-reader cost: the upstream
+implementation emits an accessibility event per printed character and mirrors
+the visible rows into a live DOM tree. A focus-only, keyboard-operable toggle is
+immediately before Terminal input in tab order. Enabling it persists a strict
+local preference, creates xterm's real `role=list` row projection and assertive
+live region, and transfers the page-local focus lease to the auxiliary control
+while it is operated. The browser gate proves the default has no accessibility
+tree, activates the control with focus plus Enter, and then finds the real CJK
+PTY output in list items. This keeps performance and accessibility explicit
+rather than silently sacrificing either one.
 
 ## Rejected alternatives
 
