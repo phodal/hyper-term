@@ -24,6 +24,14 @@ WebView, exposes accessible Terminal and Agent creation controls, and handles
 screenshot, and supervisor log are retained as the `macos-desktop-smoke`
 workflow artifact.
 
+The release job also serves the exact built Workbench to a pinned headless
+browser. It edits the CodeMirror document with CJK content, waits for the
+esbuild-wasm Worker and isolated preview handshake, opens the editable Diff,
+and scrolls the Studio into view at 480 px without document-level horizontal
+overflow. Wide and narrow screenshots are retained as
+`workbench-browser-smoke`; this complements Native automation because Native
+SDK snapshots deliberately cannot inspect WebView DOM content.
+
 A second macOS smoke opens a Rust-verified offline Bug Capsule. It asserts that
 the cold-path GenUI WebView is mounted only for that Capsule, fetches the real
 built Workbench index and hashed assets through its token-bound loopback URL,

@@ -19,6 +19,7 @@ permissions:
   contents: read
 
 env:
+  AGENT_BROWSER_VERSION: 0.25.4
   CARGO_TERM_COLOR: always
   NATIVE_SDK_COMMIT: 57bf56bc58058768d436099c1005bfc66bd55ac3
   NATIVE_SDK_VERSION: 0.5.3
@@ -169,6 +170,19 @@ jobs:
               --ignored \
               --exact
 
+      - name: Run the built Workbench browser gate
+        run: |
+          browser_prefix="$RUNNER_TEMP/agent-browser"
+          npm install \
+            --prefix "$browser_prefix" \
+            --no-audit \
+            --no-fund \
+            "agent-browser@$AGENT_BROWSER_VERSION"
+          export PATH="$browser_prefix/node_modules/.bin:$PATH"
+          agent-browser --version
+          agent-browser install
+          deno task verify:workbench-browser
+
       - name: Run Native SDK release gates
         working-directory: apps/desktop
         run: |
@@ -220,6 +234,15 @@ jobs:
         with:
           name: artifact-workbench
           path: dist/workbench
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Workbench browser evidence
+        if: ${{ always() && hashFiles('.zig-cache/workbench-browser/*.png') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: workbench-browser-smoke
+          path: .zig-cache/workbench-browser/*.png
           if-no-files-found: error
           retention-days: 7
 
