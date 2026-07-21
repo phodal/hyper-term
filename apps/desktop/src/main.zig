@@ -12,8 +12,8 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const agent_capabilities = @import("agent_capabilities.zig");
 const agent_block_view = @import("agent_block_view.zig");
+const agent_start_policy = @import("agent_start_policy.zig");
 const agent_wire = @import("agent_wire.zig");
-
 const AgentAttentionResponseWire = agent_wire.AttentionResponse;
 const AgentBlockWire = agent_wire.Block;
 const AgentCapabilitiesResponseWire = agent_wire.CapabilitiesResponse;
@@ -188,7 +188,6 @@ pub const AgentProvider = enum {
         };
     }
 };
-
 pub const AgentProviderReadiness = enum {
     unavailable,
     authenticated,
@@ -1741,6 +1740,7 @@ fn acknowledgeSessionAttention(model: *Model, session_id: u8) void {
 }
 
 fn requestAgentStart(model: *Model, session_id: u8, fx: *Effects) void {
+    const session = findSession(model, session_id) orelse return;
     var storage: [agent_effect_url_capacity]u8 = undefined;
     const request_url = writeAgentStartUrl(model, session_id, storage[0..]) orelse return;
     setAgentConnection(model, session_id, .connecting);
@@ -1751,7 +1751,7 @@ fn requestAgentStart(model: *Model, session_id: u8, fx: *Effects) void {
         // Zig 0.16's HTTP client requires POST to take the body-aware send
         // path even when this endpoint has no request fields.
         .body = "{}",
-        .timeout_ms = 12_000,
+        .timeout_ms = agent_start_policy.timeoutMs(session.agent_provider.id()),
         .on_response = Effects.responseMsg(.agent_session_started),
     });
 }

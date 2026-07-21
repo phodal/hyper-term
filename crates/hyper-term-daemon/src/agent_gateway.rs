@@ -84,11 +84,11 @@ use agent_turn::{
 };
 #[cfg(test)]
 use agent_turn::{agent_error_summary, retain_terminal_output};
+mod startup;
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_AGENT_SESSIONS: usize = 8;
 const MAX_AGENT_TERMINALS: usize = 64;
-const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const START_TURN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPLETE_TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
@@ -2544,8 +2544,8 @@ impl AgentGatewayRuntime {
                 return Err(error);
             }
         };
-        let protocol = launched.client.protocol();
-        let thread_id = match launched.client.initialize_session(INITIALIZE_TIMEOUT) {
+        let (protocol, timeout) = (launched.client.protocol(), startup::timeout(provider_id));
+        let thread_id = match launched.client.initialize_session(timeout) {
             Ok(thread_id) => thread_id,
             Err(error) => {
                 if agent_diagnostics_enabled() {
