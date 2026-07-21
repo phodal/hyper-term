@@ -1,7 +1,14 @@
 import { join, relative } from "@std/path";
 
 const sourceRoots = ["apps", "crates", "runtime", "scripts"] as const;
-const sourceExtensions = new Set([".rs", ".sh", ".ts", ".tsx", ".zig"]);
+const sourceExtensions = new Set([
+  ".css",
+  ".rs",
+  ".sh",
+  ".ts",
+  ".tsx",
+  ".zig",
+]);
 const ignoredDirectories = new Set([
   ".deno-cache",
   ".git",
