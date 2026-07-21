@@ -19,7 +19,7 @@ export const defaultSourceLineLimit = 4_000;
 // only shrink while cohesive modules are extracted in follow-up changes.
 export const legacySourceLineLimits: Readonly<Record<string, number>> = {
   "apps/desktop/src/main.zig": 5_772,
-  "crates/hyper-term-daemon/src/agent_gateway.rs": 10_471,
+  "crates/hyper-term-daemon/src/agent_gateway.rs": 10_197,
   "crates/hyper-term-daemon/src/lib.rs": 4_338,
 };
 

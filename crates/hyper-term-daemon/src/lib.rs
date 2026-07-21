@@ -47,6 +47,7 @@ use uuid::Uuid;
 
 mod acp_provider_home;
 mod agent_gateway;
+mod agent_provider_probe;
 mod agent_session_store;
 mod artifact_debug_capsule;
 mod artifact_editor_store;
@@ -63,7 +64,6 @@ mod web_gateway;
 mod workspace_apply;
 mod workspace_diff;
 mod workspace_snapshot;
-
 use artifact_store::{ArtifactStore, ArtifactStoreError, StoredGenUiArtifact};
 use workspace_apply::{
     DurableWorkspaceApplyResult, WorkspaceApplyRequest, WorkspaceApplySetPlan,
