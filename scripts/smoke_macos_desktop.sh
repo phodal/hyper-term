@@ -311,6 +311,8 @@ PY
   native automate assert \
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
+  native automate assert --timeout-ms 30000 \
+    'role=group name="Codex ACP tab [0-9]+, review ready"'
   smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
   native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text 'Run the bounded terminal'
   native automate assert \

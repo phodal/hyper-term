@@ -222,7 +222,7 @@
       <row gap="4" grow="1" cross="center" label="Open sessions">
         <for each="openSessions" key="id" as="session">
           <button-group gap="0" label="{session.tabGroupLabel}">
-            <button size="sm" variant="ghost" icon="{session.icon}" selected="{session.id == active_session_id}" on-press="select_session:{session.id}">
+            <button size="sm" variant="ghost" icon="{session.tabIcon}" selected="{session.id == active_session_id}" on-press="select_session:{session.id}">
               {session.title} {session.id}
               <context-menu>
                 <menu-item on-press="close_session:{session.id}">Close Tab</menu-item>

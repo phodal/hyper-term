@@ -440,6 +440,23 @@ struct AgentSnapshotResponse {
     document: BlockDocument,
 }
 
+/// Low-bandwidth desktop attention projection. This intentionally excludes
+/// transcript content, errors, capabilities, and operation payloads: the
+/// Native shell only needs authenticated lifecycle identity for background
+/// tabs, while full state stays on the per-session snapshot/stream routes.
+#[derive(Serialize)]
+struct AgentAttentionResponse {
+    sessions: Vec<AgentAttentionSession>,
+}
+
+#[derive(Serialize)]
+struct AgentAttentionSession {
+    session_id: u16,
+    provider: String,
+    status: AgentStatus,
+    document_revision: u64,
+}
+
 #[derive(Deserialize)]
 struct AgentConfigRequest {
     config_id: String,
@@ -1071,6 +1088,7 @@ pub async fn spawn_agent_gateway(
             "/agent/providers",
             get(agent_provider_statuses).post(agent_provider_statuses),
         )
+        .route("/agent/attention", get(agent_attention))
         .route(
             "/agent/session",
             get(snapshot_session)
@@ -1173,6 +1191,22 @@ async fn agent_provider_statuses(
         Err(_) => status_response(
             StatusCode::BAD_GATEWAY,
             "Agent provider readiness could not be refreshed",
+        ),
+    }
+}
+
+async fn agent_attention(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    if let Err(response) = authorize_gateway_token(&runtime, &query) {
+        return *response;
+    }
+    match runtime.attention() {
+        Ok(sessions) => json_response(StatusCode::OK, &AgentAttentionResponse { sessions }),
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Agent attention projection failed",
         ),
     }
 }
@@ -3328,6 +3362,38 @@ impl AgentGatewayRuntime {
             context,
             document,
         })
+    }
+
+    fn attention(&self) -> Result<Vec<AgentAttentionSession>, SessionError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| SessionError::Lock)?
+            .iter()
+            .map(|(session_id, session)| (*session_id, Arc::clone(session)))
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|(session_id, _)| *session_id);
+        sessions
+            .into_iter()
+            .map(|(session_id, session)| {
+                let status = session
+                    .progress
+                    .lock()
+                    .map_err(|_| SessionError::Lock)?
+                    .status;
+                let document_revision = self
+                    .config
+                    .daemon
+                    .block_revision(session.task_id)
+                    .map_err(|_| SessionError::Daemon)?;
+                Ok(AgentAttentionSession {
+                    session_id,
+                    provider: session.provider_id.clone(),
+                    status,
+                    document_revision,
+                })
+            })
+            .collect()
     }
 
     fn stream_status(&self, session_id: u16) -> Result<AgentStatus, SessionError> {
@@ -6838,6 +6904,31 @@ done
         assert!(String::from_utf8_lossy(&body).contains("\"readiness\":\"authenticated\""));
         let (status, body) = request_path(gateway.address(), &session_path, "POST", b"{}").await;
         assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
+        assert_eq!(
+            request_path(
+                gateway.address(),
+                "/agent/attention?token=wrong",
+                "GET",
+                b""
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        let attention_path = format!("/agent/attention?token={token}");
+        let (status, body) = request_path(gateway.address(), &attention_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let attention: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(attention["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(attention["sessions"][0]["session_id"], 1);
+        assert_eq!(attention["sessions"][0]["provider"], "codex");
+        assert_eq!(attention["sessions"][0]["status"], "ready");
+        assert!(
+            attention["sessions"][0]["document_revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > 0)
+        );
+        assert!(attention["sessions"][0].get("error").is_none());
         gateway.shutdown().await.expect("shutdown");
     }
 

@@ -214,6 +214,61 @@ test "desktop attention is background-only semantic and deduplicated" {
     try testing.expectEqual(@as(usize, 2), harness.null_platform.notificationCount());
 }
 
+test "attention feed keeps background Agent tabs observable" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    model.session_slots[1] = .{
+        .id = 2,
+        .mode = .agent,
+        .title = "Codex ACP",
+        .icon = "circle-dot",
+        .agent_provider = .codex_acp,
+        .agent_connection = .ready,
+    };
+    model.session_slots[2] = .{
+        .id = 3,
+        .mode = .agent,
+        .title = "Claude ACP",
+        .icon = "circle-dot",
+        .agent_provider = .claude_acp,
+        .agent_connection = .ready,
+    };
+    model.session_count = 3;
+    model.next_session_id = 4;
+
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    main.update(&model, .{ .agent_attention_received = .{
+        .key = main.agent_attention_effect_key,
+        .status = 200,
+        .body =
+        \\{"sessions":[{"session_id":2,"provider":"codex-acp","status":"completed","document_revision":7},{"session_id":3,"provider":"claude-acp","status":"waiting_approval","document_revision":11}]}
+        ,
+    } }, &fx);
+
+    try testing.expectEqual(main.AgentTurnStatus.completed, model.session_slots[1].agent_attention_status);
+    try testing.expectEqualStrings("check-circle", model.session_slots[1].tabIcon());
+    try testing.expectEqual(main.AgentTurnStatus.waiting_approval, model.session_slots[2].agent_attention_status);
+    try testing.expectEqualStrings("alert", model.session_slots[2].tabIcon());
+    const attention = main.agentAttention(&model).?;
+    try testing.expectEqual(@as(u8, 3), attention.session_id);
+    try testing.expectEqual(main.AgentProvider.claude_acp, attention.provider);
+    try testing.expectEqual(main.AgentAttention.Kind.approval, attention.kind);
+    try testing.expectEqual(@as(usize, 1), fx.pendingTimerCount());
+    try testing.expectEqual(main.agent_attention_poll_timer_key, fx.pendingTimerAt(0).?.key);
+
+    main.update(&model, .{ .select_session = 3 }, &fx);
+    try testing.expectEqualStrings("circle-dot", model.session_slots[2].tabIcon());
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqualStrings(
+        "Codex ACP tab 2, review ready",
+        model.session_slots[1].tabGroupLabel(arena_state.allocator()),
+    );
+}
+
 test "Native typography uses the registered broad-coverage face when available" {
     try testing.expectEqualStrings(
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",

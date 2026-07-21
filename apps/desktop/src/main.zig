@@ -28,6 +28,7 @@ const agent_url_capacity: usize = 256;
 const genui_url_capacity: usize = 512;
 const max_gateway_token_bytes: usize = 128;
 const max_agent_provider_status_bytes: usize = 4 * 1024;
+const max_agent_attention_status_bytes: usize = 4 * 1024;
 const terminal_close_url_capacity: usize = terminal_url_capacity + 64;
 const agent_effect_url_capacity: usize = agent_url_capacity + 64;
 pub const max_agent_blocks: usize = 128;
@@ -76,6 +77,8 @@ pub const agent_tier2_discard_effect_key_base: u64 = 0x4854_4d00;
 pub const agent_provider_refresh_effect_key: u64 = 0x4854_4e00;
 pub const agent_goal_effect_key_base: u64 = 0x4854_5000;
 pub const deferred_webview_timer_id: u64 = 0x4854_5100;
+pub const agent_attention_effect_key: u64 = 0x4854_5200;
+pub const agent_attention_poll_timer_key: u64 = 0x4854_5300;
 const deferred_webview_delay_ns: u64 = 1_000_000;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
@@ -180,6 +183,7 @@ pub const AgentTurnStatus = enum {
 pub const AgentAttention = struct {
     kind: Kind,
     session_id: u8,
+    provider: AgentProvider,
     document_revision: u64,
     stream_sequence: u64,
 
@@ -621,12 +625,44 @@ pub const Session = struct {
     icon: []const u8 = "terminal",
     agent_provider: AgentProvider = .codex,
     agent_connection: AgentConnection = .unavailable,
+    agent_attention_status: AgentTurnStatus = .idle,
+    agent_attention_revision: u64 = 0,
+    acknowledged_attention_status: AgentTurnStatus = .idle,
+    acknowledged_attention_revision: u64 = 0,
+
+    pub fn hasUnacknowledgedAttention(session: *const Session) bool {
+        const attention = switch (session.agent_attention_status) {
+            .waiting_approval, .completed, .failed => true,
+            else => false,
+        };
+        return attention and
+            (session.agent_attention_status != session.acknowledged_attention_status or
+                session.agent_attention_revision != session.acknowledged_attention_revision);
+    }
+
+    pub fn tabIcon(session: *const Session) []const u8 {
+        if (!session.hasUnacknowledgedAttention()) return session.icon;
+        return switch (session.agent_attention_status) {
+            .waiting_approval, .failed => "alert",
+            .completed => "check-circle",
+            else => session.icon,
+        };
+    }
 
     pub fn closeLabel(session: *const Session, arena: std.mem.Allocator) []const u8 {
         return std.fmt.allocPrint(arena, "Close {s} {d}", .{ session.title, session.id }) catch "Close tab";
     }
 
     pub fn tabGroupLabel(session: *const Session, arena: std.mem.Allocator) []const u8 {
+        if (session.hasUnacknowledgedAttention()) {
+            const attention = switch (session.agent_attention_status) {
+                .waiting_approval => "needs approval",
+                .completed => "review ready",
+                .failed => "failed",
+                else => "needs attention",
+            };
+            return std.fmt.allocPrint(arena, "{s} tab {d}, {s}", .{ session.title, session.id, attention }) catch "Agent tab needs attention";
+        }
         return std.fmt.allocPrint(arena, "{s} tab {d}", .{ session.title, session.id }) catch "Session tab";
     }
 };
@@ -666,6 +702,7 @@ pub const Model = struct {
     next_session_id: u8 = 2,
     agent_provider_picker_open: bool = false,
     agent_provider_refresh_in_flight: bool = false,
+    agent_attention_in_flight: bool = false,
     selected_agent_provider: AgentProvider = .codex,
     available_agent_providers: u8 = 0,
     authenticated_agent_providers: u8 = 0,
@@ -746,6 +783,7 @@ pub const Model = struct {
         "session_count",
         "next_session_id",
         "agentProviderUnavailable",
+        "agent_attention_in_flight",
         "available_agent_providers",
         "authenticated_agent_providers",
         "session_auth_agent_providers",
@@ -1151,19 +1189,55 @@ pub const Model = struct {
 /// Ordinary terminals, stale projections, and non-terminal Agent states never
 /// produce a system notification.
 pub fn agentAttention(model: *const Model) ?AgentAttention {
-    const session = model.activeSession();
-    if (session.mode != .agent or model.agent_projection_session_id != session.id) return null;
-    const kind: AgentAttention.Kind = switch (model.agent_turn_status) {
+    var selected: ?AgentAttention = null;
+    for (model.openSessions()) |session| {
+        if (session.mode != .agent) continue;
+        const status = if (session.id == model.active_session_id and
+            model.agent_projection_session_id == session.id and
+            attentionKind(model.agent_turn_status) != null)
+            model.agent_turn_status
+        else
+            session.agent_attention_status;
+        const kind = attentionKind(status) orelse continue;
+        const candidate: AgentAttention = .{
+            .kind = kind,
+            .session_id = session.id,
+            .provider = session.agent_provider,
+            .document_revision = if (session.id == model.active_session_id and
+                model.agent_projection_session_id == session.id)
+                @max(session.agent_attention_revision, model.agent_document_revision)
+            else
+                session.agent_attention_revision,
+            .stream_sequence = if (session.id == model.active_session_id and
+                model.agent_projection_session_id == session.id)
+                model.agent_stream_sequence
+            else
+                0,
+        };
+        if (selected == null or attentionPriority(candidate.kind) > attentionPriority(selected.?.kind) or
+            (attentionPriority(candidate.kind) == attentionPriority(selected.?.kind) and
+                candidate.session_id < selected.?.session_id))
+        {
+            selected = candidate;
+        }
+    }
+    return selected;
+}
+
+fn attentionKind(status: AgentTurnStatus) ?AgentAttention.Kind {
+    return switch (status) {
         .waiting_approval => .approval,
         .completed => .review_ready,
         .failed => .failed,
-        else => return null,
+        else => null,
     };
-    return .{
-        .kind = kind,
-        .session_id = session.id,
-        .document_revision = model.agent_document_revision,
-        .stream_sequence = model.agent_stream_sequence,
+}
+
+fn attentionPriority(kind: AgentAttention.Kind) u8 {
+    return switch (kind) {
+        .approval => 3,
+        .failed => 2,
+        .review_ready => 1,
     };
 }
 
@@ -1174,6 +1248,8 @@ pub const Msg = union(enum) {
     dismiss_agent_provider_picker,
     refresh_agent_providers,
     agent_providers_refreshed: native_sdk.EffectResponse,
+    agent_attention_received: native_sdk.EffectResponse,
+    agent_attention_poll: native_sdk.EffectTimer,
     choose_codex_agent,
     choose_codex_acp_agent,
     choose_claude_acp_agent,
@@ -1230,7 +1306,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "close_active_session", "terminal_session_closed", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -1250,6 +1326,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .dismiss_agent_provider_picker => model.agent_provider_picker_open = false,
         .refresh_agent_providers => requestAgentProviderRefresh(model, fx),
         .agent_providers_refreshed => |response| applyAgentProviderRefresh(model, response),
+        .agent_attention_received => |response| applyAgentAttentionResponse(model, response, fx),
+        .agent_attention_poll => |timer| {
+            if (timer.outcome == .fired) requestAgentAttention(model, fx);
+        },
         .choose_codex_agent => createAgentSession(model, .codex, fx),
         .choose_codex_acp_agent => createAgentSession(model, .codex_acp, fx),
         .choose_claude_acp_agent => createAgentSession(model, .claude_acp, fx),
@@ -1258,9 +1338,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const previous = model.active_session_id;
             selectSession(model, session_id);
             if (previous != model.active_session_id) {
+                acknowledgeSessionAttention(model, model.active_session_id);
                 cancelAgentStream(model, previous, fx);
                 resetAgentProjection(model, model.active_session_id);
                 requestActiveAgentStream(model, fx);
+                if (model.activeSession().mode != .agent and hasAgentSessions(model)) {
+                    requestAgentAttention(model, fx);
+                }
             }
         },
         .close_session => |session_id| closeSession(model, session_id, fx),
@@ -1452,6 +1536,11 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     model.session_count -= 1;
     model.session_slots[model.session_count] = .{};
     model.agent_pending_prompts[model.session_count] = .{};
+    if (!hasAgentSessions(model)) {
+        fx.cancel(agent_attention_effect_key);
+        fx.cancelTimer(agent_attention_poll_timer_key);
+        model.agent_attention_in_flight = false;
+    }
     refreshTerminalUrl(model);
     if (was_active) {
         resetAgentProjection(model, model.active_session_id);
@@ -1502,6 +1591,111 @@ fn applyAgentProviderRefresh(model: *Model, response: native_sdk.EffectResponse)
         model.selected_agent_provider = firstAvailableAgentProvider(ready) orelse
             firstAvailableAgentProvider(model.available_agent_providers) orelse .codex;
     }
+}
+
+const AgentAttentionSessionWire = struct {
+    session_id: u16,
+    provider: []const u8,
+    status: []const u8,
+    document_revision: u64,
+};
+
+const AgentAttentionResponseWire = struct {
+    sessions: []const AgentAttentionSessionWire,
+};
+
+fn hasAgentSessions(model: *const Model) bool {
+    for (model.openSessions()) |session| {
+        if (session.mode == .agent) return true;
+    }
+    return false;
+}
+
+fn agentSessionCount(model: *const Model) usize {
+    var count: usize = 0;
+    for (model.openSessions()) |session| {
+        if (session.mode == .agent) count += 1;
+    }
+    return count;
+}
+
+fn requestAgentAttention(model: *Model, fx: *Effects) void {
+    if (!hasAgentSessions(model) or model.agent_attention_in_flight) return;
+    var storage: [agent_effect_url_capacity]u8 = undefined;
+    const request_url = writeAgentAttentionUrl(model, &storage) orelse return;
+    model.agent_attention_in_flight = true;
+    fx.fetch(.{
+        .key = agent_attention_effect_key,
+        .url = request_url,
+        .timeout_ms = 4_000,
+        .on_response = Effects.responseMsg(.agent_attention_received),
+    });
+}
+
+fn writeAgentAttentionUrl(model: *const Model, storage: []u8) ?[]const u8 {
+    const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+    const marker = "/?token=";
+    const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+    const origin = base_url[0..marker_index];
+    const token = base_url[marker_index + marker.len ..];
+    return std.fmt.bufPrint(storage, "{s}/agent/attention?token={s}", .{ origin, token }) catch null;
+}
+
+fn applyAgentAttentionResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    if (response.key != agent_attention_effect_key) return;
+    model.agent_attention_in_flight = false;
+    defer scheduleAgentAttentionRefresh(model, fx);
+    if (response.outcome != .ok or response.status != 200 or response.truncated or
+        response.body.len == 0 or response.body.len > max_agent_attention_status_bytes) return;
+    const parsed = std.json.parseFromSlice(
+        AgentAttentionResponseWire,
+        std.heap.page_allocator,
+        response.body,
+        .{ .ignore_unknown_fields = false },
+    ) catch return;
+    defer parsed.deinit();
+    if (parsed.value.sessions.len > max_sessions) return;
+
+    var seen: [256]bool = @splat(false);
+    for (parsed.value.sessions) |incoming| {
+        if (incoming.session_id == 0 or incoming.session_id > std.math.maxInt(u8)) return;
+        const session_id: u8 = @intCast(incoming.session_id);
+        if (seen[session_id]) return;
+        seen[session_id] = true;
+        const provider = parseAgentProvider(incoming.provider) orelse return;
+        _ = parseAgentTurnStatusStrict(incoming.status) orelse return;
+        const session = findSession(model, session_id) orelse continue;
+        if (session.mode != .agent or session.agent_provider != provider) return;
+    }
+    for (parsed.value.sessions) |incoming| {
+        const session_id: u8 = @intCast(incoming.session_id);
+        const session = findSession(model, session_id) orelse continue;
+        const status = parseAgentTurnStatusStrict(incoming.status).?;
+        session.agent_attention_status = status;
+        session.agent_attention_revision = incoming.document_revision;
+    }
+}
+
+fn scheduleAgentAttentionRefresh(model: *const Model, fx: *Effects) void {
+    if (!hasAgentSessions(model)) return;
+    fx.startTimer(.{
+        .key = agent_attention_poll_timer_key,
+        .interval_ms = 1_000,
+        .on_fire = Effects.timerMsg(.agent_attention_poll),
+    });
+}
+
+fn findSession(model: *Model, session_id: u8) ?*Session {
+    for (model.session_slots[0..model.session_count]) |*session| {
+        if (session.id == session_id) return session;
+    }
+    return null;
+}
+
+fn acknowledgeSessionAttention(model: *Model, session_id: u8) void {
+    const session = findSession(model, session_id) orelse return;
+    session.acknowledged_attention_status = session.agent_attention_status;
+    session.acknowledged_attention_revision = session.agent_attention_revision;
 }
 
 fn requestAgentStart(model: *Model, session_id: u8, fx: *Effects) void {
@@ -1729,6 +1923,7 @@ fn applyAgentStartResponse(model: *Model, response: native_sdk.EffectResponse, f
             setAgentError(model, agentStartFailureMessage(response));
         }
     }
+    if (agentSessionCount(model) > 1) requestAgentAttention(model, fx);
 }
 
 fn agentStartFailureMessage(response: native_sdk.EffectResponse) []const u8 {
@@ -3593,13 +3788,17 @@ fn parseAgentMessageRole(value: []const u8) AgentMessageRole {
 }
 
 fn parseAgentTurnStatus(value: []const u8) AgentTurnStatus {
+    return parseAgentTurnStatusStrict(value) orelse .idle;
+}
+
+fn parseAgentTurnStatusStrict(value: []const u8) ?AgentTurnStatus {
     if (std.mem.eql(u8, value, "ready")) return .ready;
     if (std.mem.eql(u8, value, "running")) return .running;
     if (std.mem.eql(u8, value, "cancelling")) return .cancelling;
     if (std.mem.eql(u8, value, "completed")) return .completed;
     if (std.mem.eql(u8, value, "waiting_approval")) return .waiting_approval;
     if (std.mem.eql(u8, value, "failed")) return .failed;
-    return .idle;
+    return null;
 }
 
 fn scheduleAgentRefresh(session_id: u8, fx: *Effects) void {
@@ -4888,7 +5087,7 @@ pub const DeferredWebViewApp = struct {
         }
         runtime.showNotification(.{
             .title = next.title(),
-            .subtitle = self.model.activeSession().agent_provider.label(),
+            .subtitle = next.provider.label(),
             .body = next.body(),
         }) catch |err| {
             std.log.warn("native Agent attention notification failed: {s}", .{@errorName(err)});
