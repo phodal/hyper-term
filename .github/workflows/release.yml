@@ -10,9 +10,14 @@ on:
         description: Existing vX.Y.Z tag to publish
         required: true
         type: string
+      allow_same_day:
+        description: Emergency override for a second release in the same Asia/Shanghai day
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-daily
   cancel-in-progress: false
 
 permissions:
@@ -71,6 +76,33 @@ jobs:
         uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: 2.9.3
+
+      - name: Enforce the daily release cadence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALLOW_SAME_DAY_RELEASE: ${{ inputs.allow_same_day }}
+        run: |
+          set -euo pipefail
+          releases="$RUNNER_TEMP/hyper-term-releases.json"
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --exclude-drafts \
+            --json tagName,publishedAt \
+            > "$releases"
+          cadence_args=(
+            --tag "$RELEASE_TAG"
+            --releases "$releases"
+            --time-zone Asia/Shanghai
+          )
+          if [[ "${ALLOW_SAME_DAY_RELEASE:-false}" == "true" ]]; then
+            cadence_args+=(--allow-same-day)
+          fi
+          deno run \
+            --allow-read="$releases" \
+            scripts/check_release_cadence.ts \
+            "${cadence_args[@]}"
 
       - name: Install pinned Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1

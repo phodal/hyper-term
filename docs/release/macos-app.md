@@ -4,6 +4,12 @@ Tags matching `vX.Y.Z` start `.github/workflows/release.yml`. The workflow
 validates the Rust, Deno, and Native SDK layers, then builds separate Apple
 Silicon and Intel application archives.
 
+Release candidates are intentionally limited to one published GitHub Release
+per `Asia/Shanghai` calendar day. Commits and validation may continue normally,
+but a second tag on the same day fails before the expensive build begins. A
+rerun of the same tag remains allowed, and `workflow_dispatch` exposes an
+explicit emergency override for a second release that cannot wait.
+
 The Native CLI binary and checksum come from the pinned Native SDK release. Its
 framework checkout is also pinned to the audited commit recorded by ADR 0013;
 the workflow refuses to build when the release tag resolves elsewhere.
