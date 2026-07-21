@@ -68,6 +68,34 @@ real_root=$(mktemp -d /tmp/hyper-term-real-codex-acp.XXXXXX)
 real_log="$real_root/hyper-term-real-codex-acp.log"
 real_pid=""
 
+real_copy_evidence() {
+  if [[ -z "$real_artifact_dir" ]]; then
+    return
+  fi
+  mkdir -p "$real_artifact_dir"
+  if [[ -f "$real_root/.zig-cache/native-sdk-automation/snapshot.txt" ]]; then
+    cp \
+      "$real_root/.zig-cache/native-sdk-automation/snapshot.txt" \
+      "$real_artifact_dir/snapshot.txt"
+  fi
+  if [[ -f "$real_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png" ]]; then
+    cp \
+      "$real_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png" \
+      "$real_artifact_dir/screenshot-hyper-term-real-codex-acp.png"
+  fi
+  if [[ -f "$real_log" ]]; then
+    cp "$real_log" "$real_artifact_dir/hyper-term-real-codex-acp.log"
+  fi
+  if [[ -f "$real_root/state/events.jsonl" ]]; then
+    cp "$real_root/state/events.jsonl" "$real_artifact_dir/events.jsonl"
+  fi
+  if [[ -f "$real_root/artifact-editor-e2e.json" ]]; then
+    cp \
+      "$real_root/artifact-editor-e2e.json" \
+      "$real_artifact_dir/artifact-editor-e2e.json"
+  fi
+}
+
 real_cleanup() {
   real_status=$?
   trap - EXIT INT TERM
@@ -75,6 +103,7 @@ real_cleanup() {
     kill -INT "$real_pid" 2>/dev/null || true
     wait "$real_pid" 2>/dev/null || true
   fi
+  real_copy_evidence
   if [[ $real_status -ne 0 ]]; then
     echo "real Codex ACP desktop smoke failed; supervisor log follows:" >&2
     tail -n 100 "$real_log" >&2 || true
@@ -330,21 +359,7 @@ PY
   fi
 )
 
-if [[ -n "$real_artifact_dir" ]]; then
-  mkdir -p "$real_artifact_dir"
-  cp \
-    "$real_root/.zig-cache/native-sdk-automation/snapshot.txt" \
-    "$real_artifact_dir/snapshot.txt"
-  cp \
-    "$real_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-canvas.png" \
-    "$real_artifact_dir/screenshot-hyper-term-real-codex-acp.png"
-  cp "$real_log" "$real_artifact_dir/hyper-term-real-codex-acp.log"
-  if [[ -f "$real_root/artifact-editor-e2e.json" ]]; then
-    cp \
-      "$real_root/artifact-editor-e2e.json" \
-      "$real_artifact_dir/artifact-editor-e2e.json"
-  fi
-fi
+real_copy_evidence
 
 if [[ "$real_genui" == 1 ]]; then
   echo "real Codex ACP GenUI desktop smoke passed: $real_expected"
