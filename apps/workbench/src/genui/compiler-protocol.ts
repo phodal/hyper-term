@@ -23,6 +23,13 @@ export type CompileResponse =
     request_id: string;
     source_revision: number;
     diagnostics: CompileDiagnostic[];
+  }
+  | {
+    type: "compile_superseded";
+    request_id: string;
+    source_revision: number;
+    superseded_by_request_id: string;
+    superseded_by_source_revision: number;
   };
 
 export function validateCompileRequest(request: CompileRequest): void {

@@ -172,7 +172,27 @@ current artifact, while source-map bytes remain behind a separate task-bound
 endpoint.
 
 This proves backend parity on a real single-file React compile and closes the
-first last-known-good acceptance/delivery slice. Incremental declaration-slice
-invalidation, stale cancellation across concurrent compiles, source-mapped
-runtime navigation, hostile-runtime recovery, and the stated p95 benchmarks
-remain open gates.
+first last-known-good acceptance/delivery slice.
+
+## Incremental rebuild evidence (2026-07-21)
+
+The shared compiler engine now holds one `esbuild.context()` for a compatible
+entrypoint and virtual-file inventory and applies source edits through
+`context.rebuild()`. A changed entrypoint or file inventory disposes that
+context before creating a new one, so incompatible plugin resolution state is
+never reused. This applies to both the browser Worker and the supervised Deno
+cold path because they import the same engine.
+
+The Worker serializes rebuilds, calls `context.cancel()` when a newer revision
+arrives, and retains only the newest waiting request. Every displaced request
+receives a typed `compile_superseded` response, so browser promises do not leak
+or wait for their timeout. Rust's Deno protocol remains unchanged: the browser
+scheduling response cannot cross the daemon authority boundary.
+
+Unit tests cover context reuse, deterministic disposal, cancellation, and
+queued-edit coalescing. The ignored Rust integration test compiles three real
+artifacts through pinned Deno and `esbuild.wasm`: an initial TSX snapshot, a
+same-inventory rebuild, and a two-file inventory change.
+
+Incremental declaration-slice invalidation, randomized clean-build equivalence,
+hostile-runtime recovery, and the stated p95 benchmarks remain open gates.

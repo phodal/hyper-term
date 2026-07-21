@@ -62,5 +62,46 @@ fn pinned_deno_compiles_a_real_genui_artifact_without_workspace_authority() {
     assert_eq!(candidate.compiler.version, "0.28.1");
     assert_eq!(candidate.content_digest.len(), 64);
     assert!(candidate.bundle.contains("data-probe"));
+
+    let rebuilt = compiler
+        .compile(
+            GenUiCompileRequest {
+                source_revision: 12,
+                entrypoint: "/App.tsx".into(),
+                files: BTreeMap::from([(
+                    "/App.tsx".into(),
+                    "export default function App() { return <main data-probe=\"rebuild\">Second</main>; }"
+                        .into(),
+                )]),
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(rebuilt.source_revision, 12);
+    assert_ne!(rebuilt.content_digest, candidate.content_digest);
+    assert!(rebuilt.bundle.contains("rebuild"));
+
+    let inventory_changed = compiler
+        .compile(
+            GenUiCompileRequest {
+                source_revision: 13,
+                entrypoint: "/App.tsx".into(),
+                files: BTreeMap::from([
+                    (
+                        "/App.tsx".into(),
+                        "import { label } from './label.ts'; export default function App() { return <main>{label}</main>; }"
+                            .into(),
+                    ),
+                    (
+                        "/label.ts".into(),
+                        "export const label = 'inventory changed';".into(),
+                    ),
+                ]),
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(inventory_changed.source_revision, 13);
+    assert!(inventory_changed.bundle.contains("inventory changed"));
     assert_eq!(compiler.shutdown().unwrap(), DriverState::Closed);
 }

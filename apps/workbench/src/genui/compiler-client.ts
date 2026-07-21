@@ -67,6 +67,14 @@ export class GenUiCompiler {
     if (!pending) return;
     this.#pending.delete(response.request_id);
     clearTimeout(pending.timeout);
+    if (response.type === "compile_superseded") {
+      pending.reject(
+        new Error(
+          `compile r${response.source_revision} was superseded by r${response.superseded_by_source_revision}`,
+        ),
+      );
+      return;
+    }
     if (pending.revision < this.#latestRevision) {
       pending.reject(new Error("stale compile result was discarded"));
       return;

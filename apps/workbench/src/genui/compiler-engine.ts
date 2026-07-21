@@ -29,9 +29,15 @@ const CAPSULE_SOURCES = new Map([
     `export const replayableEffect=(name,input,invoke)=>globalThis.__HYPER_EFFECT__(name,input,invoke);`,
   ],
 ]);
+const VIRTUAL_ENTRY = "/__hyper_entry__.tsx";
 
 let initializePromise: Promise<void> | undefined;
 let compiler: typeof Esbuild | undefined;
+let activeBuild: {
+  signature: string;
+  files: Map<string, string>;
+  context: Esbuild.BuildContext<Esbuild.BuildOptions>;
+} | undefined;
 
 export async function initializeCompiler(
   backend: typeof Esbuild,
@@ -51,16 +57,68 @@ export async function compileRequest(
   validateCompileRequest(request);
   const esbuild = compiler;
   if (esbuild === undefined) throw new Error("compiler is not initialized");
-  const entry = "/__hyper_entry__.tsx";
   const files = new Map(Object.entries(request.files));
   files.set(
-    entry,
+    VIRTUAL_ENTRY,
     `import Component from ${JSON.stringify(request.entrypoint)};\n` +
       `import { mount } from "@hyper/runtime";\nmount(Component);\n`,
   );
-  const result = await esbuild.build({
+  const signature = contextSignature(request);
+  if (activeBuild?.signature !== signature) {
+    await activeBuild?.context.dispose();
+    activeBuild = undefined;
+    const mutableFiles = new Map(files);
+    activeBuild = {
+      signature,
+      files: mutableFiles,
+      context: await esbuild.context(buildOptions(mutableFiles)),
+    };
+  } else {
+    activeBuild.files.clear();
+    for (const [path, source] of files) activeBuild.files.set(path, source);
+  }
+  const result = await activeBuild.context.rebuild();
+  const output = result.outputFiles ?? [];
+  const bundle = decode(requiredOutput(output, "artifact.js"));
+  const sourceMap = decode(requiredOutput(output, "artifact.js.map"));
+  const cssFile = output.find((file) => file.path.endsWith("artifact.css"));
+  const css = cssFile ? decode(cssFile) : "";
+  const contentDigest = await sha256(bundle + css);
+
+  return {
+    type: "compiled",
+    request_id: request.request_id,
+    source_revision: request.source_revision,
+    candidate: {
+      schema_version: 1,
+      source_revision: request.source_revision,
+      entrypoint: request.entrypoint,
+      bundle,
+      css,
+      source_map: sourceMap,
+      content_digest: contentDigest,
+      compiler: { name: "esbuild-wasm", version: esbuild.version },
+      diagnostics: result.warnings.map((warning) =>
+        diagnostic(warning, "warning")
+      ),
+    },
+  };
+}
+
+export async function disposeCompiler(): Promise<void> {
+  const build = activeBuild;
+  activeBuild = undefined;
+  await build?.context.dispose();
+}
+
+export async function cancelCompiler(): Promise<void> {
+  await activeBuild?.context.cancel();
+}
+
+function buildOptions(files: Map<string, string>): Esbuild.BuildOptions {
+  return {
     absWorkingDir: "/",
-    entryPoints: [entry],
+    entryPoints: [VIRTUAL_ENTRY],
     outfile: "artifact.js",
     bundle: true,
     format: "iife",
@@ -98,32 +156,14 @@ export async function compileRequest(
         }));
       },
     }],
-  });
-  const output = result.outputFiles ?? [];
-  const bundle = decode(requiredOutput(output, "artifact.js"));
-  const sourceMap = decode(requiredOutput(output, "artifact.js.map"));
-  const cssFile = output.find((file) => file.path.endsWith("artifact.css"));
-  const css = cssFile ? decode(cssFile) : "";
-  const contentDigest = await sha256(bundle + css);
-
-  return {
-    type: "compiled",
-    request_id: request.request_id,
-    source_revision: request.source_revision,
-    candidate: {
-      schema_version: 1,
-      source_revision: request.source_revision,
-      entrypoint: request.entrypoint,
-      bundle,
-      css,
-      source_map: sourceMap,
-      content_digest: contentDigest,
-      compiler: { name: "esbuild-wasm", version: esbuild.version },
-      diagnostics: result.warnings.map((warning) =>
-        diagnostic(warning, "warning")
-      ),
-    },
   };
+}
+
+function contextSignature(request: CompileRequest): string {
+  return JSON.stringify([
+    request.entrypoint,
+    Object.keys(request.files).sort(),
+  ]);
 }
 
 export function diagnosticsFrom(error: unknown): CompileDiagnostic[] {
