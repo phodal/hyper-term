@@ -358,7 +358,6 @@ test "session bar exposes direct Terminal and Agent creation" {
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
-
     var model = main.initialModel();
     var tree = try buildTree(arena, &model);
     try testing.expectEqualStrings("Agent", findByLabel(tree.root, "New Agent tab").?.text);
@@ -1078,23 +1077,23 @@ test "ACP composer renders provider capabilities and routes configuration throug
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"ready","error":null,"capabilities":{"config_options":[{"id":"acp.session_mode","name":"Mode","description":null,"category":"mode","kind":{"type":"select","current_value":"ask"},"choices":[{"value":"ask","name":"Ask","description":null,"group":null},{"value":"code","name":"Code","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]},"document":{"blocks":[]}}
+        \\{"status":"ready","error":null,"capabilities":{"session_info":{"title":"Refactor auth"},"usage":{"used":8192,"size":32768},"config_options":[{"id":"acp.session_mode","name":"Mode","description":null,"category":"mode","kind":{"type":"select","current_value":"ask"},"choices":[{"value":"ask","name":"Ask","description":null,"group":null},{"value":"code","name":"Code","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]},"document":{"blocks":[]}}
         ,
     } }, &fx);
-
+    try testing.expectEqualStrings("Refactor auth", model.activeSession().displayTitle());
+    try testing.expectEqualStrings("25% context", model.agentContextUsage());
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var tree = try buildTree(arena, &model);
     try testing.expect(findAnyByText(tree.root, "Ask") != null);
+    try testing.expect(findByLabel(tree.root, "Agent context usage") != null);
     const command_trigger = findByLabel(tree.root, "Agent commands").?;
     main.update(&model, tree.msgForPointer(command_trigger.id, .up).?, &fx);
     tree = try buildTree(arena, &model);
     try testing.expect(findAnyByText(tree.root, "Skills · Configure skills") != null);
-
     main.update(&model, .dismiss_agent_command_picker, &fx);
     tree = try buildTree(arena, &model);
-
     const selector = findByLabel(tree.root, "Mode").?;
     main.update(&model, tree.msgForPointer(selector.id, .up).?, &fx);
     tree = try buildTree(arena, &model);
@@ -1112,12 +1111,13 @@ test "ACP composer renders provider capabilities and routes configuration throug
         .key = main.agent_config_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"session_id":2,"capabilities":{"config_options":[{"id":"acp.session_mode","name":"Mode","description":null,"category":"mode","kind":{"type":"select","current_value":"code"},"choices":[{"value":"ask","name":"Ask","description":null,"group":null},{"value":"code","name":"Code","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]}}
+        \\{"session_id":2,"capabilities":{"session_info":{"title":"Implement auth"},"usage":{"used":16384,"size":32768},"config_options":[{"id":"acp.session_mode","name":"Mode","description":null,"category":"mode","kind":{"type":"select","current_value":"code"},"choices":[{"value":"ask","name":"Ask","description":null,"group":null},{"value":"code","name":"Code","description":null,"group":null}]}],"available_commands":[{"name":"skills","description":"Configure skills","input_hint":null}]}}
         ,
     } }, &fx);
     try testing.expectEqualStrings("Code", model.agentConfigOptions()[0].currentLabel());
     try testing.expectEqual(@as(f32, 76), model.agentConfigOptions()[0].compactWidth());
-
+    try testing.expectEqualStrings("Implement auth", model.activeSession().displayTitle());
+    try testing.expectEqualStrings("50% context", model.agentContextUsage());
     tree = try buildTree(arena, &model);
     const updated_command_trigger = findByLabel(tree.root, "Agent commands").?;
     main.update(&model, tree.msgForPointer(updated_command_trigger.id, .up).?, &fx);
@@ -1235,7 +1235,7 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"completed","error":null,"document":{"blocks":[
+        \\{"status":"completed","error":null,"capabilities":{"session_info":{"title":"Artifact review"},"usage":{"used":8192,"size":32768}},"document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000031","kind":"artifact","trust_class":"isolated_artifact","payload":{"type":"artifact","artifact":{"artifact_id":"55555555-5555-4555-8555-555555555555","source_revision":7,"entrypoint":"/App.tsx","content_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","compiler":{"name":"esbuild-wasm","version":"0.28.1"}}}}
         \\]}}
         ,

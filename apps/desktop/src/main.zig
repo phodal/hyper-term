@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
+const agent_capabilities = @import("agent_capabilities.zig");
 const agent_block_view = @import("agent_block_view.zig");
 const agent_wire = @import("agent_wire.zig");
 
@@ -444,6 +445,7 @@ pub const Session = struct {
     title: []const u8 = "zsh",
     icon: []const u8 = "terminal",
     agent_provider: AgentProvider = .codex,
+    agent_capabilities: agent_capabilities.SessionState = .{},
     agent_connection: AgentConnection = .unavailable,
     agent_attention_status: AgentTurnStatus = .idle,
     agent_attention_revision: u64 = 0,
@@ -464,7 +466,10 @@ pub const Session = struct {
     }
 
     pub fn displayTitle(session: *const Session) []const u8 {
-        if (session.mode != .terminal) return session.title;
+        if (session.mode != .terminal) {
+            const agent_title = session.agent_capabilities.title();
+            return if (agent_title.len > 0) agent_title else session.title;
+        }
         const terminal_title = session.terminalTitle();
         if (terminal_title.len > 0 and terminal_title.len <= 40) return terminal_title;
         if (terminal_title.len > 40) {
@@ -1002,6 +1007,14 @@ pub const Model = struct {
             .waiting_approval => "Needs approval",
             else => "",
         };
+    }
+
+    pub fn hasAgentContextUsage(model: *const Model) bool {
+        return model.activeSession().mode == .agent and model.activeSession().agent_capabilities.hasUsage();
+    }
+
+    pub fn agentContextUsage(model: *const Model) []const u8 {
+        return model.activeSession().agent_capabilities.usageLabel();
     }
 
     pub fn hasAgentStopControl(model: *const Model) bool {
@@ -2814,100 +2827,7 @@ fn isContextDigest(value: []const u8) bool {
 }
 
 fn projectAgentCapabilities(model: *Model, capabilities: AgentCapabilitiesWire) void {
-    for (&model.agent_config_options) |*option| option.* = .{};
-    for (&model.agent_commands) |*entry| entry.* = .{};
-    model.agent_config_option_count = 0;
-    model.agent_command_count = 0;
-    var next_action_id: u16 = 1;
-    for (capabilities.config_options) |wire| {
-        if (model.agent_config_option_count == max_agent_config_options) break;
-        if (wire.id.len == 0 or wire.id.len > max_agent_capability_id_bytes or
-            wire.name.len == 0 or wire.name.len > max_agent_capability_label_bytes) continue;
-        const kind = switch (wire.kind) {
-            .object => |object| object,
-            else => continue,
-        };
-        const type_value = kind.get("type") orelse continue;
-        const type_name = switch (type_value) {
-            .string => |value| value,
-            else => continue,
-        };
-        const option = &model.agent_config_options[model.agent_config_option_count];
-        option.index = @intCast(model.agent_config_option_count);
-        copyCapabilityText(&option.id_storage, &option.id_len, wire.id);
-        copyCapabilityText(&option.name_storage, &option.name_len, wire.name);
-        if (std.mem.eql(u8, type_name, "select")) {
-            const current_value = kind.get("current_value") orelse continue;
-            const current = switch (current_value) {
-                .string => |value| value,
-                else => continue,
-            };
-            for (wire.choices) |choice| {
-                if (option.choice_count == max_agent_config_choices) break;
-                if (choice.value.len == 0 or choice.value.len > max_agent_capability_id_bytes or
-                    choice.name.len == 0 or choice.name.len > max_agent_capability_label_bytes) continue;
-                const projected = &option.choices[option.choice_count];
-                projected.action_id = next_action_id;
-                next_action_id +%= 1;
-                copyCapabilityText(&projected.value_storage, &projected.value_len, choice.value);
-                copyCapabilityText(&projected.name_storage, &projected.name_len, choice.name);
-                projected.selected = std.mem.eql(u8, choice.value, current);
-                if (projected.selected) {
-                    copyCapabilityText(&option.current_storage, &option.current_len, choice.name);
-                }
-                option.choice_count += 1;
-            }
-            if (option.choice_count == 0) continue;
-            if (option.current_len == 0) {
-                copyCapabilityText(&option.current_storage, &option.current_len, current);
-            }
-        } else if (std.mem.eql(u8, type_name, "boolean")) {
-            const current_value = kind.get("current_value") orelse continue;
-            const current = switch (current_value) {
-                .bool => |value| value,
-                else => continue,
-            };
-            option.is_boolean = true;
-            const values = [_]struct { value: []const u8, name: []const u8, selected: bool }{
-                .{ .value = "true", .name = "On", .selected = current },
-                .{ .value = "false", .name = "Off", .selected = !current },
-            };
-            for (values) |value| {
-                const projected = &option.choices[option.choice_count];
-                projected.action_id = next_action_id;
-                next_action_id +%= 1;
-                copyCapabilityText(&projected.value_storage, &projected.value_len, value.value);
-                copyCapabilityText(&projected.name_storage, &projected.name_len, value.name);
-                projected.selected = value.selected;
-                if (value.selected) {
-                    copyCapabilityText(&option.current_storage, &option.current_len, value.name);
-                }
-                option.choice_count += 1;
-            }
-        } else continue;
-        model.agent_config_option_count += 1;
-    }
-    for (capabilities.available_commands) |wire| {
-        if (model.agent_command_count == max_agent_commands) break;
-        if (wire.name.len == 0 or wire.name.len > max_agent_capability_id_bytes) continue;
-        const entry = &model.agent_commands[model.agent_command_count];
-        entry.index = @intCast(model.agent_command_count);
-        copyCapabilityText(&entry.name_storage, &entry.name_len, wire.name);
-        if (std.mem.startsWith(u8, wire.name, "$")) {
-            copyCapabilityText(&entry.label_storage, &entry.label_len, "Skill · ");
-            appendCapabilityText(&entry.label_storage, &entry.label_len, wire.name[1..]);
-        } else if (std.mem.eql(u8, wire.name, "skills")) {
-            copyCapabilityText(&entry.label_storage, &entry.label_len, "Skills");
-        } else {
-            copyCapabilityText(&entry.label_storage, &entry.label_len, "/");
-            appendCapabilityText(&entry.label_storage, &entry.label_len, wire.name);
-        }
-        if (wire.description) |description| {
-            appendCapabilityText(&entry.label_storage, &entry.label_len, " · ");
-            appendCapabilityText(&entry.label_storage, &entry.label_len, description);
-        }
-        model.agent_command_count += 1;
-    }
+    agent_capabilities.project(model, &model.session_slots[activeSessionIndex(model)].agent_capabilities, capabilities);
 }
 
 fn copyCapabilityText(destination: []u8, length: *usize, value: []const u8) void {

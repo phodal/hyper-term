@@ -133,7 +133,7 @@ official [MCP Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) provid
 client/server roles and multiple transports; only the minimal reviewed feature
 set is enabled per release.
 
-## Implementation status (2026-07-20)
+## Implementation status (2026-07-22)
 
 - `agent-client-protocol` 1.2.0 provides the bounded ACP v1 JSONL types and
   framing used by the Rust driver.
@@ -155,6 +155,13 @@ set is enabled per release.
   applies later `current_mode_update` notifications back to the same control.
   Ask/Architect/Code labels are provider data; the renderer cannot invent a
   mode or change one without the ACP adapter validating the advertised ID.
+- ACP session metadata and context usage are also authenticated session state.
+  Rust applies bounded `session_info_update` partial updates and validates
+  `usage_update` against a non-empty context window. Native uses the resulting
+  title only for the owning Agent tab and shows real usage as a compact
+  composer badge; control characters, oversized titles, and impossible usage
+  windows fail closed. Optional ACP cost is intentionally not projected until
+  currency and precision semantics have a dedicated provider-neutral model.
 - The ignored installed-Codex integration gate now covers the authenticated,
   isolated `initialize -> model/list -> skills/list -> thread/start` path and
   requires non-empty model and reasoning choices. Native projection tests prove

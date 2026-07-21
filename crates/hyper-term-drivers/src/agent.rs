@@ -8,8 +8,32 @@ use crate::DriverState;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionCapabilities {
+    #[serde(default, skip_serializing_if = "AgentSessionInfo::is_empty")]
+    pub session_info: AgentSessionInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AgentSessionUsage>,
     pub config_options: Vec<AgentSessionConfigOption>,
     pub available_commands: Vec<AgentAvailableCommand>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+impl AgentSessionInfo {
+    fn is_empty(&self) -> bool {
+        self.title.is_none() && self.updated_at.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionUsage {
+    pub used: u64,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

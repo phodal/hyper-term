@@ -18,13 +18,13 @@ export const defaultSourceLineLimit = 2_000;
 // These files predate the line limit. Freeze their current size so they can
 // only shrink while cohesive modules are extracted in follow-up changes.
 export const legacySourceLineLimits: Readonly<Record<string, number>> = {
-  "apps/desktop/src/main.zig": 5_550,
+  "apps/desktop/src/main.zig": 5_470,
   "apps/desktop/src/tests.zig": 2_644,
   "crates/hyper-term-daemon/src/agent_gateway.rs": 9_873,
   "crates/hyper-term-daemon/src/desktop.rs": 2_351,
   "crates/hyper-term-daemon/src/lib.rs": 3_951,
   "crates/hyper-term-daemon/src/workspace_apply.rs": 2_924,
-  "crates/hyper-term-drivers/src/acp.rs": 2_702,
+  "crates/hyper-term-drivers/src/acp.rs": 2_695,
 };
 
 export function sourceLineLimit(path: string): number {

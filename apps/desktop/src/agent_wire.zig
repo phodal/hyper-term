@@ -61,7 +61,18 @@ pub const Command = struct {
     description: ?[]const u8 = null,
 };
 
+pub const SessionInfo = struct {
+    title: ?[]const u8 = null,
+};
+
+pub const Usage = struct {
+    used: u64,
+    size: u64,
+};
+
 pub const Capabilities = struct {
+    session_info: SessionInfo = .{},
+    usage: ?Usage = null,
     config_options: []const ConfigOption = &.{},
     available_commands: []const Command = &.{},
 };

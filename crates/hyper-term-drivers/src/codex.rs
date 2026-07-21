@@ -490,6 +490,7 @@ impl CodexAppServerClient {
         let capabilities = AgentSessionCapabilities {
             config_options: codex_config_options(&catalog, &turn_config)?,
             available_commands,
+            ..AgentSessionCapabilities::default()
         };
         *lock(&self.model_catalog)? = catalog;
         *lock(&self.turn_config)? = turn_config;

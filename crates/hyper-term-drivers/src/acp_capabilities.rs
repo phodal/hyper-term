@@ -2,12 +2,12 @@
 
 use std::collections::HashSet;
 
-use agent_client_protocol::schema::v1;
+use agent_client_protocol::schema::{MaybeUndefined, v1};
 
 use crate::acp::{AcpAdapterError, bounded};
 use crate::{
     AgentAvailableCommand, AgentSessionCapabilities, AgentSessionConfigChoice,
-    AgentSessionConfigKind, AgentSessionConfigOption, AgentSessionConfigValue,
+    AgentSessionConfigKind, AgentSessionConfigOption, AgentSessionConfigValue, AgentSessionUsage,
 };
 
 pub(super) const ACP_SESSION_MODE_CONFIG_ID: &str = "acp.session_mode";
@@ -17,6 +17,78 @@ const MAX_SESSION_CONFIG_CHOICES: usize = 96;
 pub(super) const MAX_CAPABILITY_ID_BYTES: usize = 128;
 const MAX_CAPABILITY_LABEL_BYTES: usize = 256;
 const MAX_CAPABILITY_DESCRIPTION_BYTES: usize = 2048;
+const MAX_SESSION_TITLE_BYTES: usize = 256;
+const MAX_SESSION_UPDATED_AT_BYTES: usize = 64;
+
+pub(super) fn apply_session_capability_update(
+    capabilities: &mut AgentSessionCapabilities,
+    update: &v1::SessionUpdate,
+) -> Result<Option<&'static str>, AcpAdapterError> {
+    match update {
+        v1::SessionUpdate::ConfigOptionUpdate(update) => {
+            replace_config_options_preserving_mode(capabilities, update.config_options.clone())?;
+            Ok(Some("config_option_update"))
+        }
+        v1::SessionUpdate::CurrentModeUpdate(update) => {
+            update_session_mode(capabilities, update.current_mode_id.to_string())?;
+            Ok(Some("current_mode_update"))
+        }
+        v1::SessionUpdate::SessionInfoUpdate(update) => {
+            apply_optional_text(
+                &mut capabilities.session_info.title,
+                &update.title,
+                MAX_SESSION_TITLE_BYTES,
+                "ACP session title",
+            )?;
+            apply_optional_text(
+                &mut capabilities.session_info.updated_at,
+                &update.updated_at,
+                MAX_SESSION_UPDATED_AT_BYTES,
+                "ACP session timestamp",
+            )?;
+            Ok(Some("session_info_update"))
+        }
+        v1::SessionUpdate::UsageUpdate(update) => {
+            if update.size == 0 || update.used > update.size {
+                return Err(AcpAdapterError::InvalidMessage(
+                    "ACP context usage must fit a non-empty context window".into(),
+                ));
+            }
+            capabilities.usage = Some(AgentSessionUsage {
+                used: update.used,
+                size: update.size,
+            });
+            Ok(Some("usage_update"))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn apply_optional_text(
+    target: &mut Option<String>,
+    update: &MaybeUndefined<String>,
+    maximum: usize,
+    label: &str,
+) -> Result<(), AcpAdapterError> {
+    match update {
+        MaybeUndefined::Undefined => {}
+        MaybeUndefined::Null => *target = None,
+        MaybeUndefined::Value(value) => {
+            let value = value.trim();
+            if value.chars().any(char::is_control) {
+                return Err(AcpAdapterError::InvalidMessage(format!(
+                    "{label} contains control characters"
+                )));
+            }
+            *target = if value.is_empty() {
+                None
+            } else {
+                Some(bounded(value.to_owned(), maximum)?)
+            };
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn normalize_session_capabilities(
     modes: Option<v1::SessionModeState>,
@@ -336,5 +408,78 @@ pub(super) fn validate_config_value(
         _ => Err(AcpAdapterError::InvalidMessage(format!(
             "ACP session configuration {config_id} rejected the requested value"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn session_metadata_is_partial_clearable_and_bounded() {
+        let mut capabilities = AgentSessionCapabilities::default();
+        let update: v1::SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "session_info_update",
+            "title": "  Refactor auth  ",
+            "updatedAt": "2026-07-22T09:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(
+            apply_session_capability_update(&mut capabilities, &update).unwrap(),
+            Some("session_info_update")
+        );
+        assert_eq!(
+            capabilities.session_info.title.as_deref(),
+            Some("Refactor auth")
+        );
+
+        let clear: v1::SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "session_info_update",
+            "title": null
+        }))
+        .unwrap();
+        apply_session_capability_update(&mut capabilities, &clear).unwrap();
+        assert_eq!(capabilities.session_info.title, None);
+        assert_eq!(
+            capabilities.session_info.updated_at.as_deref(),
+            Some("2026-07-22T09:00:00Z")
+        );
+
+        let hostile: v1::SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "session_info_update",
+            "title": "unsafe\nlabel"
+        }))
+        .unwrap();
+        assert!(apply_session_capability_update(&mut capabilities, &hostile).is_err());
+    }
+
+    #[test]
+    fn context_usage_rejects_impossible_windows() {
+        let mut capabilities = AgentSessionCapabilities::default();
+        let update: v1::SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "usage_update",
+            "used": 53_000,
+            "size": 200_000,
+            "cost": {"amount": 0.045, "currency": "USD"}
+        }))
+        .unwrap();
+        apply_session_capability_update(&mut capabilities, &update).unwrap();
+        assert_eq!(
+            capabilities.usage,
+            Some(AgentSessionUsage {
+                used: 53_000,
+                size: 200_000
+            })
+        );
+
+        let invalid: v1::SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "usage_update",
+            "used": 2,
+            "size": 1
+        }))
+        .unwrap();
+        assert!(apply_session_capability_update(&mut capabilities, &invalid).is_err());
     }
 }

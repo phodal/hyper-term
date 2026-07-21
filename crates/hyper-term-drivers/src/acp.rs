@@ -21,9 +21,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::acp_capabilities::{
-    ACP_SESSION_MODE_CONFIG_ID, MAX_CAPABILITY_ID_BYTES, normalize_available_commands,
-    normalize_session_capabilities, replace_config_options_preserving_mode, update_session_mode,
-    validate_config_value,
+    ACP_SESSION_MODE_CONFIG_ID, MAX_CAPABILITY_ID_BYTES, apply_session_capability_update,
+    normalize_available_commands, normalize_session_capabilities,
+    replace_config_options_preserving_mode, update_session_mode, validate_config_value,
 };
 use crate::codex_containment::{
     agent_task_sandbox_profile, apply_managed_proxy_environment,
@@ -818,6 +818,17 @@ impl AcpAgentClient {
             .map(|pending| pending.turn_id.clone())
             .unwrap_or_else(|| "acp-turn-unknown".into());
         self.track_brokered_mcp_update(&thread_id, &notification.update)?;
+        let mut capabilities = lock(&self.session_capabilities)?;
+        let capability_update =
+            apply_session_capability_update(&mut capabilities, &notification.update)?;
+        drop(capabilities);
+        if let Some(kind) = capability_update {
+            return protocol_notice(
+                sequence,
+                Some("session/update"),
+                &serde_json::to_value(kind)?,
+            );
+        }
         match notification.update {
             v1::SessionUpdate::AgentMessageChunk(chunk) => Ok(AgentDriverEvent::MessageDelta {
                 sequence,
@@ -893,24 +904,6 @@ impl AcpAgentClient {
                         "retained": retained,
                         "truncated": normalized.truncated,
                     }),
-                )
-            }
-            v1::SessionUpdate::ConfigOptionUpdate(update) => {
-                let mut capabilities = lock(&self.session_capabilities)?;
-                replace_config_options_preserving_mode(&mut capabilities, update.config_options)?;
-                protocol_notice(
-                    sequence,
-                    Some("session/update"),
-                    &serde_json::to_value("config_option_update")?,
-                )
-            }
-            v1::SessionUpdate::CurrentModeUpdate(update) => {
-                let mut capabilities = lock(&self.session_capabilities)?;
-                update_session_mode(&mut capabilities, update.current_mode_id.to_string())?;
-                protocol_notice(
-                    sequence,
-                    Some("session/update"),
-                    &serde_json::to_value("current_mode_update")?,
                 )
             }
             update => protocol_notice(

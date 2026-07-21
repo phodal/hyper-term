@@ -30,6 +30,9 @@
             </if>
           </stack>
         </for>
+        <if test="{hasAgentContextUsage}">
+          <badge variant="secondary" label="Agent context usage">{agentContextUsage}</badge>
+        </if>
         <if test="{hasAgentComposerStatus}">
           <row gap="5" cross="center" label="Agent turn status">
             <icon name="circle-dot" width="11" height="11" foreground="accent" />
