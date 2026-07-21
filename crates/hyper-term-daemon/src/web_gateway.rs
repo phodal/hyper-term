@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::header::{
@@ -23,7 +23,7 @@ use hyper_term_protocol::{
     TerminalInputFrame, TerminalSize, TerminalWebBinaryFrame, TerminalWebClientControl,
     TerminalWebServerControl, decode_terminal_web_binary, encode_terminal_web_binary,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -36,6 +36,9 @@ const MIN_TOKEN_BYTES: usize = 32;
 const OUTBOUND_QUEUE_MESSAGES: usize = 256;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const SUBSCRIPTION_POLL: Duration = Duration::from_millis(50);
+const DESKTOP_WORKSPACE_VERSION: u16 = 1;
+const MAX_DESKTOP_WORKSPACE_BYTES: usize = 4 * 1024;
+const MAX_DESKTOP_SESSIONS: usize = 8;
 const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:* ws://[::1]:*; img-src 'self' data:; font-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 #[derive(Clone, Debug)]
@@ -48,9 +51,75 @@ pub struct TerminalGatewayConfig {
     pub default_cwd: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DesktopWorkspaceSnapshot {
+    pub version: u16,
+    pub revision: u64,
+    pub active_session_id: u8,
+    pub next_session_id: u8,
+    pub selected_agent_provider: String,
+    pub sessions: Vec<DesktopSessionSnapshot>,
+}
+
+impl Default for DesktopWorkspaceSnapshot {
+    fn default() -> Self {
+        Self {
+            version: DESKTOP_WORKSPACE_VERSION,
+            revision: 0,
+            active_session_id: 1,
+            next_session_id: 2,
+            selected_agent_provider: "codex".into(),
+            sessions: vec![DesktopSessionSnapshot {
+                id: 1,
+                mode: "terminal".into(),
+                agent_provider: None,
+            }],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DesktopSessionSnapshot {
+    pub id: u8,
+    pub mode: String,
+    pub agent_provider: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DesktopWorkspaceStore {
+    snapshot: Arc<Mutex<DesktopWorkspaceSnapshot>>,
+}
+
+impl DesktopWorkspaceStore {
+    pub fn snapshot_json(&self) -> Result<String, TerminalGatewayError> {
+        let snapshot = self
+            .snapshot
+            .lock()
+            .map_err(|_| TerminalGatewayError::WorkspaceState)?;
+        serde_json::to_string(&*snapshot).map_err(|_| TerminalGatewayError::WorkspaceState)
+    }
+
+    fn update(&self, next: DesktopWorkspaceSnapshot) -> Result<(), DesktopWorkspaceUpdateError> {
+        validate_desktop_workspace(&next)?;
+        let mut current = self
+            .snapshot
+            .lock()
+            .map_err(|_| DesktopWorkspaceUpdateError::Unavailable)?;
+        if next.revision < current.revision {
+            return Err(DesktopWorkspaceUpdateError::Stale);
+        }
+        if next.revision == current.revision && next != *current {
+            return Err(DesktopWorkspaceUpdateError::Conflict);
+        }
+        *current = next;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct TerminalGatewayHandle {
     address: SocketAddr,
+    desktop_workspace: DesktopWorkspaceStore,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
 }
@@ -58,6 +127,10 @@ pub struct TerminalGatewayHandle {
 impl TerminalGatewayHandle {
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn desktop_workspace(&self) -> DesktopWorkspaceStore {
+        self.desktop_workspace.clone()
     }
 
     pub async fn shutdown(mut self) -> Result<(), TerminalGatewayError> {
@@ -91,6 +164,8 @@ pub enum TerminalGatewayError {
     Io(#[from] std::io::Error),
     #[error("terminal gateway task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("terminal gateway desktop workspace state is unavailable")]
+    WorkspaceState,
 }
 
 #[derive(Clone)]
@@ -101,6 +176,7 @@ struct GatewayRuntime {
     origin: Arc<str>,
     default_cwd: Option<PathBuf>,
     attachments: Arc<Mutex<HashMap<TerminalAttachmentId, Attachment>>>,
+    desktop_workspace: DesktopWorkspaceStore,
 }
 
 #[derive(Clone, Copy)]
@@ -182,6 +258,14 @@ struct CloseSessionQuery {
     session_id: Option<u16>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum DesktopWorkspaceUpdateError {
+    Invalid,
+    Stale,
+    Conflict,
+    Unavailable,
+}
+
 enum Outbound {
     Binary(Vec<u8>),
     Control(TerminalWebServerControl),
@@ -208,6 +292,7 @@ pub async fn spawn_terminal_gateway(
 
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
+    let desktop_workspace_store = DesktopWorkspaceStore::default();
     let runtime = GatewayRuntime {
         daemon,
         assets: Arc::new(assets),
@@ -215,10 +300,15 @@ pub async fn spawn_terminal_gateway(
         origin: Arc::from(format!("http://{address}")),
         default_cwd: config.default_cwd,
         attachments: Arc::new(Mutex::new(HashMap::new())),
+        desktop_workspace: desktop_workspace_store.clone(),
     };
     let router = Router::new()
         .route("/terminal", get(upgrade_terminal))
         .route("/terminal/session/close", post(close_terminal_session))
+        .route(
+            "/desktop/workspace",
+            get(get_desktop_workspace).post(update_desktop_workspace),
+        )
         .fallback(get(serve_asset))
         .with_state(runtime);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -231,9 +321,122 @@ pub async fn spawn_terminal_gateway(
     });
     Ok(TerminalGatewayHandle {
         address,
+        desktop_workspace: desktop_workspace_store,
         shutdown: Some(shutdown_sender),
         task: Some(task),
     })
+}
+
+async fn get_desktop_workspace(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<AuthQuery>,
+) -> Response {
+    if !authorized(&runtime, query.token.as_deref()) {
+        return status_response(
+            StatusCode::UNAUTHORIZED,
+            "terminal gateway token is invalid",
+        );
+    }
+    match runtime.desktop_workspace.snapshot_json() {
+        Ok(snapshot) => secure_response(
+            StatusCode::OK,
+            "application/json; charset=utf-8",
+            Body::from(snapshot),
+        ),
+        Err(_) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "desktop workspace state is unavailable",
+        ),
+    }
+}
+
+async fn update_desktop_workspace(
+    State(runtime): State<GatewayRuntime>,
+    Query(query): Query<AuthQuery>,
+    body: Bytes,
+) -> Response {
+    if !authorized(&runtime, query.token.as_deref()) {
+        return status_response(
+            StatusCode::UNAUTHORIZED,
+            "terminal gateway token is invalid",
+        );
+    }
+    if body.len() > MAX_DESKTOP_WORKSPACE_BYTES {
+        return status_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "desktop workspace snapshot is too large",
+        );
+    }
+    let Ok(snapshot) = serde_json::from_slice::<DesktopWorkspaceSnapshot>(&body) else {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            "desktop workspace snapshot is invalid",
+        );
+    };
+    match runtime.desktop_workspace.update(snapshot) {
+        Ok(()) => secure_response(
+            StatusCode::NO_CONTENT,
+            "text/plain; charset=utf-8",
+            Body::empty(),
+        ),
+        Err(DesktopWorkspaceUpdateError::Invalid) => status_response(
+            StatusCode::BAD_REQUEST,
+            "desktop workspace snapshot is invalid",
+        ),
+        Err(DesktopWorkspaceUpdateError::Stale | DesktopWorkspaceUpdateError::Conflict) => {
+            status_response(
+                StatusCode::CONFLICT,
+                "desktop workspace snapshot revision conflicts",
+            )
+        }
+        Err(DesktopWorkspaceUpdateError::Unavailable) => status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "desktop workspace state is unavailable",
+        ),
+    }
+}
+
+fn validate_desktop_workspace(
+    snapshot: &DesktopWorkspaceSnapshot,
+) -> Result<(), DesktopWorkspaceUpdateError> {
+    if snapshot.version != DESKTOP_WORKSPACE_VERSION
+        || snapshot.sessions.is_empty()
+        || snapshot.sessions.len() > MAX_DESKTOP_SESSIONS
+        || snapshot.active_session_id == 0
+        || snapshot.next_session_id == 0
+        || !valid_agent_provider(&snapshot.selected_agent_provider)
+    {
+        return Err(DesktopWorkspaceUpdateError::Invalid);
+    }
+    let mut session_ids = HashSet::with_capacity(snapshot.sessions.len());
+    for session in &snapshot.sessions {
+        if session.id == 0 || !session_ids.insert(session.id) {
+            return Err(DesktopWorkspaceUpdateError::Invalid);
+        }
+        match (session.mode.as_str(), session.agent_provider.as_deref()) {
+            ("terminal", None) => {}
+            ("agent", Some(provider)) if valid_agent_provider(provider) => {}
+            _ => return Err(DesktopWorkspaceUpdateError::Invalid),
+        }
+    }
+    if !session_ids.contains(&snapshot.active_session_id) {
+        return Err(DesktopWorkspaceUpdateError::Invalid);
+    }
+    Ok(())
+}
+
+fn valid_agent_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "codex" | "codex-acp" | "claude-acp" | "copilot-acp"
+    )
+}
+
+fn authorized(runtime: &GatewayRuntime, token: Option<&str>) -> bool {
+    constant_time_eq(
+        token.unwrap_or_default().as_bytes(),
+        runtime.token.as_bytes(),
+    )
 }
 
 async fn close_terminal_session(
@@ -977,6 +1180,124 @@ mod tests {
             panic!("expected HTTP rejection, got {error}");
         };
         assert_eq!(response.status().as_u16(), expected_status);
+    }
+
+    #[tokio::test]
+    async fn desktop_workspace_is_authenticated_bounded_and_revision_ordered() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let assets = temporary.path().join("assets");
+        std::fs::create_dir(&assets).expect("create assets");
+        std::fs::write(assets.join("index.html"), "terminal").expect("write asset");
+        let daemon = DaemonState::open(temporary.path().join("state")).expect("daemon");
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let gateway = spawn_terminal_gateway(
+            TerminalGatewayConfig {
+                bind: "127.0.0.1:0".parse().expect("socket"),
+                assets,
+                token: token.clone(),
+                default_cwd: None,
+            },
+            daemon,
+        )
+        .await
+        .expect("gateway");
+
+        let (status, _) = workspace_request(gateway.address(), "GET", "wrong-token", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED.as_u16());
+        let (status, body) = workspace_request(gateway.address(), "GET", &token, &[]).await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        assert_eq!(
+            serde_json::from_slice::<DesktopWorkspaceSnapshot>(&body).expect("default snapshot"),
+            DesktopWorkspaceSnapshot::default()
+        );
+
+        let snapshot = DesktopWorkspaceSnapshot {
+            version: DESKTOP_WORKSPACE_VERSION,
+            revision: 3,
+            active_session_id: 2,
+            next_session_id: 3,
+            selected_agent_provider: "codex-acp".into(),
+            sessions: vec![
+                DesktopSessionSnapshot {
+                    id: 1,
+                    mode: "terminal".into(),
+                    agent_provider: None,
+                },
+                DesktopSessionSnapshot {
+                    id: 2,
+                    mode: "agent".into(),
+                    agent_provider: Some("codex-acp".into()),
+                },
+            ],
+        };
+        let encoded = serde_json::to_vec(&snapshot).expect("encode snapshot");
+        let (status, _) = workspace_request(gateway.address(), "POST", &token, &encoded).await;
+        assert_eq!(status, StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(
+            serde_json::from_str::<DesktopWorkspaceSnapshot>(
+                &gateway
+                    .desktop_workspace()
+                    .snapshot_json()
+                    .expect("supervisor snapshot"),
+            )
+            .expect("decode supervisor snapshot"),
+            snapshot
+        );
+
+        let mut stale = snapshot.clone();
+        stale.revision = 2;
+        let stale = serde_json::to_vec(&stale).expect("encode stale snapshot");
+        let (status, _) = workspace_request(gateway.address(), "POST", &token, &stale).await;
+        assert_eq!(status, StatusCode::CONFLICT.as_u16());
+
+        let mut invalid = snapshot.clone();
+        invalid.revision = 4;
+        invalid.sessions[1].agent_provider = Some("unknown-agent".into());
+        let invalid = serde_json::to_vec(&invalid).expect("encode invalid snapshot");
+        let (status, _) = workspace_request(gateway.address(), "POST", &token, &invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST.as_u16());
+
+        let oversized = vec![b'x'; MAX_DESKTOP_WORKSPACE_BYTES + 1];
+        let (status, _) = workspace_request(gateway.address(), "POST", &token, &oversized).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE.as_u16());
+        gateway.shutdown().await.expect("shutdown gateway");
+    }
+
+    async fn workspace_request(
+        address: SocketAddr,
+        method: &str,
+        token: &str,
+        body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect workspace HTTP");
+        let request = format!(
+            "{method} /desktop/workspace?token={token} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write workspace request");
+        stream.write_all(body).await.expect("write workspace body");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read workspace response");
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response headers");
+        let headers = String::from_utf8_lossy(&response[..header_end]);
+        let status = headers
+            .split_whitespace()
+            .nth(1)
+            .expect("HTTP status")
+            .parse()
+            .expect("numeric HTTP status");
+        (status, response[header_end + 4..].to_vec())
     }
 
     #[tokio::test]

@@ -17,8 +17,8 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use hyper_term_daemon::{
     AcpAgentProviderConfig, AgentGatewayConfig, AgentGenUiRuntimeConfig, DaemonState,
-    TerminalGatewayConfig, load_bug_capsule, probe_agent_provider_statuses, spawn_agent_gateway,
-    spawn_terminal_gateway, spawn_unix_server,
+    DesktopWorkspaceStore, TerminalGatewayConfig, load_bug_capsule, probe_agent_provider_statuses,
+    spawn_agent_gateway, spawn_terminal_gateway, spawn_unix_server,
 };
 use uuid::Uuid;
 
@@ -32,6 +32,7 @@ const AGENT_URL_ENV: &str = "HYPER_TERM_AGENT_URL";
 const AGENT_PROVIDERS_ENV: &str = "HYPER_TERM_AGENT_PROVIDERS";
 const AGENT_PROVIDER_STATUS_ENV: &str = "HYPER_TERM_AGENT_PROVIDER_STATUS";
 const BUG_CAPSULE_URL_ENV: &str = "HYPER_TERM_BUG_CAPSULE_URL";
+const DESKTOP_WORKSPACE_ENV: &str = "HYPER_TERM_DESKTOP_WORKSPACE";
 const RENDERER_RESTART_LIMIT: usize = 3;
 const RENDERER_RESTART_BASE_DELAY: Duration = Duration::from_millis(100);
 const ACP_PACKAGE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
@@ -72,6 +73,7 @@ struct RendererEnvironment {
     agent_providers: String,
     agent_provider_status: String,
     bug_capsule_url: String,
+    desktop_workspace: DesktopWorkspaceStore,
 }
 
 fn main() {
@@ -206,6 +208,7 @@ fn run() -> Result<i32, String> {
             agent_providers: agent_provider_ids,
             agent_provider_status: provider_status,
             bug_capsule_url: bug_capsule_url.unwrap_or_default(),
+            desktop_workspace: gateway.desktop_workspace(),
         };
         let status = supervise_renderer(&resolved.ui, &renderer_environment).await?;
         agent_gateway
@@ -233,6 +236,10 @@ fn spawn_renderer(
     executable: &Path,
     environment: &RendererEnvironment,
 ) -> Result<std::process::Child, String> {
+    let desktop_workspace = environment
+        .desktop_workspace
+        .snapshot_json()
+        .map_err(|error| error.to_string())?;
     Command::new(executable)
         .env(TERMINAL_URL_ENV, &environment.terminal_url)
         .env(AGENT_URL_ENV, &environment.agent_url)
@@ -242,6 +249,7 @@ fn spawn_renderer(
             &environment.agent_provider_status,
         )
         .env(BUG_CAPSULE_URL_ENV, &environment.bug_capsule_url)
+        .env(DESKTOP_WORKSPACE_ENV, desktop_workspace)
         .spawn()
         .map_err(|error| format!("cannot start native renderer: {error}"))
 }
@@ -1868,7 +1876,7 @@ exec /bin/sleep 30
         let observed_count = count_file.clone();
         let status =
             supervise_renderer_until(&executable, &RendererEnvironment::default(), async move {
-                for _ in 0..100 {
+                for _ in 0..300 {
                     if std::fs::read_to_string(&observed_count)
                         .is_ok_and(|launches| launches.trim() == "2")
                     {
@@ -1938,6 +1946,27 @@ exit 75
                 .trim(),
             "1"
         );
+    }
+
+    #[test]
+    fn renderer_receives_the_current_rust_workspace_snapshot() {
+        let temporary = tempfile::tempdir().expect("temporary renderer runtime");
+        let snapshot_file = temporary.path().join("desktop-workspace.json");
+        let body = format!(
+            "printf '%s' \"${{{DESKTOP_WORKSPACE_ENV}}}\" > '{}'\nexit 0",
+            snapshot_file.display()
+        );
+        let executable = renderer_fixture(temporary.path(), &body);
+
+        let mut renderer = spawn_renderer(&executable, &RendererEnvironment::default())
+            .expect("spawn renderer with workspace");
+        assert!(renderer.wait().expect("wait for renderer").success());
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snapshot_file).expect("read renderer workspace"))
+                .expect("decode renderer workspace");
+        assert_eq!(snapshot["version"], 1);
+        assert_eq!(snapshot["active_session_id"], 1);
+        assert_eq!(snapshot["sessions"][0]["mode"], "terminal");
     }
 
     #[test]
