@@ -234,7 +234,9 @@ real_pid=$!
       echo "real $real_provider_label GenUI approval button is unavailable" >&2
       exit 1
     fi
-    native automate widget-click hyper-term-canvas "$real_allow_id"
+    # The approval card can move while streamed Agent blocks settle. Drive the
+    # stable accessibility action instead of replaying a stale pointer center.
+    native automate widget-action hyper-term-canvas "$real_allow_id" press
   fi
   native automate assert --timeout-ms 150000 \
     "$real_expected" \
