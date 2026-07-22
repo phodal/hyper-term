@@ -242,6 +242,39 @@ raise SystemExit(f"widget not found: {pattern.pattern}")
 PY
   }
 
+  smoke_stable_latest_widget_id() {
+    python3 - .zig-cache/native-sdk-automation/snapshot.txt "$1" <<'PY'
+import pathlib
+import re
+import sys
+import time
+
+snapshot_path = pathlib.Path(sys.argv[1])
+pattern = re.compile(sys.argv[2])
+deadline = time.monotonic() + 3
+stable_id = None
+stable_since = None
+while time.monotonic() < deadline:
+    matches = []
+    for line in snapshot_path.read_text().splitlines():
+        if pattern.search(line) is None:
+            continue
+        match = re.search(r"#(\d+)", line)
+        if match is not None:
+            matches.append(match.group(1))
+    current_id = matches[-1] if matches else None
+    now = time.monotonic()
+    if current_id != stable_id:
+        stable_id = current_id
+        stable_since = now if current_id is not None else None
+    elif stable_since is not None and now - stable_since >= 0.5:
+        print(current_id)
+        raise SystemExit(0)
+    time.sleep(0.05)
+raise SystemExit(f"latest widget did not stabilize: {pattern.pattern}")
+PY
+  }
+
   smoke_select_tab() {
     smoke_tab_pattern=$1
     if smoke_tab_id=$(smoke_widget_id "$smoke_tab_pattern" 2>/dev/null); then
@@ -513,8 +546,8 @@ PY
     'Proposal SHA-256' \
     'role=button name="Allow once".*enabled=true'
   native automate snapshot >/dev/null
-  smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
-  native automate widget-click hyper-term-canvas "$smoke_allow_id"
+  smoke_allow_id=$(smoke_stable_latest_widget_id 'role=button name="Allow once".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_allow_id" press
   native automate assert --timeout-ms 5000 'role=button name="Allowed once"'
   native automate assert --timeout-ms 30000 \
     'The Agentic UI was compiled by the brokered Deno runtime\.' \
@@ -604,7 +637,7 @@ PY
     'role=button name="Plan · Run the isolated terminal"' \
     '0 / 2' \
     'role=button name="Allow once".*enabled=true'
-  smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
+  smoke_allow_id=$(smoke_stable_latest_widget_id 'role=button name="Allow once".*enabled=true')
   # The compact CI window can move the approval card across the conversation
   # scroll viewport between snapshot publication and pointer synthesis. Drive
   # the same retained button through its accessibility press action so the
@@ -800,7 +833,7 @@ PY
     'Approval required' \
     'Shell command · external effect' \
     'role=button name="Allow once".*enabled=true'
-  smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
+  smoke_allow_id=$(smoke_stable_latest_widget_id 'role=button name="Allow once".*enabled=true')
   native automate widget-action hyper-term-canvas "$smoke_allow_id" press
   native automate assert \
     'Tier 2 terminal completed.' \
