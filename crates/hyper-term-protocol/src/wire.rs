@@ -62,6 +62,11 @@ pub enum ControlRequest {
         risk: RiskClass,
         required_capabilities: Vec<String>,
     },
+    ProposeBrokeredMcpTool {
+        task_id: TaskId,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
     DecidePermission {
         task_id: TaskId,
         operation_id: OperationId,

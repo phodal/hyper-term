@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hyper_term_protocol::PermissionDecision;
+use hyper_term_protocol::{PermissionDecision, canonical_mcp_json_bytes};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -459,6 +459,14 @@ struct ToolProfile {
     required_capabilities: &'static [&'static str],
 }
 
+/// Applies the same fixed-catalog and argument-schema checks used by the MCP
+/// adapter before the daemon creates a durable brokered operation.
+pub fn validate_brokered_mcp_tool(name: &str, arguments: &Value) -> Result<McpToolClass, String> {
+    let profile = tool_profile(name).ok_or_else(|| "unknown Hyper Term tool".to_owned())?;
+    validate_arguments(profile.class, arguments)?;
+    Ok(profile.class)
+}
+
 fn tool_profile(name: &str) -> Option<ToolProfile> {
     match name {
         "hyper_term.genui.compile" => Some(ToolProfile {
@@ -778,7 +786,7 @@ fn ensure_size(value: &Value, maximum: usize, label: &str) -> Result<(), McpServ
 }
 
 fn sha256_value(value: &Value) -> Result<String, McpServerError> {
-    let digest = Sha256::digest(serde_json::to_vec(value)?);
+    let digest = Sha256::digest(canonical_mcp_json_bytes(value)?);
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 

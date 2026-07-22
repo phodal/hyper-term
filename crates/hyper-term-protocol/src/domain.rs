@@ -63,6 +63,9 @@ pub enum OperationAction {
     McpToolCall {
         call: LocalMcpToolCall,
     },
+    BrokeredMcpToolCall {
+        call: crate::BrokeredMcpToolCall,
+    },
     Opaque {
         kind: String,
         payload_digest: String,

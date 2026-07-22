@@ -879,6 +879,28 @@ fn projectApprovalDetail(view: *AgentBlockView, block: AgentBlockWire) void {
             "MCP server: {s}\nTool: {s}\nArguments SHA-256: {s}\nArgument values are not retained in this approval record.",
             .{ server, tool, arguments_digest },
         ) catch return;
+    } else if (std.mem.eql(u8, action.type, "brokered_mcp_tool")) {
+        const server = action.server_id orelse return;
+        const tool = action.tool_name orelse return;
+        const preview = action.canonical_arguments_preview orelse return;
+        const arguments_bytes = action.arguments_bytes orelse return;
+        const arguments_truncated = action.arguments_truncated orelse return;
+        const arguments_digest = action.arguments_digest orelse return;
+        const proposal_digest = action.proposal_digest orelse return;
+        if (server.len == 0 or tool.len == 0 or preview.len > 196 or arguments_bytes == 0 or
+            !isContextDigest(arguments_digest) or !isContextDigest(proposal_digest)) return;
+        writer.print(
+            "MCP server: {s}\nTool: {s}\nCanonical arguments ({d} bytes{s}):\n{s}\nArguments SHA-256: {s}\nProposal SHA-256: {s}",
+            .{
+                server,
+                tool,
+                arguments_bytes,
+                if (arguments_truncated) ", preview truncated" else "",
+                preview,
+                arguments_digest,
+                proposal_digest,
+            },
+        ) catch return;
     } else if (std.mem.eql(u8, action.type, "mcp_server_launch")) {
         const server = action.server_id orelse return;
         const executable = action.executable orelse return;

@@ -17,8 +17,8 @@ use hyper_term_drivers::{
 };
 use hyper_term_protocol::{
     BrokeredMcpToolExecution, ControlRequest, ControlResponse, DomainEvent, GenUiArtifactCandidate,
-    OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
-    OperationState, PermissionDecision, RiskClass, TaskId, WireFrame,
+    OperationCompletion, OperationId, OperationOutcome, OperationState, PermissionDecision, TaskId,
+    WireFrame,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -186,16 +186,10 @@ impl<'a, W: Write> McpGateway<'a, W> {
         let task_id = self.task()?;
         let response = authority_request(
             &self.socket,
-            ControlRequest::ProposeOperation {
+            ControlRequest::ProposeBrokeredMcpTool {
                 task_id,
-                kind: OperationKind::McpTool,
-                action: OperationAction::Opaque {
-                    kind: call.name.clone(),
-                    payload_digest: call.proposal.payload_sha256.clone(),
-                },
-                summary: call.proposal.summary.clone(),
-                risk: risk_for(call.class),
-                required_capabilities: call.proposal.required_capabilities.clone(),
+                tool_name: call.name.clone(),
+                arguments: call.arguments.clone(),
             },
         );
         let response = match response {
@@ -617,14 +611,6 @@ fn authority_request(
             Err(McpGatewayError::AuthorityRejected { code, message })
         }
         response => Ok(response),
-    }
-}
-
-fn risk_for(class: McpToolClass) -> RiskClass {
-    match class {
-        McpToolClass::GenUiCompile | McpToolClass::DenoLspQuery | McpToolClass::DiffReview => {
-            RiskClass::ReadOnly
-        }
     }
 }
 

@@ -506,10 +506,15 @@ PY
   native automate widget-click hyper-term-canvas "$smoke_send_id"
   native automate assert --timeout-ms 30000 \
     'Compile a bounded GenUI artifact with the supervised Deno runtime' \
+    'MCP server: hyper-term' \
+    'Tool: hyper_term\.genui\.compile' \
+    'Canonical arguments' \
+    'Arguments SHA-256' \
+    'Proposal SHA-256' \
     'role=button name="Allow once".*enabled=true'
   native automate snapshot >/dev/null
   smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
-  native automate widget-click hyper-term-canvas "$smoke_allow_id"
+  native automate widget-action hyper-term-canvas "$smoke_allow_id" press
   native automate assert --timeout-ms 5000 'role=button name="Allowed once"'
   native automate assert --timeout-ms 30000 \
     'The Agentic UI was compiled by the brokered Deno runtime\.' \

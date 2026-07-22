@@ -1,8 +1,10 @@
 use hyper_term_core::OperationRecord;
+use hyper_term_drivers::{McpToolClass, validate_brokered_mcp_tool};
 use hyper_term_protocol::{
     APPROVAL_DETAIL_SCHEMA_VERSION, ActionDigest, ApprovalActionDetail, ApprovalDetail,
-    ApprovalDetailDigest, BoundApprovalDetail, OperationAction, OperationId, OperationKind,
-    PermissionDecision, TaskId,
+    ApprovalDetailDigest, BROKERED_MCP_TOOL_CALL_SCHEMA_VERSION, BoundApprovalDetail,
+    BrokeredMcpToolCall, McpArgumentsDigest, OperationAction, OperationId, OperationKind,
+    PermissionDecision, RiskClass, TaskId, canonical_mcp_json_bytes,
 };
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -24,6 +26,9 @@ pub(crate) fn validate_action_kind(
         (OperationKind::McpTool, OperationAction::McpToolCall { call }) => {
             return validate_local_mcp_tool_call(call);
         }
+        (OperationKind::McpTool, OperationAction::BrokeredMcpToolCall { call }) => {
+            return validate_brokered_mcp_tool_call(call);
+        }
         (
             OperationKind::McpTool
             | OperationKind::FileEdit
@@ -42,6 +47,63 @@ pub(crate) fn validate_action_kind(
 }
 
 impl DaemonState {
+    pub fn propose_brokered_mcp_tool(
+        &self,
+        task_id: TaskId,
+        tool_name: String,
+        canonical_arguments: serde_json::Value,
+    ) -> Result<OperationRecord, DaemonError> {
+        let class = validate_brokered_mcp_tool(&tool_name, &canonical_arguments)
+            .map_err(|_| DaemonError::BrokeredMcpBindingMismatch)?;
+        let (canonical_arguments_preview, arguments_bytes, arguments_truncated) =
+            bounded_arguments_preview(&canonical_arguments)?;
+        let encoded_arguments = canonical_mcp_json_bytes(&canonical_arguments)
+            .map_err(|error| DaemonError::BrokeredMcpRuntime(error.to_string()))?;
+        let arguments_digest = McpArgumentsDigest::parse(sha256_bytes(&encoded_arguments))
+            .map_err(|_| DaemonError::BrokeredMcpBindingMismatch)?;
+        let proposal = serde_json::json!({
+            "name": tool_name,
+            "arguments": canonical_arguments,
+        });
+        let proposal_digest = sha256_bytes(
+            &canonical_mcp_json_bytes(&proposal)
+                .map_err(|error| DaemonError::BrokeredMcpRuntime(error.to_string()))?,
+        );
+        let (summary, required_capabilities) = match class {
+            McpToolClass::GenUiCompile => (
+                "Compile a bounded GenUI artifact with the supervised Deno runtime",
+                vec!["artifact_build".into(), "deno_runtime".into()],
+            ),
+            McpToolClass::DenoLspQuery => (
+                "Query the supervised Deno LSP against a workspace snapshot",
+                vec!["workspace_snapshot_read".into(), "deno_lsp".into()],
+            ),
+            McpToolClass::DiffReview => (
+                "Build a read-only diff review artifact from bounded input",
+                vec!["diff_review".into()],
+            ),
+        };
+        self.propose_operation(
+            task_id,
+            OperationKind::McpTool,
+            OperationAction::BrokeredMcpToolCall {
+                call: BrokeredMcpToolCall {
+                    schema_version: BROKERED_MCP_TOOL_CALL_SCHEMA_VERSION,
+                    server_id: "hyper-term".into(),
+                    tool_name,
+                    canonical_arguments_preview,
+                    arguments_bytes,
+                    arguments_truncated,
+                    arguments_digest,
+                    proposal_digest,
+                },
+            },
+            summary.into(),
+            RiskClass::ReadOnly,
+            required_capabilities,
+        )
+    }
+
     pub fn approval_detail(
         &self,
         operation_id: OperationId,
@@ -97,6 +159,15 @@ pub(crate) fn bound_approval_detail(
             tool_contract_digest: call.tool_contract_digest.clone(),
             arguments_digest: call.arguments_digest.clone(),
         },
+        OperationAction::BrokeredMcpToolCall { call } => ApprovalActionDetail::BrokeredMcpTool {
+            server_id: call.server_id.clone(),
+            tool_name: call.tool_name.clone(),
+            canonical_arguments_preview: call.canonical_arguments_preview.clone(),
+            arguments_bytes: call.arguments_bytes,
+            arguments_truncated: call.arguments_truncated,
+            arguments_digest: call.arguments_digest.clone(),
+            proposal_digest: call.proposal_digest.clone(),
+        },
         OperationAction::Opaque {
             kind,
             payload_digest,
@@ -130,6 +201,63 @@ pub(crate) fn bound_approval_detail(
         detail,
         detail_digest,
     })
+}
+
+pub(crate) fn validate_brokered_mcp_tool_call(
+    call: &BrokeredMcpToolCall,
+) -> Result<(), DaemonError> {
+    if call.schema_version != hyper_term_protocol::BROKERED_MCP_TOOL_CALL_SCHEMA_VERSION
+        || call.server_id != "hyper-term"
+        || !matches!(
+            call.tool_name.as_str(),
+            "hyper_term.diff.review" | "hyper_term.lsp.query" | "hyper_term.genui.compile"
+        )
+        || call.canonical_arguments_preview.is_empty()
+        || call.canonical_arguments_preview.len() > MAX_ARGUMENT_PREVIEW_BYTES + 4
+        || call.arguments_bytes == 0
+        || !is_sha256(&call.proposal_digest)
+    {
+        return Err(DaemonError::BrokeredMcpBindingMismatch);
+    }
+    Ok(())
+}
+
+const MAX_ARGUMENT_PREVIEW_BYTES: usize = 192;
+
+fn bounded_arguments_preview(
+    arguments: &serde_json::Value,
+) -> Result<(String, u32, bool), DaemonError> {
+    let compact = serde_json::to_vec(arguments).map_err(|_| DaemonError::InvalidApprovalDetail)?;
+    let arguments_bytes =
+        u32::try_from(compact.len()).map_err(|_| DaemonError::InvalidApprovalDetail)?;
+    let mut preview =
+        serde_json::to_string_pretty(arguments).map_err(|_| DaemonError::InvalidApprovalDetail)?;
+    if preview.len() <= MAX_ARGUMENT_PREVIEW_BYTES {
+        return Ok((preview, arguments_bytes, false));
+    }
+    let mut boundary = MAX_ARGUMENT_PREVIEW_BYTES;
+    while !preview.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    preview.truncate(boundary);
+    preview.push_str("\n…");
+    Ok((preview, arguments_bytes, true))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn digest_value(value: &impl serde::Serialize) -> Result<String, DaemonError> {

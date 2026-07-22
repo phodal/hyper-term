@@ -55,6 +55,15 @@ pub enum ApprovalActionDetail {
         tool_contract_digest: McpToolContractDigest,
         arguments_digest: McpArgumentsDigest,
     },
+    BrokeredMcpTool {
+        server_id: String,
+        tool_name: String,
+        canonical_arguments_preview: String,
+        arguments_bytes: u32,
+        arguments_truncated: bool,
+        arguments_digest: McpArgumentsDigest,
+        proposal_digest: String,
+    },
     Opaque {
         kind: String,
         payload_digest: String,

@@ -258,6 +258,12 @@ shape language must remain engineered and native, not bubbly or card-heavy.
   cwd and effective capabilities, and bind authorization to both the detail
   digest and operation revision. If the bounded detail cannot be projected,
   disable Allow while preserving Reject and Cancel.
+- Built-in MCP approvals show the canonical argument preview, exact encoded
+  byte count, argument digest, and whole-proposal digest in trusted Native
+  chrome. A truncated preview is labelled as such; Rust still compares the
+  complete bounded arguments and both digests before dispatch. Complete source
+  or diff arguments remain on the live capability exchange; the durable
+  operation keeps only the bounded preview and binding evidence.
 - Attention uses progressive disclosure: passive status, badge, native
   notification, then urgent system attention. Repeated animation is never the
   sole signal. Native notifications are background-only, deduplicated by the

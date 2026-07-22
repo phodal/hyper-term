@@ -28,7 +28,7 @@ use hyper_term_protocol::{
     SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime, SandboxNetworkPolicy, SandboxOutcome,
     SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy, SandboxReceipt,
     SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId, TerminalInputFrame, TerminalSize,
-    TerminalSnapshotFrame, WireError, WireFrame, read_frame, write_frame,
+    TerminalSnapshotFrame, WireError, WireFrame, canonical_mcp_json_bytes, read_frame, write_frame,
 };
 use hyper_term_sandbox::{
     IsolatedTaskReceipt, IsolatedTaskRequest, IsolatedTaskTermination, IsolatedWorktreeError,
@@ -377,7 +377,7 @@ impl DaemonState {
         if !is_sha256(&proposal_digest) {
             return Err(DaemonError::InvalidBrokeredMcpDigest);
         }
-        let arguments_bytes = serde_json::to_vec(&arguments)
+        let arguments_bytes = canonical_mcp_json_bytes(&arguments)
             .map_err(|error| DaemonError::BrokeredMcpRuntime(error.to_string()))?;
         if arguments_bytes.len() > 1024 * 1024 {
             return Err(DaemonError::BrokeredMcpArgumentsTooLarge(
@@ -385,7 +385,7 @@ impl DaemonState {
             ));
         }
         let recomputed_proposal_digest = Sha256::digest(
-            serde_json::to_vec(&serde_json::json!({
+            canonical_mcp_json_bytes(&serde_json::json!({
                 "name": tool_name,
                 "arguments": arguments,
             }))
@@ -407,10 +407,10 @@ impl DaemonState {
             return Err(DaemonError::OperationNotDispatching(record.state));
         }
         match &record.action {
-            OperationAction::Opaque {
-                kind,
-                payload_digest,
-            } if kind == &tool_name && payload_digest == &proposal_digest => {}
+            OperationAction::BrokeredMcpToolCall { call }
+                if call.tool_name == tool_name
+                    && call.proposal_digest == proposal_digest
+                    && call.arguments_digest.as_str() == arguments_digest => {}
             _ => return Err(DaemonError::BrokeredMcpBindingMismatch),
         }
         let cached_matches = |cached: &CachedBrokeredMcpExecution| {
@@ -1138,6 +1138,7 @@ impl DaemonState {
             OperationAction::Opaque { .. }
                 | OperationAction::McpServerLaunch { .. }
                 | OperationAction::McpToolCall { .. }
+                | OperationAction::BrokeredMcpToolCall { .. }
         ) {
             return Err(DaemonError::GenericDispatchRequiresOpaqueAction);
         }
@@ -1168,6 +1169,7 @@ impl DaemonState {
             OperationAction::Opaque { .. }
                 | OperationAction::McpServerLaunch { .. }
                 | OperationAction::McpToolCall { .. }
+                | OperationAction::BrokeredMcpToolCall { .. }
         ) {
             return Err(DaemonError::GenericDispatchRequiresOpaqueAction);
         }
@@ -1267,6 +1269,10 @@ impl DaemonState {
         }
         if record.kind != OperationKind::McpTool
             || !matches!(
+                &record.action,
+                OperationAction::BrokeredMcpToolCall { call }
+                    if call.tool_name == "hyper_term.genui.compile"
+            ) && !matches!(
                 &record.action,
                 OperationAction::Opaque { kind, .. } if kind == "hyper_term.genui.compile"
             )

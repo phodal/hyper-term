@@ -10,6 +10,30 @@ use crate::{
 
 pub const LOCAL_MCP_LAUNCH_SCHEMA_VERSION: u16 = 1;
 pub const LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION: u16 = 1;
+pub const BROKERED_MCP_TOOL_CALL_SCHEMA_VERSION: u16 = 1;
+
+/// Stable JSON encoding used for brokered MCP argument and proposal digests.
+/// Object keys are sorted recursively so a parser or adapter cannot change an
+/// authorization identity merely by preserving a different insertion order.
+pub fn canonical_mcp_json_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&canonical_mcp_json_value(value))
+}
+
+fn canonical_mcp_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_mcp_json_value).collect()),
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::with_capacity(object.len());
+            for key in keys {
+                canonical.insert(key.clone(), canonical_mcp_json_value(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        scalar => scalar.clone(),
+    }
+}
 
 /// Live, operation-bound result returned by the Rust authority after it runs a
 /// bundled MCP tool outside the Agent process tree. Only the final receipt is
@@ -107,4 +131,48 @@ pub struct LocalMcpToolCallReceipt {
     pub result_digest: McpToolResultDigest,
     pub content_count: u16,
     pub has_structured_content: bool,
+}
+
+/// Rust-derived, bounded review identity for exact arguments proposed through
+/// Hyper Term's built-in MCP server.
+///
+/// The complete arguments stay on the live capability connection so source or
+/// diff content is not copied into the operation journal. Rust persists a
+/// labelled preview plus exact byte count and digests, and later recomputes the
+/// same digests over the live execution request before dispatch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrokeredMcpToolCall {
+    pub schema_version: u16,
+    pub server_id: String,
+    pub tool_name: String,
+    pub canonical_arguments_preview: String,
+    pub arguments_bytes: u32,
+    pub arguments_truncated: bool,
+    pub arguments_digest: McpArgumentsDigest,
+    pub proposal_digest: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brokered_mcp_json_is_canonical_across_nested_object_order() {
+        let first = serde_json::json!({
+            "z": {"second": 2, "first": 1},
+            "a": true
+        });
+        let second = serde_json::json!({
+            "a": true,
+            "z": {"first": 1, "second": 2}
+        });
+        assert_eq!(
+            canonical_mcp_json_bytes(&first).unwrap(),
+            canonical_mcp_json_bytes(&second).unwrap()
+        );
+        assert_eq!(
+            canonical_mcp_json_bytes(&first).unwrap(),
+            br#"{"a":true,"z":{"first":1,"second":2}}"#
+        );
+    }
 }

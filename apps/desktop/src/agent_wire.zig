@@ -167,6 +167,10 @@ pub const ApprovalActionDetail = struct {
     runtime_identity_digest: ?[]const u8 = null,
     catalog_digest: ?[]const u8 = null,
     tool_contract_digest: ?[]const u8 = null,
+    canonical_arguments_preview: ?[]const u8 = null,
+    arguments_bytes: ?u32 = null,
+    arguments_truncated: ?bool = null,
+    proposal_digest: ?[]const u8 = null,
     kind: ?[]const u8 = null,
     payload_digest: ?[]const u8 = null,
 };

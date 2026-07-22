@@ -738,16 +738,10 @@
                 .expect("task UUID"),
         );
         let mcp = daemon
-            .propose_operation(
+            .propose_brokered_mcp_tool(
                 task_id,
-                OperationKind::McpTool,
-                OperationAction::Opaque {
-                    kind: "hyper_term.diff.review".into(),
-                    payload_digest: "a".repeat(64),
-                },
-                "Build a bounded diff review".into(),
-                RiskClass::ReadOnly,
-                vec!["diff_review".into()],
+                "hyper_term.diff.review".into(),
+                serde_json::json!({"before": "before", "after": "after"}),
             )
             .expect("MCP proposal");
         let allow = serde_json::json!({

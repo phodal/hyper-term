@@ -17,12 +17,7 @@ impl ConnectionAuthority {
         match self {
             Self::DesktopController => true,
             Self::AgentMcpConnector { task_id: bound } => match request {
-                ControlRequest::ProposeOperation {
-                    task_id,
-                    kind: OperationKind::McpTool,
-                    action: OperationAction::Opaque { .. },
-                    ..
-                }
+                ControlRequest::ProposeBrokeredMcpTool { task_id, .. }
                 | ControlRequest::BeginOperation { task_id, .. }
                 | ControlRequest::ExecuteBrokeredMcpTool { task_id, .. }
                 | ControlRequest::CompleteOperation { task_id, .. }
@@ -400,6 +395,17 @@ fn handle_request(
                 required_capabilities,
             } => state
                 .propose_operation(task_id, kind, action, summary, risk, required_capabilities)
+                .map(|record| ControlResponse::OperationUpdated {
+                    operation_id: record.operation_id,
+                    revision: record.revision,
+                    state: record.state,
+                }),
+            ControlRequest::ProposeBrokeredMcpTool {
+                task_id,
+                tool_name,
+                arguments,
+            } => state
+                .propose_brokered_mcp_tool(task_id, tool_name, arguments)
                 .map(|record| ControlResponse::OperationUpdated {
                     operation_id: record.operation_id,
                     revision: record.revision,

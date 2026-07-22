@@ -62,6 +62,20 @@ fn agent_capability_endpoint_is_private_task_scoped_and_cannot_self_approve() {
         },
         TIMEOUT,
     ));
+    assert_denied(client.request(
+        ControlRequest::ProposeOperation {
+            task_id: bound_task,
+            kind: OperationKind::McpTool,
+            action: OperationAction::Opaque {
+                kind: "hyper_term.diff.review".into(),
+                payload_digest: "a".repeat(64),
+            },
+            summary: "forged generic proposal".into(),
+            risk: RiskClass::ReadOnly,
+            required_capabilities: vec!["diff_review".into()],
+        },
+        TIMEOUT,
+    ));
     assert_denied(client.request(proposal(other_task), TIMEOUT));
 
     let (operation_id, revision) = match client.request(proposal(bound_task), TIMEOUT).unwrap() {
@@ -123,16 +137,10 @@ fn agent_capability_endpoint_is_private_task_scoped_and_cannot_self_approve() {
 }
 
 fn proposal(task_id: hyper_term_protocol::TaskId) -> ControlRequest {
-    ControlRequest::ProposeOperation {
+    ControlRequest::ProposeBrokeredMcpTool {
         task_id,
-        kind: OperationKind::McpTool,
-        action: OperationAction::Opaque {
-            kind: "hyper_term.diff.review".into(),
-            payload_digest: "a".repeat(64),
-        },
-        summary: "review a diff".into(),
-        risk: RiskClass::ReadOnly,
-        required_capabilities: vec!["diff.review".into()],
+        tool_name: "hyper_term.diff.review".into(),
+        arguments: serde_json::json!({"before": "a", "after": "b"}),
     }
 }
 

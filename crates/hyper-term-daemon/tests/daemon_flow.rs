@@ -11,16 +11,16 @@ use std::time::{Duration, Instant};
 use hyper_term_core::{TerminalEvent, TerminalReplay};
 use hyper_term_daemon::{BrokeredMcpRuntimeConfig, DaemonError, DaemonState, spawn_unix_server};
 use hyper_term_protocol::{
-    ApprovalDetailDigest, BlockPayload, ClientId, ContextDigest, ContextReceipt, ControlRequest,
-    ControlRequestEnvelope, ControlResponse, DomainEvent, EXECUTION_CONTEXT_SCHEMA_VERSION,
-    EnvironmentPlanDigest, ExecutionMode, GenUiArtifactCandidate, GenUiCompilerIdentity,
-    LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle,
+    ApprovalActionDetail, ApprovalDetailDigest, BlockPayload, ClientId, ContextDigest,
+    ContextReceipt, ControlRequest, ControlRequestEnvelope, ControlResponse, DomainEvent,
+    EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest, ExecutionMode, GenUiArtifactCandidate,
+    GenUiCompilerIdentity, LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle,
     LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt,
     LocalMcpToolContractReceipt, McpArgumentsDigest, McpCapabilitiesDigest, McpCatalogDigest,
     McpRuntimeIdentityDigest, McpToolContractDigest, McpToolResultDigest, OperationAction,
     OperationCompletion, OperationKind, OperationOutcome, OperationState, PermissionDecision,
     RequestId, RiskClass, SandboxProfileDigest, TerminalCommand, TerminalDataFrame,
-    TerminalInputFrame, TerminalSize, WireFrame, read_frame, write_frame,
+    TerminalInputFrame, TerminalSize, WireFrame, canonical_mcp_json_bytes, read_frame, write_frame,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -28,6 +28,13 @@ use tempfile::tempdir;
 
 fn json_sha256(value: &impl Serialize) -> String {
     Sha256::digest(serde_json::to_vec(value).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn mcp_json_sha256(value: &serde_json::Value) -> String {
+    Sha256::digest(canonical_mcp_json_bytes(value).unwrap())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -108,22 +115,12 @@ fn brokered_mcp_execution_is_operation_bound_and_idempotent() {
         "method": "textDocument/documentSymbol",
         "documentPath": "src/main.ts"
     });
-    let proposal_digest = json_sha256(&serde_json::json!({
+    let proposal_digest = mcp_json_sha256(&serde_json::json!({
         "name": "hyper_term.lsp.query",
         "arguments": arguments,
     }));
     let operation = state
-        .propose_operation(
-            task_id,
-            OperationKind::McpTool,
-            OperationAction::Opaque {
-                kind: "hyper_term.lsp.query".into(),
-                payload_digest: proposal_digest.clone(),
-            },
-            "Query a bounded Deno workspace snapshot".into(),
-            RiskClass::ReadOnly,
-            vec!["workspace.read".into()],
-        )
+        .propose_brokered_mcp_tool(task_id, "hyper_term.lsp.query".into(), arguments.clone())
         .unwrap();
     let authorized = state
         .decide_permission(
@@ -335,6 +332,110 @@ fn approval_detail_digest_binds_the_review_and_redacts_environment_values() {
             .state,
         OperationState::Authorized
     );
+}
+
+#[test]
+fn brokered_mcp_approval_shows_canonical_arguments_and_rejects_substitution() {
+    let temporary = tempdir().unwrap();
+    let state = DaemonState::open(temporary.path().join("state")).unwrap();
+    let task_id = state.create_task("review exact MCP call".into()).unwrap();
+    let arguments = serde_json::json!({
+        "documentPath": "src/main.ts",
+        "method": "textDocument/hover",
+        "position": {"character": 7, "line": 3}
+    });
+    let arguments_digest = McpArgumentsDigest::parse(mcp_json_sha256(&arguments)).unwrap();
+    let proposal_digest = mcp_json_sha256(&serde_json::json!({
+        "name": "hyper_term.lsp.query",
+        "arguments": arguments,
+    }));
+    let operation = state
+        .propose_brokered_mcp_tool(task_id, "hyper_term.lsp.query".into(), arguments.clone())
+        .unwrap();
+    let approval = state.approval_detail(operation.operation_id).unwrap();
+    let approval_detail_digest = approval.detail_digest.clone();
+    let ApprovalActionDetail::BrokeredMcpTool {
+        canonical_arguments_preview,
+        arguments_bytes,
+        arguments_truncated,
+        arguments_digest: reviewed_arguments_digest,
+        proposal_digest: reviewed_proposal_digest,
+        ..
+    } = approval.detail.action
+    else {
+        panic!("expected a brokered MCP approval");
+    };
+    assert!(canonical_arguments_preview.contains("textDocument/hover"));
+    assert!(canonical_arguments_preview.contains("src/main.ts"));
+    assert!(arguments_bytes > 0);
+    assert!(!arguments_truncated);
+    assert_eq!(reviewed_arguments_digest, arguments_digest);
+    assert_eq!(reviewed_proposal_digest, proposal_digest);
+
+    let authorized = state
+        .decide_permission_bound(
+            task_id,
+            operation.operation_id,
+            operation.revision,
+            &approval_detail_digest,
+            PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let dispatching = state
+        .begin_operation(task_id, operation.operation_id, authorized.revision)
+        .unwrap();
+    assert!(matches!(
+        state.execute_brokered_mcp_tool(
+            task_id,
+            operation.operation_id,
+            dispatching.revision,
+            "hyper_term.lsp.query".into(),
+            proposal_digest,
+            serde_json::json!({
+                "documentPath": "src/secrets.ts",
+                "method": "textDocument/hover"
+            }),
+        ),
+        Err(DaemonError::BrokeredMcpBindingMismatch)
+    ));
+}
+
+#[test]
+fn brokered_mcp_journal_keeps_only_a_labelled_bounded_argument_preview() {
+    let temporary = tempdir().unwrap();
+    let state = DaemonState::open(temporary.path().join("state")).unwrap();
+    let task_id = state
+        .create_task("review bounded GenUI source".into())
+        .unwrap();
+    let source = format!(
+        "export default function App() {{ return <pre>{}</pre>; }}//TAIL_PRIVATE_MARKER",
+        "visible-preview-".repeat(64)
+    );
+    let operation = state
+        .propose_brokered_mcp_tool(
+            task_id,
+            "hyper_term.genui.compile".into(),
+            serde_json::json!({"source": source, "entry": "/App.tsx"}),
+        )
+        .unwrap();
+    let durable_operation = serde_json::to_string(&operation.action).unwrap();
+    assert!(durable_operation.contains("canonical_arguments_preview"));
+    assert!(durable_operation.contains("arguments_truncated\":true"));
+    assert!(!durable_operation.contains("TAIL_PRIVATE_MARKER"));
+
+    let approval = state.approval_detail(operation.operation_id).unwrap();
+    let ApprovalActionDetail::BrokeredMcpTool {
+        arguments_bytes,
+        arguments_truncated,
+        canonical_arguments_preview,
+        ..
+    } = approval.detail.action
+    else {
+        panic!("expected a brokered MCP approval");
+    };
+    assert!(arguments_bytes > canonical_arguments_preview.len() as u32);
+    assert!(arguments_truncated);
+    assert!(canonical_arguments_preview.ends_with('…'));
 }
 
 #[cfg(target_os = "macos")]

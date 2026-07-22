@@ -5050,11 +5050,11 @@ fn allowable_brokered_mcp_operation(operation: &hyper_term_core::OperationRecord
     if operation.kind != OperationKind::McpTool || operation.risk != RiskClass::ReadOnly {
         return false;
     }
-    let OperationAction::Opaque { kind, .. } = &operation.action else {
+    let OperationAction::BrokeredMcpToolCall { call } = &operation.action else {
         return false;
     };
     matches!(
-        kind.as_str(),
+        call.tool_name.as_str(),
         "hyper_term.diff.review" | "hyper_term.lsp.query" | "hyper_term.genui.compile"
     )
 }

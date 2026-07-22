@@ -638,7 +638,7 @@ test "Agent conversation uses responsive reading and composer rails" {
     try testing.expectEqual(@as(f32, 0), composer_rail.layout.min_size.width);
 }
 
-test "read-only MCP approvals expose an exact Allow once action" {
+test "brokered MCP approvals show canonical arguments and expose exact Allow once" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     var model = main.initialModelWithServices(terminal_url, agent_url);
@@ -655,7 +655,7 @@ test "read-only MCP approvals expose an exact Allow once action" {
         .body =
         \\{"status":"waiting_approval","error":null,"pending_operation_id":"44444444-4444-4444-8444-444444444444","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000021","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"44444444-4444-4444-8444-444444444444","kind":"mcp_tool","summary":"Build a bounded diff review","risk":"read_only","state":"waiting_human"}},
-        \\  {"block_id":"00000000-0000-4000-8000-000000000022","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"44444444-4444-4444-8444-444444444444","operation_revision":3,"approval":{"detail":{"schema_version":1,"operation_id":"44444444-4444-4444-8444-444444444444","operation_revision":3,"action_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","action":{"type":"mcp_tool","server_id":"hyper-term","tool_name":"workspace.diff","arguments_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"risk":"read_only","effective_capabilities":["mcp.tool"],"opaque_effect":false},"detail_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
+        \\  {"block_id":"00000000-0000-4000-8000-000000000022","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"44444444-4444-4444-8444-444444444444","operation_revision":3,"approval":{"detail":{"schema_version":1,"operation_id":"44444444-4444-4444-8444-444444444444","operation_revision":3,"action_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","action":{"type":"brokered_mcp_tool","server_id":"hyper-term","tool_name":"hyper_term.lsp.query","canonical_arguments_preview":"{\n  \"documentPath\": \"src/main.ts\",\n  \"method\": \"textDocument/hover\"\n}","arguments_bytes":4096,"arguments_truncated":true,"arguments_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","proposal_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},"risk":"read_only","effective_capabilities":["mcp.tool"],"opaque_effect":false},"detail_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
         \\]}}
         ,
     } }, &fx);
@@ -666,8 +666,12 @@ test "read-only MCP approvals expose an exact Allow once action" {
     defer arena_state.deinit();
     const tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(containsText(tree.root, "Brokered read-only tool · receipt recorded"));
-    try testing.expect(containsText(tree.root, "Tool: workspace.diff"));
+    try testing.expect(containsText(tree.root, "Tool: hyper_term.lsp.query"));
+    try testing.expect(containsText(tree.root, "src/main.ts"));
+    try testing.expect(containsText(tree.root, "textDocument/hover"));
+    try testing.expect(containsText(tree.root, "Canonical arguments (4096 bytes, preview truncated)"));
     try testing.expect(containsText(tree.root, "Arguments SHA-256"));
+    try testing.expect(containsText(tree.root, "Proposal SHA-256"));
     try testing.expect(!containsText(tree.root, "Allow unavailable until Rust can enforce"));
     const allow = findByText(tree.root, .button, "Allow once").?;
     main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);

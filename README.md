@@ -34,10 +34,11 @@ structured messages, approvals, diffs, and generated interfaces.
 - **You stay in control.** Agents propose operations; Rust checks permissions
   and waits for approval before execution or workspace writes.
 - **Approvals are bound to what you reviewed.** Native trusted chrome shows the
-  Rust-projected command or MCP identity, argument boundaries or digest, working
+  Rust-projected command or MCP identity, argument boundaries, and a bounded
+  canonical preview of built-in MCP arguments with its full digest, working
   directory, capabilities, and risk. Each authorization carries the matching
-  detail digest and operation revision; stale or substituted approvals fail
-  closed.
+  detail digest and operation revision; stale or substituted arguments fail
+  closed before dispatch.
 - **Local by default.** PTYs, process lifecycle, transcripts, and accepted
   artifacts stay under the local Rust core. WebViews only render trusted data.
 
