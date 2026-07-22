@@ -156,10 +156,15 @@ The bounded desktop state and its pure derived bindings are separately isolated
 in the 1,173-line `src/desktop_model.zig`. It has no process, filesystem-I/O,
 PTY, network, or WebView effect authority. Search matching lives with the Agent
 Block projection so both the Model's result count and the virtual View use the
-same predicate. Together these extractions drop `main.zig` from 5,455 to 3,721
-lines and ratchet its legacy size ceiling to the new value. New modules remain
-subject to the repository-wide 2,000-line limit; the remaining entrypoint
-exception may only shrink as effect routers are extracted.
+same predicate.
+
+Rust-authenticated Agent wire snapshots and stream metadata are projected by the
+1,041-line `src/agent_projection.zig`. The module parses and bounds Native
+Block, Goal, Diff, capability, execution-context, and composer recovery state,
+but has no effect authority. These extractions drop `main.zig` from 5,455 to
+2,748 lines and ratchet its legacy size ceiling to the new value. New modules
+remain subject to the repository-wide 2,000-line limit; extracting the remaining
+HTTP/timer effect router is the next step to remove the entrypoint exception.
 
 ## Compact Agent interaction evidence (2026-07-20)
 
