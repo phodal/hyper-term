@@ -605,7 +605,11 @@ PY
     '0 / 2' \
     'role=button name="Allow once".*enabled=true'
   smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
-  native automate widget-click hyper-term-canvas "$smoke_allow_id"
+  # The compact CI window can move the approval card across the conversation
+  # scroll viewport between snapshot publication and pointer synthesis. Drive
+  # the same retained button through its accessibility press action so the
+  # permission-broker Msg is covered without a stale geometry dependency.
+  native automate widget-action hyper-term-canvas "$smoke_allow_id" press
   native automate assert \
     'Tier 2 terminal completed.' \
     'role=button name="Plan complete"' \
@@ -797,7 +801,7 @@ PY
     'Shell command · external effect' \
     'role=button name="Allow once".*enabled=true'
   smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
-  native automate widget-click hyper-term-canvas "$smoke_allow_id"
+  native automate widget-action hyper-term-canvas "$smoke_allow_id" press
   native automate assert \
     'Tier 2 terminal completed.' \
     'role=button name="Plan complete"' \
