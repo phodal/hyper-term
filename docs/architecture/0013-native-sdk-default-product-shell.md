@@ -161,10 +161,15 @@ same predicate.
 Rust-authenticated Agent wire snapshots and stream metadata are projected by the
 1,041-line `src/agent_projection.zig`. The module parses and bounds Native
 Block, Goal, Diff, capability, execution-context, and composer recovery state,
-but has no effect authority. These extractions drop `main.zig` from 5,455 to
-2,748 lines and ratchet its legacy size ceiling to the new value. New modules
-remain subject to the repository-wide 2,000-line limit; extracting the remaining
-HTTP/timer effect router is the next step to remove the entrypoint exception.
+but has no effect authority.
+
+Per-session Agent HTTP, stream, and timer orchestration is isolated in the
+1,124-line `src/agent_effects.zig`. It can address only the authenticated
+loopback Rust gateway through bounded Native SDK effects; provider spawning,
+command execution, file access, and permission decisions remain Rust-owned.
+Together these extractions drop `main.zig` from 5,455 to 1,740 lines and remove
+its legacy size exception. Every desktop Zig source now uses the repository-wide
+2,000-line default budget.
 
 ## Compact Agent interaction evidence (2026-07-20)
 
