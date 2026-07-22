@@ -171,6 +171,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     try testing.expect(containsText(tree.root, "Program: touch"));
     try testing.expect(containsText(tree.root, "[0] forbidden"));
     try testing.expect(containsText(tree.root, "Allow unavailable until Rust can enforce"));
+    try testing.expect(findByLabel(tree.root, "Pending Agent approval actions") != null);
     try testing.expect(findByLabel(tree.root, "Agent prompt composer") != null);
     try testing.expect(findByLabel(tree.root, "Stop Agent turn") != null);
     const tokens = main.hyperTermTokens(&model);
@@ -207,6 +208,9 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     } }, &fx);
     try testing.expect(!model.agentPermissionBusy());
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+
+    const resolved_tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(resolved_tree.root, "Pending Agent approval actions") == null);
 }
 
 test "restored Agent history archives approvals from the previous runtime" {

@@ -131,7 +131,8 @@ pub fn DesktopView(
                     ui.text(.{ .padding = 6, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("Older activity is compacted · showing the latest {d} blocks", .{config.max_agent_blocks})),
                     timeline,
                 });
-            const content = if (model.agent_tier2_result_count == 0 and
+            const content = if (model.activeAgentApproval() == null and
+                model.agent_tier2_result_count == 0 and
                 !model.agent_plan_visible and !model.agent_goal_visible)
                 transcript
             else
@@ -153,6 +154,10 @@ pub fn DesktopView(
                 .padding = 4,
                 .semantics = .{ .label = "Agent context shelf" },
             }, .{
+                if (model.activeAgentApproval()) |approval|
+                    agentPinnedApprovalNode(ui, model, approval)
+                else
+                    ui.el(.stack, .{}, .{}),
                 if (model.agent_tier2_result_count > 0)
                     agentTier2ResultsNode(ui, model)
                 else
@@ -165,6 +170,41 @@ pub fn DesktopView(
                     agentGoalNode(ui, model)
                 else
                     ui.el(.stack, .{}, .{}),
+            });
+        }
+
+        fn agentPinnedApprovalNode(ui: *Ui, model: *const Model, block: anytype) Ui.Node {
+            const operation_id = block.operationId();
+            const cancel_key = canvas.uiKey(ui.fmt("approval-rail:{s}:cancel", .{operation_id}));
+            const reject_key = canvas.uiKey(ui.fmt("approval-rail:{s}:reject", .{operation_id}));
+            const allow_key = canvas.uiKey(ui.fmt("approval-rail:{s}:allow", .{operation_id}));
+            const controls = if (block.canAllowOnce())
+                ui.row(.{ .gap = 6, .cross = .center }, .{
+                    ui.button(.{ .global_key = cancel_key, .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Cancel"),
+                    ui.button(.{ .global_key = reject_key, .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Reject"),
+                    ui.button(.{ .global_key = allow_key, .size = .sm, .variant = .primary, .on_press = Msg{ .allow_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Allow once"),
+                })
+            else
+                ui.row(.{ .gap = 6, .cross = .center }, .{
+                    ui.button(.{ .global_key = cancel_key, .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Cancel"),
+                    ui.button(.{ .global_key = reject_key, .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Reject"),
+                });
+            return ui.el(.card, .{
+                .global_key = canvas.uiKey(ui.fmt("approval-rail:{s}", .{operation_id})),
+                .semantics = .{ .label = "Pending Agent approval actions" },
+                .style_tokens = .{ .border_color = .warning },
+            }, .{
+                ui.column(.{ .gap = 5, .padding = 7 }, .{
+                    ui.row(.{ .gap = 6, .cross = .center }, .{
+                        ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .warning } }, "alert"),
+                        ui.text(.{ .grow = 1 }, block.approvalTitle()),
+                        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
+                    }),
+                    ui.row(.{ .gap = 6, .cross = .center }, .{
+                        ui.text(.{ .grow = 1, .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.approvalBoundaryLabel()),
+                        controls,
+                    }),
+                }),
             });
         }
 
@@ -568,23 +608,6 @@ pub fn DesktopView(
                         ui.el(.stack, .{}, .{}),
                 });
             }
-            const operation_id = block.operationId();
-            const cancel_key = canvas.uiKey(ui.fmt("approval:{s}:cancel", .{operation_id}));
-            const reject_key = canvas.uiKey(ui.fmt("approval:{s}:reject", .{operation_id}));
-            const allow_key = canvas.uiKey(ui.fmt("approval:{s}:allow", .{operation_id}));
-            const decision = if (block.canAllowOnce())
-                ui.row(.{ .gap = 6, .cross = .center }, .{
-                    ui.text(.{ .grow = 1, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.approvalBoundaryLabel()),
-                    ui.button(.{ .global_key = cancel_key, .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Cancel"),
-                    ui.button(.{ .global_key = reject_key, .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Reject"),
-                    ui.button(.{ .global_key = allow_key, .size = .sm, .variant = .primary, .on_press = Msg{ .allow_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Allow once"),
-                })
-            else
-                ui.row(.{ .gap = 6, .cross = .center }, .{
-                    ui.text(.{ .grow = 1, .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.approvalBoundaryLabel()),
-                    ui.button(.{ .global_key = cancel_key, .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Cancel"),
-                    ui.button(.{ .global_key = reject_key, .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Reject"),
-                });
             return ui.el(.card, .{
                 .global_key = canvas.uiKey(block.id),
                 .style_tokens = .{ .border_color = .warning },
@@ -604,7 +627,7 @@ pub fn DesktopView(
                         }, block.approvalDetail())
                     else
                         ui.text(.{ .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Rust could not produce complete review detail; Allow is disabled."),
-                    decision,
+                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "Approval actions are pinned below."),
                 }),
             });
         }

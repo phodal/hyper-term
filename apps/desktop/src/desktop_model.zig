@@ -967,6 +967,16 @@ pub const Model = struct {
         );
     }
 
+    pub fn activeAgentApproval(model: *const Model) ?*const AgentBlockView {
+        var index = model.agent_block_count;
+        while (index > 0) {
+            index -= 1;
+            const block = &model.agent_blocks[index];
+            if (model.isLiveAgentApproval(block)) return block;
+        }
+        return null;
+    }
+
     pub fn agentConfigOptions(model: *const Model) []const AgentConfigOptionView {
         return model.agent_config_options[0..model.agent_config_option_count];
     }
