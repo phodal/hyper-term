@@ -147,6 +147,9 @@ jobs:
           HYPER_TERM_CAPSULE_SMOKE_ARTIFACT_DIR: ${{ github.workspace }}/dist/smoke/macos/capsule
           HYPER_TERM_SMOKE_FIRST_FRAME_BUDGET_MS: "1500"
         run: |
+          deno_path="$(command -v deno)"
+          export HYPER_TERM_DENO_PATH="$deno_path"
+          export HYPER_TERM_DENO_SHA256="$(shasum -a 256 "$deno_path" | awk '{print $1}')"
           cargo build \
             --locked \
             --package hyper-term-daemon \

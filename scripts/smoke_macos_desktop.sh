@@ -10,6 +10,7 @@ smoke_codex_goal_fixture="$smoke_repo_root/scripts/fixtures/codex_goal_agent.sh"
 smoke_lima_fixture="$smoke_repo_root/scripts/fixtures/fake_limactl.sh"
 smoke_artifact_dir=${HYPER_TERM_SMOKE_ARTIFACT_DIR:-}
 smoke_first_frame_budget_ms=${HYPER_TERM_SMOKE_FIRST_FRAME_BUDGET_MS:-150}
+smoke_deno=${HYPER_TERM_DENO_PATH:-"$smoke_repo_root/.tools/deno/2.9.3/deno"}
 
 if [[ ! "$smoke_first_frame_budget_ms" =~ ^[0-9]+$ ]] || (( smoke_first_frame_budget_ms == 0 )); then
   echo "desktop first-frame budget must be a positive integer in milliseconds" >&2
@@ -71,8 +72,17 @@ for smoke_asset in \
     exit 1
   fi
 done
-if [[ ! -x "$smoke_repo_root/.tools/deno/2.9.3/deno" ]]; then
-  echo "pinned Deno runtime is unavailable: $smoke_repo_root/.tools/deno/2.9.3/deno" >&2
+if [[ "$smoke_deno" != /* || ! -x "$smoke_deno" ]]; then
+  echo "pinned Deno runtime is unavailable: $smoke_deno" >&2
+  exit 1
+fi
+if ! "$smoke_deno" --version | grep -q '^deno 2\.9\.3 '; then
+  echo "desktop smoke requires Deno 2.9.3: $smoke_deno" >&2
+  exit 1
+fi
+smoke_deno_sha256=$(shasum -a 256 "$smoke_deno" | awk '{print $1}')
+if [[ -n "${HYPER_TERM_DENO_SHA256:-}" && "$smoke_deno_sha256" != "$HYPER_TERM_DENO_SHA256" ]]; then
+  echo "Deno runtime digest does not match HYPER_TERM_DENO_SHA256" >&2
   exit 1
 fi
 
@@ -113,7 +123,7 @@ smoke_start_supervisor() {
       --state-dir "$smoke_root/state" \
       --terminal-assets "$smoke_repo_root/dist/terminal" \
       --workbench-assets "$smoke_repo_root/dist/workbench" \
-      --deno-runtime "$smoke_repo_root/.tools/deno/2.9.3/deno" \
+      --deno-runtime "$smoke_deno" \
       --genui-script "$smoke_repo_root/dist/runtime/genui-compiler.js" \
       --genui-wasm "$smoke_repo_root/dist/runtime/esbuild.wasm" \
       --genui-preview "$smoke_repo_root/dist/runtime/genui/preview.html" \
