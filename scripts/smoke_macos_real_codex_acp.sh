@@ -12,6 +12,7 @@ real_artifact_dir=${HYPER_TERM_REAL_ACP_ARTIFACT_DIR:-}
 real_genui=${HYPER_TERM_REAL_ACP_GENUI:-0}
 real_hostile=${HYPER_TERM_REAL_ACP_HOSTILE:-0}
 real_provider=${HYPER_TERM_REAL_ACP_PROVIDER:-codex}
+real_decision=${HYPER_TERM_REAL_ACP_DECISION:-allow_once}
 
 if [[ "$real_app" != /* ]]; then
   real_app="$PWD/$real_app"
@@ -33,6 +34,18 @@ if [[ "$real_hostile" != 0 && "$real_hostile" != 1 ]]; then
 fi
 if [[ "$real_hostile" == 1 && "$real_genui" != 1 ]]; then
   echo "HYPER_TERM_REAL_ACP_HOSTILE requires HYPER_TERM_REAL_ACP_GENUI=1" >&2
+  exit 1
+fi
+if [[ "$real_decision" != allow_once && "$real_decision" != reject_once ]]; then
+  echo "HYPER_TERM_REAL_ACP_DECISION must be allow_once or reject_once" >&2
+  exit 1
+fi
+if [[ "$real_decision" == reject_once && "$real_genui" != 1 ]]; then
+  echo "HYPER_TERM_REAL_ACP_DECISION=reject_once requires HYPER_TERM_REAL_ACP_GENUI=1" >&2
+  exit 1
+fi
+if [[ "$real_hostile" == 1 && "$real_decision" != allow_once ]]; then
+  echo "HYPER_TERM_REAL_ACP_HOSTILE requires HYPER_TERM_REAL_ACP_DECISION=allow_once" >&2
   exit 1
 fi
 case "$real_provider" in
@@ -229,25 +242,88 @@ real_pid=$!
     native automate assert --timeout-ms 120000 \
       'Approval required' \
       'role=button name="Allow once".*enabled=true'
-    real_allow_id=$(real_widget_id 'role=button name="Allow once".*enabled=true')
-    if [[ -z "$real_allow_id" ]]; then
-      echo "real $real_provider_label GenUI approval button is unavailable" >&2
+    if [[ "$real_decision" == allow_once ]]; then
+      real_decision_pattern='role=button name="Allow once".*enabled=true'
+    else
+      real_decision_pattern='role=button name="Reject".*enabled=true'
+    fi
+    real_decision_id=$(real_widget_id "$real_decision_pattern")
+    if [[ -z "$real_decision_id" ]]; then
+      echo "real $real_provider_label GenUI $real_decision button is unavailable" >&2
       exit 1
     fi
     # The approval card can move while streamed Agent blocks settle. Drive the
     # stable accessibility action instead of replaying a stale pointer center.
-    native automate widget-action hyper-term-canvas "$real_allow_id" press
+    native automate widget-action hyper-term-canvas "$real_decision_id" press
   fi
-  native automate assert --timeout-ms 150000 \
-    "$real_expected" \
-    'role=textbox name="Agent prompt".*enabled=true' \
-    'role=button name="Send prompt".*enabled=true'
+  if [[ "$real_decision" == allow_once ]]; then
+    native automate assert --timeout-ms 150000 \
+      "$real_expected" \
+      'role=textbox name="Agent prompt".*enabled=true' \
+      'role=button name="Send prompt".*enabled=true'
+  else
+    native automate assert --timeout-ms 150000 \
+      'Request rejected' \
+      'role=textbox name="Agent prompt".*enabled=true' \
+      'role=button name="Send prompt".*enabled=true'
+  fi
   native automate assert --absent \
     'role=button name="Stop Agent turn"' \
     'invalid ACP message:' \
     'error event=' \
     'dispatch_errors=[1-9]'
-  if [[ "$real_genui" == 1 ]]; then
+
+  python3 - \
+    "$real_root/state/events.jsonl" \
+    "$real_expected" \
+    "$real_genui" \
+    "$real_decision" <<'PY'
+import collections
+import json
+import pathlib
+import sys
+
+events_path, expected, genui, decision = sys.argv[1:]
+events = [
+    json.loads(line)
+    for line in pathlib.Path(events_path).read_text().splitlines()
+    if line.strip()
+]
+payloads = [event.get("payload", {}) for event in events]
+
+if decision == "allow_once":
+    messages = collections.defaultdict(str)
+    for payload in payloads:
+        if payload.get("type") == "message_appended" and payload.get("role") == "agent":
+            messages[payload.get("block_id")] += payload.get("text", "")
+    if not any(message.strip() == expected for message in messages.values()):
+        raise SystemExit("Agent event stream did not contain the exact expected response")
+
+if genui == "1":
+    if not any(
+        payload.get("type") == "permission_decided"
+        and payload.get("decision") == decision
+        for payload in payloads
+    ):
+        raise SystemExit(f"GenUI event stream did not record {decision}")
+
+if decision == "reject_once":
+    if not any(
+        payload.get("type") == "operation_state_changed"
+        and payload.get("to") == "cancelled"
+        for payload in payloads
+    ):
+        raise SystemExit("rejected GenUI operation did not enter cancelled state")
+    if any(payload.get("type") == "artifact_accepted" for payload in payloads):
+        raise SystemExit("rejected GenUI operation accepted an artifact")
+    if any(
+        payload.get("type") == "operation_receipt" and payload.get("succeeded") is True
+        for payload in payloads
+    ):
+        raise SystemExit("rejected GenUI operation produced a successful receipt")
+PY
+
+  if [[ "$real_genui" == 1 && "$real_decision" == allow_once ]]; then
     native automate assert 'succeeded' 'Allowed once'
     grep -q '"type":"artifact_accepted"' "$real_root/state/events.jsonl"
     grep -q '"executor":"hyper-term-mcp","succeeded":true' \
@@ -440,7 +516,9 @@ PY
 
 real_copy_evidence
 
-if [[ "$real_genui" == 1 ]]; then
+if [[ "$real_decision" == reject_once ]]; then
+  echo "real $real_provider_label GenUI rejection smoke passed"
+elif [[ "$real_genui" == 1 ]]; then
   echo "real $real_provider_label GenUI desktop smoke passed: $real_expected"
 else
   echo "real $real_provider_label desktop smoke passed: $real_expected"
