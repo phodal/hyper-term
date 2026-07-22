@@ -568,18 +568,22 @@ pub fn DesktopView(
                         ui.el(.stack, .{}, .{}),
                 });
             }
+            const operation_id = block.operationId();
+            const cancel_key = canvas.uiKey(ui.fmt("approval:{s}:cancel", .{operation_id}));
+            const reject_key = canvas.uiKey(ui.fmt("approval:{s}:reject", .{operation_id}));
+            const allow_key = canvas.uiKey(ui.fmt("approval:{s}:allow", .{operation_id}));
             const decision = if (block.canAllowOnce())
                 ui.row(.{ .gap = 6, .cross = .center }, .{
                     ui.text(.{ .grow = 1, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.approvalBoundaryLabel()),
-                    ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel"),
-                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
-                    ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .allow_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Allow once"),
+                    ui.button(.{ .global_key = cancel_key, .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Cancel"),
+                    ui.button(.{ .global_key = reject_key, .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Reject"),
+                    ui.button(.{ .global_key = allow_key, .size = .sm, .variant = .primary, .on_press = Msg{ .allow_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Allow once"),
                 })
             else
                 ui.row(.{ .gap = 6, .cross = .center }, .{
                     ui.text(.{ .grow = 1, .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, block.approvalBoundaryLabel()),
-                    ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel"),
-                    ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
+                    ui.button(.{ .global_key = cancel_key, .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Cancel"),
+                    ui.button(.{ .global_key = reject_key, .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Reject"),
                 });
             return ui.el(.card, .{
                 .global_key = canvas.uiKey(block.id),

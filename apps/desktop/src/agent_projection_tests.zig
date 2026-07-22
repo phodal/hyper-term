@@ -760,7 +760,22 @@ test "ACP Tier 2 terminal approvals expose the Rust-backed Allow once action" {
     try testing.expect(containsText(tree.root, "Program: cargo"));
     try testing.expect(containsText(tree.root, "[0] test"));
     try testing.expect(containsText(tree.root, "Isolated Tier 2 command · no ordinary PTY access"));
+    const operation_id = "66666666-6666-4666-8666-666666666666";
+    const cancel = findByText(tree.root, .button, "Cancel").?;
+    const reject = findByText(tree.root, .button, "Reject").?;
     const allow = findByText(tree.root, .button, "Allow once").?;
+    try testing.expectEqual(
+        canvas.globalWidgetId(.button, canvas.uiKey("approval:" ++ operation_id ++ ":cancel")),
+        cancel.id,
+    );
+    try testing.expectEqual(
+        canvas.globalWidgetId(.button, canvas.uiKey("approval:" ++ operation_id ++ ":reject")),
+        reject.id,
+    );
+    try testing.expectEqual(
+        canvas.globalWidgetId(.button, canvas.uiKey("approval:" ++ operation_id ++ ":allow")),
+        allow.id,
+    );
     main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);
     const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
     try testing.expectEqualStrings(
