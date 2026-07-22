@@ -1,7 +1,10 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use hyper_term_protocol::{EVENT_SCHEMA_VERSION, EventEnvelope, EventId, NewEvent};
 use thiserror::Error;
@@ -26,12 +29,8 @@ impl JsonlJournal {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
-        let events = read_existing(&path)?;
+        let file = open_private_journal(&path)?;
+        let events = read_existing(&file)?;
         Ok(Self { path, file, events })
     }
 
@@ -109,8 +108,34 @@ impl EventJournal for JsonlJournal {
     }
 }
 
-fn read_existing(path: &Path) -> Result<Vec<EventEnvelope>, JournalError> {
-    let file = File::open(path)?;
+fn open_private_journal(path: &Path) -> Result<File, JournalError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(JournalError::UnsafePath(path.to_path_buf()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).read(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(JournalError::UnsafePath(path.to_path_buf()));
+    }
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn read_existing(file: &File) -> Result<Vec<EventEnvelope>, JournalError> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(file);
     let mut events = Vec::new();
     let mut line = Vec::new();
@@ -150,6 +175,8 @@ fn read_existing(path: &Path) -> Result<Vec<EventEnvelope>, JournalError> {
 pub enum JournalError {
     #[error("journal I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("journal path is not a private regular file: {0}")]
+    UnsafePath(PathBuf),
     #[error("journal JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid journal event: {0}")]
@@ -171,6 +198,11 @@ pub enum JournalError {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use hyper_term_protocol::{DomainEvent, NewEvent, TaskId};
     use tempfile::tempdir;
@@ -224,5 +256,45 @@ mod tests {
             .err()
             .expect("must reject torn tail");
         assert!(matches!(error, JournalError::TornTail));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn journal_migrates_private_mode_and_is_not_inherited_by_exec() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("events.jsonl");
+        File::create(&path).expect("journal fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("public fixture mode");
+
+        let journal = JsonlJournal::open(&path).expect("private journal");
+        assert_eq!(
+            journal
+                .file
+                .metadata()
+                .expect("journal metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let flags = unsafe { libc::fcntl(journal.file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn journal_rejects_a_symbolic_link_before_reading_it() {
+        let directory = tempdir().expect("tempdir");
+        let target = directory.path().join("outside.jsonl");
+        File::create(&target).expect("journal target");
+        let path = directory.path().join("events.jsonl");
+        symlink(&target, &path).expect("journal symlink");
+
+        assert!(matches!(
+            JsonlJournal::open(&path),
+            Err(JournalError::UnsafePath(rejected)) if rejected == path
+        ));
     }
 }
