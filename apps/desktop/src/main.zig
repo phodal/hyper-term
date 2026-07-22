@@ -5450,5 +5450,6 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("tests.zig");
+    _ = @import("agent_projection_tests.zig");
     _ = @import("provider_login_tests.zig");
 }
