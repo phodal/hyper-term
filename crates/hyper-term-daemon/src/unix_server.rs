@@ -18,14 +18,15 @@ impl ConnectionAuthority {
             Self::DesktopController => true,
             Self::AgentMcpConnector { task_id: bound } => match request {
                 ControlRequest::ProposeBrokeredMcpTool { task_id, .. }
-                | ControlRequest::BeginOperation { task_id, .. }
-                | ControlRequest::ExecuteBrokeredMcpTool { task_id, .. }
-                | ControlRequest::CompleteOperation { task_id, .. }
-                | ControlRequest::AcceptGenUiArtifact { task_id, .. } => *task_id == bound,
+                | ControlRequest::RunAuthorizedBrokeredMcpTool { task_id, .. } => *task_id == bound,
                 ControlRequest::Hello { .. }
                 | ControlRequest::CreateTask { .. }
                 | ControlRequest::ProposeOperation { .. }
                 | ControlRequest::DecidePermission { .. }
+                | ControlRequest::BeginOperation { .. }
+                | ControlRequest::ExecuteBrokeredMcpTool { .. }
+                | ControlRequest::CompleteOperation { .. }
+                | ControlRequest::AcceptGenUiArtifact { .. }
                 | ControlRequest::DispatchTerminal { .. }
                 | ControlRequest::OpenUserShell { .. }
                 | ControlRequest::SubscribeTerminal { .. }
@@ -411,6 +412,23 @@ fn handle_request(
                     revision: record.revision,
                     state: record.state,
                 }),
+            ControlRequest::RunAuthorizedBrokeredMcpTool {
+                task_id,
+                operation_id,
+                expected_revision,
+                tool_name,
+                proposal_digest,
+                arguments,
+            } => state
+                .run_authorized_brokered_mcp_tool(
+                    task_id,
+                    operation_id,
+                    expected_revision,
+                    tool_name,
+                    proposal_digest,
+                    arguments,
+                )
+                .map(|execution| ControlResponse::BrokeredMcpToolExecuted { execution }),
             ControlRequest::DecidePermission {
                 task_id,
                 operation_id,

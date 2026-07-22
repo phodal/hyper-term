@@ -16,12 +16,10 @@ use hyper_term_drivers::{
     path_to_file_uri,
 };
 use hyper_term_protocol::{
-    BrokeredMcpToolExecution, ControlRequest, ControlResponse, DomainEvent, GenUiArtifactCandidate,
-    OperationCompletion, OperationId, OperationOutcome, OperationState, PermissionDecision, TaskId,
-    WireFrame,
+    BrokeredMcpToolExecution, ControlRequest, ControlResponse, DomainEvent, OperationId,
+    OperationOutcome, OperationState, PermissionDecision, TaskId, WireFrame,
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -295,147 +293,38 @@ impl<'a, W: Write> McpGateway<'a, W> {
             return Err(McpGatewayError::AuthorizedOperationWasRejected);
         };
         let task_id = self.task_id.ok_or(McpGatewayError::TaskMissing)?;
-        let dispatching_revision = match authority_request(
+        match authority_request(
             &self.socket,
-            ControlRequest::BeginOperation {
+            ControlRequest::RunAuthorizedBrokeredMcpTool {
                 task_id,
                 operation_id,
                 expected_revision: authorized_revision,
+                tool_name: call.name.clone(),
+                proposal_digest: call.proposal.payload_sha256.clone(),
+                arguments: call.arguments.clone(),
             },
         )? {
-            ControlResponse::OperationUpdated {
-                revision,
-                state: OperationState::Dispatching,
-                ..
-            } => revision,
-            ControlResponse::Error { code, message } => {
-                return self.fail_authorized_call(
-                    operation_id,
-                    &pending.request_id,
-                    format!("broker could not begin the tool ({code}): {message}"),
-                );
+            ControlResponse::BrokeredMcpToolExecuted { execution } => {
+                let result = McpToolResult {
+                    text: execution.text,
+                    structured_content: execution.structured_content,
+                    is_error: execution.is_error,
+                };
+                let response = self.server.complete_tool(&pending.request_id, result)?;
+                self.pending.remove(&operation_id);
+                self.write_response(&response)
             }
-            response => {
-                return self.fail_authorized_call(
-                    operation_id,
-                    &pending.request_id,
-                    format!("broker returned an unexpected begin response: {response:?}"),
-                );
-            }
-        };
-        let mut execution = self.execute_tool(task_id, operation_id, dispatching_revision, &call);
-        if call.class == McpToolClass::GenUiCompile
-            && execution.outcome == OperationOutcome::Succeeded
-        {
-            execution.result = self.accept_genui_result(
-                task_id,
+            ControlResponse::Error { code, message } => self.fail_authorized_call(
                 operation_id,
-                dispatching_revision,
-                execution.result,
-            );
-            if execution.result.is_error {
-                execution.outcome = OperationOutcome::Failed;
-            }
-        }
-        let result = execution.result;
-        let result_digest = sha256_json(&result)?;
-        let completion = OperationCompletion {
-            executor: "hyper-term-mcp".into(),
-            succeeded: execution.outcome.succeeded(),
-            outcome: Some(execution.outcome),
-            summary: match execution.outcome {
-                OperationOutcome::Succeeded => format!("{} completed", call.name),
-                OperationOutcome::Failed => format!("{} failed", call.name),
-                OperationOutcome::UnknownExecution => {
-                    format!("{} outcome is unknown", call.name)
-                }
-            },
-            result_digest: Some(result_digest),
-        };
-        match authority_request(
-            &self.socket,
-            ControlRequest::CompleteOperation {
-                task_id,
+                &pending.request_id,
+                format!("Rust authority could not run the tool ({code}): {message}"),
+            ),
+            response => self.fail_authorized_call(
                 operation_id,
-                expected_revision: dispatching_revision,
-                completion,
-            },
-        )? {
-            ControlResponse::OperationUpdated { state, .. }
-                if state
-                    == match execution.outcome {
-                        OperationOutcome::Succeeded => OperationState::Succeeded,
-                        OperationOutcome::Failed => OperationState::Failed,
-                        OperationOutcome::UnknownExecution => OperationState::UnknownExecution,
-                    } => {}
-            ControlResponse::Error { code, message } => {
-                return self.fail_authorized_call(
-                    operation_id,
-                    &pending.request_id,
-                    format!("broker could not record the tool receipt ({code}): {message}"),
-                );
-            }
-            response => {
-                return self.fail_authorized_call(
-                    operation_id,
-                    &pending.request_id,
-                    format!("broker returned an unexpected completion response: {response:?}"),
-                );
-            }
+                &pending.request_id,
+                format!("Rust authority returned an unexpected response: {response:?}"),
+            ),
         }
-        let response = self.server.complete_tool(&pending.request_id, result)?;
-        self.pending.remove(&operation_id);
-        self.write_response(&response)
-    }
-
-    fn accept_genui_result(
-        &self,
-        task_id: TaskId,
-        operation_id: OperationId,
-        dispatching_revision: u64,
-        mut result: McpToolResult,
-    ) -> McpToolResult {
-        let candidate = match result
-            .structured_content
-            .clone()
-            .and_then(|value| serde_json::from_value::<GenUiArtifactCandidate>(value).ok())
-        {
-            Some(candidate) => candidate,
-            None => return tool_failure("GenUI compiler returned an invalid artifact candidate"),
-        };
-        let accepted = match authority_request(
-            &self.socket,
-            ControlRequest::AcceptGenUiArtifact {
-                task_id,
-                operation_id,
-                expected_revision: dispatching_revision,
-                candidate,
-            },
-        ) {
-            Ok(ControlResponse::GenUiArtifactAccepted { artifact }) => artifact,
-            Ok(response) => {
-                return tool_failure(format!(
-                    "permission broker returned an unexpected artifact response: {response:?}"
-                ));
-            }
-            Err(error) => {
-                return tool_failure(format!(
-                    "permission broker rejected the GenUI artifact: {error}"
-                ));
-            }
-        };
-        if let Some(Value::Object(structured)) = result.structured_content.as_mut() {
-            structured.insert(
-                "artifact_id".into(),
-                Value::String(accepted.artifact_id.to_string()),
-            );
-            structured.insert("accepted_by".into(), Value::String("rust_host".into()));
-        }
-        result.text = format!(
-            "Accepted GenUI revision {} as artifact {} ({}).",
-            accepted.source_revision, accepted.artifact_id, accepted.content_digest
-        );
-        result
     }
 
     fn reject_cancelled(&mut self, operation_id: OperationId) -> Result<(), McpGatewayError> {
@@ -503,37 +392,6 @@ impl<'a, W: Write> McpGateway<'a, W> {
             MAX_MCP_FRAME_BYTES,
         )?;
         Ok(())
-    }
-
-    fn execute_tool(
-        &mut self,
-        task_id: TaskId,
-        operation_id: OperationId,
-        dispatching_revision: u64,
-        call: &McpToolCall,
-    ) -> ToolExecution {
-        match call.class {
-            McpToolClass::DiffReview => ToolExecution::definitive(diff_review(&call.arguments)),
-            McpToolClass::DenoLspQuery | McpToolClass::GenUiCompile => match authority_request(
-                &self.socket,
-                ControlRequest::ExecuteBrokeredMcpTool {
-                    task_id,
-                    operation_id,
-                    expected_revision: dispatching_revision,
-                    tool_name: call.name.clone(),
-                    proposal_digest: call.proposal.payload_sha256.clone(),
-                    arguments: call.arguments.clone(),
-                },
-            ) {
-                Ok(ControlResponse::BrokeredMcpToolExecuted { execution }) => execution.into(),
-                Ok(response) => ToolExecution::failed(format!(
-                    "Rust MCP executor returned an unexpected response: {response:?}"
-                )),
-                Err(error) => ToolExecution::failed(format!(
-                    "Rust MCP executor rejected the operation: {error}"
-                )),
-            },
-        }
     }
 }
 
@@ -675,9 +533,10 @@ impl BrokeredMcpExecutor {
         arguments: &Value,
     ) -> BrokeredMcpToolExecution {
         let execution = match tool_name {
+            "hyper_term.diff.review" => ToolExecution::definitive(diff_review(arguments)),
             "hyper_term.lsp.query" => self.execute_lsp(arguments),
             "hyper_term.genui.compile" => self.execute_genui(arguments),
-            _ => ToolExecution::failed("tool is not a brokered Deno executor"),
+            _ => ToolExecution::failed("tool is not a brokered Rust executor"),
         };
         BrokeredMcpToolExecution {
             text: execution.result.text,
@@ -1020,11 +879,6 @@ fn diff_review(arguments: &Value) -> McpToolResult {
             "unifiedDiff": unified
         })),
     )
-}
-
-fn sha256_json(value: &impl serde::Serialize) -> Result<String, McpGatewayError> {
-    let digest = Sha256::digest(serde_json::to_vec(value)?);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn is_sha256(value: &str) -> bool {

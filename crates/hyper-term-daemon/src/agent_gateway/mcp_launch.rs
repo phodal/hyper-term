@@ -50,6 +50,7 @@ impl AgentGatewayRuntime {
             "--task-id".into(),
             task_id.to_string().into(),
         ];
+        let mut registration = BrokeredMcpRuntimeConfig::default();
         if let Some(runtime) = &self.config.genui_runtime {
             let deno_sha256 = match sha256_file(&runtime.deno_executable) {
                 Ok(digest) => digest,
@@ -81,7 +82,7 @@ impl AgentGatewayRuntime {
                     return Some(Err(StartError::Driver));
                 }
             }
-            let registration = BrokeredMcpRuntimeConfig {
+            registration = BrokeredMcpRuntimeConfig {
                 deno_lsp: snapshot.map(|snapshot| DenoMcpExecutorConfig {
                     executable: runtime.deno_executable.clone(),
                     executable_sha256: deno_sha256.clone(),
@@ -104,19 +105,19 @@ impl AgentGatewayRuntime {
                 }),
             };
             let lsp_enabled = registration.deno_lsp.is_some();
-            if self
-                .config
-                .daemon
-                .register_brokered_mcp_runtime(task_id, registration)
-                .is_err()
-            {
-                let _ = std::fs::remove_dir_all(&deno_root);
-                return Some(Err(StartError::Driver));
-            }
             if lsp_enabled {
                 arguments.push("--enable-deno-lsp".into());
             }
             arguments.push("--enable-genui".into());
+        }
+        if self
+            .config
+            .daemon
+            .register_brokered_mcp_runtime(task_id, registration)
+            .is_err()
+        {
+            let _ = std::fs::remove_dir_all(self.brokered_mcp_root(task_id));
+            return Some(Err(StartError::Driver));
         }
         Some(Ok(BrokeredMcpLaunch {
             executable,

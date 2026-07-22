@@ -1,15 +1,19 @@
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use hyper_term_daemon::{
-    ControlClient, ControlClientError, DaemonState, spawn_agent_capability_server,
+    BrokeredMcpRuntimeConfig, ControlClient, ControlClientError, DaemonState,
+    spawn_agent_capability_server,
 };
 use hyper_term_protocol::{
-    ApprovalDetailDigest, BlockId, ControlRequest, ControlResponse, MessageRole, OperationAction,
-    OperationKind, OperationState, RiskClass, TerminalSize, WireFrame,
+    ApprovalDetailDigest, BlockId, ControlRequest, ControlResponse, GenUiArtifactCandidate,
+    GenUiCompilerIdentity, MessageRole, OperationAction, OperationCompletion, OperationKind,
+    OperationOutcome, OperationState, RiskClass, TerminalSize, WireFrame, canonical_mcp_json_bytes,
 };
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -22,6 +26,9 @@ fn agent_capability_endpoint_is_private_task_scoped_and_cannot_self_approve() {
     let state = DaemonState::open(directory.path().join("state")).unwrap();
     let bound_task = state.create_task("bound Agent task".into()).unwrap();
     let other_task = state.create_task("other task".into()).unwrap();
+    state
+        .register_brokered_mcp_runtime(bound_task, BrokeredMcpRuntimeConfig::default())
+        .unwrap();
     let _server = spawn_agent_capability_server(&socket, state.clone(), bound_task).unwrap();
 
     assert_eq!(
@@ -86,6 +93,7 @@ fn agent_capability_endpoint_is_private_task_scoped_and_cannot_self_approve() {
         } => (operation_id, revision),
         response => panic!("unexpected proposal response: {response:?}"),
     };
+    let proposal_digest = diff_proposal_digest();
     assert_denied(client.request(
         ControlRequest::DecidePermission {
             task_id: bound_task,
@@ -96,6 +104,75 @@ fn agent_capability_endpoint_is_private_task_scoped_and_cannot_self_approve() {
         },
         TIMEOUT,
     ));
+    assert_denied(client.request(
+        ControlRequest::BeginOperation {
+            task_id: bound_task,
+            operation_id,
+            expected_revision: revision,
+        },
+        TIMEOUT,
+    ));
+    assert_denied(client.request(
+        ControlRequest::ExecuteBrokeredMcpTool {
+            task_id: bound_task,
+            operation_id,
+            expected_revision: revision,
+            tool_name: "hyper_term.diff.review".into(),
+            proposal_digest: proposal_digest.clone(),
+            arguments: diff_arguments(),
+        },
+        TIMEOUT,
+    ));
+    assert_denied(client.request(
+        ControlRequest::CompleteOperation {
+            task_id: bound_task,
+            operation_id,
+            expected_revision: revision,
+            completion: OperationCompletion {
+                executor: "forged-agent".into(),
+                succeeded: true,
+                outcome: Some(OperationOutcome::Succeeded),
+                summary: "forged receipt".into(),
+                result_digest: None,
+            },
+        },
+        TIMEOUT,
+    ));
+    assert_denied(client.request(
+        ControlRequest::AcceptGenUiArtifact {
+            task_id: bound_task,
+            operation_id,
+            expected_revision: revision,
+            candidate: genui_candidate(),
+        },
+        TIMEOUT,
+    ));
+
+    let authorized = state
+        .decide_permission(
+            bound_task,
+            operation_id,
+            revision,
+            hyper_term_protocol::PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+    let first_execution = run_authorized_diff(
+        &mut client,
+        bound_task,
+        operation_id,
+        authorized.revision,
+        &proposal_digest,
+    );
+    assert!(!first_execution.is_error, "{first_execution:?}");
+    assert_eq!(first_execution.outcome, OperationOutcome::Succeeded);
+    let replayed_execution = run_authorized_diff(
+        &mut client,
+        bound_task,
+        operation_id,
+        authorized.revision,
+        &proposal_digest,
+    );
+    assert_eq!(replayed_execution, first_execution);
 
     while client.recv_timeout(Duration::from_millis(20)).is_ok() {}
 
@@ -140,7 +217,68 @@ fn proposal(task_id: hyper_term_protocol::TaskId) -> ControlRequest {
     ControlRequest::ProposeBrokeredMcpTool {
         task_id,
         tool_name: "hyper_term.diff.review".into(),
-        arguments: serde_json::json!({"before": "a", "after": "b"}),
+        arguments: diff_arguments(),
+    }
+}
+
+fn diff_arguments() -> serde_json::Value {
+    serde_json::json!({"before": "a", "after": "b"})
+}
+
+fn diff_proposal_digest() -> String {
+    Sha256::digest(
+        canonical_mcp_json_bytes(&serde_json::json!({
+            "name": "hyper_term.diff.review",
+            "arguments": diff_arguments(),
+        }))
+        .unwrap(),
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+fn run_authorized_diff(
+    client: &mut ControlClient,
+    task_id: hyper_term_protocol::TaskId,
+    operation_id: hyper_term_protocol::OperationId,
+    revision: u64,
+    proposal_digest: &str,
+) -> hyper_term_protocol::BrokeredMcpToolExecution {
+    match client
+        .request(
+            ControlRequest::RunAuthorizedBrokeredMcpTool {
+                task_id,
+                operation_id,
+                expected_revision: revision,
+                tool_name: "hyper_term.diff.review".into(),
+                proposal_digest: proposal_digest.into(),
+                arguments: diff_arguments(),
+            },
+            TIMEOUT,
+        )
+        .unwrap()
+    {
+        ControlResponse::BrokeredMcpToolExecuted { execution } => execution,
+        response => panic!("unexpected run response: {response:?}"),
+    }
+}
+
+fn genui_candidate() -> GenUiArtifactCandidate {
+    GenUiArtifactCandidate {
+        schema_version: 1,
+        source_revision: 1,
+        entrypoint: "/App.tsx".into(),
+        source_files: BTreeMap::from([("/App.tsx".into(), "export default () => null;".into())]),
+        bundle: "bundle".into(),
+        css: String::new(),
+        source_map: "{}".into(),
+        content_digest: "a".repeat(64),
+        compiler: GenUiCompilerIdentity {
+            name: "esbuild-wasm".into(),
+            version: "test".into(),
+        },
+        diagnostics: Vec::new(),
     }
 }
 

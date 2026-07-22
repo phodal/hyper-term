@@ -24,6 +24,9 @@ fn approved_diff_tool_runs_through_mcp_and_leaves_a_receipt() {
     let state_directory = directory.path().join("state");
     let state = DaemonState::open(&state_directory).unwrap();
     let agent_task_id = state.create_task("Codex Agent session 1".into()).unwrap();
+    state
+        .register_brokered_mcp_runtime(agent_task_id, BrokeredMcpRuntimeConfig::default())
+        .unwrap();
     let _server = spawn_agent_capability_server(&socket, state.clone(), agent_task_id).unwrap();
     let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
     client_io
@@ -118,7 +121,7 @@ fn approved_diff_tool_runs_through_mcp_and_leaves_a_receipt() {
                 outcome: Some(OperationOutcome::Succeeded),
                 result_digest: Some(digest),
                 ..
-            } if *id == operation_id && executor == "hyper-term-mcp" && digest.len() == 64
+            } if *id == operation_id && executor == "hyper-term-daemon" && digest.len() == 64
         )
     }));
 
@@ -407,7 +410,7 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
                         executor,
                         outcome: Some(OperationOutcome::Succeeded),
                         ..
-                    } if *id == operation_id && executor == "hyper-term-mcp"
+                    } if *id == operation_id && executor == "hyper-term-daemon"
                 )
             })
     );

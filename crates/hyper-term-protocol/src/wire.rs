@@ -67,6 +67,14 @@ pub enum ControlRequest {
         tool_name: String,
         arguments: serde_json::Value,
     },
+    RunAuthorizedBrokeredMcpTool {
+        task_id: TaskId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        tool_name: String,
+        proposal_digest: String,
+        arguments: serde_json::Value,
+    },
     DecidePermission {
         task_id: TaskId,
         operation_id: OperationId,
@@ -499,6 +507,24 @@ mod tests {
                     "source": "export default function App(){ return <main />; }",
                     "entry": "App.tsx"
                 }),
+            },
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &original).expect("encode");
+        assert_eq!(read_frame(bytes.as_slice()).expect("decode"), original);
+    }
+
+    #[test]
+    fn authorized_brokered_mcp_run_round_trips_as_one_capability_request() {
+        let original = WireFrame::Request(ControlRequestEnvelope {
+            request_id: RequestId::new(),
+            request: ControlRequest::RunAuthorizedBrokeredMcpTool {
+                task_id: TaskId::new(),
+                operation_id: OperationId::new(),
+                expected_revision: 3,
+                tool_name: "hyper_term.diff.review".into(),
+                proposal_digest: "b".repeat(64),
+                arguments: serde_json::json!({"before": "a", "after": "b"}),
             },
         });
         let mut bytes = Vec::new();
