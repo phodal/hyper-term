@@ -142,6 +142,12 @@ test "desktop defers WebViews until native glass and mounts GenUI on demand" {
     try testing.expectEqualStrings(main.terminal_view_label, mounted_views[1].label);
     try testing.expectEqualStrings(main.genui_view_label, mounted_views[2].label);
     try testing.expect(mounted_views[2].focused);
+
+    app_state.model.session_slots[0].mode = .agent;
+    try app.event(&harness.runtime, .{ .lifecycle = .frame });
+    try testing.expect(!app_state.model.genui_webview_mounted);
+    try testing.expectEqual(@as(usize, 2), harness.runtime.listViews(1, &views_buffer).len);
+    try testing.expect(harness.runtime.listViews(1, &views_buffer)[0].focused);
 }
 
 test "desktop focus lease follows Terminal tabs and returns to Native Agent canvas" {
@@ -1284,8 +1290,7 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
     main.update(&model, tree.msgForPointer(close_editor.id, .up).?, &fx);
     try testing.expect(!model.hasAgentEditor());
     try testing.expect(model.canOpenAgentEditor());
-    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
-    try testing.expectEqualStrings("zero://inline", panes[1].url);
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
 
     tree = try buildTree(arena, &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);

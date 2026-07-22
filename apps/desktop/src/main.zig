@@ -1386,16 +1386,15 @@ pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize 
         };
         count += 1;
     }
-    if (model.genui_webview_mounted and count < out.len) {
-        out[count] = if (model.isCapsule() or model.hasAgentEditor()) .{
+    if (model.genui_webview_mounted and
+        (model.isCapsule() or model.hasAgentEditor()) and
+        count < out.len)
+    {
+        out[count] = .{
             .label = genui_view_label,
             .anchor = genui_view_anchor,
             .url = model.genUiWorkbenchUrl(),
             .reload_token = model.genui_source_revision,
-        } else .{
-            .label = genui_view_label,
-            .frame = geometry.RectF.init(0, 0, 1, 1),
-            .url = "zero://inline",
         };
         count += 1;
     }
@@ -1545,6 +1544,8 @@ pub const DeferredWebViewApp = struct {
         try self.mountTerminal(runtime);
         if (self.model.isCapsule() or self.model.hasAgentEditor()) {
             try self.mountGenUi(runtime);
+        } else {
+            try self.unmountGenUi(runtime);
         }
         self.projectInputFocus(runtime);
     }
@@ -1616,6 +1617,13 @@ pub const DeferredWebViewApp = struct {
             .url = url,
         });
         self.model.genui_webview_mounted = true;
+    }
+
+    fn unmountGenUi(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) !void {
+        if (!self.model.genui_webview_mounted) return;
+        try runtime.closeView(self.primary_window_id, genui_view_label);
+        self.model.genui_webview_mounted = false;
+        if (self.focused_surface == .genui) self.focused_surface = .none;
     }
 
     /// Transfers the platform first responder only when the active interactive

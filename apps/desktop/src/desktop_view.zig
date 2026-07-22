@@ -581,7 +581,10 @@ pub fn DesktopView(
                     ui.button(.{ .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Cancel"),
                     ui.button(.{ .size = .sm, .variant = .destructive, .on_press = Msg{ .reject_agent_effect = block.operationId() }, .disabled = model.agentPermissionBusy() }, "Reject"),
                 });
-            return ui.el(.card, .{ .style_tokens = .{ .border_color = .warning } }, .{
+            return ui.el(.card, .{
+                .global_key = canvas.uiKey(block.id),
+                .style_tokens = .{ .border_color = .warning },
+            }, .{
                 ui.column(.{ .gap = 6, .padding = 8 }, .{
                     ui.row(.{ .gap = 6, .cross = .center }, .{
                         ui.icon(.{ .width = 13, .height = 13, .style_tokens = .{ .foreground = .warning } }, "alert"),

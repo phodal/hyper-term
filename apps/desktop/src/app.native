@@ -114,7 +114,7 @@
 </template>
 
 <template name="agent-editor">
-  <column min-width="360" grow="1" background="background" label="ACP artifact editor">
+  <column global-key="{genUiArtifactLabel}" min-width="360" grow="1" background="background" label="ACP artifact editor">
     <row gap="8" padding="9" cross="center" background="surface_subtle">
       <icon name="edit" width="13" height="13" foreground="accent" />
       <text grow="1"><span weight="medium">Edit</span></text>
