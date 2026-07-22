@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 const MAX_GITHUB_TOKEN_BYTES: u64 = 64 * 1024;
 
 #[cfg(unix)]
-fn take_valid_token(bytes: &mut Vec<u8>) -> Result<OsString, std::io::Error> {
+fn take_valid_token(bytes: &mut [u8]) -> Result<OsString, std::io::Error> {
     use std::os::unix::ffi::OsStringExt;
 
     let start = bytes
