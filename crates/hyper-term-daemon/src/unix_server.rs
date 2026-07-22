@@ -1,24 +1,61 @@
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::*;
+use crate::agent_capability::{
+    AgentCapabilityPolicy, CapabilityControl, CapabilityRevocationReason,
+};
 
-#[derive(Clone, Copy)]
-enum ConnectionAuthority {
+#[derive(Clone)]
+struct ConnectionAuthority {
+    scope: ConnectionScope,
+    control: Arc<CapabilityControl>,
+}
+
+#[derive(Clone)]
+enum ConnectionScope {
     DesktopController,
-    AgentMcpConnector { task_id: TaskId },
+    AgentMcpConnector {
+        task_id: TaskId,
+        allowed_tools: Arc<[String]>,
+    },
 }
 
 impl ConnectionAuthority {
-    fn allows_request(self, request: &ControlRequest) -> bool {
-        match self {
-            Self::DesktopController => true,
-            Self::AgentMcpConnector { task_id: bound } => match request {
-                ControlRequest::ProposeBrokeredMcpTool { task_id, .. }
-                | ControlRequest::RunAuthorizedBrokeredMcpTool { task_id, .. } => *task_id == bound,
+    fn desktop() -> Self {
+        Self {
+            scope: ConnectionScope::DesktopController,
+            control: CapabilityControl::desktop(),
+        }
+    }
+
+    fn agent(policy: &AgentCapabilityPolicy, control: Arc<CapabilityControl>) -> Self {
+        Self {
+            scope: ConnectionScope::AgentMcpConnector {
+                task_id: policy.task_id,
+                allowed_tools: Arc::from(policy.allowed_tools.clone()),
+            },
+            control,
+        }
+    }
+
+    fn allows_request(&self, request: &ControlRequest) -> bool {
+        match &self.scope {
+            ConnectionScope::DesktopController => true,
+            ConnectionScope::AgentMcpConnector {
+                task_id: bound,
+                allowed_tools,
+            } => match request {
+                ControlRequest::ProposeBrokeredMcpTool {
+                    task_id, tool_name, ..
+                }
+                | ControlRequest::RunAuthorizedBrokeredMcpTool {
+                    task_id, tool_name, ..
+                } => task_id == bound && allowed_tools.iter().any(|allowed| allowed == tool_name),
                 ControlRequest::Hello { .. }
                 | ControlRequest::CreateTask { .. }
                 | ControlRequest::ProposeOperation { .. }
@@ -39,30 +76,51 @@ impl ConnectionAuthority {
         }
     }
 
-    fn allows_terminal_input(self) -> bool {
-        matches!(self, Self::DesktopController)
+    fn allows_terminal_input(&self) -> bool {
+        matches!(&self.scope, ConnectionScope::DesktopController)
     }
 
-    fn allows_broadcast(self, response: &ControlResponse) -> bool {
-        match self {
-            Self::DesktopController => true,
-            Self::AgentMcpConnector { task_id } => matches!(
+    fn allows_broadcast(&self, response: &ControlResponse) -> bool {
+        match &self.scope {
+            ConnectionScope::DesktopController => true,
+            ConnectionScope::AgentMcpConnector { task_id, .. } => matches!(
                 response,
-                ControlResponse::Event { event } if event.task_id == task_id
+                ControlResponse::Event { event } if event.task_id == *task_id
             ),
         }
+    }
+
+    fn is_active(&self) -> bool {
+        self.control.is_active()
+    }
+
+    fn record_invalid_request(&self) -> bool {
+        self.control.record_invalid_request()
+    }
+
+    fn revoke(&self, reason: CapabilityRevocationReason) {
+        self.control.revoke(reason);
     }
 }
 
 pub struct UnixServerHandle {
     path: PathBuf,
     stop: Arc<AtomicBool>,
+    control: Arc<CapabilityControl>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+impl UnixServerHandle {
+    pub(crate) fn revoke(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.control
+            .revoke(CapabilityRevocationReason::ServerDropped);
+    }
 }
 
 impl Drop for UnixServerHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.revoke();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -74,7 +132,7 @@ pub fn spawn_unix_server(
     path: impl AsRef<Path>,
     state: DaemonState,
 ) -> Result<UnixServerHandle, DaemonError> {
-    spawn_server(path, state, ConnectionAuthority::DesktopController)
+    spawn_server(path, state, ConnectionAuthority::desktop())
 }
 
 /// Starts a server-assigned, task-scoped endpoint for the MCP connector inside
@@ -85,11 +143,34 @@ pub fn spawn_agent_capability_server(
     state: DaemonState,
     task_id: TaskId,
 ) -> Result<UnixServerHandle, DaemonError> {
-    spawn_server(
-        path,
-        state,
-        ConnectionAuthority::AgentMcpConnector { task_id },
-    )
+    let policy = AgentCapabilityPolicy::new(
+        task_id,
+        [
+            "hyper_term.diff.review".into(),
+            "hyper_term.lsp.query".into(),
+            "hyper_term.genui.compile".into(),
+        ],
+    )?;
+    spawn_agent_capability_server_with_policy(path, state, policy)
+}
+
+pub fn spawn_agent_capability_server_with_policy(
+    path: impl AsRef<Path>,
+    state: DaemonState,
+    policy: AgentCapabilityPolicy,
+) -> Result<UnixServerHandle, DaemonError> {
+    policy.validate()?;
+    state.require_task(policy.task_id)?;
+    let task_id = policy.task_id;
+    let revoke_state = state.clone();
+    let control = CapabilityControl::agent(
+        &policy,
+        Box::new(move |reason| {
+            let _ = revoke_state.revoke_pending_brokered_mcp_operations(task_id, reason.message());
+        }),
+    )?;
+    let authority = ConnectionAuthority::agent(&policy, Arc::clone(&control));
+    spawn_server(path, state, authority)
 }
 
 fn spawn_server(
@@ -102,12 +183,18 @@ fn spawn_server(
     listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let thread_authority = authority.clone();
+    let thread_path = path.clone();
     let thread = thread::Builder::new()
         .name("hyperd-accept".into())
-        .spawn(move || accept_until_stopped(listener, state, authority, thread_stop))?;
+        .spawn(move || {
+            let _cleanup = SocketCleanup(thread_path);
+            accept_until_stopped(listener, state, thread_authority, thread_stop)
+        })?;
     Ok(UnixServerHandle {
         path,
         stop,
+        control: authority.control,
         thread: Some(thread),
     })
 }
@@ -116,13 +203,10 @@ pub fn run_unix_server(path: impl AsRef<Path>, state: DaemonState) -> Result<(),
     let path = path.as_ref().to_path_buf();
     let listener = bind_socket(&path)?;
     let _cleanup = SocketCleanup(path);
+    let authority = ConnectionAuthority::desktop();
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => spawn_connection(
-                stream,
-                state.clone(),
-                ConnectionAuthority::DesktopController,
-            )?,
+            Ok(stream) => spawn_connection(stream, state.clone(), authority.clone())?,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error.into()),
         }
@@ -163,16 +247,19 @@ fn accept_until_stopped(
     authority: ConnectionAuthority,
     stop: Arc<AtomicBool>,
 ) {
-    while !stop.load(Ordering::Acquire) {
+    while !stop.load(Ordering::Acquire) && authority.is_active() {
         match listener.accept() {
             Ok((stream, _)) => {
-                let _ = spawn_connection(stream, state.clone(), authority);
+                let _ = spawn_connection(stream, state.clone(), authority.clone());
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Err(_) => {
+                authority.revoke(CapabilityRevocationReason::ListenerFailed);
+                break;
+            }
         }
     }
 }
@@ -187,9 +274,14 @@ fn spawn_connection(
     // the framed protocol blocking and avoid treating a handshake race as
     // an invalid frame.
     stream.set_nonblocking(false)?;
+    let Some(connection) = authority.control.register_connection(&stream)? else {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    };
     thread::Builder::new()
         .name("hyperd-client".into())
         .spawn(move || {
+            let _connection = connection;
             let _ = handle_connection(stream, state, authority);
         })?;
     Ok(())
@@ -256,6 +348,10 @@ fn handle_connection(
         }
         _ => return Err(DaemonError::HelloRequired),
     };
+    if !authority.is_active() {
+        let _ = writer.response(Some(hello_request), capability_revoked());
+        return Ok(());
+    }
     // Register the event stream before acknowledging the handshake. A
     // client may act as soon as `connect` returns, so sending `Welcome`
     // first leaves a window where authority events can be lost.
@@ -273,11 +369,12 @@ fn handle_connection(
     };
 
     let control_writer = writer.clone();
+    let event_authority = authority.clone();
     thread::Builder::new()
         .name(format!("hyperd-events-{client_id}"))
         .spawn(move || {
             while let Ok(response) = control.recv() {
-                if !authority.allows_broadcast(&response) {
+                if !event_authority.allows_broadcast(&response) {
                     continue;
                 }
                 if control_writer.response(None, response).is_err() {
@@ -312,11 +409,16 @@ fn handle_connection(
         };
         match frame {
             WireFrame::Request(request) => {
-                handle_request(&state, &writer, client_id, authority, request)?;
+                if !handle_request(&state, &writer, client_id, &authority, request)? {
+                    break;
+                }
             }
             WireFrame::TerminalInput(frame) => {
                 if !authority.allows_terminal_input() {
                     writer.response(None, authority_denied())?;
+                    if authority.record_invalid_request() {
+                        break;
+                    }
                 } else if let Err(error) = state.write_terminal_input(client_id, frame) {
                     writer.response(None, error_response(&error))?;
                 }
@@ -331,6 +433,9 @@ fn handle_connection(
                         message: "client sent a daemon-only frame".into(),
                     },
                 )?;
+                if authority.record_invalid_request() {
+                    break;
+                }
             }
         }
     }
@@ -352,13 +457,13 @@ fn handle_request(
     state: &DaemonState,
     writer: &ConnectionWriter,
     session_client_id: ClientId,
-    authority: ConnectionAuthority,
+    authority: &ConnectionAuthority,
     envelope: ControlRequestEnvelope,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
     let request_id = envelope.request_id;
     if !authority.allows_request(&envelope.request) {
         writer.response(Some(request_id), authority_denied())?;
-        return Ok(());
+        return Ok(!authority.record_invalid_request());
     }
     if let ControlRequest::SubscribeTerminal {
         terminal_id,
@@ -378,7 +483,7 @@ fn handle_request(
             }
             Err(error) => writer.response(Some(request_id), error_response(&error))?,
         }
-        return Ok(());
+        return Ok(true);
     }
 
     let response =
@@ -551,7 +656,7 @@ fn handle_request(
             Err(error) => error_response(&error),
         },
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn spawn_terminal_forwarder(
@@ -640,5 +745,12 @@ fn authority_denied() -> ControlResponse {
     ControlResponse::Error {
         code: "authority_denied".into(),
         message: "request is not allowed for this connection".into(),
+    }
+}
+
+fn capability_revoked() -> ControlResponse {
+    ControlResponse::Error {
+        code: "capability_revoked".into(),
+        message: "Agent capability is expired or revoked".into(),
     }
 }

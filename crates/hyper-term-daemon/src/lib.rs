@@ -41,6 +41,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod acp_provider_home;
+#[cfg(unix)]
+mod agent_capability;
 mod agent_gateway;
 mod agent_provider_probe;
 mod agent_session_store;
@@ -97,6 +99,8 @@ pub use isolated_result_store::{
     IsolatedResultReview,
 };
 
+#[cfg(unix)]
+pub use agent_capability::AgentCapabilityPolicy;
 pub use agent_gateway::{
     AcpAgentProviderConfig, AgentGatewayConfig, AgentGatewayError, AgentGatewayHandle,
     AgentGenUiRuntimeConfig, AgentProviderContainment, AgentProviderReadiness, AgentProviderStatus,
@@ -1345,7 +1349,8 @@ mod unix_server;
 
 #[cfg(unix)]
 pub use unix_server::{
-    UnixServerHandle, run_unix_server, spawn_agent_capability_server, spawn_unix_server,
+    UnixServerHandle, run_unix_server, spawn_agent_capability_server,
+    spawn_agent_capability_server_with_policy, spawn_unix_server,
 };
 
 #[derive(Debug, Error)]
@@ -1451,6 +1456,8 @@ pub enum DaemonError {
     BrokeredMcpBindingMismatch,
     #[error("brokered MCP operation was replayed with different inputs")]
     BrokeredMcpReplayMismatch,
+    #[error("Agent MCP capability policy is invalid or unbounded")]
+    InvalidAgentCapabilityPolicy,
     #[error("the negotiated local MCP runtime for this call is not recorded")]
     LocalMcpRuntimeNotRecorded,
     #[error("terminal dispatch only supports an exact shell action")]
@@ -1577,6 +1584,7 @@ impl DaemonError {
             | Self::BrokeredMcpArgumentsTooLarge(_)
             | Self::BrokeredMcpBindingMismatch
             | Self::BrokeredMcpReplayMismatch
+            | Self::InvalidAgentCapabilityPolicy
             | Self::InvalidLocalMcpRuntimeReceipt
             | Self::InvalidLocalMcpToolCallReceipt
             | Self::LocalMcpRuntimeNotRecorded

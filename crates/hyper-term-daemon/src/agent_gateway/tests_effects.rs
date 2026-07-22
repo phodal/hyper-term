@@ -929,6 +929,47 @@
             .collect::<Vec<_>>();
         assert!(degraded_arguments.contains(&std::borrow::Cow::Borrowed("--enable-genui")));
         assert!(!degraded_arguments.contains(&std::borrow::Cow::Borrowed("--enable-deno-lsp")));
+        let mut degraded_client = crate::ControlClient::connect(
+            &degraded.capability_socket,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            degraded_client
+                .request(
+                    hyper_term_protocol::ControlRequest::ProposeBrokeredMcpTool {
+                        task_id: degraded_task,
+                        tool_name: "hyper_term.lsp.query".into(),
+                        arguments: serde_json::json!({
+                            "method": "textDocument/documentSymbol",
+                            "path": "src/main.ts"
+                        }),
+                    },
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+            hyper_term_protocol::ControlResponse::Error { code, .. }
+                if code == "authority_denied"
+        ));
+        assert!(matches!(
+            degraded_client
+                .request(
+                    hyper_term_protocol::ControlRequest::ProposeBrokeredMcpTool {
+                        task_id: degraded_task,
+                        tool_name: "hyper_term.genui.compile".into(),
+                        arguments: serde_json::json!({
+                            "source": "export default function App(){ return <main>Ready</main>; }",
+                            "entry": "/App.tsx"
+                        }),
+                    },
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+            hyper_term_protocol::ControlResponse::OperationUpdated {
+                state: OperationState::WaitingHuman,
+                ..
+            }
+        ));
         assert!(
             !state_directory
                 .join("brokered-mcp")

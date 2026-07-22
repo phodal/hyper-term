@@ -31,38 +31,28 @@ impl AgentGatewayRuntime {
             .parent()?
             .join(".acp")
             .join(&task_key[..16]);
-        let capability_server = match spawn_agent_capability_server(
-            &capability_socket,
-            self.config.daemon.clone(),
-            task_id,
-        ) {
-            Ok(server) => server,
-            Err(_) => return Some(Err(StartError::Driver)),
-        };
-        let capability_socket = match capability_socket.canonicalize() {
-            Ok(socket) => socket,
-            Err(_) => return Some(Err(StartError::Driver)),
-        };
-        let mut arguments = vec![
-            "--agent-mode".into(),
-            "--socket".into(),
-            capability_socket.clone().into_os_string(),
-            "--task-id".into(),
-            task_id.to_string().into(),
-        ];
         let mut registration = BrokeredMcpRuntimeConfig::default();
         if let Some(runtime) = &self.config.genui_runtime {
             let deno_sha256 = match sha256_file(&runtime.deno_executable) {
                 Ok(digest) => digest,
-                Err(_) => return Some(Err(StartError::Driver)),
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(self.brokered_mcp_root(task_id));
+                    return Some(Err(StartError::Driver));
+                }
             };
             let script_sha256 = match sha256_file(&runtime.compiler_script) {
                 Ok(digest) => digest,
-                Err(_) => return Some(Err(StartError::Driver)),
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(self.brokered_mcp_root(task_id));
+                    return Some(Err(StartError::Driver));
+                }
             };
             let wasm_sha256 = match sha256_file(&runtime.compiler_wasm) {
                 Ok(digest) => digest,
-                Err(_) => return Some(Err(StartError::Driver)),
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(self.brokered_mcp_root(task_id));
+                    return Some(Err(StartError::Driver));
+                }
             };
             let deno_root = self.brokered_mcp_root(task_id);
             if create_private_runtime_root(&deno_root).is_err() {
@@ -79,6 +69,7 @@ impl AgentGatewayRuntime {
             let genui_scratch = deno_root.join("genui-scratch");
             for directory in [&lsp_cache, &lsp_scratch, &genui_cache, &genui_scratch] {
                 if create_private_runtime_root(directory).is_err() {
+                    let _ = std::fs::remove_dir_all(&deno_root);
                     return Some(Err(StartError::Driver));
                 }
             }
@@ -104,12 +95,16 @@ impl AgentGatewayRuntime {
                     scratch_directory: genui_scratch,
                 }),
             };
-            let lsp_enabled = registration.deno_lsp.is_some();
-            if lsp_enabled {
-                arguments.push("--enable-deno-lsp".into());
-            }
-            arguments.push("--enable-genui".into());
         }
+        let mut allowed_tools = vec!["hyper_term.diff.review".to_owned()];
+        if registration.deno_lsp.is_some() {
+            allowed_tools.push("hyper_term.lsp.query".to_owned());
+        }
+        if registration.deno_genui.is_some() {
+            allowed_tools.push("hyper_term.genui.compile".to_owned());
+        }
+        let lsp_enabled = registration.deno_lsp.is_some();
+        let genui_enabled = registration.deno_genui.is_some();
         if self
             .config
             .daemon
@@ -118,6 +113,45 @@ impl AgentGatewayRuntime {
         {
             let _ = std::fs::remove_dir_all(self.brokered_mcp_root(task_id));
             return Some(Err(StartError::Driver));
+        }
+        let policy = match AgentCapabilityPolicy::new(task_id, allowed_tools) {
+            Ok(policy) => policy,
+            Err(_) => {
+                self.cleanup_brokered_mcp_runtime(task_id);
+                return Some(Err(StartError::Driver));
+            }
+        };
+        let capability_server = match spawn_agent_capability_server_with_policy(
+            &capability_socket,
+            self.config.daemon.clone(),
+            policy,
+        ) {
+            Ok(server) => server,
+            Err(_) => {
+                self.cleanup_brokered_mcp_runtime(task_id);
+                return Some(Err(StartError::Driver));
+            }
+        };
+        let capability_socket = match capability_socket.canonicalize() {
+            Ok(socket) => socket,
+            Err(_) => {
+                drop(capability_server);
+                self.cleanup_brokered_mcp_runtime(task_id);
+                return Some(Err(StartError::Driver));
+            }
+        };
+        let mut arguments = vec![
+            "--agent-mode".into(),
+            "--socket".into(),
+            capability_socket.clone().into_os_string(),
+            "--task-id".into(),
+            task_id.to_string().into(),
+        ];
+        if lsp_enabled {
+            arguments.push("--enable-deno-lsp".into());
+        }
+        if genui_enabled {
+            arguments.push("--enable-genui".into());
         }
         Some(Ok(BrokeredMcpLaunch {
             executable,

@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use hyper_term_protocol::{
-    BrokeredMcpToolExecution, GenUiArtifactCandidate, OperationAction, OperationCompletion,
-    OperationId, OperationOutcome, OperationState, TaskId, canonical_mcp_json_bytes,
+    Actor, BrokeredMcpToolExecution, DomainEvent, GenUiArtifactCandidate, NewEvent,
+    OperationAction, OperationCompletion, OperationId, OperationOutcome, OperationState,
+    PermissionDecision, TaskId, canonical_mcp_json_bytes,
 };
 use sha2::{Digest, Sha256};
 
@@ -23,6 +24,80 @@ pub(super) struct CachedBrokeredMcpExecution {
 }
 
 impl DaemonState {
+    pub(crate) fn revoke_pending_brokered_mcp_operations(
+        &self,
+        task_id: TaskId,
+        reason: &str,
+    ) -> Result<usize, DaemonError> {
+        let candidates = {
+            let authority = lock(&self.inner.authority)?;
+            authority
+                .operations
+                .records()
+                .filter(|record| {
+                    record.task_id == task_id
+                        && matches!(&record.action, OperationAction::BrokeredMcpToolCall { .. })
+                        && matches!(
+                            record.state,
+                            OperationState::WaitingHuman | OperationState::Authorized
+                        )
+                })
+                .map(|record| record.operation_id)
+                .collect::<Vec<_>>()
+        };
+        let mut revoked = 0;
+        for operation_id in candidates {
+            if matches!(
+                self.cancel_brokered_mcp_operation(task_id, operation_id, reason),
+                Ok(true)
+            ) {
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
+    }
+
+    fn cancel_brokered_mcp_operation(
+        &self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        reason: &str,
+    ) -> Result<bool, DaemonError> {
+        let record = self.operation(operation_id)?;
+        if record.task_id != task_id
+            || !matches!(record.action, OperationAction::BrokeredMcpToolCall { .. })
+            || !matches!(
+                record.state,
+                OperationState::WaitingHuman | OperationState::Authorized
+            )
+        {
+            return Ok(false);
+        }
+        if record.state == OperationState::WaitingHuman {
+            self.record(NewEvent {
+                task_id,
+                run_id: None,
+                operation_id: Some(operation_id),
+                causation_id: None,
+                correlation_id: None,
+                payload: DomainEvent::PermissionDecided {
+                    operation_revision: record.revision,
+                    decision: PermissionDecision::Cancelled,
+                    actor: Actor::System,
+                },
+            })?;
+        }
+        self.transition(
+            task_id,
+            operation_id,
+            record.revision,
+            OperationState::Cancelled,
+            Actor::System,
+            Some(reason.to_owned()),
+        )?;
+        Ok(true)
+    }
+
     pub fn register_brokered_mcp_runtime(
         &self,
         task_id: TaskId,

@@ -2,16 +2,17 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyper_term_daemon::{
-    BrokeredMcpRuntimeConfig, ControlClient, ControlClientError, DaemonState,
-    spawn_agent_capability_server,
+    AgentCapabilityPolicy, BrokeredMcpRuntimeConfig, ControlClient, ControlClientError,
+    DaemonState, spawn_agent_capability_server, spawn_agent_capability_server_with_policy,
 };
 use hyper_term_protocol::{
-    ApprovalDetailDigest, BlockId, ControlRequest, ControlResponse, GenUiArtifactCandidate,
-    GenUiCompilerIdentity, MessageRole, OperationAction, OperationCompletion, OperationKind,
-    OperationOutcome, OperationState, RiskClass, TerminalSize, WireFrame, canonical_mcp_json_bytes,
+    ApprovalDetailDigest, BlockId, BlockPayload, ControlRequest, ControlResponse,
+    GenUiArtifactCandidate, GenUiCompilerIdentity, MessageRole, OperationAction,
+    OperationCompletion, OperationId, OperationKind, OperationOutcome, OperationState, RiskClass,
+    TaskId, TerminalSize, WireFrame, canonical_mcp_json_bytes,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -29,7 +30,19 @@ fn agent_capability_endpoint_is_private_task_scoped_and_cannot_self_approve() {
     state
         .register_brokered_mcp_runtime(bound_task, BrokeredMcpRuntimeConfig::default())
         .unwrap();
-    let _server = spawn_agent_capability_server(&socket, state.clone(), bound_task).unwrap();
+    let policy = AgentCapabilityPolicy::new(
+        bound_task,
+        [
+            "hyper_term.diff.review".into(),
+            "hyper_term.lsp.query".into(),
+            "hyper_term.genui.compile".into(),
+        ],
+    )
+    .unwrap()
+    .with_invalid_request_limit(16)
+    .unwrap();
+    let _server =
+        spawn_agent_capability_server_with_policy(&socket, state.clone(), policy).unwrap();
 
     assert_eq!(
         std::fs::metadata(&socket_root)
@@ -211,6 +224,173 @@ fn agent_capability_endpoint_is_private_task_scoped_and_cannot_self_approve() {
         }
     }
     panic!("bound task event was not delivered");
+}
+
+#[test]
+fn agent_capability_exposes_only_the_registered_tool_catalog() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("mcp.sock");
+    let state = DaemonState::open(directory.path().join("state")).unwrap();
+    let task_id = state
+        .create_task("catalog-bound Agent task".into())
+        .unwrap();
+    state
+        .register_brokered_mcp_runtime(task_id, BrokeredMcpRuntimeConfig::default())
+        .unwrap();
+    let policy = AgentCapabilityPolicy::new(task_id, ["hyper_term.diff.review".into()]).unwrap();
+    let _server = spawn_agent_capability_server_with_policy(&socket, state, policy).unwrap();
+    let mut client = ControlClient::connect(&socket, TIMEOUT).unwrap();
+
+    assert_denied(client.request(
+        ControlRequest::ProposeBrokeredMcpTool {
+            task_id,
+            tool_name: "hyper_term.genui.compile".into(),
+            arguments: serde_json::json!({}),
+        },
+        TIMEOUT,
+    ));
+    assert!(matches!(
+        client.request(proposal(task_id), TIMEOUT).unwrap(),
+        ControlResponse::OperationUpdated {
+            state: OperationState::WaitingHuman,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn dropping_capability_revokes_connections_and_cancels_pending_operations() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("mcp.sock");
+    let state = DaemonState::open(directory.path().join("state")).unwrap();
+    let task_id = state.create_task("revoked Agent task".into()).unwrap();
+    state
+        .register_brokered_mcp_runtime(task_id, BrokeredMcpRuntimeConfig::default())
+        .unwrap();
+    let server = spawn_agent_capability_server(&socket, state.clone(), task_id).unwrap();
+    let mut client = ControlClient::connect(&socket, TIMEOUT).unwrap();
+    let (operation_id, revision) = proposed_operation(&mut client, task_id);
+    state
+        .decide_permission(
+            task_id,
+            operation_id,
+            revision,
+            hyper_term_protocol::PermissionDecision::AllowOnce,
+        )
+        .unwrap();
+
+    drop(server);
+
+    wait_for_operation_state(&state, task_id, operation_id, OperationState::Cancelled);
+    assert!(!socket.exists());
+    assert_disconnected(&mut client);
+}
+
+#[test]
+fn invalid_request_budget_revokes_the_whole_capability() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("mcp.sock");
+    let state = DaemonState::open(directory.path().join("state")).unwrap();
+    let task_id = state.create_task("budgeted Agent task".into()).unwrap();
+    state
+        .register_brokered_mcp_runtime(task_id, BrokeredMcpRuntimeConfig::default())
+        .unwrap();
+    let policy = AgentCapabilityPolicy::new(task_id, ["hyper_term.diff.review".into()])
+        .unwrap()
+        .with_invalid_request_limit(2)
+        .unwrap();
+    let _server =
+        spawn_agent_capability_server_with_policy(&socket, state.clone(), policy).unwrap();
+    let mut observer = ControlClient::connect(&socket, TIMEOUT).unwrap();
+    let (operation_id, _) = proposed_operation(&mut observer, task_id);
+    let mut attacker = ControlClient::connect(&socket, TIMEOUT).unwrap();
+
+    for _ in 0..2 {
+        assert_denied(attacker.request(ControlRequest::GetBlockSnapshot { task_id }, TIMEOUT));
+    }
+
+    wait_for_operation_state(&state, task_id, operation_id, OperationState::Cancelled);
+    assert_disconnected(&mut observer);
+}
+
+#[test]
+fn expired_capability_cancels_work_that_was_not_dispatched() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("mcp.sock");
+    let state = DaemonState::open(directory.path().join("state")).unwrap();
+    let task_id = state.create_task("expiring Agent task".into()).unwrap();
+    state
+        .register_brokered_mcp_runtime(task_id, BrokeredMcpRuntimeConfig::default())
+        .unwrap();
+    let policy = AgentCapabilityPolicy::new(task_id, ["hyper_term.diff.review".into()])
+        .unwrap()
+        .with_lifetime(Duration::from_millis(250))
+        .unwrap();
+    let _server =
+        spawn_agent_capability_server_with_policy(&socket, state.clone(), policy).unwrap();
+    let mut client = ControlClient::connect(&socket, TIMEOUT).unwrap();
+    let (operation_id, _) = proposed_operation(&mut client, task_id);
+
+    wait_for_operation_state(&state, task_id, operation_id, OperationState::Cancelled);
+    assert_disconnected(&mut client);
+}
+
+fn proposed_operation(client: &mut ControlClient, task_id: TaskId) -> (OperationId, u64) {
+    match client.request(proposal(task_id), TIMEOUT).unwrap() {
+        ControlResponse::OperationUpdated {
+            operation_id,
+            revision,
+            state: OperationState::WaitingHuman,
+            ..
+        } => (operation_id, revision),
+        response => panic!("unexpected proposal response: {response:?}"),
+    }
+}
+
+fn wait_for_operation_state(
+    state: &DaemonState,
+    task_id: TaskId,
+    operation_id: OperationId,
+    expected: OperationState,
+) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if state
+            .block_snapshot(task_id)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| {
+                matches!(
+                    &block.payload,
+                    BlockPayload::Operation {
+                        operation_id: id,
+                        state,
+                        ..
+                    } if *id == operation_id && *state == expected
+                )
+            })
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "operation was not {expected:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_disconnected(client: &mut ControlClient) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "capability connection remained open");
+        match client.recv_timeout(remaining) {
+            Ok(_) => continue,
+            Err(ControlClientError::Timeout) => {
+                panic!("capability connection remained open until timeout")
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 fn proposal(task_id: hyper_term_protocol::TaskId) -> ControlRequest {

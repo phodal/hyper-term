@@ -136,7 +136,7 @@ impl AgentGatewayRuntime {
             pending_effect: Mutex::new(None),
             terminals: Mutex::new(HashMap::new()),
             _managed_proxy: launched.managed_proxy,
-            _capability_server: launched.capability_server,
+            capability_server: launched.capability_server,
         });
         if self
             .session_bindings

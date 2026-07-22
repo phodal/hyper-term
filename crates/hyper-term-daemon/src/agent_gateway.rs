@@ -72,9 +72,10 @@ use crate::workspace_diff::{
 };
 use crate::workspace_snapshot::{create_private_runtime_root, create_workspace_snapshot};
 use crate::{
-    BrokeredMcpRuntimeConfig, DaemonError, DaemonState, DenoGenUiMcpExecutorConfig,
-    DenoMcpExecutorConfig, IsolatedAcceptancePreview, IsolatedAcceptanceReview,
-    LocalMcpRuntimeError, LocalMcpRuntimeManager, UnixServerHandle, spawn_agent_capability_server,
+    AgentCapabilityPolicy, BrokeredMcpRuntimeConfig, DaemonError, DaemonState,
+    DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig, IsolatedAcceptancePreview,
+    IsolatedAcceptanceReview, LocalMcpRuntimeError, LocalMcpRuntimeManager, UnixServerHandle,
+    spawn_agent_capability_server_with_policy,
 };
 
 mod view_model;
@@ -323,7 +324,7 @@ struct AgentSession {
     pending_effect: Mutex<Option<PendingAgentEffect>>,
     terminals: Mutex<HashMap<String, AgentTerminalRecord>>,
     _managed_proxy: Option<ManagedConnectProxy>,
-    _capability_server: Option<UnixServerHandle>,
+    capability_server: Option<UnixServerHandle>,
 }
 
 struct LaunchedAgentProvider {

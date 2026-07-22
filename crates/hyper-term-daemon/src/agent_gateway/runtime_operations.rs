@@ -1258,6 +1258,9 @@ impl AgentGatewayRuntime {
             .and_then(|mut sessions| sessions.remove(&session_id));
         if let Some(session) = session {
             let task_id = session.task_id;
+            if let Some(capability_server) = &session.capability_server {
+                capability_server.revoke();
+            }
             let _ = session.client.close();
             self.cleanup_brokered_mcp_runtime(session.task_id);
             let _ = std::fs::remove_dir_all(&session.runtime_root);
