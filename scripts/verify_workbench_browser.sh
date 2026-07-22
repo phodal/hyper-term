@@ -42,7 +42,7 @@ trap verify_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for verify_command in agent-browser grep mkdir python3; do
+for verify_command in agent-browser deno grep mkdir; do
   if ! command -v "$verify_command" >/dev/null 2>&1; then
     echo "required command is unavailable: $verify_command" >&2
     exit 1
@@ -60,21 +60,14 @@ for verify_asset in compiler.worker.js esbuild.wasm genui/preview.html; do
 done
 
 mkdir -p "$verify_artifact_dir"
-python3 -u - "$verify_assets" "$verify_ready" >"$verify_log" 2>&1 <<'PYTHON' &
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-import sys
-
-assets, ready = sys.argv[1:]
-handler = lambda *args, **kwargs: SimpleHTTPRequestHandler(
-    *args,
-    directory=assets,
-    **kwargs,
-)
-server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-Path(ready).write_text(f"http://127.0.0.1:{server.server_address[1]}")
-server.serve_forever()
-PYTHON
+deno run \
+  --allow-net=127.0.0.1 \
+  --allow-read="$verify_assets" \
+  --allow-write="$verify_ready" \
+  "$verify_repo_root/scripts/serve_verification_assets.ts" \
+  "$verify_assets" \
+  "$verify_ready" \
+  >"$verify_log" 2>&1 &
 verify_pid=$!
 
 verify_origin=""
