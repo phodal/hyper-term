@@ -62,12 +62,19 @@ if [[ ! -x "$smoke_lima_fixture" ]]; then
 fi
 for smoke_asset in \
   "$smoke_repo_root/dist/terminal/index.html" \
-  "$smoke_repo_root/dist/workbench/index.html"; do
+  "$smoke_repo_root/dist/workbench/index.html" \
+  "$smoke_repo_root/dist/runtime/genui-compiler.js" \
+  "$smoke_repo_root/dist/runtime/esbuild.wasm" \
+  "$smoke_repo_root/dist/runtime/genui/preview.html"; do
   if [[ ! -f "$smoke_asset" ]]; then
     echo "built desktop asset is unavailable: $smoke_asset" >&2
     exit 1
   fi
 done
+if [[ ! -x "$smoke_repo_root/.tools/deno/2.9.3/deno" ]]; then
+  echo "pinned Deno runtime is unavailable: $smoke_repo_root/.tools/deno/2.9.3/deno" >&2
+  exit 1
+fi
 
 smoke_root=$(mktemp -d)
 smoke_log="$smoke_root/hyper-term-smoke.log"
@@ -106,6 +113,10 @@ smoke_start_supervisor() {
       --state-dir "$smoke_root/state" \
       --terminal-assets "$smoke_repo_root/dist/terminal" \
       --workbench-assets "$smoke_repo_root/dist/workbench" \
+      --deno-runtime "$smoke_repo_root/.tools/deno/2.9.3/deno" \
+      --genui-script "$smoke_repo_root/dist/runtime/genui-compiler.js" \
+      --genui-wasm "$smoke_repo_root/dist/runtime/esbuild.wasm" \
+      --genui-preview "$smoke_repo_root/dist/runtime/genui/preview.html" \
       --shell-cwd "$smoke_workspace" \
       --codex "$smoke_codex_goal" \
       --codex-acp "$smoke_acp" \
@@ -479,6 +490,79 @@ PY
     'The proposed file change is ready to review\.' \
     'role=textbox name="Agent prompt".*focused=true'
 
+  smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text 'Generate the Agentic UI'
+  smoke_send_id=$(smoke_widget_id 'role=button name="Send prompt".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_send_id"
+  native automate assert --timeout-ms 30000 \
+    'Compile a bounded GenUI artifact with the supervised Deno runtime' \
+    'role=button name="Allow once".*enabled=true'
+  native automate snapshot >/dev/null
+  smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_allow_id"
+  native automate assert --timeout-ms 5000 'role=button name="Allowed once"'
+  native automate assert --timeout-ms 30000 \
+    'The Agentic UI was compiled by the brokered Deno runtime\.' \
+    'role=button name="Open ACP artifact editor".*enabled=true'
+  smoke_open_editor_id=$(smoke_widget_id 'role=button name="Open ACP artifact editor".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_open_editor_id"
+  native automate assert --timeout-ms 30000 \
+    'name="ACP artifact editor"' \
+    'role=button name="Close ACP artifact editor".*enabled=true' \
+    'view @w1/hyper-term-genui-view.*surface=artifact'
+  python3 - .zig-cache/native-sdk-automation/snapshot.txt <<'PY'
+import json
+import pathlib
+import re
+import sys
+import urllib.parse
+import urllib.request
+
+snapshot = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r'hyper-term-genui-view.*url="([^"]+)"', snapshot)
+if match is None:
+    raise SystemExit("Native snapshot is missing the mounted Agentic UI Workbench URL")
+workbench_url = match.group(1)
+parsed = urllib.parse.urlsplit(workbench_url)
+query = urllib.parse.parse_qs(parsed.query)
+artifact_id = query.get("artifact_id", [""])[0]
+session_id = query.get("session_id", [""])[0]
+token = query.get("token", [""])[0]
+if not artifact_id or not session_id or not token:
+    raise SystemExit(f"Workbench URL is not artifact-bound: {workbench_url}")
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open(workbench_url, timeout=3) as response:
+    index = response.read().decode()
+if response.status != 200 or "<title>Hyper Term Workbench</title>" not in index:
+    raise SystemExit("mounted Workbench did not serve the trusted packaged editor")
+source_url = urllib.parse.urlunsplit((
+    parsed.scheme,
+    parsed.netloc,
+    f"/agent/artifact/{artifact_id}/source",
+    urllib.parse.urlencode({"session_id": session_id, "token": token}),
+    "",
+))
+with opener.open(source_url, timeout=3) as response:
+    source = json.load(response)
+encoded = json.dumps(source, sort_keys=True)
+if "App.tsx" not in encoded or "Hyper Term Agentic UI" not in encoded:
+    raise SystemExit(f"Rust artifact source is not the accepted GenUI program: {source!r}")
+print(f"Agentic UI Workbench verified for artifact {artifact_id}")
+PY
+  native automate screenshot hyper-term-canvas
+  smoke_genui_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-genui.png
+  cp "$smoke_screenshot" "$smoke_genui_screenshot"
+  native automate snapshot >/dev/null
+  smoke_close_editor_id=$(smoke_widget_id 'role=button name="Close ACP artifact editor".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_close_editor_id"
+  native automate assert --absent \
+    'name="ACP artifact editor"' \
+    'view @w1/hyper-term-genui-view'
+  native automate assert \
+    'role=button name="Open ACP artifact editor".*enabled=true' \
+    'role=textbox name="Agent prompt".*focused=true'
+  native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
+
   native automate shortcut hyper-term.new-claude-acp-agent
   native automate assert \
     'role=textbox name="Agent prompt".*enabled=true' \
@@ -744,6 +828,9 @@ if [[ -n "$smoke_artifact_dir" ]]; then
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-goal.png" \
     "$smoke_artifact_dir/screenshot-hyper-term-goal.png"
+  cp \
+    "$smoke_root/.zig-cache/native-sdk-automation/screenshot-hyper-term-genui.png" \
+    "$smoke_artifact_dir/screenshot-hyper-term-genui.png"
   cp \
     "$smoke_root/.zig-cache/native-sdk-automation/renderer-restart.txt" \
     "$smoke_artifact_dir/renderer-restart.txt"
