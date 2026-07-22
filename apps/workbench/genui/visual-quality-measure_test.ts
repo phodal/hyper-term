@@ -1,5 +1,9 @@
 import { assertAlmostEquals, assertEquals } from "@std/assert";
-import { contrastRatio, parseCssColor } from "./visual-quality-measure.ts";
+import {
+  contrastRatio,
+  parseCssColor,
+  viewportMatches,
+} from "./visual-quality-measure.ts";
 
 Deno.test("visual quality contrast checker is deterministic", () => {
   assertEquals(parseCssColor("rgb(255, 255, 255)"), [255, 255, 255]);
@@ -14,4 +18,11 @@ Deno.test("visual quality contrast checker is deterministic", () => {
     4.478,
     0.01,
   );
+});
+
+Deno.test("visual quality capture waits for the exact requested viewport", () => {
+  const expected = { width: 390, height: 844 };
+  assertEquals(viewportMatches(1, 1, expected), false);
+  assertEquals(viewportMatches(389.6, 844.4, expected), true);
+  assertEquals(viewportMatches(390, 843, expected), false);
 });

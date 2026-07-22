@@ -483,6 +483,12 @@ function isVisualQualityMeasureMessage(
     message.source_revision! > 0 &&
     Boolean(message.capture) &&
     typeof message.capture?.capture_id === "string" &&
+    Number.isSafeInteger(message.capture.viewport?.width) &&
+    message.capture.viewport.width > 0 &&
+    message.capture.viewport.width <= 4_096 &&
+    Number.isSafeInteger(message.capture.viewport?.height) &&
+    message.capture.viewport.height > 0 &&
+    message.capture.viewport.height <= 4_096 &&
     message.capture.color_scheme === "light" &&
     message.capture.locale === "en" &&
     message.capture.scenario === "default" &&

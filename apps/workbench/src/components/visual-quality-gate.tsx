@@ -134,12 +134,23 @@ export function VisualQualityGate(props: VisualQualityContext) {
           source_revision: run.payload.source_revision,
           capture: {
             capture_id: capture.id,
+            viewport: { width: capture.width, height: capture.height },
             color_scheme: "light",
             locale: "en",
             scenario: "default",
             reduced_motion: false,
           },
         }, "*");
+        return;
+      }
+      if (
+        message.type === "hyper_term_preview_error" &&
+        message.artifact_id === run.payload.artifact_id &&
+        message.source_revision === run.payload.source_revision
+      ) {
+        setStatus("failed");
+        setError(message.message);
+        setRun(undefined);
         return;
       }
       if (
@@ -260,6 +271,8 @@ export function VisualQualityGate(props: VisualQualityContext) {
           aria-hidden="true"
           sandbox="allow-scripts"
           src={previewUrl}
+          width={capture.width}
+          height={capture.height}
           style={{ width: capture.width, height: capture.height }}
           onLoad={() => run && sendAcceptedArtifact(run)}
         />

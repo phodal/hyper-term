@@ -11,6 +11,7 @@ export type VisualFindingCategory =
 
 export interface VisualQualityMeasureRequest {
   capture_id: string;
+  viewport: { width: number; height: number };
   color_scheme: "light";
   locale: "en";
   scenario: "default";
@@ -63,7 +64,7 @@ export async function measureVisualQuality(
   request: VisualQualityMeasureRequest,
   counters: VisualQualityRuntimeCounters,
 ): Promise<VisualCaptureObservation> {
-  await settleLayout();
+  await settleLayout(request.viewport);
   const viewport = {
     width: Math.max(1, Math.round(globalThis.innerWidth)),
     height: Math.max(1, Math.round(globalThis.innerHeight)),
@@ -161,13 +162,37 @@ export async function measureVisualQuality(
   };
 }
 
-async function settleLayout(): Promise<void> {
+async function settleLayout(
+  expected: VisualQualityMeasureRequest["viewport"],
+): Promise<void> {
   // Chromium can indefinitely suspend requestAnimationFrame for an isolated
   // capture frame that is intentionally transparent and far off-screen. Two
   // task turns let React commit the imported component without depending on a
-  // visible frame clock; the geometry reads below then force layout.
+  // visible frame clock. CI can briefly expose a new iframe as 1x1 before its
+  // host dimensions propagate, so do not capture until the child viewport
+  // itself matches the fixed Rust-owned matrix.
+  const deadline = performance.now() + 2_000;
+  while (
+    !viewportMatches(globalThis.innerWidth, globalThis.innerHeight, expected)
+  ) {
+    if (performance.now() >= deadline) {
+      throw new Error(
+        `Capture viewport ${globalThis.innerWidth}×${globalThis.innerHeight} did not settle at ${expected.width}×${expected.height}.`,
+      );
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+export function viewportMatches(
+  width: number,
+  height: number,
+  expected: { width: number; height: number },
+): boolean {
+  return Math.round(width) === expected.width &&
+    Math.round(height) === expected.height;
 }
 
 function isVisible(element: HTMLElement): boolean {
