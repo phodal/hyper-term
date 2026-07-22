@@ -514,7 +514,7 @@ PY
     'role=button name="Allow once".*enabled=true'
   native automate snapshot >/dev/null
   smoke_allow_id=$(smoke_widget_id 'role=button name="Allow once".*enabled=true')
-  native automate widget-action hyper-term-canvas "$smoke_allow_id" press
+  native automate widget-click hyper-term-canvas "$smoke_allow_id"
   native automate assert --timeout-ms 5000 'role=button name="Allowed once"'
   native automate assert --timeout-ms 30000 \
     'The Agentic UI was compiled by the brokered Deno runtime\.' \
