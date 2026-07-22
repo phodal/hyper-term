@@ -205,9 +205,8 @@ containment, and signed macOS distribution.
 - Complete the Deno/esbuild-wasm Agentic UI loop: React editing, bounded Diff,
   live preview, runtime traces, semantic Time Travel, and host-owned pixel,
   theme, content, motion, and focus-state visual evidence.
-- Remove the remaining source-size exceptions by extracting cohesive View,
-  Model, protocol, and test modules. New source files are limited to 2,000
-  lines; legacy hotspots are frozen and may only shrink.
+- Keep every source file within 2,000 lines by extracting cohesive View, Model,
+  protocol, and test modules before a responsibility becomes a new hotspot.
 - Harden sandboxing, accessibility, crash recovery, signing, notarization, and
   the once-daily prerelease pipeline before a stable public release.
 

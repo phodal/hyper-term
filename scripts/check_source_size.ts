@@ -22,14 +22,8 @@ const ignoredDirectories = new Set([
 
 export const defaultSourceLineLimit = 2_000;
 
-// These files predate the line limit. Freeze their current size so they can
-// only shrink while cohesive modules are extracted in follow-up changes.
-export const legacySourceLineLimits: Readonly<Record<string, number>> = {
-  "crates/hyper-term-daemon/src/workspace_apply.rs": 2_924,
-};
-
-export function sourceLineLimit(path: string): number {
-  return legacySourceLineLimits[path] ?? defaultSourceLineLimit;
+export function sourceLineLimit(_path: string): number {
+  return defaultSourceLineLimit;
 }
 
 export function sourceLineCount(source: string): number {
@@ -84,7 +78,7 @@ async function main(): Promise<void> {
     Deno.exit(1);
   }
   console.log(
-    `Source size check passed: ${checked} files; new files <= ${defaultSourceLineLimit} lines; legacy hotspots frozen.`,
+    `Source size check passed: ${checked} files; every source file <= ${defaultSourceLineLimit} lines.`,
   );
 }
 

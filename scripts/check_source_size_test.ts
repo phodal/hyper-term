@@ -12,7 +12,7 @@ Deno.test("source line counts match wc semantics", () => {
   assertEquals(sourceLineCount("one\ntwo\n"), 2);
 });
 
-Deno.test("new files use the default budget while legacy hotspots are frozen", () => {
+Deno.test("every source file uses the default line budget", () => {
   assertEquals(defaultSourceLineLimit, 2_000);
   assertEquals(
     sourceLineLimit("apps/desktop/src/new_view.zig"),
@@ -36,7 +36,7 @@ Deno.test("new files use the default budget while legacy hotspots are frozen", (
   );
   assertEquals(
     sourceLineLimit("crates/hyper-term-daemon/src/workspace_apply.rs"),
-    2_924,
+    defaultSourceLineLimit,
   );
   assertEquals(
     sourceLineLimit("crates/hyper-term-drivers/src/acp.rs"),
