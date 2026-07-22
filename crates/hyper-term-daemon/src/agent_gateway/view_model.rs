@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 
 use hyper_term_drivers::{AgentSessionCapabilities, AgentSessionConfigValue, AgentThreadGoal};
 use hyper_term_protocol::{
-    AcceptedGenUiArtifact, ArtifactId, BlockDocument, EventEnvelope, LocalMcpServerRuntimeReceipt,
-    LocalMcpToolCallReceipt, OperationId, OperationState, PermissionDecision, TaskId,
+    AcceptedGenUiArtifact, ApprovalDetailDigest, ArtifactId, BlockDocument, EventEnvelope,
+    LocalMcpServerRuntimeReceipt, LocalMcpToolCallReceipt, OperationId, OperationState,
+    PermissionDecision, TaskId,
 };
 use hyper_term_sandbox::{IsolatedChange, IsolatedTaskTermination};
 use serde::{Deserialize, Serialize};
@@ -241,6 +242,7 @@ pub(super) struct AgentWorkspaceApplyChangeResponse {
 pub(super) struct AgentPermissionRequest {
     pub(super) operation_id: OperationId,
     pub(super) expected_revision: u64,
+    pub(super) approval_detail_digest: Option<ApprovalDetailDigest>,
     pub(super) decision: PermissionDecision,
 }
 

@@ -11,16 +11,16 @@ use std::time::{Duration, Instant};
 use hyper_term_core::{TerminalEvent, TerminalReplay};
 use hyper_term_daemon::{BrokeredMcpRuntimeConfig, DaemonError, DaemonState, spawn_unix_server};
 use hyper_term_protocol::{
-    BlockPayload, ClientId, ContextDigest, ContextReceipt, ControlRequest, ControlRequestEnvelope,
-    ControlResponse, DomainEvent, EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest,
-    ExecutionMode, GenUiArtifactCandidate, GenUiCompilerIdentity, LocalMcpCredentialScope,
-    LocalMcpServerLaunch, LocalMcpServerLifecycle, LocalMcpServerRuntimeReceipt, LocalMcpToolCall,
-    LocalMcpToolCallReceipt, LocalMcpToolContractReceipt, McpArgumentsDigest,
-    McpCapabilitiesDigest, McpCatalogDigest, McpRuntimeIdentityDigest, McpToolContractDigest,
-    McpToolResultDigest, OperationAction, OperationCompletion, OperationKind, OperationOutcome,
-    OperationState, PermissionDecision, RequestId, RiskClass, SandboxProfileDigest,
-    TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame, read_frame,
-    write_frame,
+    ApprovalDetailDigest, BlockPayload, ClientId, ContextDigest, ContextReceipt, ControlRequest,
+    ControlRequestEnvelope, ControlResponse, DomainEvent, EXECUTION_CONTEXT_SCHEMA_VERSION,
+    EnvironmentPlanDigest, ExecutionMode, GenUiArtifactCandidate, GenUiCompilerIdentity,
+    LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle,
+    LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt,
+    LocalMcpToolContractReceipt, McpArgumentsDigest, McpCapabilitiesDigest, McpCatalogDigest,
+    McpRuntimeIdentityDigest, McpToolContractDigest, McpToolResultDigest, OperationAction,
+    OperationCompletion, OperationKind, OperationOutcome, OperationState, PermissionDecision,
+    RequestId, RiskClass, SandboxProfileDigest, TerminalCommand, TerminalDataFrame,
+    TerminalInputFrame, TerminalSize, WireFrame, read_frame, write_frame,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -269,6 +269,72 @@ fn propose_shell(
             vec!["shell".into()],
         )
         .expect("propose operation")
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn approval_detail_digest_binds_the_review_and_redacts_environment_values() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let state = DaemonState::open(temporary.path().join("state")).unwrap();
+    let task_id = state.create_task("review exact command".into()).unwrap();
+    let operation = state
+        .propose_operation(
+            task_id,
+            OperationKind::Shell,
+            OperationAction::Shell {
+                command: TerminalCommand {
+                    program: "/usr/bin/env".into(),
+                    args: vec!["--token".into(), "argument-secret".into()],
+                    cwd: Some(workspace),
+                    env: BTreeMap::from([("API_TOKEN".into(), "environment-secret".into())]),
+                },
+            },
+            "inspect the exact command".into(),
+            RiskClass::ExternalEffect,
+            vec!["shell".into()],
+        )
+        .unwrap();
+    let approval = state.approval_detail(operation.operation_id).unwrap();
+    let snapshot = serde_json::to_string(&state.block_snapshot(task_id).unwrap()).unwrap();
+    assert!(snapshot.contains("<redacted>"));
+    assert!(snapshot.contains("API_TOKEN"));
+    assert!(!snapshot.contains("argument-secret"));
+    assert!(!snapshot.contains("environment-secret"));
+
+    let wrong = ApprovalDetailDigest::parse("f".repeat(64)).unwrap();
+    assert!(matches!(
+        state.decide_permission_bound(
+            task_id,
+            operation.operation_id,
+            operation.revision,
+            &wrong,
+            PermissionDecision::AllowOnce,
+        ),
+        Err(DaemonError::ApprovalDetailMismatch)
+    ));
+    assert_eq!(
+        state
+            .approval_detail(operation.operation_id)
+            .unwrap()
+            .detail
+            .operation_revision,
+        operation.revision
+    );
+    assert_eq!(
+        state
+            .decide_permission_bound(
+                task_id,
+                operation.operation_id,
+                operation.revision,
+                &approval.detail_digest,
+                PermissionDecision::AllowOnce,
+            )
+            .unwrap()
+            .state,
+        OperationState::Authorized
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1468,7 +1534,7 @@ fn unix_client_can_reconnect_and_replay_terminal_output() {
     let workspace = directory.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let state = DaemonState::open(directory.path().join("state")).unwrap();
-    let _server = spawn_unix_server(&socket, state).expect("spawn server");
+    let _server = spawn_unix_server(&socket, state.clone()).expect("spawn server");
 
     let mut client = Client::connect(&socket);
     let task_id = match client.request(ControlRequest::CreateTask {
@@ -1496,6 +1562,7 @@ fn unix_client_can_reconnect_and_replay_terminal_output() {
         task_id,
         operation_id,
         expected_revision: waiting_revision,
+        approval_detail_digest: state.approval_detail(operation_id).unwrap().detail_digest,
         decision: PermissionDecision::AllowOnce,
     }) {
         ControlResponse::OperationUpdated {

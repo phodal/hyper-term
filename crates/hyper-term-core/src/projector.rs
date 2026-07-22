@@ -164,6 +164,7 @@ impl BlockProjector {
             }
             DomainEvent::PermissionRequested {
                 operation_revision,
+                approval,
                 prompt,
                 options,
             } => {
@@ -179,6 +180,7 @@ impl BlockProjector {
                     BlockPayload::Approval {
                         operation_id,
                         operation_revision: *operation_revision,
+                        approval: approval.clone(),
                         prompt: prompt.clone(),
                         options: options.clone(),
                         decision: None,
@@ -887,6 +889,7 @@ mod tests {
                 Some(operation_id),
                 DomainEvent::PermissionRequested {
                     operation_revision: 3,
+                    approval: None,
                     prompt: "Allow this exact operation once?".into(),
                     options: vec![
                         PermissionDecision::AllowOnce,
@@ -961,6 +964,7 @@ mod tests {
                 Some(operation_id),
                 DomainEvent::PermissionRequested {
                     operation_revision: 2,
+                    approval: None,
                     prompt: "Allow once?".into(),
                     options: vec![PermissionDecision::AllowOnce],
                 },

@@ -11,6 +11,8 @@ pub const max_operation_id_bytes: usize = 36;
 pub const max_operation_kind_bytes: usize = 96;
 pub const max_activity_title_bytes: usize = 512;
 pub const max_activity_meta_bytes: usize = 512;
+pub const max_approval_detail_bytes: usize = 512;
+pub const approval_detail_digest_bytes: usize = 64;
 pub const max_diff_files: usize = 8;
 pub const max_diff_path_bytes: usize = 256;
 
@@ -84,6 +86,11 @@ pub const BlockView = struct {
     diff_file_count: usize = 0,
     diff_files_truncated: bool = false,
     operation_revision: u64 = 0,
+    approval_detail_storage: [max_approval_detail_bytes]u8 = [_]u8{0} ** max_approval_detail_bytes,
+    approval_detail_len: usize = 0,
+    approval_detail_digest_storage: [approval_detail_digest_bytes]u8 = [_]u8{0} ** approval_detail_digest_bytes,
+    approval_detail_bound: bool = false,
+    approval_detail_valid: bool = false,
     allow_once_available: bool = false,
     tier2_isolated: bool = false,
     risk: Risk = .unknown,
@@ -152,7 +159,7 @@ pub const BlockView = struct {
     }
 
     pub fn canAllowOnce(block: *const BlockView) bool {
-        return block.isApprovalPending() and block.allow_once_available and
+        return block.isApprovalPending() and block.allow_once_available and block.approval_detail_valid and
             (block.isBrokeredMcpReview() or block.isWorkspaceReview() or block.isTier2TerminalReview());
     }
 
@@ -176,6 +183,15 @@ pub const BlockView = struct {
         if (block.isBrokeredMcpReview()) return "Brokered read-only tool · receipt recorded";
         if (block.isTier2TerminalReview()) return "Isolated Tier 2 command · no ordinary PTY access";
         return "Allow unavailable until Rust can enforce this effect.";
+    }
+
+    pub fn approvalDetail(block: *const BlockView) []const u8 {
+        return block.approval_detail_storage[0..block.approval_detail_len];
+    }
+
+    pub fn approvalDetailDigest(block: *const BlockView) []const u8 {
+        if (!block.approval_detail_bound) return "";
+        return &block.approval_detail_digest_storage;
     }
 
     pub fn operationId(block: *const BlockView) []const u8 {
@@ -272,6 +288,7 @@ test "only Rust-enforceable approvals expose Allow once" {
         .kind = .approval,
         .risk = .workspace_write,
         .allow_once_available = true,
+        .approval_detail_valid = true,
     };
     const label = "Workspace edit";
     @memcpy(workspace.operation_kind_storage[0..label.len], label);

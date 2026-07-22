@@ -150,6 +150,41 @@ pub const PlanEntry = struct {
     status: []const u8,
 };
 
+pub const ApprovalActionDetail = struct {
+    type: []const u8,
+    program: ?[]const u8 = null,
+    argv: []const []const u8 = &.{},
+    cwd: ?[]const u8 = null,
+    environment_keys: []const []const u8 = &.{},
+    server_id: ?[]const u8 = null,
+    executable: ?[]const u8 = null,
+    executable_sha256: ?[]const u8 = null,
+    argument_count: ?u16 = null,
+    arguments_digest: ?[]const u8 = null,
+    working_directory: ?[]const u8 = null,
+    sandbox_profile_digest: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+    runtime_identity_digest: ?[]const u8 = null,
+    catalog_digest: ?[]const u8 = null,
+    tool_contract_digest: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    payload_digest: ?[]const u8 = null,
+};
+
+pub const BoundApprovalDetail = struct {
+    detail: struct {
+        schema_version: u16,
+        operation_id: []const u8,
+        operation_revision: u64,
+        action_digest: []const u8,
+        action: ApprovalActionDetail,
+        risk: []const u8,
+        effective_capabilities: []const []const u8 = &.{},
+        opaque_effect: bool,
+    },
+    detail_digest: []const u8,
+};
+
 pub const Block = struct {
     block_id: ?[]const u8 = null,
     block_revision: u64 = 0,
@@ -161,6 +196,7 @@ pub const Block = struct {
         text: ?[]const u8 = null,
         operation_id: ?[]const u8 = null,
         operation_revision: ?u64 = null,
+        approval: ?BoundApprovalDetail = null,
         kind: ?std.json.Value = null,
         summary: ?[]const u8 = null,
         risk: ?[]const u8 = null,

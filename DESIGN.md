@@ -253,6 +253,11 @@ shape language must remain engineered and native, not bubbly or card-heavy.
 - Approval controls always state the proposed effect, scope, and risk. The
   primary action may use the accent only when it is the safe recommended path;
   destructive authorization stays red.
+- Approval detail is Rust-authenticated Native chrome, never provider prose or
+  WebView markup. Keep argv items distinct, redact credential material, show
+  cwd and effective capabilities, and bind authorization to both the detail
+  digest and operation revision. If the bounded detail cannot be projected,
+  disable Allow while preserving Reject and Cancel.
 - Attention uses progressive disclosure: passive status, badge, native
   notification, then urgent system attention. Repeated animation is never the
   sole signal. Native notifications are background-only, deduplicated by the

@@ -409,9 +409,16 @@ fn handle_request(
                 task_id,
                 operation_id,
                 expected_revision,
+                approval_detail_digest,
                 decision,
             } => state
-                .decide_permission(task_id, operation_id, expected_revision, decision)
+                .decide_permission_bound(
+                    task_id,
+                    operation_id,
+                    expected_revision,
+                    &approval_detail_digest,
+                    decision,
+                )
                 .map(|record| ControlResponse::OperationUpdated {
                     operation_id: record.operation_id,
                     revision: record.revision,

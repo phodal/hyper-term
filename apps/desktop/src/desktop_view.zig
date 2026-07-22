@@ -592,6 +592,14 @@ pub fn DesktopView(
                         ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("{s} · {s}", .{ block.operationKindLabel(), block.riskLabel() })),
                     }),
                     ui.text(.{ .wrap = true }, block.content()),
+                    if (block.approval_detail_valid)
+                        ui.text(.{
+                            .wrap = true,
+                            .size = .sm,
+                            .style_tokens = .{ .foreground = .text_muted },
+                        }, block.approvalDetail())
+                    else
+                        ui.text(.{ .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .warning } }, "Rust could not produce complete review detail; Allow is disabled."),
                     decision,
                 }),
             });

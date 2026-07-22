@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AcceptedGenUiArtifact, BlockDocument, BlockPatch, BrokeredMcpToolExecution, ClientId,
-    EventEnvelope, GenUiArtifactCandidate, InputLeaseId, OperationAction, OperationCompletion,
-    OperationId, OperationKind, OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId,
-    RiskClass, TaskId, TerminalId, TerminalSize,
+    AcceptedGenUiArtifact, ApprovalDetailDigest, BlockDocument, BlockPatch,
+    BrokeredMcpToolExecution, ClientId, EventEnvelope, GenUiArtifactCandidate, InputLeaseId,
+    OperationAction, OperationCompletion, OperationId, OperationKind, OperationState,
+    PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, TaskId, TerminalId, TerminalSize,
 };
 
 const MAGIC: [u8; 4] = *b"HTRM";
@@ -66,6 +66,7 @@ pub enum ControlRequest {
         task_id: TaskId,
         operation_id: OperationId,
         expected_revision: u64,
+        approval_detail_digest: ApprovalDetailDigest,
         decision: PermissionDecision,
     },
     BeginOperation {

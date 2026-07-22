@@ -816,6 +816,7 @@ fn projectApprovalBlock(
     copyAgentBlockContent(view, block.payload.prompt.?);
     copyOperationId(view, block.payload.operation_id.?);
     view.operation_revision = block.payload.operation_revision.?;
+    projectApprovalDetail(view, block);
     view.allow_once_available = stringListContains(block.payload.options, "allow_once");
     view.decision = parseAgentDecision(block.payload.decision);
     view.state = if (view.decision == .none) .waiting_human else .cancelled;
@@ -835,6 +836,80 @@ fn projectApprovalBlock(
         }
         break;
     }
+}
+
+fn projectApprovalDetail(view: *AgentBlockView, block: AgentBlockWire) void {
+    const approval = block.payload.approval orelse return;
+    const detail = approval.detail;
+    if (detail.schema_version != 1 or
+        detail.operation_revision != block.payload.operation_revision.? or
+        !std.mem.eql(u8, detail.operation_id, block.payload.operation_id.?) or
+        !isContextDigest(detail.action_digest) or
+        !isContextDigest(approval.detail_digest) or
+        detail.effective_capabilities.len > 128)
+    {
+        return;
+    }
+    @memcpy(&view.approval_detail_digest_storage, approval.detail_digest[0..agent_block_view.approval_detail_digest_bytes]);
+    view.approval_detail_bound = true;
+    var writer = std.Io.Writer.fixed(&view.approval_detail_storage);
+    const action = detail.action;
+    if (std.mem.eql(u8, action.type, "shell")) {
+        const program = action.program orelse return;
+        if (program.len == 0 or action.argv.len > 128 or action.environment_keys.len > 128) return;
+        writer.print("Program: {s}\n", .{program}) catch return;
+        writer.writeAll("Arguments:") catch return;
+        if (action.argv.len == 0) writer.writeAll(" none\n") catch return else {
+            writer.writeByte('\n') catch return;
+            for (action.argv, 0..) |argument, index| {
+                writer.print("  [{d}] {s}\n", .{ index, argument }) catch return;
+            }
+        }
+        writer.print("Working directory: {s}\n", .{action.cwd orelse "inherited"}) catch return;
+        writer.writeAll("Environment keys:") catch return;
+        if (action.environment_keys.len == 0) writer.writeAll(" none") catch return else {
+            for (action.environment_keys) |key| writer.print(" {s}", .{key}) catch return;
+        }
+    } else if (std.mem.eql(u8, action.type, "mcp_tool")) {
+        const server = action.server_id orelse return;
+        const tool = action.tool_name orelse return;
+        const arguments_digest = action.arguments_digest orelse return;
+        if (!isContextDigest(arguments_digest)) return;
+        writer.print(
+            "MCP server: {s}\nTool: {s}\nArguments SHA-256: {s}\nArgument values are not retained in this approval record.",
+            .{ server, tool, arguments_digest },
+        ) catch return;
+    } else if (std.mem.eql(u8, action.type, "mcp_server_launch")) {
+        const server = action.server_id orelse return;
+        const executable = action.executable orelse return;
+        const executable_digest = action.executable_sha256 orelse return;
+        const arguments_digest = action.arguments_digest orelse return;
+        if (!isContextDigest(executable_digest) or !isContextDigest(arguments_digest)) return;
+        writer.print(
+            "MCP server: {s}\nExecutable: {s}\nExecutable SHA-256: {s}\nArguments: {d} item(s) · SHA-256 {s}\nWorking directory: {s}",
+            .{ server, executable, executable_digest, action.argument_count orelse return, arguments_digest, action.working_directory orelse "inherited" },
+        ) catch return;
+    } else if (std.mem.eql(u8, action.type, "opaque")) {
+        const kind = action.kind orelse return;
+        const payload_digest = action.payload_digest orelse return;
+        if (!isContextDigest(payload_digest)) return;
+        if (detail.opaque_effect)
+            writer.print(
+                "Opaque operation: {s}\nPayload SHA-256: {s}\nThe payload is not reviewable; Allow remains unavailable.",
+                .{ kind, payload_digest },
+            ) catch return
+        else
+            writer.print(
+                "Rust-reviewed operation: {s}\nReview SHA-256: {s}\nSee the trusted Diff or artifact review above for exact changes.",
+                .{ kind, payload_digest },
+            ) catch return;
+    } else return;
+    if (detail.effective_capabilities.len > 0) {
+        writer.writeAll("\nCapabilities:") catch return;
+        for (detail.effective_capabilities) |capability| writer.print(" {s}", .{capability}) catch return;
+    }
+    view.approval_detail_len = writer.buffered().len;
+    view.approval_detail_valid = !detail.opaque_effect;
 }
 
 fn stringListContains(values: ?[]const []const u8, expected: []const u8) bool {

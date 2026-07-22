@@ -811,6 +811,7 @@ done
         let stale_approval = serde_json::to_vec(&serde_json::json!({
             "operation_id": operation_id,
             "expected_revision": proposal["operation_revision"].as_u64().unwrap() + 1,
+            "approval_detail_digest": approval_digest(&daemon, operation_id),
             "decision": "allow_once"
         }))
         .unwrap();
@@ -833,6 +834,7 @@ done
         let approval = serde_json::to_vec(&serde_json::json!({
             "operation_id": operation_id,
             "expected_revision": proposal["operation_revision"],
+            "approval_detail_digest": approval_digest(&daemon, operation_id),
             "decision": "allow_once"
         }))
         .unwrap();
@@ -1224,6 +1226,7 @@ done
         let rejection = serde_json::to_vec(&serde_json::json!({
             "operation_id": rejected_operation,
             "expected_revision": rejected["operation_revision"],
+            "approval_detail_digest": approval_digest(&daemon, rejected_operation),
             "decision": "reject_once"
         }))
         .unwrap();
@@ -1263,6 +1266,7 @@ done
         let permission = serde_json::to_vec(&serde_json::json!({
             "operation_id": operation_id,
             "expected_revision": operation_revision,
+            "approval_detail_digest": approval_digest(&daemon, operation_id),
             "decision": "allow_once"
         }))
         .unwrap();

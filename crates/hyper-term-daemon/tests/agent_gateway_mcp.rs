@@ -140,6 +140,7 @@ async fn acp_agent_discovers_the_real_brokered_deno_tool_catalog() {
     let decision = serde_json::to_vec(&serde_json::json!({
         "operation_id": approval["operation_id"],
         "expected_revision": approval["operation_revision"],
+        "approval_detail_digest": approval["approval"]["detail_digest"],
         "decision": "allow_once"
     }))
     .unwrap();

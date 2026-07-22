@@ -7,8 +7,8 @@ use hyper_term_daemon::{
     ControlClient, ControlClientError, DaemonState, spawn_agent_capability_server,
 };
 use hyper_term_protocol::{
-    BlockId, ControlRequest, ControlResponse, MessageRole, OperationAction, OperationKind,
-    OperationState, RiskClass, TerminalSize, WireFrame,
+    ApprovalDetailDigest, BlockId, ControlRequest, ControlResponse, MessageRole, OperationAction,
+    OperationKind, OperationState, RiskClass, TerminalSize, WireFrame,
 };
 use tempfile::tempdir;
 
@@ -77,6 +77,7 @@ fn agent_capability_endpoint_is_private_task_scoped_and_cannot_self_approve() {
             task_id: bound_task,
             operation_id,
             expected_revision: revision,
+            approval_detail_digest: ApprovalDetailDigest::parse("a".repeat(64)).unwrap(),
             decision: hyper_term_protocol::PermissionDecision::AllowOnce,
         },
         TIMEOUT,

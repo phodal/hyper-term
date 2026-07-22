@@ -197,6 +197,8 @@ pub enum BlockPayload {
     Approval {
         operation_id: OperationId,
         operation_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval: Option<crate::BoundApprovalDetail>,
         prompt: String,
         options: Vec<PermissionDecision>,
         decision: Option<PermissionDecision>,

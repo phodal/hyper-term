@@ -17,6 +17,14 @@
     };
     use super::*;
 
+    fn approval_digest(daemon: &DaemonState, operation_id: OperationId) -> String {
+        daemon
+            .approval_detail(operation_id)
+            .expect("approval detail")
+            .detail_digest
+            .to_string()
+    }
+
     #[test]
     fn agent_diagnostics_drop_unsafe_controls_and_stay_bounded() {
         let diagnostic = format!("prefix\0{}suffix", "x".repeat(5000));
@@ -179,7 +187,7 @@ done
             token: token.clone(),
             workspace: workspace.clone(),
             state_directory: temporary.path().join("gateway-state"),
-            daemon,
+            daemon: daemon.clone(),
             provider_home: temporary.path().to_owned(),
             codex_executable: Some(codex),
             codex_auth_file: None,
@@ -220,6 +228,10 @@ done
         let approval = serde_json::json!({
             "operation_id": launch["operation_id"],
             "expected_revision": launch["operation_revision"],
+            "approval_detail_digest": approval_digest(
+                &daemon,
+                serde_json::from_value(launch["operation_id"].clone()).unwrap(),
+            ),
             "decision": "allow_once"
         });
         let (status, body) = request_path(
@@ -248,6 +260,10 @@ done
         let approval = serde_json::json!({
             "operation_id": call["operation_id"],
             "expected_revision": call["operation_revision"],
+            "approval_detail_digest": approval_digest(
+                &daemon,
+                serde_json::from_value(call["operation_id"].clone()).unwrap(),
+            ),
             "decision": "allow_once"
         });
         let (status, body) = request_path(
@@ -1109,6 +1125,10 @@ done
         let permission = serde_json::to_vec(&serde_json::json!({
             "operation_id": review["operation_id"],
             "expected_revision": review["operation_revision"],
+            "approval_detail_digest": approval_digest(
+                &daemon,
+                serde_json::from_value(review["operation_id"].clone()).unwrap(),
+            ),
             "decision": "allow_once",
         }))
         .unwrap();
@@ -1273,6 +1293,7 @@ done
         let permission = serde_json::to_vec(&serde_json::json!({
             "operation_id": brokered.operation_id,
             "expected_revision": brokered.revision,
+            "approval_detail_digest": approval_digest(&daemon, brokered.operation_id),
             "decision": "reject_once",
         }))
         .unwrap();

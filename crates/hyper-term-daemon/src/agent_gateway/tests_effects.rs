@@ -484,6 +484,7 @@
         let approval = serde_json::to_vec(&serde_json::json!({
             "operation_id": operation_id,
             "expected_revision": operation_revision,
+            "approval_detail_digest": approval_digest(&daemon, operation_id),
             "decision": "allow_once"
         }))
         .expect("approval");
@@ -559,7 +560,7 @@
             token: token.clone(),
             workspace,
             state_directory: state,
-            daemon,
+            daemon: daemon.clone(),
             provider_home: temporary.path().to_owned(),
             codex_executable: Some(fake_codex),
             codex_auth_file: None,
@@ -624,9 +625,13 @@
             })
             .await
             .expect("Agent did not reach waiting approval");
+        let parsed_operation_id = OperationId::from_uuid(
+            uuid::Uuid::parse_str(&operation_id).expect("operation UUID"),
+        );
         let unsafe_decision = serde_json::json!({
             "operation_id": operation_id,
             "expected_revision": operation_revision,
+            "approval_detail_digest": approval_digest(&daemon, parsed_operation_id),
             "decision": "allow_once"
         });
         let (status, _) = request_path(
@@ -748,6 +753,7 @@
         let allow = serde_json::json!({
             "operation_id": mcp.operation_id,
             "expected_revision": mcp.revision,
+            "approval_detail_digest": approval_digest(&daemon, mcp.operation_id),
             "decision": "allow_once"
         });
         let (status, _) = request_path(
@@ -782,6 +788,7 @@
         let unsafe_allow = serde_json::json!({
             "operation_id": opaque.operation_id,
             "expected_revision": opaque.revision,
+            "approval_detail_digest": approval_digest(&daemon, opaque.operation_id),
             "decision": "allow_once"
         });
         let (status, _) = request_path(

@@ -44,6 +44,7 @@ mod acp_provider_home;
 mod agent_gateway;
 mod agent_provider_probe;
 mod agent_session_store;
+mod approval_detail;
 mod artifact_debug_capsule;
 mod artifact_editor_store;
 mod artifact_runtime_trace_store;
@@ -60,6 +61,7 @@ mod web_gateway;
 mod workspace_apply;
 mod workspace_diff;
 mod workspace_snapshot;
+use approval_detail::{bound_approval_detail, validate_action_kind};
 use artifact_store::{ArtifactStore, ArtifactStoreError, StoredGenUiArtifact};
 use isolated_result_store::{
     IsolatedAcceptance, IsolatedResult, PreparedIsolatedAcceptance, StoredIsolatedAcceptance,
@@ -831,6 +833,7 @@ impl DaemonState {
             Actor::Policy,
             Some("M1 requires explicit human approval for every effect".into()),
         )?;
+        let approval = bound_approval_detail(&waiting)?;
         self.record(NewEvent {
             task_id,
             run_id: None,
@@ -839,6 +842,7 @@ impl DaemonState {
             correlation_id: None,
             payload: DomainEvent::PermissionRequested {
                 operation_revision: waiting.revision,
+                approval: Some(approval),
                 prompt: "Allow this exact operation once?".into(),
                 options: vec![
                     PermissionDecision::AllowOnce,
@@ -2859,32 +2863,6 @@ impl OutputObservation {
     }
 }
 
-fn validate_action_kind(kind: &OperationKind, action: &OperationAction) -> Result<(), DaemonError> {
-    let valid = match (kind, action) {
-        (OperationKind::Shell, OperationAction::Shell { .. }) => true,
-        (OperationKind::McpServerLaunch, OperationAction::McpServerLaunch { launch }) => {
-            return validate_mcp_server_launch(launch);
-        }
-        (OperationKind::McpTool, OperationAction::McpToolCall { call }) => {
-            return validate_local_mcp_tool_call(call);
-        }
-        (
-            OperationKind::McpTool
-            | OperationKind::FileEdit
-            | OperationKind::AgentTool
-            | OperationKind::ComputerUse
-            | OperationKind::ArtifactBuild
-            | OperationKind::Other(_),
-            OperationAction::Opaque { .. },
-        ) => true,
-        _ => false,
-    };
-    if !valid {
-        return Err(DaemonError::ActionKindMismatch);
-    }
-    Ok(())
-}
-
 fn validate_local_mcp_tool_call(call: &LocalMcpToolCall) -> Result<(), DaemonError> {
     if call.schema_version != hyper_term_protocol::LOCAL_MCP_TOOL_CALL_SCHEMA_VERSION
         || call.server_id.is_empty()
@@ -3253,6 +3231,10 @@ pub enum DaemonError {
     StaleOperationRevision { expected: u64, actual: u64 },
     #[error("operation is {0:?}, not waiting for permission")]
     OperationNotWaiting(OperationState),
+    #[error("the operation could not produce bounded approval detail")]
+    InvalidApprovalDetail,
+    #[error("the approval detail no longer matches the reviewed operation")]
+    ApprovalDetailMismatch,
     #[error("operation is {0:?}, not authorized")]
     OperationNotAuthorized(OperationState),
     #[error("operation is {0:?}, not dispatching")]

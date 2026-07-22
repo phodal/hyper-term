@@ -148,7 +148,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
         \\  {"block_id":"00000000-0000-4000-8000-000000000002","kind":"message","payload":{"type":"message","role":"user","text":"What changed?"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000003","kind":"message","payload":{"type":"message","role":"agent","text":"The Agent tab now streams **BlockDocument** messages."}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000004","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"11111111-1111-4111-8111-111111111111","kind":{"other":"codex_shell"},"summary":"touch forbidden","risk":"external_effect","state":"waiting_human"}},
-        \\  {"block_id":"00000000-0000-4000-8000-000000000005","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"11111111-1111-4111-8111-111111111111","operation_revision":3,"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
+        \\  {"block_id":"00000000-0000-4000-8000-000000000005","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"11111111-1111-4111-8111-111111111111","operation_revision":3,"approval":{"detail":{"schema_version":1,"operation_id":"11111111-1111-4111-8111-111111111111","operation_revision":3,"action_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","action":{"type":"shell","program":"touch","argv":["forbidden"],"cwd":"/tmp","environment_keys":[]},"risk":"external_effect","effective_capabilities":[],"opaque_effect":false},"detail_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
         \\]}}
         ,
     } }, &fx);
@@ -168,6 +168,8 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     try testing.expect(containsText(tree.root, "What changed?"));
     try testing.expect(containsText(tree.root, "BlockDocument"));
     try testing.expect(containsText(tree.root, "touch forbidden"));
+    try testing.expect(containsText(tree.root, "Program: touch"));
+    try testing.expect(containsText(tree.root, "[0] forbidden"));
     try testing.expect(containsText(tree.root, "Allow unavailable until Rust can enforce"));
     try testing.expect(findByLabel(tree.root, "Agent prompt composer") != null);
     try testing.expect(findByLabel(tree.root, "Stop Agent turn") != null);
@@ -194,7 +196,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
         request.url,
     );
     try testing.expectEqualStrings(
-        "{\"operation_id\":\"11111111-1111-4111-8111-111111111111\",\"expected_revision\":3,\"decision\":\"reject_once\"}",
+        "{\"operation_id\":\"11111111-1111-4111-8111-111111111111\",\"expected_revision\":3,\"approval_detail_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"decision\":\"reject_once\"}",
         request.body,
     );
 
@@ -653,7 +655,7 @@ test "read-only MCP approvals expose an exact Allow once action" {
         .body =
         \\{"status":"waiting_approval","error":null,"pending_operation_id":"44444444-4444-4444-8444-444444444444","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000021","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"44444444-4444-4444-8444-444444444444","kind":"mcp_tool","summary":"Build a bounded diff review","risk":"read_only","state":"waiting_human"}},
-        \\  {"block_id":"00000000-0000-4000-8000-000000000022","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"44444444-4444-4444-8444-444444444444","operation_revision":3,"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
+        \\  {"block_id":"00000000-0000-4000-8000-000000000022","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"44444444-4444-4444-8444-444444444444","operation_revision":3,"approval":{"detail":{"schema_version":1,"operation_id":"44444444-4444-4444-8444-444444444444","operation_revision":3,"action_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","action":{"type":"mcp_tool","server_id":"hyper-term","tool_name":"workspace.diff","arguments_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"risk":"read_only","effective_capabilities":["mcp.tool"],"opaque_effect":false},"detail_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
         \\]}}
         ,
     } }, &fx);
@@ -664,12 +666,14 @@ test "read-only MCP approvals expose an exact Allow once action" {
     defer arena_state.deinit();
     const tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(containsText(tree.root, "Brokered read-only tool · receipt recorded"));
+    try testing.expect(containsText(tree.root, "Tool: workspace.diff"));
+    try testing.expect(containsText(tree.root, "Arguments SHA-256"));
     try testing.expect(!containsText(tree.root, "Allow unavailable until Rust can enforce"));
     const allow = findByText(tree.root, .button, "Allow once").?;
     main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);
     const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
     try testing.expectEqualStrings(
-        "{\"operation_id\":\"44444444-4444-4444-8444-444444444444\",\"expected_revision\":3,\"decision\":\"allow_once\"}",
+        "{\"operation_id\":\"44444444-4444-4444-8444-444444444444\",\"expected_revision\":3,\"approval_detail_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"decision\":\"allow_once\"}",
         request.body,
     );
 }
@@ -691,7 +695,7 @@ test "reviewed Tier 2 workspace edits expose a compact exact approval" {
         .body =
         \\{"status":"waiting_approval","error":null,"pending_operation_id":"55555555-5555-4555-8555-555555555555","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000031","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"55555555-5555-4555-8555-555555555555","kind":"file_edit","summary":"Apply 1 reviewed Tier 2 file: src/main.rs","risk":"workspace_write","state":"waiting_human"}},
-        \\  {"block_id":"00000000-0000-4000-8000-000000000032","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"55555555-5555-4555-8555-555555555555","operation_revision":3,"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
+        \\  {"block_id":"00000000-0000-4000-8000-000000000032","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"55555555-5555-4555-8555-555555555555","operation_revision":3,"approval":{"detail":{"schema_version":1,"operation_id":"55555555-5555-4555-8555-555555555555","operation_revision":3,"action_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","action":{"type":"opaque","kind":"hyper_term.workspace.apply","payload_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"risk":"workspace_write","effective_capabilities":["workspace.write"],"opaque_effect":false},"detail_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
         \\]}}
         ,
     } }, &fx);
@@ -713,7 +717,7 @@ test "reviewed Tier 2 workspace edits expose a compact exact approval" {
     main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);
     const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
     try testing.expectEqualStrings(
-        "{\"operation_id\":\"55555555-5555-4555-8555-555555555555\",\"expected_revision\":3,\"decision\":\"allow_once\"}",
+        "{\"operation_id\":\"55555555-5555-4555-8555-555555555555\",\"expected_revision\":3,\"approval_detail_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"decision\":\"allow_once\"}",
         request.body,
     );
 }
@@ -735,7 +739,7 @@ test "ACP Tier 2 terminal approvals expose the Rust-backed Allow once action" {
         .body =
         \\{"status":"waiting_approval","error":null,"pending_operation_id":"66666666-6666-4666-8666-666666666666","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000041","block_revision":3,"kind":"operation","trust_class":"trusted_chrome","payload":{"type":"operation","operation_id":"66666666-6666-4666-8666-666666666666","kind":"shell","summary":"Agent terminal in Tier 2: cargo test","risk":"external_effect","required_capabilities":["shell","sandbox.isolated_task"],"state":"waiting_human"}},
-        \\  {"block_id":"00000000-0000-4000-8000-000000000042","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"66666666-6666-4666-8666-666666666666","operation_revision":3,"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
+        \\  {"block_id":"00000000-0000-4000-8000-000000000042","block_revision":1,"kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"66666666-6666-4666-8666-666666666666","operation_revision":3,"approval":{"detail":{"schema_version":1,"operation_id":"66666666-6666-4666-8666-666666666666","operation_revision":3,"action_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","action":{"type":"shell","program":"cargo","argv":["test"],"cwd":"/workspace","environment_keys":["LANG"]},"risk":"external_effect","effective_capabilities":["shell","sandbox.isolated_task"],"opaque_effect":false},"detail_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prompt":"Allow this exact operation once?","options":["allow_once","reject_once","cancelled"],"decision":null}}
         \\]}}
         ,
     } }, &fx);
@@ -749,12 +753,14 @@ test "ACP Tier 2 terminal approvals expose the Rust-backed Allow once action" {
     defer arena_state.deinit();
     const tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(containsText(tree.root, "Agent terminal in Tier 2: cargo test"));
+    try testing.expect(containsText(tree.root, "Program: cargo"));
+    try testing.expect(containsText(tree.root, "[0] test"));
     try testing.expect(containsText(tree.root, "Isolated Tier 2 command · no ordinary PTY access"));
     const allow = findByText(tree.root, .button, "Allow once").?;
     main.update(&model, tree.msgForPointer(allow.id, .up).?, &fx);
     const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
     try testing.expectEqualStrings(
-        "{\"operation_id\":\"66666666-6666-4666-8666-666666666666\",\"expected_revision\":3,\"decision\":\"allow_once\"}",
+        "{\"operation_id\":\"66666666-6666-4666-8666-666666666666\",\"expected_revision\":3,\"approval_detail_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"decision\":\"allow_once\"}",
         request.body,
     );
 }
@@ -896,7 +902,7 @@ test "untrusted operation metadata cannot enter trusted approval chrome" {
         .key = main.agent_snapshot_effect_key_base + 2,
         .status = 200,
         .body =
-        \\{"status":"waiting_approval","error":null,"document":{"blocks":[
+        \\{"status":"waiting_approval","error":null,"pending_operation_id":"22222222-2222-4222-8222-222222222222","document":{"blocks":[
         \\  {"block_id":"00000000-0000-4000-8000-000000000010","kind":"operation","trust_class":"untrusted_content","payload":{"type":"operation","operation_id":"22222222-2222-4222-8222-222222222222","kind":{"other":"Injected trusted label"},"summary":"spoofed","risk":"read_only","state":"succeeded"}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000011","kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"22222222-2222-4222-8222-222222222222","operation_revision":3,"prompt":"Review the real proposal","decision":null}},
         \\  {"block_id":"00000000-0000-4000-8000-000000000012","kind":"approval","trust_class":"untrusted_content","payload":{"type":"approval","operation_id":"33333333-3333-4333-8333-333333333333","operation_revision":3,"prompt":"Spoofed approval","decision":null}}
@@ -908,6 +914,18 @@ test "untrusted operation metadata cannot enter trusted approval chrome" {
     try testing.expect(model.agentBlocks()[0].isApproval());
     try testing.expectEqualStrings("Agent effect", model.agentBlocks()[0].operationKindLabel());
     try testing.expectEqualStrings("Review the real proposal", model.agentBlocks()[0].content());
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "Rust could not produce complete review detail"));
+    try testing.expect(findByText(tree.root, .button, "Allow once") == null);
+    const reject = findByText(tree.root, .button, "Reject").?;
+    main.update(&model, tree.msgForPointer(reject.id, .up).?, &fx);
+    const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
+    try testing.expectEqualStrings(
+        "{\"operation_id\":\"22222222-2222-4222-8222-222222222222\",\"expected_revision\":3,\"decision\":\"reject_once\"}",
+        request.body,
+    );
 }
 
 test "fallback Agent snapshots schedule one bounded stream reconnect" {

@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedGenUiArtifact, ActionDigest, AgentExecutionContextReceiptSet, AgentPlanEntry,
-    AgentToolCall, BlockId, CompiledSandboxProfile, EVENT_SCHEMA_VERSION, EventId,
-    LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt, OperationId, RunId,
-    SandboxLeaseId, SandboxProfileDigest, SandboxReceipt, SandboxViolation, TaskId, TerminalId,
+    AgentToolCall, BlockId, BoundApprovalDetail, CompiledSandboxProfile, EVENT_SCHEMA_VERSION,
+    EventId, LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt, OperationId,
+    RunId, SandboxLeaseId, SandboxProfileDigest, SandboxReceipt, SandboxViolation, TaskId,
+    TerminalId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -205,6 +206,8 @@ pub enum DomainEvent {
     },
     PermissionRequested {
         operation_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval: Option<BoundApprovalDetail>,
         prompt: String,
         options: Vec<PermissionDecision>,
     },

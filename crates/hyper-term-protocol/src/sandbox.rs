@@ -64,6 +64,7 @@ macro_rules! sha256_digest {
 }
 
 sha256_digest!(ActionDigest);
+sha256_digest!(ApprovalDetailDigest);
 sha256_digest!(ContextDigest);
 sha256_digest!(EnvironmentPlanDigest);
 sha256_digest!(McpArgumentsDigest);

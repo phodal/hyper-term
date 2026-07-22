@@ -535,17 +535,25 @@ pub fn Router(comptime Effects: type) type {
                 if (candidate.isApprovalPending() and
                     std.mem.eql(u8, candidate.operationId(), operation_id)) break candidate;
             } else return;
-            if (block.operation_revision == 0) return;
+            if (block.operation_revision == 0 or
+                (std.mem.eql(u8, decision, "allow_once") and !block.approval_detail_valid)) return;
             const session = model.activeSession();
             if (session.mode != .agent or session.agent_connection != .ready) return;
             var url_storage: [agent_effect_url_capacity + 16]u8 = undefined;
             const request_url = writeAgentPermissionUrl(model, session.id, url_storage[0..]) orelse return;
             var body_storage: [256]u8 = undefined;
-            const body = std.fmt.bufPrint(
-                body_storage[0..],
-                "{{\"operation_id\":\"{s}\",\"expected_revision\":{d},\"decision\":\"{s}\"}}",
-                .{ block.operationId(), block.operation_revision, decision },
-            ) catch return;
+            const body = if (block.approval_detail_bound)
+                std.fmt.bufPrint(
+                    body_storage[0..],
+                    "{{\"operation_id\":\"{s}\",\"expected_revision\":{d},\"approval_detail_digest\":\"{s}\",\"decision\":\"{s}\"}}",
+                    .{ block.operationId(), block.operation_revision, block.approvalDetailDigest(), decision },
+                ) catch return
+            else
+                std.fmt.bufPrint(
+                    body_storage[0..],
+                    "{{\"operation_id\":\"{s}\",\"expected_revision\":{d},\"decision\":\"{s}\"}}",
+                    .{ block.operationId(), block.operation_revision, decision },
+                ) catch return;
             fx.fetch(.{
                 .key = agent_permission_effect_key_base + session.id,
                 .method = .POST,
