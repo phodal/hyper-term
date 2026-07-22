@@ -1,5 +1,6 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
+const agent_block_view = @import("agent_block_view.zig");
 
 const canvas = native_sdk.canvas;
 
@@ -26,58 +27,8 @@ pub fn DesktopView(
         const agent_timeline_line_height: f32 = 19;
         const agent_timeline_viewport_fallback: f32 = 480;
 
-        fn containsAsciiInsensitive(haystack: []const u8, needle: []const u8) bool {
-            if (needle.len == 0) return true;
-            if (needle.len > haystack.len) return false;
-            var start: usize = 0;
-            while (start + needle.len <= haystack.len) : (start += 1) {
-                var offset: usize = 0;
-                while (offset < needle.len and
-                    std.ascii.toLower(haystack[start + offset]) == std.ascii.toLower(needle[offset])) : (offset += 1)
-                {}
-                if (offset == needle.len) return true;
-            }
-            return false;
-        }
-
-        fn agentBlockMatchesQuery(block: anytype, query: []const u8) bool {
-            if (containsAsciiInsensitive(block.content(), query)) return true;
-            switch (block.kind) {
-                .message => if (containsAsciiInsensitive(block.roleLabel(), query)) return true,
-                .tool_call, .plan => if (containsAsciiInsensitive(block.activityTitle(), query) or
-                    containsAsciiInsensitive(block.activityMeta(), query)) return true,
-                .operation => if (containsAsciiInsensitive(block.operationKindLabel(), query) or
-                    containsAsciiInsensitive(block.operationId(), query) or
-                    containsAsciiInsensitive(block.riskLabel(), query) or
-                    containsAsciiInsensitive(block.stateLabel(), query)) return true,
-                .approval => if (containsAsciiInsensitive(block.approvalTitle(), query) or
-                    containsAsciiInsensitive(block.operationKindLabel(), query) or
-                    containsAsciiInsensitive(block.operationId(), query) or
-                    containsAsciiInsensitive(block.riskLabel(), query) or
-                    containsAsciiInsensitive(block.stateLabel(), query)) return true,
-            }
-            for (block.diffFiles()) |*file| {
-                if (containsAsciiInsensitive(file.path(), query)) return true;
-            }
-            return false;
-        }
-
-        pub fn agentSearchQuery(model: *const Model) []const u8 {
-            return std.mem.trim(u8, model.agent_search_buffer.text(), " \t\r\n");
-        }
-
         fn agentSearchFiltering(model: *const Model) bool {
-            return model.agentSearchOpen() and agentSearchQuery(model).len > 0;
-        }
-
-        pub fn agentSearchMatchCount(model: *const Model) usize {
-            if (!agentSearchFiltering(model)) return model.agent_block_count;
-            const query = agentSearchQuery(model);
-            var count: usize = 0;
-            for (model.agent_blocks[0..model.agent_block_count]) |*block| {
-                if (agentBlockMatchesQuery(block, query)) count += 1;
-            }
-            return count;
+            return model.agentSearchOpen() and model.hasAgentSearchQuery();
         }
 
         fn agentTimelineBlockIndex(model: *const Model, list_index: u64) ?usize {
@@ -87,10 +38,10 @@ pub fn DesktopView(
                 if (physical >= model.agent_block_count) return null;
                 return @intCast(physical);
             }
-            const query = agentSearchQuery(model);
+            const query = model.agentSearchQuery();
             var match_index: u64 = 0;
             for (model.agent_blocks[0..model.agent_block_count], 0..) |*block, physical| {
-                if (!agentBlockMatchesQuery(block, query)) continue;
+                if (!agent_block_view.matchesQuery(block, query)) continue;
                 if (match_index == list_index) return physical;
                 match_index += 1;
             }
@@ -131,7 +82,7 @@ pub fn DesktopView(
             const filtering = agentSearchFiltering(model);
             return .{
                 .id = agent_timeline_id,
-                .item_count = agentSearchMatchCount(model),
+                .item_count = model.agentSearchResultCount(),
                 .index_base = if (filtering) 0 else model.agent_block_index_base,
                 .item_extent = 36,
                 .extent_estimate = agentBlockExtentEstimate,

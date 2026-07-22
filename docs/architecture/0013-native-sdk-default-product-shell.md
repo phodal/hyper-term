@@ -147,14 +147,19 @@ then pass through the same builder-owned Agent Block composition seam. Release
 builds retain only the ahead-of-time compiled document and no source watcher.
 
 The builder-owned projection is now isolated in `src/desktop_view.zig`. It is a
-759-line generic Native View over the product `Model` and `Msg` contract and
+710-line generic Native View over the product `Model` and `Msg` contract and
 owns only virtual Agent transcript rows, compact Goal/Diff/Approval cards, and
 desktop Tab chrome. It cannot spawn processes, read files, or mutate the PTY;
-those effects remain in the Rust-backed update boundary. This extraction drops
-`main.zig` from 5,455 to 4,766 lines and ratchets its legacy size ceiling to the
-new value. New modules remain subject to the repository-wide 2,000-line limit;
-the remaining entrypoint exception may only shrink as Model and effect routers
-are extracted.
+those effects remain in the Rust-backed update boundary.
+
+The bounded desktop state and its pure derived bindings are separately isolated
+in the 1,173-line `src/desktop_model.zig`. It has no process, filesystem-I/O,
+PTY, network, or WebView effect authority. Search matching lives with the Agent
+Block projection so both the Model's result count and the virtual View use the
+same predicate. Together these extractions drop `main.zig` from 5,455 to 3,721
+lines and ratchet its legacy size ceiling to the new value. New modules remain
+subject to the repository-wide 2,000-line limit; the remaining entrypoint
+exception may only shrink as effect routers are extracted.
 
 ## Compact Agent interaction evidence (2026-07-20)
 

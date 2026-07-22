@@ -231,6 +231,42 @@ pub const BlockView = struct {
     }
 };
 
+fn containsAsciiInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var offset: usize = 0;
+        while (offset < needle.len and
+            std.ascii.toLower(haystack[start + offset]) == std.ascii.toLower(needle[offset])) : (offset += 1)
+        {}
+        if (offset == needle.len) return true;
+    }
+    return false;
+}
+
+pub fn matchesQuery(block: *const BlockView, query: []const u8) bool {
+    if (containsAsciiInsensitive(block.content(), query)) return true;
+    switch (block.kind) {
+        .message => if (containsAsciiInsensitive(block.roleLabel(), query)) return true,
+        .tool_call, .plan => if (containsAsciiInsensitive(block.activityTitle(), query) or
+            containsAsciiInsensitive(block.activityMeta(), query)) return true,
+        .operation => if (containsAsciiInsensitive(block.operationKindLabel(), query) or
+            containsAsciiInsensitive(block.operationId(), query) or
+            containsAsciiInsensitive(block.riskLabel(), query) or
+            containsAsciiInsensitive(block.stateLabel(), query)) return true,
+        .approval => if (containsAsciiInsensitive(block.approvalTitle(), query) or
+            containsAsciiInsensitive(block.operationKindLabel(), query) or
+            containsAsciiInsensitive(block.operationId(), query) or
+            containsAsciiInsensitive(block.riskLabel(), query) or
+            containsAsciiInsensitive(block.stateLabel(), query)) return true,
+    }
+    for (block.diffFiles()) |*file| {
+        if (containsAsciiInsensitive(file.path(), query)) return true;
+    }
+    return false;
+}
+
 test "only Rust-enforceable approvals expose Allow once" {
     var workspace: BlockView = .{
         .kind = .approval,
