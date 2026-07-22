@@ -330,7 +330,7 @@ done
         wait_for_provider_readiness(gateway.address(), &path, "login_required").await;
         let session_path = format!("/agent/session?token={token}&session_id=1&provider=codex");
         assert_eq!(
-            request_path(gateway.address(), &session_path, "POST", b"{}")
+            request_path(gateway.address(), &session_path, "POST", b"")
                 .await
                 .0,
             StatusCode::SERVICE_UNAVAILABLE.as_u16()
@@ -338,7 +338,7 @@ done
 
         std::fs::write(&marker, "ready").expect("complete login");
         wait_for_provider_readiness(gateway.address(), &path, "authenticated").await;
-        let (status, body) = request_path(gateway.address(), &session_path, "POST", b"{}").await;
+        let (status, body) = request_path(gateway.address(), &session_path, "POST", b"").await;
         assert_eq!(status, StatusCode::OK.as_u16(), "{body:?}");
         assert_eq!(
             request_path(

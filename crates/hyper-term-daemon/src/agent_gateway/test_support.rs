@@ -75,7 +75,7 @@ pub(super) async fn wait_for_provider_readiness(address: SocketAddr, path: &str,
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let marker = format!("\"readiness\":\"{expected}\"");
     loop {
-        let (status, body) = request_path(address, path, "POST", b"{}").await;
+        let (status, body) = request_path(address, path, "GET", b"").await;
         if status == StatusCode::OK.as_u16() && String::from_utf8_lossy(&body).contains(&marker) {
             return;
         }
