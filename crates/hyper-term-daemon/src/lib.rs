@@ -63,6 +63,8 @@ mod local_mcp_runtime;
 #[cfg(unix)]
 mod mcp_gateway;
 mod network_proxy;
+#[cfg(unix)]
+mod state_root_lock;
 mod web_gateway;
 mod workspace_apply;
 mod workspace_diff;
@@ -76,6 +78,8 @@ use isolated_result_store::{
     recover_completed_isolated_results, recover_isolated_acceptances, remove_isolated_acceptance,
     safe_isolated_result_path, write_isolated_acceptance,
 };
+#[cfg(unix)]
+use state_root_lock::StateRootLock;
 use workspace_apply::{
     DurableWorkspaceApplyResult, WorkspaceApplyRequest, WorkspaceTransactionContext,
     WorkspaceTransactionOutcome, acknowledge_workspace_transaction,
@@ -137,6 +141,8 @@ pub struct DaemonState {
 
 struct DaemonInner {
     instance_id: Uuid,
+    #[cfg(unix)]
+    _state_root_lock: StateRootLock,
     authority: Mutex<AuthorityState>,
     terminals: TerminalSupervisor,
     terminal_contexts: Mutex<HashMap<TerminalId, TerminalContext>>,
@@ -234,8 +240,10 @@ impl DaemonState {
         state_directory: impl AsRef<Path>,
         sandbox_launcher: Arc<dyn SandboxLauncher>,
     ) -> Result<Self, DaemonError> {
-        fs::create_dir_all(state_directory.as_ref())?;
+        create_private_directory(state_directory.as_ref())?;
         let state_directory = fs::canonicalize(state_directory.as_ref())?;
+        #[cfg(unix)]
+        let state_root_lock = StateRootLock::acquire(&state_directory)?;
         let artifacts = ArtifactStore::open(&state_directory)?;
         let isolated_worktree_manager = IsolatedWorktreeManager::discover()?;
         let isolated_results_root = state_directory.join("isolated-results");
@@ -284,6 +292,8 @@ impl DaemonState {
         let daemon = Self {
             inner: Arc::new(DaemonInner {
                 instance_id,
+                #[cfg(unix)]
+                _state_root_lock: state_root_lock,
                 authority: Mutex::new(AuthorityState {
                     journal,
                     operations,
@@ -1497,6 +1507,10 @@ pub enum DaemonError {
     ArtifactStore(String),
     #[error("daemon state lock is poisoned")]
     LockPoisoned,
+    #[error("daemon state directory is already owned by another process: {0}")]
+    StateDirectoryInUse(PathBuf),
+    #[error("daemon state lock is not a regular private file: {0}")]
+    InvalidStateLock(PathBuf),
     #[error("task title must not be empty")]
     EmptyTaskTitle,
     #[error("message text must not be empty")]

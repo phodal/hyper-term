@@ -849,7 +849,19 @@ fn terminal_dispatch_requires_permission_and_survives_client_subscription_drop()
 
     let digest = state.block_snapshot(task_id).unwrap().semantic_digest;
     drop(state);
-    let reopened = DaemonState::open(directory.path().join("state")).expect("replay journal");
+    // The detached terminal monitor owns the last daemon clone until it observes
+    // the PTY exit barrier. A restart must wait for that owner to release the
+    // state root instead of racing a second journal writer into the directory.
+    let restart_deadline = Instant::now() + Duration::from_secs(3);
+    let reopened = loop {
+        match DaemonState::open(directory.path().join("state")) {
+            Ok(reopened) => break reopened,
+            Err(DaemonError::StateDirectoryInUse(_)) if Instant::now() < restart_deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("replay journal: {error}"),
+        }
+    };
     assert_eq!(
         reopened.block_snapshot(task_id).unwrap().semantic_digest,
         digest
