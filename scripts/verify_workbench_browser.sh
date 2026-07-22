@@ -7,6 +7,7 @@ verify_artifact_dir=${HYPER_TERM_WORKBENCH_BROWSER_ARTIFACT_DIR:-"$verify_repo_r
 verify_session="hyper-term-workbench-$$"
 verify_root=$(mktemp -d "${TMPDIR:-/tmp}/hyper-term-workbench-browser.XXXXXX")
 verify_log="$verify_root/server.log"
+verify_ready="$verify_root/server.ready"
 verify_pid=""
 verify_warm_p95_budget_ms=${HYPER_TERM_GENUI_WARM_P95_BUDGET_MS:-100}
 
@@ -59,21 +60,26 @@ for verify_asset in compiler.worker.js esbuild.wasm genui/preview.html; do
 done
 
 mkdir -p "$verify_artifact_dir"
-python3 -u -m http.server 0 \
-  --bind 127.0.0.1 \
-  --directory "$verify_assets" \
-  >"$verify_log" 2>&1 &
+python3 -u - "$verify_assets" "$verify_ready" >"$verify_log" 2>&1 <<'PYTHON' &
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import sys
+
+assets, ready = sys.argv[1:]
+handler = lambda *args, **kwargs: SimpleHTTPRequestHandler(
+    *args,
+    directory=assets,
+    **kwargs,
+)
+server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+Path(ready).write_text(f"http://127.0.0.1:{server.server_address[1]}")
+server.serve_forever()
+PYTHON
 verify_pid=$!
 
 verify_origin=""
 for _ in {1..200}; do
-  verify_origin=$(grep -Eo 'http://127\.0\.0\.1:[0-9]+' "$verify_log" | tail -n 1 || true)
-  if [[ -z "$verify_origin" ]]; then
-    verify_server_line=$(grep -E 'Serving HTTP on 127\.0\.0\.1 port [0-9]+' "$verify_log" | tail -n 1 || true)
-    if [[ "$verify_server_line" =~ port[[:space:]]+([0-9]+) ]]; then
-      verify_origin="http://127.0.0.1:${BASH_REMATCH[1]}"
-    fi
-  fi
+  [[ -f "$verify_ready" ]] && verify_origin=$(<"$verify_ready")
   [[ -n "$verify_origin" ]] && break
   if ! kill -0 "$verify_pid" 2>/dev/null; then
     echo "Workbench static server exited before publishing its loopback address" >&2
