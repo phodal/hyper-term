@@ -63,6 +63,7 @@ mod local_mcp_runtime;
 #[cfg(unix)]
 mod mcp_gateway;
 mod network_proxy;
+mod private_fs;
 #[cfg(unix)]
 mod state_root_lock;
 mod web_gateway;
@@ -1460,12 +1461,7 @@ fn now_ms() -> Result<u64, DaemonError> {
 }
 
 fn create_private_directory(path: &Path) -> Result<(), DaemonError> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    private_fs::ensure_private_directory(path)?;
     Ok(())
 }
 

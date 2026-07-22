@@ -58,6 +58,7 @@ use crate::artifact_runtime_trace_store::{ArtifactRuntimeTraceStore, RuntimeTrac
 use crate::artifact_visual_quality_store::ArtifactVisualQualityStore;
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
 use crate::network_proxy::ManagedConnectProxy;
+use crate::private_fs::ensure_private_directory;
 use crate::workspace_apply::{
     DurableWorkspaceApplyResult, MAX_WORKSPACE_APPLY_FILES, WorkspaceApplyError,
     WorkspaceApplySetPlan, WorkspaceRecoveryReport, WorkspaceTransactionContext,
@@ -410,7 +411,7 @@ pub async fn spawn_agent_gateway(
             config.provider_home.clone(),
         ));
     }
-    std::fs::create_dir_all(&config.state_directory)?;
+    ensure_private_directory(&config.state_directory)?;
     config.state_directory = config
         .state_directory
         .canonicalize()

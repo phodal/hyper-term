@@ -3,9 +3,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, ArtifactId, GenUiArtifactCandidate, GenUiCompileDiagnostic,
     MAX_GENUI_SOURCE_BYTES, MAX_GENUI_SOURCE_FILES, MAX_GENUI_VIRTUAL_PATH_BYTES,
@@ -336,12 +333,7 @@ fn validate_diagnostics(diagnostics: &[GenUiCompileDiagnostic]) -> Result<(), Ar
 }
 
 fn create_private_directory(path: &Path) -> Result<(), std::io::Error> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    crate::private_fs::ensure_private_directory(path)
 }
 
 fn hex_digest(digest: impl AsRef<[u8]>) -> String {
@@ -386,6 +378,9 @@ pub(crate) enum ArtifactStoreError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use hyper_term_protocol::{GenUiArtifactCandidate, GenUiCompilerIdentity};
 
     use super::*;

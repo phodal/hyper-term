@@ -211,10 +211,7 @@ fn read_bounded_regular_file(path: &Path) -> Result<Option<Vec<u8>>, WorkspaceSn
 }
 
 fn create_private_directory(path: &Path) -> Result<(), std::io::Error> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    crate::private_fs::ensure_private_directory(path)
 }
 
 pub(crate) fn create_private_runtime_root(path: &Path) -> Result<(), std::io::Error> {

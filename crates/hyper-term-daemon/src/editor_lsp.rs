@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 use hyper_term_drivers::{DenoLspClient, DenoLspConfig, path_to_file_uri};
 use hyper_term_protocol::{
@@ -652,10 +652,7 @@ fn language_id(path: &Path) -> &'static str {
 }
 
 fn create_private_directory(path: &Path) -> Result<(), std::io::Error> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    crate::private_fs::ensure_private_directory(path)
 }
 
 fn create_private_descendant(root: &Path, path: &Path) -> Result<(), std::io::Error> {
