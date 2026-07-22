@@ -1,0 +1,179 @@
+name: Validate Hyper Term
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AGENT_BROWSER_VERSION: 0.25.4
+  CARGO_TERM_COLOR: always
+  NATIVE_SDK_COMMIT: 57bf56bc58058768d436099c1005bfc66bd55ac3
+  NATIVE_SDK_VERSION: 0.5.3
+
+jobs:
+  validate-macos:
+    name: Validate macOS application
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install pinned Deno
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.9.3
+
+      - name: Install pinned Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Install verified Native SDK CLI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          native_asset=native-sdk-darwin-arm64
+          cli_dir="$RUNNER_TEMP/native-sdk"
+          bin_dir="$RUNNER_TEMP/native-sdk-bin"
+          mkdir -p "$cli_dir" "$bin_dir"
+          gh release download "v$NATIVE_SDK_VERSION" \
+            --repo vercel-labs/native \
+            --pattern "$native_asset" \
+            --pattern CHECKSUMS.txt \
+            --dir "$cli_dir"
+          grep -E "[[:space:]]+$native_asset$" "$cli_dir/CHECKSUMS.txt" \
+            | (cd "$cli_dir" && shasum -a 256 -c -)
+          install -m 0755 "$cli_dir/$native_asset" "$bin_dir/native"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+          framework_dir="$RUNNER_TEMP/native-sdk-framework"
+          git clone \
+            --branch "v$NATIVE_SDK_VERSION" \
+            --depth 1 \
+            https://github.com/vercel-labs/native.git \
+            "$framework_dir"
+          if [[ "$(git -C "$framework_dir" rev-parse HEAD)" != "$NATIVE_SDK_COMMIT" ]]; then
+            echo "Native SDK tag does not match audited commit $NATIVE_SDK_COMMIT" >&2
+            exit 1
+          fi
+          echo "NATIVE_SDK_PATH=$framework_dir" >> "$GITHUB_ENV"
+
+      - name: Run Rust gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+      - name: Build and verify Deno surfaces
+        run: |
+          deno task verify:runtime
+          deno task check
+          deno task test
+          deno task build:terminal
+          deno task build:workbench
+          deno task build:runtime
+
+      - name: Verify real Deno LSP and packaged ACP adapters
+        run: |
+          set -euo pipefail
+          deno_path="$(command -v deno)"
+          deno_sha256="$(shasum -a 256 "$deno_path" | awk '{print $1}')"
+          HYPER_TERM_DENO_PATH="$deno_path" \
+          HYPER_TERM_DENO_SHA256="$deno_sha256" \
+            deno task verify:deno-lsp
+          HYPER_TERM_ACP_RUNTIME_ROOT="$GITHUB_WORKSPACE/dist/runtime/acp" \
+          HYPER_TERM_DENO_PATH="$deno_path" \
+          HYPER_TERM_DENO_SHA256="$deno_sha256" \
+            cargo test \
+              --locked \
+              --package hyper-term-drivers \
+              --test acp_agent \
+              bundled_codex_acp_completes_the_release_initialize_handshake \
+              -- \
+              --ignored \
+              --exact
+          HYPER_TERM_ACP_RUNTIME_ROOT="$GITHUB_WORKSPACE/dist/runtime/acp" \
+          HYPER_TERM_DENO_PATH="$deno_path" \
+          HYPER_TERM_DENO_SHA256="$deno_sha256" \
+            cargo test \
+              --locked \
+              --package hyper-term-drivers \
+              --test acp_agent \
+              bundled_claude_acp_creates_a_release_session_with_external_provider \
+              -- \
+              --ignored \
+              --exact
+
+      - name: Verify the built Workbench in a browser
+        run: |
+          browser_prefix="$RUNNER_TEMP/agent-browser"
+          npm install \
+            --prefix "$browser_prefix" \
+            --no-audit \
+            --no-fund \
+            "agent-browser@$AGENT_BROWSER_VERSION"
+          export PATH="$browser_prefix/node_modules/.bin:$PATH"
+          agent-browser install
+          deno task verify:workbench-browser
+          deno_path="$(command -v deno)"
+          deno_sha256="$(shasum -a 256 "$deno_path" | awk '{print $1}')"
+          HYPER_TERM_DENO_PATH="$deno_path" \
+          HYPER_TERM_DENO_SHA256="$deno_sha256" \
+            deno task verify:artifact-workbench-browser
+
+      - name: Build and test the Native shell
+        working-directory: apps/desktop
+        run: |
+          native check --strict
+          native test
+          native build --release=fast -Dautomation=true
+
+      - name: Run integrated macOS desktop smokes
+        env:
+          HYPER_TERM_SMOKE_ARTIFACT_DIR: ${{ github.workspace }}/dist/smoke/macos
+          HYPER_TERM_CAPSULE_SMOKE_ARTIFACT_DIR: ${{ github.workspace }}/dist/smoke/macos/capsule
+          HYPER_TERM_SMOKE_FIRST_FRAME_BUDGET_MS: "1500"
+        run: |
+          cargo build \
+            --locked \
+            --package hyper-term-daemon \
+            --bin hyper-term-desktop
+          ./scripts/smoke_macos_desktop.sh \
+            target/debug/hyper-term-desktop \
+            apps/desktop/zig-out/bin/hyper-term
+          ./scripts/smoke_macos_capsule.sh \
+            target/debug/hyper-term-desktop \
+            apps/desktop/zig-out/bin/hyper-term
+
+      - name: Upload desktop evidence
+        if: ${{ always() && hashFiles('dist/smoke/macos/**') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-desktop-ci-${{ github.run_attempt }}
+          path: dist/smoke/macos
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Workbench browser evidence
+        if: ${{ always() && hashFiles('.zig-cache/workbench-browser/*.png', '.zig-cache/artifact-workbench-browser/*.png') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: workbench-browser-ci-${{ github.run_attempt }}
+          path: |
+            .zig-cache/workbench-browser/*.png
+            .zig-cache/artifact-workbench-browser/*.png
+          if-no-files-found: error
+          retention-days: 7

@@ -4,6 +4,14 @@ Tags matching `vX.Y.Z` start `.github/workflows/release.yml`. The workflow
 validates the Rust, Deno, and Native SDK layers, then builds separate Apple
 Silicon and Intel application archives.
 
+Every pull request and push to `main` runs `.github/workflows/ci.yml` without
+creating a tag or Release. That workflow exercises the Rust and Deno gates,
+the real Deno LSP and packaged ACP adapter handshakes, the browser Workbench,
+the Native shell, and the integrated macOS desktop and Bug Capsule smokes.
+Release frequency is therefore independent from validation frequency: ordinary
+development stays continuously checked while only an explicit release tag can
+publish application archives.
+
 Release candidates are intentionally limited to one published GitHub Release
 per `Asia/Shanghai` calendar day. Commits and validation may continue normally,
 but a second tag on the same day fails before the expensive build begins. A
