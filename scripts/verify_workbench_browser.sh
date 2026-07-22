@@ -66,9 +66,19 @@ python3 -u -m http.server 0 \
 verify_pid=$!
 
 verify_origin=""
-for _ in {1..100}; do
+for _ in {1..200}; do
   verify_origin=$(grep -Eo 'http://127\.0\.0\.1:[0-9]+' "$verify_log" | tail -n 1 || true)
+  if [[ -z "$verify_origin" ]]; then
+    verify_server_line=$(grep -E 'Serving HTTP on 127\.0\.0\.1 port [0-9]+' "$verify_log" | tail -n 1 || true)
+    if [[ "$verify_server_line" =~ port[[:space:]]+([0-9]+) ]]; then
+      verify_origin="http://127.0.0.1:${BASH_REMATCH[1]}"
+    fi
+  fi
   [[ -n "$verify_origin" ]] && break
+  if ! kill -0 "$verify_pid" 2>/dev/null; then
+    echo "Workbench static server exited before publishing its loopback address" >&2
+    exit 1
+  fi
   sleep 0.05
 done
 if [[ -z "$verify_origin" ]]; then
