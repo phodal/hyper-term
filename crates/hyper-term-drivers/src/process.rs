@@ -747,10 +747,15 @@ fn signal_process_group(shared: &Arc<DriverShared>, force: bool) -> Result<(), D
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error.into())
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        // Closing stdin lets cooperative providers exit while the stdout
+        // reader and the caller may both be finishing the process. macOS can
+        // return EPERM after that leader has already been reaped and its
+        // process-group ID is no longer ours. Re-check the owned Child before
+        // accepting that race; a still-running leader remains fail-closed.
+        Some(libc::EPERM) if try_wait(shared)?.is_some() => Ok(()),
+        _ => Err(error.into()),
     }
 }
 
@@ -765,7 +770,10 @@ fn process_group_exists(shared: &Arc<DriverShared>) -> Result<bool, DriverError>
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
         Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
+        // An un-reaped leader proves this is still our live group. Once the
+        // leader is reaped, EPERM identifies a group ID we no longer own;
+        // same-user descendants of the original group remain signalable.
+        Some(libc::EPERM) => Ok(try_wait(shared)?.is_none()),
         _ => Err(error.into()),
     }
 }
@@ -1133,6 +1141,34 @@ mod tests {
         );
         assert!(!process_group_exists(&process.shared).unwrap());
         assert_ne!(process_group_id, std::process::id());
+    }
+
+    #[test]
+    fn cooperative_provider_exit_does_not_race_group_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        for _ in 0..32 {
+            let process = DriverProcess::spawn(DriverSpec {
+                manifest: manifest(&shell, DriverKind::AcpAgent),
+                executable: shell.clone(),
+                arguments: vec![
+                    OsString::from("-c"),
+                    OsString::from("while IFS= read -r line; do :; done"),
+                ],
+                working_directory: temp.path().canonicalize().unwrap(),
+                environment: BTreeMap::new(),
+                sandbox: None,
+                framing: DriverFraming::JsonLines,
+                max_frame_bytes: 1024,
+                max_pending_output_bytes: DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES,
+            })
+            .unwrap();
+            process.mark_ready().unwrap();
+            assert_eq!(
+                process.stop(Duration::from_millis(50)).unwrap(),
+                DriverState::Closed
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
