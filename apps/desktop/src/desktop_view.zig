@@ -175,9 +175,9 @@ pub fn DesktopView(
 
         fn agentPinnedApprovalNode(ui: *Ui, model: *const Model, block: anytype) Ui.Node {
             const operation_id = block.operationId();
-            const cancel_key = canvas.uiKey(ui.fmt("approval-rail:{s}:cancel", .{operation_id}));
-            const reject_key = canvas.uiKey(ui.fmt("approval-rail:{s}:reject", .{operation_id}));
-            const allow_key = canvas.uiKey(ui.fmt("approval-rail:{s}:allow", .{operation_id}));
+            const cancel_key = canvas.uiKey(ui.fmt("approval:{s}:cancel", .{operation_id}));
+            const reject_key = canvas.uiKey(ui.fmt("approval:{s}:reject", .{operation_id}));
+            const allow_key = canvas.uiKey(ui.fmt("approval:{s}:allow", .{operation_id}));
             const controls = if (block.canAllowOnce())
                 ui.row(.{ .gap = 6, .cross = .center }, .{
                     ui.button(.{ .global_key = cancel_key, .size = .sm, .variant = .outline, .on_press = Msg{ .cancel_agent_effect = operation_id }, .disabled = model.agentPermissionBusy() }, "Cancel"),
