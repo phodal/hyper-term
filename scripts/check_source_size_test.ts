@@ -28,11 +28,15 @@ Deno.test("new files use the default budget while legacy hotspots are frozen", (
   );
   assertEquals(
     sourceLineLimit("crates/hyper-term-daemon/src/agent_gateway.rs"),
-    5_217,
+    defaultSourceLineLimit,
   );
   assertEquals(
     sourceLineLimit("crates/hyper-term-daemon/src/lib.rs"),
-    3_441,
+    defaultSourceLineLimit,
+  );
+  assertEquals(
+    sourceLineLimit("crates/hyper-term-daemon/src/workspace_apply.rs"),
+    2_924,
   );
   assertEquals(
     sourceLineLimit("crates/hyper-term-drivers/src/acp.rs"),
