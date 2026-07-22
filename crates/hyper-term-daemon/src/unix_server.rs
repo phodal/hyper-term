@@ -1,10 +1,62 @@
 use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::*;
+
+#[derive(Clone, Copy)]
+enum ConnectionAuthority {
+    DesktopController,
+    AgentMcpConnector { task_id: TaskId },
+}
+
+impl ConnectionAuthority {
+    fn allows_request(self, request: &ControlRequest) -> bool {
+        match self {
+            Self::DesktopController => true,
+            Self::AgentMcpConnector { task_id: bound } => match request {
+                ControlRequest::ProposeOperation {
+                    task_id,
+                    kind: OperationKind::McpTool,
+                    action: OperationAction::Opaque { .. },
+                    ..
+                }
+                | ControlRequest::BeginOperation { task_id, .. }
+                | ControlRequest::ExecuteBrokeredMcpTool { task_id, .. }
+                | ControlRequest::CompleteOperation { task_id, .. }
+                | ControlRequest::AcceptGenUiArtifact { task_id, .. } => *task_id == bound,
+                ControlRequest::Hello { .. }
+                | ControlRequest::CreateTask { .. }
+                | ControlRequest::ProposeOperation { .. }
+                | ControlRequest::DecidePermission { .. }
+                | ControlRequest::DispatchTerminal { .. }
+                | ControlRequest::OpenUserShell { .. }
+                | ControlRequest::SubscribeTerminal { .. }
+                | ControlRequest::ResizeTerminal { .. }
+                | ControlRequest::CloseTerminal { .. }
+                | ControlRequest::AcquireInputLease { .. }
+                | ControlRequest::ReleaseInputLease { .. }
+                | ControlRequest::GetBlockSnapshot { .. } => false,
+            },
+        }
+    }
+
+    fn allows_terminal_input(self) -> bool {
+        matches!(self, Self::DesktopController)
+    }
+
+    fn allows_broadcast(self, response: &ControlResponse) -> bool {
+        match self {
+            Self::DesktopController => true,
+            Self::AgentMcpConnector { task_id } => matches!(
+                response,
+                ControlResponse::Event { event } if event.task_id == task_id
+            ),
+        }
+    }
+}
 
 pub struct UnixServerHandle {
     path: PathBuf,
@@ -26,6 +78,29 @@ pub fn spawn_unix_server(
     path: impl AsRef<Path>,
     state: DaemonState,
 ) -> Result<UnixServerHandle, DaemonError> {
+    spawn_server(path, state, ConnectionAuthority::DesktopController)
+}
+
+/// Starts a server-assigned, task-scoped endpoint for the MCP connector inside
+/// an Agent provider sandbox. The connector cannot promote itself to desktop
+/// authority through the wire handshake.
+pub fn spawn_agent_capability_server(
+    path: impl AsRef<Path>,
+    state: DaemonState,
+    task_id: TaskId,
+) -> Result<UnixServerHandle, DaemonError> {
+    spawn_server(
+        path,
+        state,
+        ConnectionAuthority::AgentMcpConnector { task_id },
+    )
+}
+
+fn spawn_server(
+    path: impl AsRef<Path>,
+    state: DaemonState,
+    authority: ConnectionAuthority,
+) -> Result<UnixServerHandle, DaemonError> {
     let path = path.as_ref().to_path_buf();
     let listener = bind_socket(&path)?;
     listener.set_nonblocking(true)?;
@@ -33,7 +108,7 @@ pub fn spawn_unix_server(
     let thread_stop = Arc::clone(&stop);
     let thread = thread::Builder::new()
         .name("hyperd-accept".into())
-        .spawn(move || accept_until_stopped(listener, state, thread_stop))?;
+        .spawn(move || accept_until_stopped(listener, state, authority, thread_stop))?;
     Ok(UnixServerHandle {
         path,
         stop,
@@ -47,7 +122,11 @@ pub fn run_unix_server(path: impl AsRef<Path>, state: DaemonState) -> Result<(),
     let _cleanup = SocketCleanup(path);
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => spawn_connection(stream, state.clone())?,
+            Ok(stream) => spawn_connection(
+                stream,
+                state.clone(),
+                ConnectionAuthority::DesktopController,
+            )?,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error.into()),
         }
@@ -66,6 +145,7 @@ impl Drop for SocketCleanup {
 fn bind_socket(path: &Path) -> Result<UnixListener, DaemonError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if !metadata.file_type().is_socket() {
@@ -76,14 +156,21 @@ fn bind_socket(path: &Path) -> Result<UnixListener, DaemonError> {
         }
         fs::remove_file(path)?;
     }
-    Ok(UnixListener::bind(path)?)
+    let listener = UnixListener::bind(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
 
-fn accept_until_stopped(listener: UnixListener, state: DaemonState, stop: Arc<AtomicBool>) {
+fn accept_until_stopped(
+    listener: UnixListener,
+    state: DaemonState,
+    authority: ConnectionAuthority,
+    stop: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let _ = spawn_connection(stream, state.clone());
+                let _ = spawn_connection(stream, state.clone(), authority);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -94,7 +181,11 @@ fn accept_until_stopped(listener: UnixListener, state: DaemonState, stop: Arc<At
     }
 }
 
-fn spawn_connection(stream: UnixStream, state: DaemonState) -> Result<(), DaemonError> {
+fn spawn_connection(
+    stream: UnixStream,
+    state: DaemonState,
+    authority: ConnectionAuthority,
+) -> Result<(), DaemonError> {
     // A nonblocking listener can yield a nonblocking accepted socket on
     // some Unix hosts. Each connection has its own reader thread, so keep
     // the framed protocol blocking and avoid treating a handshake race as
@@ -103,7 +194,7 @@ fn spawn_connection(stream: UnixStream, state: DaemonState) -> Result<(), Daemon
     thread::Builder::new()
         .name("hyperd-client".into())
         .spawn(move || {
-            let _ = handle_connection(stream, state);
+            let _ = handle_connection(stream, state, authority);
         })?;
     Ok(())
 }
@@ -137,7 +228,11 @@ impl ConnectionWriter {
     }
 }
 
-fn handle_connection(stream: UnixStream, state: DaemonState) -> Result<(), DaemonError> {
+fn handle_connection(
+    stream: UnixStream,
+    state: DaemonState,
+    authority: ConnectionAuthority,
+) -> Result<(), DaemonError> {
     let mut reader = stream.try_clone()?;
     let writer = ConnectionWriter::new(stream);
     let (client_id, hello_request) = match read_frame(&mut reader)? {
@@ -186,6 +281,9 @@ fn handle_connection(stream: UnixStream, state: DaemonState) -> Result<(), Daemo
         .name(format!("hyperd-events-{client_id}"))
         .spawn(move || {
             while let Ok(response) = control.recv() {
+                if !authority.allows_broadcast(&response) {
+                    continue;
+                }
                 if control_writer.response(None, response).is_err() {
                     break;
                 }
@@ -218,10 +316,12 @@ fn handle_connection(stream: UnixStream, state: DaemonState) -> Result<(), Daemo
         };
         match frame {
             WireFrame::Request(request) => {
-                handle_request(&state, &writer, client_id, request)?;
+                handle_request(&state, &writer, client_id, authority, request)?;
             }
             WireFrame::TerminalInput(frame) => {
-                if let Err(error) = state.write_terminal_input(client_id, frame) {
+                if !authority.allows_terminal_input() {
+                    writer.response(None, authority_denied())?;
+                } else if let Err(error) = state.write_terminal_input(client_id, frame) {
                     writer.response(None, error_response(&error))?;
                 }
             }
@@ -256,9 +356,14 @@ fn handle_request(
     state: &DaemonState,
     writer: &ConnectionWriter,
     session_client_id: ClientId,
+    authority: ConnectionAuthority,
     envelope: ControlRequestEnvelope,
 ) -> Result<(), DaemonError> {
     let request_id = envelope.request_id;
+    if !authority.allows_request(&envelope.request) {
+        writer.response(Some(request_id), authority_denied())?;
+        return Ok(());
+    }
     if let ControlRequest::SubscribeTerminal {
         terminal_id,
         after_sequence,
@@ -497,5 +602,12 @@ fn error_response(error: &DaemonError) -> ControlResponse {
     ControlResponse::Error {
         code: error.code().into(),
         message: error.to_string(),
+    }
+}
+
+fn authority_denied() -> ControlResponse {
+    ControlResponse::Error {
+        code: "authority_denied".into(),
+        message: "request is not allowed for this connection".into(),
     }
 }

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use hyper_term_daemon::{
     BrokeredMcpRuntimeConfig, DaemonState, DenoGenUiMcpExecutorConfig, DenoMcpExecutorConfig,
-    McpStdioConfig, run_mcp_stdio, spawn_unix_server,
+    McpStdioConfig, run_mcp_stdio, spawn_agent_capability_server,
 };
 use hyper_term_drivers::{DriverFraming, sha256_file};
 use hyper_term_protocol::{
@@ -24,7 +24,7 @@ fn approved_diff_tool_runs_through_mcp_and_leaves_a_receipt() {
     let state_directory = directory.path().join("state");
     let state = DaemonState::open(&state_directory).unwrap();
     let agent_task_id = state.create_task("Codex Agent session 1".into()).unwrap();
-    let _server = spawn_unix_server(&socket, state.clone()).unwrap();
+    let _server = spawn_agent_capability_server(&socket, state.clone(), agent_task_id).unwrap();
     let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
     client_io
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -167,7 +167,7 @@ fn approved_lsp_tool_queries_the_pinned_deno_snapshot() {
             },
         )
         .unwrap();
-    let _server = spawn_unix_server(&socket, state.clone()).unwrap();
+    let _server = spawn_agent_capability_server(&socket, state.clone(), agent_task_id).unwrap();
     let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
     client_io
         .set_read_timeout(Some(Duration::from_secs(15)))
@@ -301,7 +301,7 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
             },
         )
         .unwrap();
-    let _server = spawn_unix_server(&socket, state.clone()).unwrap();
+    let _server = spawn_agent_capability_server(&socket, state.clone(), agent_task_id).unwrap();
     let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
     client_io
         .set_read_timeout(Some(Duration::from_secs(20)))

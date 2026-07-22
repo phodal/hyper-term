@@ -3203,7 +3203,9 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, DaemonError> {
 mod unix_server;
 
 #[cfg(unix)]
-pub use unix_server::{UnixServerHandle, run_unix_server, spawn_unix_server};
+pub use unix_server::{
+    UnixServerHandle, run_unix_server, spawn_agent_capability_server, spawn_unix_server,
+};
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
