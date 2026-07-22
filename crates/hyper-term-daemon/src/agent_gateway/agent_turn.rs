@@ -434,7 +434,14 @@ pub(super) fn continue_turn(
                 }
                 return;
             }
-            AgentDriverEvent::Exited { .. } => {
+            AgentDriverEvent::Exited { code, state } => {
+                if agent_diagnostics_enabled() {
+                    let stderr = session.client.stderr_tail().unwrap_or_default();
+                    eprintln!(
+                        "hyper-term-agent: provider exited during turn: code={code:?} state={state:?}; stderr={}",
+                        bounded_agent_diagnostic(&stderr),
+                    );
+                }
                 set_progress_failed(&session, "Agent exited before the turn completed");
                 return;
             }
