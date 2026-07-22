@@ -26,7 +26,6 @@ export const defaultSourceLineLimit = 2_000;
 // only shrink while cohesive modules are extracted in follow-up changes.
 export const legacySourceLineLimits: Readonly<Record<string, number>> = {
   "crates/hyper-term-daemon/src/agent_gateway.rs": 5_298,
-  "crates/hyper-term-daemon/src/desktop.rs": 2_351,
   "crates/hyper-term-daemon/src/lib.rs": 3_452,
   "crates/hyper-term-daemon/src/workspace_apply.rs": 2_924,
   "crates/hyper-term-drivers/src/acp.rs": 2_655,
