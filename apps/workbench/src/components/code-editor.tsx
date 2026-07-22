@@ -195,6 +195,9 @@ export function CodeEditor(
           javascript({ jsx: true, typescript: true }),
           editorTheme,
           runtimeErrorLine,
+          EditorView.contentAttributes.of({
+            "aria-label": `Artifact source ${documentPath}`,
+          }),
           EditorState.readOnly.of(readOnly),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {

@@ -109,6 +109,26 @@ grep -q 'tab "Diff"' <<<"$verify_snapshot"
 grep -q 'tab "Time Travel"' <<<"$verify_snapshot"
 grep -q 'Iframe "Accepted Agentic UI artifact"' <<<"$verify_snapshot"
 
+# The IDE tabs must use the standard horizontal roving-focus interaction, not
+# only expose role=tab as presentation metadata. Drive the real keyboard path
+# and prove selection, focus, and the active panel stay aligned.
+agent-browser --session "$verify_session" \
+  focus '.studio-tabs [data-view="code"]' >/dev/null
+agent-browser --session "$verify_session" press ArrowRight >/dev/null
+verify_diff_tab=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const view=document.activeElement?.getAttribute("data-view");const selected=document.activeElement?.getAttribute("aria-selected");const panel=document.querySelector(".studio-editor")?.id;const tabStops=[...document.querySelectorAll(".studio-tabs [role=tab]")].filter(tab=>tab.tabIndex===0).map(tab=>tab.getAttribute("data-view"));return view==="diff"&&selected==="true"&&panel==="artifact-diff-panel"&&tabStops.length===1&&tabStops[0]==="diff"?"OK":JSON.stringify({view,selected,panel,tabStops});})()')
+grep -q '"OK"' <<<"$verify_diff_tab"
+agent-browser --session "$verify_session" press End >/dev/null
+verify_trace_tab=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const view=document.activeElement?.getAttribute("data-view");const panel=document.querySelector(".studio-editor")?.id;return view==="trace"&&panel==="artifact-trace-panel"?"OK":JSON.stringify({view,panel});})()')
+grep -q '"OK"' <<<"$verify_trace_tab"
+agent-browser --session "$verify_session" press Home >/dev/null
+verify_code_tab=$(agent-browser --session "$verify_session" eval \
+  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const editor=document.querySelector(".cm-content");const view=document.activeElement?.getAttribute("data-view");const panel=document.querySelector(".studio-editor")?.id;if(view==="code"&&panel==="artifact-code-panel"&&editor?.getAttribute("aria-label")==="Artifact source /main.ts"){clearInterval(poll);resolve("OK");}else if(performance.now()-started>5000){clearInterval(poll);reject(new Error(JSON.stringify({view,panel,label:editor?.getAttribute("aria-label")})));}},25)})')
+grep -q '"OK"' <<<"$verify_code_tab"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/artifact-workbench-keyboard-tabs.png" >/dev/null
+
 # The host-owned quality gate must load the exact Rust-accepted bundle into a
 # token-free isolated preview, exercise the fixed three-viewport matrix, and
 # persist a revision-bound report. Version 1 intentionally remains
@@ -176,6 +196,7 @@ fi
 echo "Artifact Workbench browser verified: authenticated Rust Gateway, real Deno LSP diagnostics, and visible CodeMirror completion"
 echo "Artifact Workbench diagnostic screenshot: $verify_artifact_dir/artifact-workbench-deno-diagnostic.png"
 echo "Artifact Workbench completion screenshot: $verify_artifact_dir/artifact-workbench-deno-completion.png"
+echo "Artifact Workbench keyboard tabs screenshot: $verify_artifact_dir/artifact-workbench-keyboard-tabs.png"
 echo "Artifact Workbench visual quality screenshot: $verify_artifact_dir/artifact-workbench-visual-quality.png"
 echo "Artifact Workbench hostile preview denied native, cross-origin, popup, clipboard, network, and oversized status injection"
 echo "Artifact Workbench hostile screenshot: $verify_artifact_dir/artifact-workbench-hostile-denied.png"

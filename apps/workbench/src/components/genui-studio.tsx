@@ -26,6 +26,7 @@ import {
 import { CodeDiff } from "./code-diff.tsx";
 import { CodeEditor } from "./code-editor.tsx";
 import { ArtifactFileTabs } from "./artifact-file-tabs.tsx";
+import { StudioToolTabs } from "./studio-tool-tabs.tsx";
 import {
   type BugCapsule,
   downloadBugCapsule,
@@ -586,7 +587,11 @@ export function GenUiStudio({
           >
             Draft sync · {checkpointStatusLabel(checkpointStatus)}
           </span>
-          <span className={`compiler-status ${error ? "has-error" : ""}`}>
+          <span
+            className={`compiler-status ${error ? "has-error" : ""}`}
+            role="status"
+            aria-live="polite"
+          >
             <span /> {status}
           </span>
           {onPublishDraft && (
@@ -615,31 +620,18 @@ export function GenUiStudio({
         files={files}
         onSelect={setActivePath}
       />
-      <div className="studio-tabs" role="tablist" aria-label="Artifact tools">
-        {(["code", "diff", "trace"] as const).map((tab) => (
-          <button
-            key={tab}
-            className={view === tab ? "active" : ""}
-            type="button"
-            role="tab"
-            aria-selected={view === tab}
-            onClick={() => setView(tab)}
-          >
-            {tab === "code" ? "Code" : tab === "diff" ? "Diff" : "Time Travel"}
-          </button>
-        ))}
-        <span className="studio-spacer" />
-        {languageService && (
-          <span
-            className={`language-status ${languageStatus}`}
-            title="Rust-supervised Deno LSP against the private artifact snapshot"
-          >
-            Deno LSP · {languageStatus}
-          </span>
-        )}
-        <span className="source-revision">source r{revision.current || 1}</span>
-      </div>
-      <div className="studio-editor">
+      <StudioToolTabs
+        view={view}
+        revision={revision.current}
+        languageStatus={languageService ? languageStatus : undefined}
+        onSelect={setView}
+      />
+      <div
+        className="studio-editor"
+        id={`artifact-${view}-panel`}
+        role="tabpanel"
+        aria-labelledby={`artifact-${view}-tab`}
+      >
         {view === "code" && (
           <CodeEditor
             value={source}

@@ -258,6 +258,23 @@ Accepted Artifact source, runtime trace, and Bug Capsule upgrades are now also
 implemented as separate version 2 contracts. Each preserves its own source,
 storage, or replay digest rather than inheriting the editor format.
 
+## Keyboard and accessibility evidence (2026-07-23)
+
+Artifact file tabs and Code, Diff, and Time Travel now implement a horizontal
+roving-focus contract. Only the selected tab participates in the ordinary Tab
+sequence; Left and Right wrap, while Home and End move directly to the first or
+last tab. Keyboard movement selects the corresponding view immediately and
+keeps focus, `aria-selected`, and the active `tabpanel` revision aligned.
+
+The CodeMirror content surface carries the active virtual path in its accessible
+name. Compiler and Rust-supervised Deno LSP changes use polite status semantics
+instead of relying on color alone. The authenticated Artifact Workbench browser
+gate drives the real key path through Code, Diff, and Time Travel, returns to a
+named `/main.ts` editor, then continues through live Deno diagnostics,
+completion, isolated preview, and hostile-preview denial. It retains a focused
+tab screenshot so focus visibility remains a release artifact rather than a
+DOM-only assertion.
+
 ## Validation gates
 
 - Restore Tiptap and CodeMirror documents, selections, attachments, and undo
