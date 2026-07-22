@@ -31,6 +31,7 @@ import {
 } from "../workspace-apply-publisher.ts";
 import { BugCapsuleClient } from "../debug-capsule-client.ts";
 import { GenUiStudio } from "./genui-studio.tsx";
+import { VisualQualityGate } from "./visual-quality-gate.tsx";
 import { WorkspaceReview } from "./workspace-review.tsx";
 import { WorkspaceApplyComposer } from "./workspace-apply-composer.tsx";
 
@@ -552,6 +553,15 @@ export function ArtifactWorkbench() {
               onRuntimeTrace={recordRuntimeTrace}
               onPrepareBugCapsule={prepareBugCapsule}
             />
+            {context && (
+              <VisualQualityGate
+                key={`quality:${state.source.artifact_id}:${state.source.source_revision}`}
+                artifactId={state.source.artifact_id}
+                sourceRevision={state.source.source_revision}
+                sessionId={context.sessionId}
+                token={context.token}
+              />
+            )}
           </div>
           {workspacePanel === "mapping" && (
             <WorkspaceApplyComposer

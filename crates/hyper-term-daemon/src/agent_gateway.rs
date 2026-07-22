@@ -55,6 +55,7 @@ use crate::artifact_editor_store::{
     ArtifactEditorStoreError,
 };
 use crate::artifact_runtime_trace_store::{ArtifactRuntimeTraceStore, RuntimeTraceStoreError};
+use crate::artifact_visual_quality_store::ArtifactVisualQualityStore;
 use crate::editor_lsp::{EditorLspError, EditorLspRequest, EditorLspResponse, EditorLspService};
 use crate::network_proxy::ManagedConnectProxy;
 use crate::workspace_apply::{
@@ -88,6 +89,10 @@ mod launch_provider;
 mod mcp_launch;
 mod permission;
 use permission::decide_permission;
+mod artifact_quality;
+use artifact_quality::{
+    artifact_render_payload, artifact_visual_quality, submit_artifact_visual_quality,
+};
 mod startup;
 #[cfg(test)]
 mod test_support;
@@ -227,6 +232,7 @@ struct AgentGatewayRuntime {
     sessions: Arc<Mutex<HashMap<u16, Arc<AgentSession>>>>,
     session_bindings: Arc<AgentSessionBindingStore>,
     preview_shell: Option<Arc<str>>,
+    preview_runtime_digest: Option<Arc<str>>,
     workbench_assets: Option<Arc<PathBuf>>,
     editor_lsp: Option<Arc<EditorLspService>>,
     artifact_draft_compiler: Option<Arc<ArtifactDraftCompiler>>,
@@ -234,6 +240,8 @@ struct AgentGatewayRuntime {
     artifact_editor_lock: Arc<Mutex<()>>,
     artifact_runtime_trace_store: Arc<ArtifactRuntimeTraceStore>,
     artifact_runtime_trace_lock: Arc<Mutex<()>>,
+    artifact_visual_quality_store: Arc<ArtifactVisualQualityStore>,
+    artifact_visual_quality_lock: Arc<Mutex<()>>,
     artifact_drafts: Arc<Mutex<HashMap<OperationId, ArtifactDraftRecord>>>,
     workspace_applies: Arc<Mutex<HashMap<OperationId, WorkspaceApplyRecord>>>,
     workspace_recovery_block: Arc<Mutex<Option<String>>>,
@@ -436,6 +444,9 @@ pub async fn spawn_agent_gateway(
         .map(|runtime| read_preview_shell(&runtime.preview_shell))
         .transpose()?
         .map(Arc::<str>::from);
+    let preview_runtime_digest = preview_shell
+        .as_deref()
+        .map(|shell| Arc::<str>::from(sha256_bytes(shell.as_bytes())));
     let editor_lsp = config
         .genui_runtime
         .as_ref()
@@ -473,6 +484,10 @@ pub async fn spawn_agent_gateway(
         ArtifactRuntimeTraceStore::open(&config.state_directory)
             .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?,
     );
+    let artifact_visual_quality_store = Arc::new(
+        ArtifactVisualQualityStore::open(&config.state_directory)
+            .map_err(|error| AgentGatewayError::WorkspaceRecovery(error.to_string()))?,
+    );
     let workbench_assets = config
         .workbench_assets
         .take()
@@ -507,6 +522,7 @@ pub async fn spawn_agent_gateway(
         sessions: Arc::new(Mutex::new(HashMap::new())),
         session_bindings,
         preview_shell,
+        preview_runtime_digest,
         workbench_assets,
         editor_lsp,
         artifact_draft_compiler,
@@ -514,6 +530,8 @@ pub async fn spawn_agent_gateway(
         artifact_editor_lock: Arc::new(Mutex::new(())),
         artifact_runtime_trace_store,
         artifact_runtime_trace_lock: Arc::new(Mutex::new(())),
+        artifact_visual_quality_store,
+        artifact_visual_quality_lock: Arc::new(Mutex::new(())),
         artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
         workspace_applies: Arc::new(Mutex::new(HashMap::new())),
         workspace_recovery_block: Arc::new(Mutex::new(workspace_recovery_block)),
@@ -549,6 +567,10 @@ pub async fn spawn_agent_gateway(
             get(preview_artifact),
         )
         .route(
+            "/agent/artifact/{artifact_id}/render-payload",
+            get(artifact_render_payload),
+        )
+        .route(
             "/agent/artifact/{artifact_id}/source-map",
             get(artifact_source_map),
         )
@@ -560,6 +582,10 @@ pub async fn spawn_agent_gateway(
         .route(
             "/agent/artifact/{artifact_id}/runtime-trace",
             get(artifact_runtime_trace).post(append_artifact_runtime_trace),
+        )
+        .route(
+            "/agent/artifact/{artifact_id}/visual-quality",
+            get(artifact_visual_quality).post(submit_artifact_visual_quality),
         )
         .route(
             "/agent/artifact/{artifact_id}/debug-capsule",

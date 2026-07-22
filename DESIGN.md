@@ -271,6 +271,11 @@ shape language must remain engineered and native, not bubbly or card-heavy.
   transitions; Terminal output and provider prose are never notification input.
 - Generated React UI is isolated in a bounded WebView Block with explicit
   origin, capability, focus, and lifetime leases.
+- Visual quality is progressive evidence, not a beauty score. The Workbench
+  keeps the summary compact, folds detailed findings, and identifies the exact
+  accepted revision and viewport. Rust derives blocking state; missing host
+  pixels, themes, motion, content, or focus scenarios remain visible coverage
+  gaps and prevent a browser from approving its own output.
 
 ## Do's and Don'ts
 

@@ -860,6 +860,7 @@
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_bindings: Arc::new(AgentSessionBindingStore::open(&state_directory).unwrap()),
             preview_shell: None,
+            preview_runtime_digest: Some(Arc::from("e".repeat(64))),
             workbench_assets: None,
             editor_lsp: None,
             artifact_draft_compiler: None,
@@ -869,6 +870,10 @@
                 ArtifactRuntimeTraceStore::open(&state_directory).unwrap(),
             ),
             artifact_runtime_trace_lock: Arc::new(Mutex::new(())),
+            artifact_visual_quality_store: Arc::new(
+                ArtifactVisualQualityStore::open(&state_directory).unwrap(),
+            ),
+            artifact_visual_quality_lock: Arc::new(Mutex::new(())),
             artifact_drafts: Arc::new(Mutex::new(HashMap::new())),
             workspace_applies: Arc::new(Mutex::new(HashMap::new())),
             workspace_recovery_block: Arc::new(Mutex::new(None)),

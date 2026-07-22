@@ -49,6 +49,7 @@ mod artifact_debug_capsule;
 mod artifact_editor_store;
 mod artifact_runtime_trace_store;
 mod artifact_store;
+mod artifact_visual_quality_store;
 #[cfg(unix)]
 mod client;
 mod editor_lsp;

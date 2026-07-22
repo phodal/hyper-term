@@ -109,6 +109,16 @@ grep -q 'tab "Diff"' <<<"$verify_snapshot"
 grep -q 'tab "Time Travel"' <<<"$verify_snapshot"
 grep -q 'Iframe "Accepted Agentic UI artifact"' <<<"$verify_snapshot"
 
+# The host-owned quality gate must load the exact Rust-accepted bundle into a
+# token-free isolated preview, exercise the fixed three-viewport matrix, and
+# persist a revision-bound report. Version 1 intentionally remains
+# needs_review when host pixel/theme/state evidence is unavailable.
+verify_quality=$(agent-browser --session "$verify_session" eval \
+  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const gate=document.querySelector(".visual-quality-gate");const summary=gate?.querySelector("summary")?.textContent||"";const state=gate?.className||"";const error=gate?.querySelector("[role=alert]")?.textContent||"";if((state.includes("needs_review")||state.includes("needs_revision"))&&summary.includes("3 viewports")&&!error){clearInterval(poll);resolve(JSON.stringify({state,summary}));}else if(performance.now()-started>20000){clearInterval(poll);reject(new Error(JSON.stringify({state,summary,error})));}},50)})')
+grep -q '3 viewports' <<<"$verify_quality"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/artifact-workbench-visual-quality.png" >/dev/null
+
 # Drive CodeMirror through the same contenteditable path as a user and require
 # a diagnostic returned by the Rust-managed Deno LSP session to reach the UI.
 verify_diagnostic_source=$'export default function App() {\n  const value: string = 42;\n  return value;\n}\n'
@@ -166,5 +176,6 @@ fi
 echo "Artifact Workbench browser verified: authenticated Rust Gateway, real Deno LSP diagnostics, and visible CodeMirror completion"
 echo "Artifact Workbench diagnostic screenshot: $verify_artifact_dir/artifact-workbench-deno-diagnostic.png"
 echo "Artifact Workbench completion screenshot: $verify_artifact_dir/artifact-workbench-deno-completion.png"
+echo "Artifact Workbench visual quality screenshot: $verify_artifact_dir/artifact-workbench-visual-quality.png"
 echo "Artifact Workbench hostile preview denied native, cross-origin, popup, clipboard, network, and oversized status injection"
 echo "Artifact Workbench hostile screenshot: $verify_artifact_dir/artifact-workbench-hostile-denied.png"

@@ -8,6 +8,8 @@ use uuid::Uuid;
 pub const MAX_GENUI_SOURCE_FILES: usize = 1_000;
 pub const MAX_GENUI_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_GENUI_VIRTUAL_PATH_BYTES: usize = 4 * 1024;
+pub const GENUI_VISUAL_QUALITY_SCHEMA_VERSION: u16 = 1;
+pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenUiCompilerIdentity {
@@ -64,6 +66,161 @@ pub struct AcceptedGenUiArtifact {
     pub entrypoint: String,
     pub content_digest: String,
     pub compiler: GenUiCompilerIdentity,
+}
+
+/// Host-owned review state for one exact Rust-accepted GenUI revision.
+///
+/// Browser observations can contribute bounded evidence, but only Rust derives
+/// this state. The first checker version deliberately remains `needs_review`
+/// when host pixel captures or required scenarios are absent.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenUiVisualReviewState {
+    NeedsRevision,
+    NeedsReview,
+    ReviewReady,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenUiObjectiveVisualStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenUiAdvisoryVisualStatus {
+    NotRun,
+    NeedsReview,
+    Clear,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenUiVisualFindingCategory {
+    EmptyRender,
+    ViewportOverflow,
+    ClippedContent,
+    UndersizedTarget,
+    LowContrast,
+    HiddenPrimaryAction,
+    ConsoleError,
+    ResourceFailure,
+    LayoutInstability,
+    CoverageGap,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenUiVisualFindingSeverity {
+    Blocking,
+    Warning,
+    Info,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiVisualViewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiVisualRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One bounded location sampled by the packaged preview checker.
+///
+/// The sample is evidence, not a caller-selected finding or status.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiVisualIssueSample {
+    pub category: GenUiVisualFindingCategory,
+    pub semantic_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rect: Option<GenUiVisualRect>,
+}
+
+/// Raw layout observation produced from the exact accepted bundle inside the
+/// packaged isolated preview. Rust validates the fixed capture matrix and
+/// derives findings from these counters.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiVisualCaptureObservation {
+    pub capture_id: String,
+    pub viewport: GenUiVisualViewport,
+    pub color_scheme: String,
+    pub locale: String,
+    pub scenario: String,
+    pub reduced_motion: bool,
+    pub document_width: u32,
+    pub document_height: u32,
+    pub element_count: u32,
+    pub interactive_count: u32,
+    pub clipped_count: u32,
+    pub undersized_target_count: u32,
+    pub low_contrast_count: u32,
+    pub hidden_primary_action_count: u32,
+    pub console_error_count: u32,
+    pub resource_failure_count: u32,
+    pub layout_shift_milli: u32,
+    pub semantic_digest: String,
+    #[serde(default)]
+    pub samples: Vec<GenUiVisualIssueSample>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiVisualQualitySubmission {
+    pub schema_version: u16,
+    pub source_revision: u64,
+    pub artifact_digest: String,
+    pub captures: Vec<GenUiVisualCaptureObservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiVisualCaptureEvidence {
+    #[serde(flatten)]
+    pub observation: GenUiVisualCaptureObservation,
+    pub observation_digest: String,
+    /// Pixel capture is not yet available from the sandboxed WebView path.
+    /// Keeping it explicit prevents layout observations from masquerading as
+    /// screenshot evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiVisualQualityFinding {
+    pub finding_id: String,
+    pub category: GenUiVisualFindingCategory,
+    pub severity: GenUiVisualFindingSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<String>,
+    pub explanation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<GenUiVisualIssueSample>,
+}
+
+/// Durable, revision-bound visual quality evidence. Screenshots remain local
+/// content-addressed files; this journal-safe contract retains only digests
+/// and bounded observations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GenUiVisualQualityReport {
+    pub schema_version: u16,
+    pub artifact_id: ArtifactId,
+    pub source_revision: u64,
+    pub artifact_digest: String,
+    pub preview_runtime_digest: String,
+    pub capture_manifest_digest: String,
+    pub checker_version: String,
+    pub captures: Vec<GenUiVisualCaptureEvidence>,
+    pub findings: Vec<GenUiVisualQualityFinding>,
+    pub objective_status: GenUiObjectiveVisualStatus,
+    pub advisory_status: GenUiAdvisoryVisualStatus,
+    pub review_state: GenUiVisualReviewState,
+    pub report_digest: String,
 }
 
 /// Semantic runtime evidence emitted by an isolated GenUI preview.

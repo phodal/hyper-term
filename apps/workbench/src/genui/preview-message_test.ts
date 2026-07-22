@@ -59,6 +59,38 @@ Deno.test("preview messages accept only the bounded channel-bound vocabulary", (
     }, channel)?.type,
     "hyper_term_preview_trace",
   );
+  assertEquals(
+    parsePreviewMessage({
+      type: "hyper_term_preview_quality_capture",
+      schema_version: 1,
+      channel_token: channel,
+      artifact_id: artifact,
+      source_revision: 3,
+      artifact_digest: "a".repeat(64),
+      observation: {
+        capture_id: "narrow-light-default",
+        viewport: { width: 390, height: 844 },
+        color_scheme: "light",
+        locale: "en",
+        scenario: "default",
+        reduced_motion: false,
+        document_width: 390,
+        document_height: 844,
+        element_count: 12,
+        interactive_count: 2,
+        clipped_count: 0,
+        undersized_target_count: 0,
+        low_contrast_count: 0,
+        hidden_primary_action_count: 0,
+        console_error_count: 0,
+        resource_failure_count: 0,
+        layout_shift_milli: 0,
+        semantic_digest: "b".repeat(64),
+        samples: [],
+      },
+    }, channel)?.type,
+    "hyper_term_preview_quality_capture",
+  );
 });
 
 Deno.test("hostile preview envelopes fail closed without throwing", () => {
@@ -95,6 +127,15 @@ Deno.test("hostile preview envelopes fail closed without throwing", () => {
       artifact_id: artifact,
       source_revision: 1,
       event: { kind: "checkpoint" },
+    },
+    {
+      type: "hyper_term_preview_quality_capture",
+      schema_version: 1,
+      channel_token: channel,
+      artifact_id: artifact,
+      source_revision: 1,
+      artifact_digest: "not-a-digest",
+      observation: {},
     },
     {
       type: "hyper_term_preview_boot",

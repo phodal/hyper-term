@@ -18,6 +18,11 @@ import {
   RuntimeReplaySession,
   verifyReplayProjectionDigest,
 } from "../src/genui/runtime-replay.ts";
+import {
+  measureVisualQuality,
+  type VisualQualityMeasureRequest,
+  type VisualQualityRuntimeCounters,
+} from "./visual-quality-measure.ts";
 
 interface RenderArtifactMessage {
   type: "hyper_term_render_artifact";
@@ -41,6 +46,15 @@ interface ReplayArtifactMessage extends Omit<RenderArtifactMessage, "type"> {
     projection_digest: string;
     events: RuntimeTraceEvent[];
   };
+}
+
+interface MeasureVisualQualityMessage {
+  type: "hyper_term_measure_visual_quality";
+  schema_version: 1;
+  channel_token: string;
+  artifact_id: string;
+  source_revision: number;
+  capture: VisualQualityMeasureRequest;
 }
 
 type RuntimeTraceKind =
@@ -89,9 +103,46 @@ let currentModule: string | undefined;
 let activeArtifact:
   | Pick<
     RenderArtifactMessage["artifact"],
-    "artifact_id" | "source_revision" | "source_map"
+    "artifact_id" | "source_revision" | "content_digest" | "source_map"
   >
   | undefined;
+const visualQualityCounters: VisualQualityRuntimeCounters = {
+  consoleErrors: 0,
+  resourceFailures: 0,
+  layoutShiftMilli: 0,
+};
+
+const originalConsoleError = console.error.bind(console);
+console.error = (...values: unknown[]) => {
+  visualQualityCounters.consoleErrors++;
+  originalConsoleError(...values);
+};
+globalThis.addEventListener("error", (event) => {
+  if (event.target instanceof HTMLElement && event.target !== document.body) {
+    visualQualityCounters.resourceFailures++;
+  }
+}, true);
+if (
+  typeof PerformanceObserver !== "undefined" &&
+  PerformanceObserver.supportedEntryTypes.includes("layout-shift")
+) {
+  const observer = new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
+      const shift = entry as PerformanceEntry & {
+        value?: number;
+        hadRecentInput?: boolean;
+      };
+      if (!shift.hadRecentInput && typeof shift.value === "number") {
+        visualQualityCounters.layoutShiftMilli = Math.min(
+          10_000,
+          visualQualityCounters.layoutShiftMilli +
+            Math.round(shift.value * 1_000),
+        );
+      }
+    }
+  });
+  observer.observe({ type: "layout-shift", buffered: true });
+}
 
 function requiredElement(id: string): HTMLElement {
   const element = document.getElementById(id);
@@ -182,10 +233,11 @@ globalThis.__HYPER_EFFECT__ = async <T>(
 };
 
 globalThis.addEventListener("message", (event: MessageEvent<unknown>) => {
-  if (!isRenderMessage(event.data)) {
-    return;
+  if (isRenderMessage(event.data)) {
+    void render(event.data);
+  } else if (isVisualQualityMeasureMessage(event.data)) {
+    void captureVisualQuality(event.data);
   }
-  void render(event.data);
 });
 globalThis.addEventListener("error", (event: ErrorEvent) => {
   reportRuntimeError(event.error ?? event.message);
@@ -227,6 +279,7 @@ async function render(
       reportRuntimeError("runtime replay projection digest mismatch", {
         artifact_id: artifact.artifact_id,
         source_revision: artifact.source_revision,
+        content_digest: artifact.content_digest,
         source_map: artifact.source_map,
       });
       return;
@@ -244,9 +297,13 @@ async function render(
   // to the Rust-accepted source revision.
   runtimeTraceStreamId = crypto.randomUUID();
   runtimeTraceSequence = 0;
+  visualQualityCounters.consoleErrors = 0;
+  visualQualityCounters.resourceFailures = 0;
+  visualQualityCounters.layoutShiftMilli = 0;
   activeArtifact = {
     artifact_id: artifact.artifact_id,
     source_revision: artifact.source_revision,
+    content_digest: artifact.content_digest,
     source_map: artifact.source_map,
   };
   if (
@@ -299,6 +356,30 @@ async function render(
           projection_digest: replaySession.projectionDigest,
         }
         : {}),
+    });
+  } catch (error) {
+    reportRuntimeError(error, activeArtifact);
+  }
+}
+
+async function captureVisualQuality(
+  message: MeasureVisualQualityMessage,
+): Promise<void> {
+  if (
+    !activeArtifact || message.artifact_id !== activeArtifact.artifact_id ||
+    message.source_revision !== activeArtifact.source_revision
+  ) return;
+  try {
+    const observation = await measureVisualQuality(
+      rootElement,
+      message.capture,
+      visualQualityCounters,
+    );
+    report("hyper_term_preview_quality_capture", {
+      artifact_id: activeArtifact.artifact_id,
+      source_revision: activeArtifact.source_revision,
+      artifact_digest: activeArtifact.content_digest,
+      observation,
     });
   } catch (error) {
     reportRuntimeError(error, activeArtifact);
@@ -388,6 +469,24 @@ function isRenderMessage(
         Number(message.replay?.source_revision) > 0 &&
         typeof message.replay?.projection_digest === "string" &&
         Array.isArray(message.replay?.events)));
+}
+
+function isVisualQualityMeasureMessage(
+  value: unknown,
+): value is MeasureVisualQualityMessage {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<MeasureVisualQualityMessage>;
+  return message.type === "hyper_term_measure_visual_quality" &&
+    message.schema_version === 1 && message.channel_token === channelToken &&
+    typeof message.artifact_id === "string" &&
+    Number.isSafeInteger(message.source_revision) &&
+    message.source_revision! > 0 &&
+    Boolean(message.capture) &&
+    typeof message.capture?.capture_id === "string" &&
+    message.capture.color_scheme === "light" &&
+    message.capture.locale === "en" &&
+    message.capture.scenario === "default" &&
+    message.capture.reduced_motion === false;
 }
 
 function validRuntimeTraceKind(value: string): value is RuntimeTraceKind {

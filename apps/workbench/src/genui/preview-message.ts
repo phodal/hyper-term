@@ -6,6 +6,7 @@ import {
   isRuntimeTraceMessage,
   type RuntimeTraceInput,
 } from "../runtime-trace-client.ts";
+import type { VisualCaptureObservation } from "../../genui/visual-quality-measure.ts";
 
 export const MAX_PREVIEW_MESSAGE_BYTES = 64 * 1024;
 const MAX_ARTIFACT_ID_BYTES = 128;
@@ -44,11 +45,20 @@ export interface PreviewTraceMessage extends PreviewMessageBase {
   event: RuntimeTraceInput;
 }
 
+export interface PreviewQualityCaptureMessage extends PreviewMessageBase {
+  type: "hyper_term_preview_quality_capture";
+  artifact_id: string;
+  source_revision: number;
+  artifact_digest: string;
+  observation: VisualCaptureObservation;
+}
+
 export type PreviewMessage =
   | PreviewBootMessage
   | PreviewReadyMessage
   | PreviewErrorMessage
-  | PreviewTraceMessage;
+  | PreviewTraceMessage
+  | PreviewQualityCaptureMessage;
 
 export function parsePreviewMessage(
   value: unknown,
@@ -93,7 +103,81 @@ export function parsePreviewMessage(
     value.type === "hyper_term_preview_trace" &&
     isRuntimeTraceMessage(value.event)
   ) return value as unknown as PreviewTraceMessage;
+  if (
+    value.type === "hyper_term_preview_quality_capture" &&
+    sha256(value.artifact_digest) && validVisualObservation(value.observation)
+  ) return value as unknown as PreviewQualityCaptureMessage;
   return undefined;
+}
+
+function validVisualObservation(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const capture = value as Record<string, unknown>;
+  const viewport = capture.viewport as Record<string, unknown> | undefined;
+  const samples = capture.samples;
+  const boundedCounts = [
+    capture.document_width,
+    capture.document_height,
+    capture.element_count,
+    capture.interactive_count,
+    capture.clipped_count,
+    capture.undersized_target_count,
+    capture.low_contrast_count,
+    capture.hidden_primary_action_count,
+    capture.console_error_count,
+    capture.resource_failure_count,
+    capture.layout_shift_milli,
+  ];
+  return boundedString(capture.capture_id, 64) &&
+    viewport !== undefined && positiveSafeInteger(viewport.width) &&
+    positiveSafeInteger(viewport.height) && capture.color_scheme === "light" &&
+    capture.locale === "en" && capture.scenario === "default" &&
+    capture.reduced_motion === false &&
+    boundedCounts.every((count) =>
+      nonNegativeBoundedInteger(count, 1_000_000)
+    ) &&
+    sha256(capture.semantic_digest) && Array.isArray(samples) &&
+    samples.length <= 24 && samples.every(validVisualSample);
+}
+
+function validVisualSample(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const sample = value as Record<string, unknown>;
+  const categories = new Set([
+    "empty_render",
+    "viewport_overflow",
+    "clipped_content",
+    "undersized_target",
+    "low_contrast",
+    "hidden_primary_action",
+    "console_error",
+    "resource_failure",
+    "layout_instability",
+  ]);
+  if (
+    typeof sample.category !== "string" || !categories.has(sample.category) ||
+    !boundedString(sample.semantic_path, 256)
+  ) return false;
+  if (sample.rect === undefined) return true;
+  if (
+    !sample.rect || typeof sample.rect !== "object" ||
+    Array.isArray(sample.rect)
+  ) {
+    return false;
+  }
+  const rect = sample.rect as Record<string, unknown>;
+  return Number.isSafeInteger(rect.x) && Number.isSafeInteger(rect.y) &&
+    nonNegativeBoundedInteger(rect.width, 1_000_000) &&
+    nonNegativeBoundedInteger(rect.height, 1_000_000);
+}
+
+function sha256(value: unknown): boolean {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function nonNegativeBoundedInteger(value: unknown, maximum: number): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 0 &&
+    Number(value) <= maximum;
 }
 
 function boundedJsonRecord(
