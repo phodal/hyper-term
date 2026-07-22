@@ -1,0 +1,91 @@
+<!-- Compile-only contract for the Zig-built Agent timeline. This fragment is
+     checked with the product model but is never installed as the root view. -->
+<column label="Agent block compile-only contract">
+<if test="false">
+  <scroll grow="1" label="Agent block contract">
+    <column gap="3" padding="10">
+      <if test="{hasAgentBlocks}">
+        <for each="agentBlocks" key="id" as="block">
+          <if test="{block.isMessage}">
+            <if test="{block.isUserMessage}">
+              <row>
+                <spacer grow="1" />
+                <bubble>
+                  <column gap="4" padding="9">
+                    <text wrap="true">{block.content}</text>
+                    <if test="{block.truncated}">
+                      <text foreground="warning">Block clipped to 8 KiB in this view.</text>
+                    </if>
+                  </column>
+                </bubble>
+              </row>
+            </if>
+            <else>
+              <column gap="4" padding="2">
+                <column padding="2"><markdown source="{block.content}" /></column>
+                <if test="{block.truncated}">
+                  <text foreground="warning">Response clipped to 8 KiB in this view.</text>
+                </if>
+              </column>
+            </else>
+          </if>
+          <else>
+            <if test="{block.isActivity}">
+              <accordion size="sm" text="{block.activityTitle}" selected="{block.expanded}" on-toggle="toggle_agent_block:{block.id}">
+                <column gap="5" padding="7">
+                  <text foreground="text_muted">{block.activityMeta}</text>
+                  <if test="{block.hasActivityDetails}"><markdown source="{block.content}" /></if>
+                  <if test="{block.truncated}"><text foreground="warning">Tool details clipped to 8 KiB in this view.</text></if>
+                </column>
+              </accordion>
+            </if>
+            <else>
+              <if test="{block.isOperation}">
+                <row gap="7" padding="5" cross="center">
+                  <icon name="wrench" width="13" height="13" foreground="info" />
+                  <text grow="1"><span weight="medium">{block.content}</span></text>
+                  <text foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
+                  <badge variant="secondary">{block.stateLabel}</badge>
+                </row>
+              </if>
+              <else>
+                <card border-color="warning">
+                  <column gap="6" padding="8">
+                    <row gap="6" cross="center">
+                      <icon name="alert" width="13" height="13" foreground="warning" />
+                      <text grow="1"><span weight="medium">{block.approvalTitle}</span></text>
+                      <text foreground="text_muted">{block.operationKindLabel} · {block.riskLabel}</text>
+                    </row>
+                    <text wrap="true">{block.content}</text>
+                    <if test="{block.isApprovalPending}">
+                      <if test="{block.canAllowOnce}">
+                        <row gap="6" cross="center">
+                          <if test="{block.isWorkspaceReview}"><text grow="1" foreground="text_muted">Rust-verified Diff · durable apply</text></if>
+                          <else><text grow="1" foreground="text_muted">Brokered read-only tool · receipt recorded</text></else>
+                          <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel</button>
+                          <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
+                          <button size="sm" variant="primary" on-press="allow_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Allow once</button>
+                        </row>
+                      </if>
+                      <else>
+                        <row gap="6" cross="center">
+                          <text grow="1" wrap="true" foreground="text_muted">Allow unavailable until Rust can enforce this effect.</text>
+                          <button size="sm" variant="outline" on-press="cancel_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Cancel</button>
+                          <button size="sm" variant="destructive" on-press="reject_agent_effect:{block.operationId}" disabled="{agentPermissionBusy}">Reject</button>
+                        </row>
+                      </else>
+                    </if>
+                    <else><text foreground="text_muted">Decision: {block.decisionLabel}</text></else>
+                  </column>
+                </card>
+              </else>
+            </else>
+          </else>
+        </for>
+        <if test="{agent_history_clipped}"><text foreground="text_muted">Showing the latest 16 Agent blocks.</text></if>
+      </if>
+      <else><spacer height="4" /></else>
+    </column>
+  </scroll>
+</if>
+</column>

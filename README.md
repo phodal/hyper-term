@@ -100,9 +100,12 @@ cargo run -p hyper-term-daemon --bin hyper-term-desktop -- \
   --workbench-assets "$PWD/dist/workbench"
 ```
 
-The app opens as a normal terminal; no agent provider is required. To use an
-Agent tab, install and sign in to a supported provider CLI first. Run
-`cargo run -p hyper-term-daemon --bin hyper-term-desktop -- --help` to see
+The app opens as a normal terminal; no agent provider is required. When an
+installed Codex or Claude CLI needs authentication, the Agent provider menu
+offers **Sign in … in Terminal**. Hyper Term opens an ordinary Terminal tab and
+copies the fixed login command; it never executes the command for you. Paste,
+review, press Return, then choose **Refresh** to let Rust re-check readiness.
+Run `cargo run -p hyper-term-daemon --bin hyper-term-desktop -- --help` to see
 provider-path options.
 
 ### Build a local macOS app
@@ -181,12 +184,29 @@ provider process and every Terminal PTY still start fresh instead of pretending
 their old processes survived. The current focus is reliability, accessibility,
 containment, and signed macOS distribution.
 
+## Roadmap
+
+- Keep zsh-compatible Terminal startup, input, resize, search, and burst output
+  on a fast path independent from Agent availability.
+- Finish provider sign-in recovery, permission review, and real Codex, Claude,
+  and Copilot ACP compatibility without giving Native or WebViews process
+  authority.
+- Complete the Deno/esbuild-wasm Agentic UI loop: React editing, bounded Diff,
+  live preview, runtime traces, and semantic Time Travel.
+- Remove the remaining source-size exceptions by extracting cohesive View,
+  Model, protocol, and test modules. New source files are limited to 2,000
+  lines; legacy hotspots are frozen and may only shrink.
+- Harden sandboxing, accessibility, crash recovery, signing, notarization, and
+  the once-daily prerelease pipeline before a stable public release.
+
 ## Contributing
 
 Issues and focused pull requests are welcome. Read [AGENTS.md](AGENTS.md) before
 changing protocols or process lifecycle behavior, and add a regression test for
-every such change. Keep `hyper-term-core` independent from the renderer and keep
-command and filesystem authority out of WebViews.
+every such change. Keep source files within 2,000 lines and split them at a
+cohesive View, Model, protocol, or test boundary. Keep `hyper-term-core`
+independent from the renderer and keep command and filesystem authority out of
+WebViews.
 
 ## License
 

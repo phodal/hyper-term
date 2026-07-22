@@ -12,6 +12,7 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const agent_capabilities = @import("agent_capabilities.zig");
 const agent_block_view = @import("agent_block_view.zig");
+const agent_provider = @import("agent_provider.zig");
 const agent_start_policy = @import("agent_start_policy.zig");
 const agent_wire = @import("agent_wire.zig");
 const AgentAttentionResponseWire = agent_wire.AttentionResponse;
@@ -108,6 +109,7 @@ pub const agent_attention_poll_timer_key: u64 = 0x4854_5300;
 pub const desktop_workspace_effect_key: u64 = 0x4854_5400;
 pub const terminal_metadata_effect_key: u64 = 0x4854_5500;
 pub const terminal_metadata_poll_timer_key: u64 = 0x4854_5600;
+pub const provider_login_clipboard_effect_key: u64 = 0x4854_5700;
 const deferred_webview_delay_ns: u64 = 1_000_000;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
@@ -117,6 +119,7 @@ pub const titlebar_natural_height: f32 = 44;
 
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
+    native_sdk.security.permission_clipboard,
     native_sdk.security.permission_network,
     native_sdk.security.permission_notifications,
     native_sdk.security.permission_view,
@@ -164,38 +167,8 @@ pub const AgentDecision = agent_block_view.Decision;
 pub const AgentDiffFileView = agent_block_view.DiffFileView;
 pub const AgentBlockView = agent_block_view.BlockView;
 
-pub const AgentProvider = enum {
-    codex,
-    codex_acp,
-    claude_acp,
-    copilot_acp,
-
-    pub fn id(provider: AgentProvider) []const u8 {
-        return switch (provider) {
-            .codex => "codex",
-            .codex_acp => "codex-acp",
-            .claude_acp => "claude-acp",
-            .copilot_acp => "copilot-acp",
-        };
-    }
-
-    pub fn label(provider: AgentProvider) []const u8 {
-        return switch (provider) {
-            .codex => "Codex",
-            .codex_acp => "Codex ACP",
-            .claude_acp => "Claude ACP",
-            .copilot_acp => "Copilot ACP",
-        };
-    }
-};
-pub const AgentProviderReadiness = enum {
-    unavailable,
-    authenticated,
-    available,
-    login_required,
-    provider_missing,
-    probe_failed,
-};
+pub const AgentProvider = agent_provider.Provider;
+pub const AgentProviderReadiness = agent_provider.Readiness;
 
 pub const AgentConnection = enum {
     unavailable,
@@ -612,6 +585,7 @@ pub const Model = struct {
     provider_missing_agent_providers: u8 = 0,
     provider_probe_failed_agent_providers: u8 = 0,
     contained_agent_providers: u8 = 0,
+    provider_login: agent_provider.LoginGuide = .{},
     terminal_base_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
     terminal_base_url_len: usize = 0,
     terminal_url_storage: [terminal_url_capacity]u8 = [_]u8{0} ** terminal_url_capacity,
@@ -708,6 +682,7 @@ pub const Model = struct {
         "provider_missing_agent_providers",
         "provider_probe_failed_agent_providers",
         "contained_agent_providers",
+        "provider_login",
         "terminal_base_url_storage",
         "terminal_base_url_len",
         "terminal_url_storage",
@@ -856,21 +831,32 @@ pub const Model = struct {
             "Refresh providers";
     }
 
-    pub fn codexProviderAvailable(model: *const Model) bool {
-        return model.agentProviderAvailable(.codex);
+    pub fn codexLoginRequired(model: *const Model) bool {
+        return model.agentProviderReadiness(.codex) == .login_required or
+            model.agentProviderReadiness(.codex_acp) == .login_required;
     }
 
-    pub fn codexAcpProviderAvailable(model: *const Model) bool {
-        return model.agentProviderAvailable(.codex_acp);
+    pub fn claudeLoginRequired(model: *const Model) bool {
+        return model.agentProviderReadiness(.claude_acp) == .login_required;
     }
 
-    pub fn claudeAcpProviderAvailable(model: *const Model) bool {
-        return model.agentProviderAvailable(.claude_acp);
+    pub fn hasProviderLoginActions(model: *const Model) bool {
+        return model.codexLoginRequired() or model.claudeLoginRequired();
     }
 
-    pub fn copilotAcpProviderAvailable(model: *const Model) bool {
-        return model.agentProviderAvailable(.copilot_acp);
+    pub fn hasProviderLoginHint(model: *const Model) bool {
+        return model.provider_login.visible(model.active_session_id, model.isTerminal());
     }
+
+    pub fn providerLoginLabel(model: *const Model) []const u8 { return model.provider_login.label(); }
+    pub fn providerLoginCommand(model: *const Model) []const u8 { return model.provider_login.command(); }
+    pub fn providerLoginStatus(model: *const Model) []const u8 { return model.provider_login.status(); }
+    pub fn providerLoginCopyInFlight(model: *const Model) bool { return model.provider_login.copy_state == .copying; }
+
+    pub fn codexProviderAvailable(model: *const Model) bool { return model.agentProviderAvailable(.codex); }
+    pub fn codexAcpProviderAvailable(model: *const Model) bool { return model.agentProviderAvailable(.codex_acp); }
+    pub fn claudeAcpProviderAvailable(model: *const Model) bool { return model.agentProviderAvailable(.claude_acp); }
+    pub fn copilotAcpProviderAvailable(model: *const Model) bool { return model.agentProviderAvailable(.copilot_acp); }
 
     pub fn agentProviderAvailable(model: *const Model, provider: AgentProvider) bool {
         return model.available_agent_providers & providerBit(provider) != 0;
@@ -891,37 +877,15 @@ pub const Model = struct {
         return .unavailable;
     }
 
-    pub fn codexProviderDisabled(model: *const Model) bool {
-        return !model.agentProviderReady(.codex);
-    }
+    pub fn codexProviderDisabled(model: *const Model) bool { return !model.agentProviderReady(.codex); }
+    pub fn codexAcpProviderDisabled(model: *const Model) bool { return !model.agentProviderReady(.codex_acp); }
+    pub fn claudeAcpProviderDisabled(model: *const Model) bool { return !model.agentProviderReady(.claude_acp); }
+    pub fn copilotAcpProviderDisabled(model: *const Model) bool { return !model.agentProviderReady(.copilot_acp); }
 
-    pub fn codexAcpProviderDisabled(model: *const Model) bool {
-        return !model.agentProviderReady(.codex_acp);
-    }
-
-    pub fn claudeAcpProviderDisabled(model: *const Model) bool {
-        return !model.agentProviderReady(.claude_acp);
-    }
-
-    pub fn copilotAcpProviderDisabled(model: *const Model) bool {
-        return !model.agentProviderReady(.copilot_acp);
-    }
-
-    pub fn codexProviderMenuLabel(model: *const Model) []const u8 {
-        return providerMenuLabel(model, .codex);
-    }
-
-    pub fn codexAcpProviderMenuLabel(model: *const Model) []const u8 {
-        return providerMenuLabel(model, .codex_acp);
-    }
-
-    pub fn claudeAcpProviderMenuLabel(model: *const Model) []const u8 {
-        return providerMenuLabel(model, .claude_acp);
-    }
-
-    pub fn copilotAcpProviderMenuLabel(model: *const Model) []const u8 {
-        return providerMenuLabel(model, .copilot_acp);
-    }
+    pub fn codexProviderMenuLabel(model: *const Model) []const u8 { return providerMenuLabel(model, .codex); }
+    pub fn codexAcpProviderMenuLabel(model: *const Model) []const u8 { return providerMenuLabel(model, .codex_acp); }
+    pub fn claudeAcpProviderMenuLabel(model: *const Model) []const u8 { return providerMenuLabel(model, .claude_acp); }
+    pub fn copilotAcpProviderMenuLabel(model: *const Model) []const u8 { return providerMenuLabel(model, .copilot_acp); }
 
     pub fn agentStatus(model: *const Model) []const u8 {
         const session = model.activeSession();
@@ -1245,6 +1209,11 @@ pub const Msg = union(enum) {
     dismiss_agent_provider_picker,
     refresh_agent_providers,
     agent_providers_refreshed: native_sdk.EffectResponse,
+    open_codex_login_terminal,
+    open_claude_login_terminal,
+    copy_provider_login_command,
+    dismiss_provider_login_hint,
+    provider_login_command_copied: native_sdk.EffectClipboardResult,
     agent_attention_received: native_sdk.EffectResponse,
     agent_attention_poll: native_sdk.EffectTimer,
     terminal_metadata_received: native_sdk.EffectResponse,
@@ -1309,7 +1278,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "toggle_session_picker", "dismiss_session_picker", "select_session", "close_session", "close_active_session", "open_agent_search", "terminal_session_closed", "terminal_metadata_received", "terminal_metadata_poll", "desktop_workspace_persisted", "agent_providers_refreshed", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "toggle_session_picker", "dismiss_session_picker", "select_session", "close_session", "close_active_session", "open_agent_search", "terminal_session_closed", "terminal_metadata_received", "terminal_metadata_poll", "desktop_workspace_persisted", "agent_providers_refreshed", "provider_login_command_copied", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -1334,6 +1303,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .dismiss_agent_provider_picker => model.agent_provider_picker_open = false,
         .refresh_agent_providers => requestAgentProviderRefresh(model, fx),
         .agent_providers_refreshed => |response| applyAgentProviderRefresh(model, response),
+        .open_codex_login_terminal => openProviderLoginTerminal(model, .codex, fx),
+        .open_claude_login_terminal => openProviderLoginTerminal(model, .claude_acp, fx),
+        .copy_provider_login_command => copyProviderLoginCommand(model, fx),
+        .dismiss_provider_login_hint => model.provider_login.clear(),
+        .provider_login_command_copied => |result| applyProviderLoginClipboardResult(model, result),
         .agent_attention_received => |response| applyAgentAttentionResponse(model, response, fx),
         .agent_attention_poll => |timer| {
             if (timer.outcome == .fired) requestAgentAttention(model, fx);
@@ -1515,6 +1489,31 @@ fn createAgentSession(model: *Model, provider: AgentProvider, fx: *Effects) void
     }
 }
 
+fn openProviderLoginTerminal(model: *Model, provider: AgentProvider, fx: *Effects) void {
+    model.agent_provider_picker_open = false;
+    if (provider.loginCommand() == null) return;
+    const session_id = appendSession(model, .terminal) orelse return;
+    model.provider_login.open(provider, session_id);
+    copyProviderLoginCommand(model, fx);
+    markDesktopWorkspaceChanged(model, fx);
+}
+
+fn copyProviderLoginCommand(model: *Model, fx: *Effects) void {
+    const login_command = model.provider_login.command();
+    if (login_command.len == 0) return;
+    model.provider_login.copy_state = .copying;
+    fx.writeClipboard(.{
+        .key = provider_login_clipboard_effect_key,
+        .text = login_command,
+        .on_result = Effects.clipboardMsg(.provider_login_command_copied),
+    });
+}
+
+fn applyProviderLoginClipboardResult(model: *Model, result: native_sdk.EffectClipboardResult) void {
+    if (result.key != provider_login_clipboard_effect_key or result.op != .write) return;
+    model.provider_login.copy_state = if (result.outcome == .ok) .copied else .failed;
+}
+
 fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     model.session_picker_open = false;
     saveActiveAgentComposer(model);
@@ -1527,6 +1526,7 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     }
     const index = closing_index orelse return;
     const session = model.session_slots[index];
+    if (model.provider_login.session_id == session_id) model.provider_login.clear();
     const was_active = model.active_session_id == session_id;
     if (model.agent_editor_open_session_id == session_id) {
         model.agent_editor_open_session_id = 0;
@@ -1638,6 +1638,13 @@ fn applyAgentProviderRefresh(model: *Model, response: native_sdk.EffectResponse)
     model.agent_provider_refresh_in_flight = false;
     if (response.outcome != .ok or response.status != 200 or response.truncated) return;
     if (!applyAgentProviderStatus(model, response.body)) return;
+    if (model.provider_login.provider) |provider| {
+        const ready = if (provider == .codex or provider == .codex_acp)
+            model.agentProviderReady(.codex) or model.agentProviderReady(.codex_acp)
+        else
+            model.agentProviderReady(provider);
+        if (ready) model.provider_login.clear();
+    }
     const ready = model.authenticated_agent_providers | model.session_auth_agent_providers;
     if (!model.agentProviderReady(model.selected_agent_provider)) {
         model.selected_agent_provider = firstAvailableAgentProvider(ready) orelse
@@ -4030,9 +4037,12 @@ pub fn preferredUiFontPath(configured: ?[]const u8) []const u8 {
 
 pub const HyperTermUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
+pub const agent_block_contract_markup = @embedFile("agent_block_contract.native");
 pub const CompiledHyperTermView = canvas.CompiledMarkupView(Model, Msg, app_markup);
+pub const CompiledAgentBlockContractView = canvas.CompiledMarkupView(Model, Msg, agent_block_contract_markup);
 pub const hyper_term_fragments = [_]canvas.MarkupFragment{
     CompiledHyperTermView.fragment("src/app.native"),
+    CompiledAgentBlockContractView.fragment("src/agent_block_contract.native"),
 };
 const AgentMarkdown = native_sdk.markdown.Markdown(Msg);
 
@@ -5012,42 +5022,15 @@ fn clearAgentProviderStatus(model: *Model) void {
 }
 
 fn parseAgentProvider(id: []const u8) ?AgentProvider {
-    inline for (.{ AgentProvider.codex, AgentProvider.codex_acp, AgentProvider.claude_acp, AgentProvider.copilot_acp }) |provider| {
-        if (std.mem.eql(u8, id, provider.id())) return provider;
-    }
-    return null;
+    return agent_provider.parse(id);
 }
 
 fn expectedAgentProtocol(provider: AgentProvider) []const u8 {
-    return if (provider == .codex) "codex-app-server-v2" else "acp-v1";
+    return provider.protocol();
 }
 
 fn providerMenuLabel(model: *const Model, provider: AgentProvider) []const u8 {
-    return switch (provider) {
-        .codex => switch (model.agentProviderReadiness(provider)) {
-            .authenticated => "Codex · App Server · authenticated",
-            .login_required => "Codex · App Server · sign in required",
-            .probe_failed => "Codex · App Server · readiness failed",
-            else => "Codex · App Server · unavailable",
-        },
-        .codex_acp => switch (model.agentProviderReadiness(provider)) {
-            .authenticated => "Codex · ACP · authenticated",
-            .login_required => "Codex · ACP · sign in required",
-            .probe_failed => "Codex · ACP · readiness failed",
-            else => "Codex · ACP · unavailable",
-        },
-        .claude_acp => switch (model.agentProviderReadiness(provider)) {
-            .authenticated => "Claude · ACP · authenticated",
-            .login_required => "Claude · ACP · sign in required",
-            .probe_failed => "Claude · ACP · readiness failed",
-            else => "Claude · ACP · unavailable",
-        },
-        .copilot_acp => switch (model.agentProviderReadiness(provider)) {
-            .available => "Copilot · ACP · auth on session",
-            .probe_failed => "Copilot · ACP · readiness failed",
-            else => "Copilot · ACP · unavailable",
-        },
-    };
+    return agent_provider.menuLabel(provider, model.agentProviderReadiness(provider));
 }
 
 fn refreshTerminalUrl(model: *Model) void {
@@ -5467,4 +5450,5 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("tests.zig");
+    _ = @import("provider_login_tests.zig");
 }

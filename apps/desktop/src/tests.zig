@@ -1774,10 +1774,10 @@ test "Agent stream uses a tail-anchored variable timeline with stable block iden
     try testing.expectEqual(first_id, model.agentBlocks()[0].id);
 }
 
-test "desktop registers app markup as a hybrid hot reload fragment" {
-    try testing.expectEqual(@as(usize, 1), main.hyper_term_fragments.len);
+test "desktop registers product and contract markup as hot reload fragments" {
+    try testing.expectEqual(@as(usize, 2), main.hyper_term_fragments.len);
     try testing.expectEqualStrings("src/app.native", main.hyper_term_fragments[0].path);
-    try testing.expectEqualStrings(main.app_markup, main.hyper_term_fragments[0].source);
+    try testing.expectEqualStrings("src/agent_block_contract.native", main.hyper_term_fragments[1].path);
 }
 
 test "Agent timeline mounts only a tail window at the full retained block bound" {

@@ -179,11 +179,16 @@ set is enabled per release.
   Codex ACP, Claude ACP, and `copilot --acp --stdio` are separate provider
   registrations chosen explicitly from the Agent menu rather than inferred
   from terminal contents. Disabled menu entries retain the reason they cannot
-  start. Opening the provider disclosure requests a bounded refresh, so a
-  `codex login` or `claude auth login` completed in a normal Terminal tab takes
-  effect without restarting Hyper Term. Native never probes credentials or
-  launches a provider, and a failed refresh preserves the last complete status
-  projection.
+  start. A login-required Codex or Claude registration also exposes an explicit
+  Terminal sign-in action. Native creates an ordinary Terminal session and
+  writes only the fixed `codex login` or `claude auth login` text to the system
+  clipboard; it does not inject PTY bytes, press Return, probe credentials, or
+  launch a provider. The visible guide asks the user to paste and review the
+  command, then refreshes the Rust-owned readiness probe. A successful refresh
+  clears the guide only when that provider family becomes ready, while a failed
+  refresh preserves the last complete status projection. The compile-only
+  Agent Block vocabulary is a separate Native fragment so product layout and
+  protocol-contract growth remain independent.
 - ACP resolution is explicit path first, then the digest-inventoried bundled
   runtime, then a recognized installed package. This keeps automatic startup
   on the adapter version tested with the desktop build while preserving exact
@@ -254,10 +259,12 @@ set is enabled per release.
   the stricter Diff and GenUI MCP catalog. This is important for the normal
   Terminal default of starting in the user's home directory: Home is not
   silently treated as one giant Agent workspace.
-- Distribution still needs the containment decision in ADR 0014, a
-  terminal-auth UI, and the full fuzz and protocol-upgrade matrix. The internal
-  MCP adapter remains a bounded stdio subset; adopting the complete Rust MCP SDK
-  remains a release gate.
+- Distribution still needs the containment decision in ADR 0014 and the full
+  fuzz and protocol-upgrade matrix. Provider sign-in recovery now has a
+  terminal-first Native baseline, but packaged credential and Keychain failure
+  cases still require release automation. The internal MCP adapter remains a
+  bounded stdio subset; adopting the complete Rust MCP SDK remains a release
+  gate.
 
 ## Validation gates
 
