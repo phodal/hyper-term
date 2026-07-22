@@ -55,6 +55,7 @@ case "$real_provider" in
     real_provider_flag="--codex"
     real_agent_command="codex"
     real_adapter_package="@agentclientprotocol/codex-acp"
+    real_genui_tool_label="hyper_term.genui.compile"
     ;;
   claude)
     real_provider_label="Claude ACP"
@@ -62,6 +63,7 @@ case "$real_provider" in
     real_provider_flag="--claude"
     real_agent_command="claude"
     real_adapter_package="@agentclientprotocol/claude-agent-acp"
+    real_genui_tool_label="hyper_term.genui.compile"
     ;;
   copilot)
     real_provider_label="Copilot ACP"
@@ -69,6 +71,7 @@ case "$real_provider" in
     real_provider_flag="--copilot"
     real_agent_command="copilot"
     real_adapter_package=""
+    real_genui_tool_label="hyper_term-hyper_term-genui-compile"
     ;;
   *)
     echo "HYPER_TERM_REAL_ACP_PROVIDER must be codex, claude, or copilot" >&2
@@ -186,6 +189,21 @@ real_widget_id() {
     tail -n 1
 }
 
+real_widget_action_retry() {
+  real_action_pattern=$1
+  real_action=$2
+  shift 2
+  for _real_attempt in 1 2 3; do
+    real_action_id=$(real_widget_id "$real_action_pattern")
+    if [[ -n "$real_action_id" ]] &&
+      native automate widget-action hyper-term-canvas "$real_action_id" "$real_action" "$@"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
 (
   cd "$real_root"
   export HYPER_TERM_AGENT_DIAGNOSTICS=1
@@ -212,31 +230,31 @@ real_pid=$!
     'role=textbox name="Agent prompt".*enabled=true' \
     'role=button name="Send prompt".*enabled=true'
 
-  real_composer_id=$(real_widget_id 'role=textbox name="Agent prompt".*enabled=true')
-  if [[ -z "$real_composer_id" ]]; then
-    echo "real $real_provider_label composer widget is unavailable" >&2
-    exit 1
-  fi
   if [[ "$real_hostile" == 1 ]]; then
     real_source='import React, { useEffect } from "react"; import { traceCheckpoint } from "@hyper/runtime"; export default function App(){ useEffect(() => { const host = globalThis as typeof globalThis & { zero?: unknown; webkit?: { messageHandlers?: unknown } }; const denied = host.zero === undefined && !host.webkit?.messageHandlers; traceCheckpoint(denied ? "security.native_denied" : "security.native_exposed", { denied }); }, []); return React.createElement("main", null, "Native bridge isolation probe"); }'
-    real_prompt="Use hyper_term.genui.compile exactly once to compile this exact source with entry App.tsx: $real_source Do not run shell commands or modify workspace files. After the tool succeeds, reply exactly $real_expected."
+    real_prompt="Use $real_genui_tool_label exactly once to compile this exact source with entry App.tsx: $real_source Do not run shell commands or modify workspace files. After the tool succeeds, reply exactly $real_expected."
   elif [[ "$real_genui" == 1 ]]; then
-    real_prompt="Use hyper_term.genui.compile exactly once to compile this source with entry App.tsx: export default function App(){ return <main data-hyper-term=\"real-mcp\">$real_expected</main>; }. Do not run shell commands or modify workspace files. After the tool succeeds, reply exactly $real_expected."
+    real_prompt="Use $real_genui_tool_label exactly once to compile this source with entry App.tsx: export default function App(){ return <main data-hyper-term=\"real-mcp\">$real_expected</main>; }. Do not run shell commands or modify workspace files. After the tool succeeds, reply exactly $real_expected."
   else
     real_prompt="Reply with exactly $real_expected. Do not use tools or modify files."
   fi
-  native automate widget-action hyper-term-canvas "$real_composer_id" set-text \
-    "$real_prompt"
+  if ! real_widget_action_retry \
+    'role=textbox name="Agent prompt".*enabled=true' \
+    set-text \
+    "$real_prompt"; then
+    echo "real $real_provider_label composer widget is unavailable" >&2
+    exit 1
+  fi
   native automate assert \
     "role=textbox name=\"Agent prompt\".*$real_expected" \
     'role=button name="Send prompt".*enabled=true'
 
-  real_send_id=$(real_widget_id 'role=button name="Send prompt".*enabled=true')
-  if [[ -z "$real_send_id" ]]; then
+  if ! real_widget_action_retry \
+    'role=button name="Send prompt".*enabled=true' \
+    press; then
     echo "real $real_provider_label send widget is unavailable" >&2
     exit 1
   fi
-  native automate widget-click hyper-term-canvas "$real_send_id"
   native automate assert --timeout-ms 30000 'role=button name="Stop Agent turn"'
   if [[ "$real_genui" == 1 ]]; then
     native automate assert --timeout-ms 120000 \
