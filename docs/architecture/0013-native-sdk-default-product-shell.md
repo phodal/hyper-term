@@ -146,6 +146,16 @@ embedded by the Zig `rootView`; saved edits reload that fragment in place and
 then pass through the same builder-owned Agent Block composition seam. Release
 builds retain only the ahead-of-time compiled document and no source watcher.
 
+The builder-owned projection is now isolated in `src/desktop_view.zig`. It is a
+759-line generic Native View over the product `Model` and `Msg` contract and
+owns only virtual Agent transcript rows, compact Goal/Diff/Approval cards, and
+desktop Tab chrome. It cannot spawn processes, read files, or mutate the PTY;
+those effects remain in the Rust-backed update boundary. This extraction drops
+`main.zig` from 5,455 to 4,766 lines and ratchets its legacy size ceiling to the
+new value. New modules remain subject to the repository-wide 2,000-line limit;
+the remaining entrypoint exception may only shrink as Model and effect routers
+are extracted.
+
 ## Compact Agent interaction evidence (2026-07-20)
 
 The compact hierarchy is based on two local reference implementations, not on a
