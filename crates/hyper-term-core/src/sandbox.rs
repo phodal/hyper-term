@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use hyper_term_protocol::{
-    ActionDigest, Actor, CapabilityLease, CompiledSandboxProfile, OperationId, SandboxBackendKind,
-    SandboxLeaseId, SandboxPathAccess, SandboxPathRule, SandboxProfile, SandboxProfileDigest,
-    TerminalCommand,
+    ActionDigest, Actor, CompiledSandboxProfile, ContextDigest, ExecutionCapabilityLease,
+    OperationId, SandboxBackendKind, SandboxLeaseId, SandboxPathAccess, SandboxPathRule,
+    SandboxProfile, SandboxProfileDigest, TerminalCommand,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -227,6 +227,7 @@ fn stricter_access(left: SandboxPathAccess, right: SandboxPathAccess) -> Sandbox
 pub struct SandboxLeaseExpectation {
     pub operation_id: OperationId,
     pub operation_revision: u64,
+    pub context_digest: ContextDigest,
     pub action_digest: ActionDigest,
     pub profile_digest: SandboxProfileDigest,
     pub actor: Actor,
@@ -234,7 +235,7 @@ pub struct SandboxLeaseExpectation {
 
 #[derive(Clone, Debug)]
 struct LeaseEntry {
-    lease: CapabilityLease,
+    lease: ExecutionCapabilityLease,
     consumed_at_ms: Option<u64>,
 }
 
@@ -244,21 +245,22 @@ pub struct CapabilityLeaseLedger {
 }
 
 impl CapabilityLeaseLedger {
-    pub fn issue(&mut self, lease: CapabilityLease) -> Result<(), SandboxLeaseError> {
-        if lease.operation_revision == 0 {
+    pub fn issue(&mut self, lease: ExecutionCapabilityLease) -> Result<(), SandboxLeaseError> {
+        let capability = &lease.lease;
+        if capability.operation_revision == 0 {
             return Err(SandboxLeaseError::ZeroRevision);
         }
-        if lease.expires_at_ms <= lease.issued_at_ms {
+        if capability.expires_at_ms <= capability.issued_at_ms {
             return Err(SandboxLeaseError::InvalidLifetime);
         }
-        if !lease.one_use {
+        if !capability.one_use {
             return Err(SandboxLeaseError::ReusableLeaseForbidden);
         }
-        if self.leases.contains_key(&lease.lease_id) {
-            return Err(SandboxLeaseError::AlreadyExists(lease.lease_id));
+        if self.leases.contains_key(&capability.lease_id) {
+            return Err(SandboxLeaseError::AlreadyExists(capability.lease_id));
         }
         self.leases.insert(
-            lease.lease_id,
+            capability.lease_id,
             LeaseEntry {
                 lease,
                 consumed_at_ms: None,
@@ -272,7 +274,7 @@ impl CapabilityLeaseLedger {
         lease_id: SandboxLeaseId,
         expected: &SandboxLeaseExpectation,
         now_ms: u64,
-    ) -> Result<CapabilityLease, SandboxLeaseError> {
+    ) -> Result<ExecutionCapabilityLease, SandboxLeaseError> {
         let entry = self
             .leases
             .get_mut(&lease_id)
@@ -280,28 +282,32 @@ impl CapabilityLeaseLedger {
         if entry.consumed_at_ms.is_some() {
             return Err(SandboxLeaseError::AlreadyConsumed(lease_id));
         }
-        if now_ms < entry.lease.issued_at_ms {
+        let capability = &entry.lease.lease;
+        if now_ms < capability.issued_at_ms {
             return Err(SandboxLeaseError::NotYetValid);
         }
-        if now_ms >= entry.lease.expires_at_ms {
+        if now_ms >= capability.expires_at_ms {
             return Err(SandboxLeaseError::Expired);
         }
-        if entry.lease.operation_id != expected.operation_id {
+        if capability.operation_id != expected.operation_id {
             return Err(SandboxLeaseError::OperationMismatch);
         }
-        if entry.lease.operation_revision != expected.operation_revision {
+        if capability.operation_revision != expected.operation_revision {
             return Err(SandboxLeaseError::RevisionMismatch {
-                expected: entry.lease.operation_revision,
+                expected: capability.operation_revision,
                 actual: expected.operation_revision,
             });
         }
-        if entry.lease.action_digest != expected.action_digest {
+        if entry.lease.context_digest != expected.context_digest {
+            return Err(SandboxLeaseError::ContextDigestMismatch);
+        }
+        if capability.action_digest != expected.action_digest {
             return Err(SandboxLeaseError::ActionDigestMismatch);
         }
-        if entry.lease.profile_digest != expected.profile_digest {
+        if capability.profile_digest != expected.profile_digest {
             return Err(SandboxLeaseError::ProfileDigestMismatch);
         }
-        if entry.lease.actor != expected.actor {
+        if capability.actor != expected.actor {
             return Err(SandboxLeaseError::ActorMismatch);
         }
         entry.consumed_at_ms = Some(now_ms);
@@ -373,6 +379,8 @@ pub enum SandboxLeaseError {
     RevisionMismatch { expected: u64, actual: u64 },
     #[error("sandbox lease action digest does not match")]
     ActionDigestMismatch,
+    #[error("sandbox lease execution-context digest does not match")]
+    ContextDigestMismatch,
     #[error("sandbox lease profile digest does not match")]
     ProfileDigestMismatch,
     #[error("sandbox lease actor does not match")]
@@ -590,53 +598,56 @@ mod tests {
         assert_ne!(original_digest, terminal_action_digest(&changed).unwrap());
     }
 
-    fn lease() -> CapabilityLease {
-        CapabilityLease {
-            lease_id: SandboxLeaseId::new(),
-            operation_id: OperationId::new(),
-            operation_revision: 4,
-            action_digest: terminal_action_digest(&command()).unwrap(),
-            profile_digest: sandbox_profile_digest(&profile(Vec::new())).unwrap(),
-            actor: Actor::Agent {
-                adapter: "test".into(),
+    fn lease() -> ExecutionCapabilityLease {
+        ExecutionCapabilityLease {
+            context_digest: ContextDigest::parse("9".repeat(64)).unwrap(),
+            lease: hyper_term_protocol::CapabilityLease {
+                lease_id: SandboxLeaseId::new(),
+                operation_id: OperationId::new(),
+                operation_revision: 4,
+                action_digest: terminal_action_digest(&command()).unwrap(),
+                profile_digest: sandbox_profile_digest(&profile(Vec::new())).unwrap(),
+                actor: Actor::Agent {
+                    adapter: "test".into(),
+                },
+                issued_at_ms: 100,
+                expires_at_ms: 200,
+                one_use: true,
             },
-            issued_at_ms: 100,
-            expires_at_ms: 200,
-            one_use: true,
         }
     }
 
-    fn expectation(lease: &CapabilityLease) -> SandboxLeaseExpectation {
+    fn expectation(lease: &ExecutionCapabilityLease) -> SandboxLeaseExpectation {
         SandboxLeaseExpectation {
-            operation_id: lease.operation_id,
-            operation_revision: lease.operation_revision,
-            action_digest: lease.action_digest.clone(),
-            profile_digest: lease.profile_digest.clone(),
-            actor: lease.actor.clone(),
+            operation_id: lease.lease.operation_id,
+            operation_revision: lease.lease.operation_revision,
+            context_digest: lease.context_digest.clone(),
+            action_digest: lease.lease.action_digest.clone(),
+            profile_digest: lease.lease.profile_digest.clone(),
+            actor: lease.lease.actor.clone(),
         }
     }
 
     #[test]
     fn lease_is_revision_bound_and_consumed_once() {
         let lease = lease();
+        let lease_id = lease.lease.lease_id;
         let mut ledger = CapabilityLeaseLedger::default();
         ledger.issue(lease.clone()).unwrap();
 
         let mut wrong_revision = expectation(&lease);
         wrong_revision.operation_revision += 1;
         assert!(matches!(
-            ledger.consume(lease.lease_id, &wrong_revision, 150),
+            ledger.consume(lease_id, &wrong_revision, 150),
             Err(SandboxLeaseError::RevisionMismatch { .. })
         ));
-        assert_eq!(ledger.is_consumed(lease.lease_id), Some(false));
+        assert_eq!(ledger.is_consumed(lease_id), Some(false));
 
-        ledger
-            .consume(lease.lease_id, &expectation(&lease), 150)
-            .unwrap();
-        assert_eq!(ledger.is_consumed(lease.lease_id), Some(true));
+        ledger.consume(lease_id, &expectation(&lease), 150).unwrap();
+        assert_eq!(ledger.is_consumed(lease_id), Some(true));
         assert_eq!(
-            ledger.consume(lease.lease_id, &expectation(&lease), 151),
-            Err(SandboxLeaseError::AlreadyConsumed(lease.lease_id))
+            ledger.consume(lease_id, &expectation(&lease), 151),
+            Err(SandboxLeaseError::AlreadyConsumed(lease_id))
         );
     }
 
@@ -645,6 +656,7 @@ mod tests {
         let variants = ["action", "profile", "actor"];
         for variant in variants {
             let lease = lease();
+            let lease_id = lease.lease.lease_id;
             let mut ledger = CapabilityLeaseLedger::default();
             ledger.issue(lease.clone()).unwrap();
             let mut expected = expectation(&lease);
@@ -662,14 +674,26 @@ mod tests {
                     SandboxLeaseError::ActorMismatch
                 }
             };
-            assert_eq!(ledger.consume(lease.lease_id, &expected, 150), Err(wanted));
+            assert_eq!(ledger.consume(lease_id, &expected, 150), Err(wanted));
         }
 
+        let context_lease = lease();
+        let lease_id = context_lease.lease.lease_id;
+        let mut ledger = CapabilityLeaseLedger::default();
+        ledger.issue(context_lease.clone()).unwrap();
+        let mut wrong_context = expectation(&context_lease);
+        wrong_context.context_digest = ContextDigest::parse("8".repeat(64)).unwrap();
+        assert_eq!(
+            ledger.consume(lease_id, &wrong_context, 150),
+            Err(SandboxLeaseError::ContextDigestMismatch)
+        );
+
         let lease = lease();
+        let lease_id = lease.lease.lease_id;
         let mut ledger = CapabilityLeaseLedger::default();
         ledger.issue(lease.clone()).unwrap();
         assert_eq!(
-            ledger.consume(lease.lease_id, &expectation(&lease), 200),
+            ledger.consume(lease_id, &expectation(&lease), 200),
             Err(SandboxLeaseError::Expired)
         );
     }

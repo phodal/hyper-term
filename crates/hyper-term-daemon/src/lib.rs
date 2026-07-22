@@ -10,25 +10,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use hyper_term_core::{
-    BlockProjector, CapabilityLeaseLedger, JournalError, JsonlJournal, OperationError,
-    OperationRecord, OperationReducer, ProjectorError, SandboxCompileRequest, SandboxError,
+    BlockProjector, CapabilityLeaseLedger, ExecutionAuthorizationError,
+    ExecutionAuthorizationRequest, ExecutionContextInputs, JournalError, JsonlJournal,
+    OperationError, OperationRecord, OperationReducer, ProjectorError, SandboxError,
     SandboxLaunchPlan, SandboxLauncher, SandboxLeaseError, SandboxLeaseExpectation, TerminalConfig,
     TerminalError, TerminalEvent, TerminalReplay, TerminalSessionHandle, TerminalSubscription,
-    TerminalSupervisor, UserShellConfig,
+    TerminalSupervisor, UserShellConfig, compile_authorized_execution_plan,
 };
 use hyper_term_protocol::{
     AcceptedGenUiArtifact, Actor, AgentExecutionContextReceiptSet, BlockDocument, BlockId,
-    BlockPatch, CapabilityLease, ClientId, CompiledSandboxProfile, ContextReceipt, ControlRequest,
+    BlockPatch, ClientId, CompiledSandboxProfile, ContextDigest, ContextReceipt, ControlRequest,
     ControlRequestEnvelope, ControlResponse, ControlResponseEnvelope, DomainEvent,
-    EXECUTION_CONTEXT_SCHEMA_VERSION, EventEnvelope, GenUiArtifactCandidate, InputLeaseId,
-    LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt, MessageRole, NewEvent,
-    OperationAction, OperationCompletion, OperationId, OperationKind, OperationOutcome,
-    OperationState, PROTOCOL_VERSION, PermissionDecision, RequestId, RiskClass, SandboxEnforcement,
-    SandboxEnvironmentPolicy, SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime,
-    SandboxNetworkPolicy, SandboxOutcome, SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy,
-    SandboxReceipt, SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId,
-    TerminalInputFrame, TerminalSize, TerminalSnapshotFrame, WireError, WireFrame, read_frame,
-    write_frame,
+    EXECUTION_CONTEXT_SCHEMA_VERSION, EventEnvelope, ExecutionCapabilityLease,
+    GenUiArtifactCandidate, InputLeaseId, LocalMcpServerRuntimeReceipt, LocalMcpToolCall,
+    LocalMcpToolCallReceipt, MessageRole, NewEvent, OperationAction, OperationCompletion,
+    OperationId, OperationKind, OperationOutcome, OperationState, PROTOCOL_VERSION,
+    PermissionDecision, RequestId, RiskClass, SandboxEnforcement, SandboxEnvironmentPolicy,
+    SandboxFileSystemPolicy, SandboxLeaseId, SandboxLifetime, SandboxNetworkPolicy, SandboxOutcome,
+    SandboxPathAccess, SandboxPathRule, SandboxProcessPolicy, SandboxReceipt,
+    SandboxResourceLimits, TaskId, TerminalDataFrame, TerminalId, TerminalInputFrame, TerminalSize,
+    TerminalSnapshotFrame, WireError, WireFrame, read_frame, write_frame,
 };
 use hyper_term_sandbox::{
     IsolatedTaskReceipt, IsolatedTaskRequest, IsolatedTaskTermination, IsolatedWorktreeError,
@@ -67,6 +68,7 @@ mod local_mcp_runtime;
 #[cfg(unix)]
 mod mcp_gateway;
 mod network_proxy;
+mod operation_execution_context;
 mod private_fs;
 #[cfg(unix)]
 mod state_root_lock;
@@ -206,13 +208,15 @@ struct OperationTerminalContext {
 #[derive(Clone)]
 struct AuthorizedSandbox {
     lease_id: SandboxLeaseId,
+    context_digest: ContextDigest,
     plan: SandboxLaunchPlan,
     scratch_directory: PathBuf,
 }
 
 struct PreparedSandbox {
     authorized: AuthorizedSandbox,
-    lease: CapabilityLease,
+    lease: ExecutionCapabilityLease,
+    context_receipt: ContextReceipt,
 }
 
 #[derive(Clone)]
@@ -887,22 +891,7 @@ impl DaemonState {
                 },
                 filesystem: SandboxFileSystemPolicy { rules },
                 network: SandboxNetworkPolicy::Offline,
-                environment: SandboxEnvironmentPolicy {
-                    clear_inherited: true,
-                    variables: std::collections::BTreeMap::from([
-                        (
-                            "HOME".into(),
-                            scratch_directory.to_string_lossy().into_owned(),
-                        ),
-                        (
-                            "TMPDIR".into(),
-                            scratch_directory.to_string_lossy().into_owned(),
-                        ),
-                        ("LANG".into(), "C.UTF-8".into()),
-                        ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
-                        ("TERM".into(), "xterm-256color".into()),
-                    ]),
-                },
+                environment: SandboxEnvironmentPolicy::default(),
                 platform: Default::default(),
                 process: SandboxProcessPolicy {
                     allow_child_processes: true,
@@ -923,43 +912,54 @@ impl DaemonState {
             let actor = Actor::System;
             let mut normalized_command = command.clone();
             normalized_command.cwd = Some(workspace.clone());
-            let compile_request = SandboxCompileRequest {
+            let context = operation_execution_context::operation_execution_context_spec(
+                record.operation_id,
+                authorized_revision,
+                &normalized_command,
+                &workspace,
+                &scratch_directory,
+                profile,
+            );
+            let issued_at_ms = now_ms()?;
+            let request = ExecutionAuthorizationRequest {
                 operation_id: record.operation_id,
                 operation_revision: authorized_revision,
-                actor: actor.clone(),
+                actor,
+                context,
                 command: normalized_command,
-                profile,
+                lease_id: SandboxLeaseId::new(),
+                issued_at_ms,
+                expires_at_ms: issued_at_ms.saturating_add(SANDBOX_LEASE_TTL_MS),
             };
-            let plan = if isolated_task {
-                LimaIsolatedTaskLauncher.compile(&compile_request)?
+            let authorization = if isolated_task {
+                compile_authorized_execution_plan(
+                    request,
+                    &ExecutionContextInputs::default(),
+                    &LimaIsolatedTaskLauncher,
+                )?
             } else {
-                self.inner.sandbox_launcher.compile(&compile_request)?
+                compile_authorized_execution_plan(
+                    request,
+                    &ExecutionContextInputs::default(),
+                    self.inner.sandbox_launcher.as_ref(),
+                )?
             };
-            if !plan.compiled.enforced
-                || plan.compiled.backend
+            if !authorization.sandbox.compiled.enforced
+                || authorization.sandbox.compiled.backend
                     == hyper_term_protocol::SandboxBackendKind::TestOnlyUnenforced
             {
                 return Err(DaemonError::UnenforcedSandboxBackend);
             }
-            let issued_at_ms = now_ms()?;
-            let lease = CapabilityLease {
-                lease_id: SandboxLeaseId::new(),
-                operation_id: record.operation_id,
-                operation_revision: authorized_revision,
-                action_digest: plan.compiled.action_digest.clone(),
-                profile_digest: plan.compiled.profile_digest.clone(),
-                actor,
-                issued_at_ms,
-                expires_at_ms: issued_at_ms.saturating_add(SANDBOX_LEASE_TTL_MS),
-                one_use: true,
-            };
+            let lease = authorization.capability_lease;
             Ok(PreparedSandbox {
                 authorized: AuthorizedSandbox {
-                    lease_id: lease.lease_id,
-                    plan,
+                    lease_id: lease.lease.lease_id,
+                    context_digest: lease.context_digest.clone(),
+                    plan: authorization.sandbox,
                     scratch_directory: scratch_directory.clone(),
                 },
                 lease,
+                context_receipt: authorization.context_receipt,
             })
         })();
         if result.is_err() {
@@ -974,8 +974,19 @@ impl DaemonState {
         operation_revision: u64,
         prepared: PreparedSandbox,
     ) -> Result<(), DaemonError> {
-        let operation_id = prepared.lease.operation_id;
+        let operation_id = prepared.lease.lease.operation_id;
         let activation = (|| {
+            self.record(NewEvent {
+                task_id,
+                run_id: None,
+                operation_id: Some(operation_id),
+                causation_id: None,
+                correlation_id: None,
+                payload: DomainEvent::OperationExecutionContextCompiled {
+                    operation_revision,
+                    receipt: prepared.context_receipt.clone(),
+                },
+            })?;
             self.record(NewEvent {
                 task_id,
                 run_id: None,
@@ -995,10 +1006,10 @@ impl DaemonState {
                 correlation_id: None,
                 payload: DomainEvent::SandboxLeaseIssued {
                     operation_revision,
-                    lease_id: prepared.lease.lease_id,
-                    expires_at_ms: prepared.lease.expires_at_ms,
-                    profile_digest: prepared.lease.profile_digest.clone(),
-                    action_digest: prepared.lease.action_digest.clone(),
+                    lease_id: prepared.lease.lease.lease_id,
+                    expires_at_ms: prepared.lease.lease.expires_at_ms,
+                    profile_digest: prepared.lease.lease.profile_digest.clone(),
+                    action_digest: prepared.lease.lease.action_digest.clone(),
                 },
             })?;
             lock(&self.inner.sandbox_leases)?.issue(prepared.lease.clone())?;
@@ -1368,6 +1379,8 @@ pub enum DaemonError {
     #[error(transparent)]
     Sandbox(#[from] SandboxError),
     #[error(transparent)]
+    ExecutionAuthorization(#[from] ExecutionAuthorizationError),
+    #[error(transparent)]
     SandboxLease(#[from] SandboxLeaseError),
     #[error(transparent)]
     Wire(#[from] WireError),
@@ -1434,6 +1447,8 @@ pub enum DaemonError {
     InconsistentOperationOutcome,
     #[error("operation kind and action payload do not match")]
     ActionKindMismatch,
+    #[error("operation environment binding {0} requires a broker-owned opaque channel")]
+    UnsafeOperationEnvironment(String),
     #[error("local MCP server launch identity is invalid")]
     InvalidMcpServerLaunch,
     #[error("local MCP server runtime receipt is invalid")]
@@ -1588,6 +1603,7 @@ impl DaemonError {
             | Self::InvalidLocalMcpRuntimeReceipt
             | Self::InvalidLocalMcpToolCallReceipt
             | Self::LocalMcpRuntimeNotRecorded
+            | Self::UnsafeOperationEnvironment(_)
             | Self::EmptyMessage
             | Self::MessageTooLarge(_)
             | Self::ExternalMessageIdTooLarge

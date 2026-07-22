@@ -13,14 +13,15 @@ use hyper_term_daemon::{BrokeredMcpRuntimeConfig, DaemonError, DaemonState, spaw
 use hyper_term_protocol::{
     ApprovalActionDetail, ApprovalDetailDigest, BlockPayload, ClientId, ContextDigest,
     ContextReceipt, ControlRequest, ControlRequestEnvelope, ControlResponse, DomainEvent,
-    EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest, ExecutionMode, GenUiArtifactCandidate,
-    GenUiCompilerIdentity, LocalMcpCredentialScope, LocalMcpServerLaunch, LocalMcpServerLifecycle,
-    LocalMcpServerRuntimeReceipt, LocalMcpToolCall, LocalMcpToolCallReceipt,
-    LocalMcpToolContractReceipt, McpArgumentsDigest, McpCapabilitiesDigest, McpCatalogDigest,
-    McpRuntimeIdentityDigest, McpToolContractDigest, McpToolResultDigest, OperationAction,
-    OperationCompletion, OperationKind, OperationOutcome, OperationState, PermissionDecision,
-    RequestId, RiskClass, SandboxProfileDigest, TerminalCommand, TerminalDataFrame,
-    TerminalInputFrame, TerminalSize, WireFrame, canonical_mcp_json_bytes, read_frame, write_frame,
+    EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentPlanDigest, EventEnvelope, ExecutionMode,
+    GenUiArtifactCandidate, GenUiCompilerIdentity, LocalMcpCredentialScope, LocalMcpServerLaunch,
+    LocalMcpServerLifecycle, LocalMcpServerRuntimeReceipt, LocalMcpToolCall,
+    LocalMcpToolCallReceipt, LocalMcpToolContractReceipt, McpArgumentsDigest,
+    McpCapabilitiesDigest, McpCatalogDigest, McpRuntimeIdentityDigest, McpToolContractDigest,
+    McpToolResultDigest, OperationAction, OperationCompletion, OperationKind, OperationOutcome,
+    OperationState, PermissionDecision, RequestId, RiskClass, SandboxProfileDigest,
+    TerminalCommand, TerminalDataFrame, TerminalInputFrame, TerminalSize, WireFrame,
+    canonical_mcp_json_bytes, read_frame, write_frame,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -285,7 +286,7 @@ fn approval_detail_digest_binds_the_review_and_redacts_environment_values() {
                     program: "/usr/bin/env".into(),
                     args: vec!["--token".into(), "argument-secret".into()],
                     cwd: Some(workspace),
-                    env: BTreeMap::from([("API_TOKEN".into(), "environment-secret".into())]),
+                    env: BTreeMap::from([("MODEL_CONFIG".into(), "environment-secret".into())]),
                 },
             },
             "inspect the exact command".into(),
@@ -296,7 +297,7 @@ fn approval_detail_digest_binds_the_review_and_redacts_environment_values() {
     let approval = state.approval_detail(operation.operation_id).unwrap();
     let snapshot = serde_json::to_string(&state.block_snapshot(task_id).unwrap()).unwrap();
     assert!(snapshot.contains("<redacted>"));
-    assert!(snapshot.contains("API_TOKEN"));
+    assert!(snapshot.contains("MODEL_CONFIG"));
     assert!(!snapshot.contains("argument-secret"));
     assert!(!snapshot.contains("environment-secret"));
 
@@ -979,6 +980,24 @@ fn daemon_restart_invalidates_an_unused_sandbox_lease() {
         OperationState::Failed,
     );
     let events = std::fs::read_to_string(state_path.join("events.jsonl")).unwrap();
+    let context_receipt = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<EventEnvelope>(line).ok())
+        .find_map(|event| match event.payload {
+            DomainEvent::OperationExecutionContextCompiled {
+                operation_revision,
+                receipt,
+            } if event.operation_id == Some(operation.operation_id) => {
+                assert_eq!(operation_revision, authorized.revision);
+                Some(receipt)
+            }
+            _ => None,
+        })
+        .expect("durable execution context receipt");
+    assert_eq!(context_receipt.context_revision, authorized.revision);
+    assert_eq!(context_receipt.context_digest.as_str().len(), 64);
+    assert_eq!(context_receipt.environment_digest.as_str().len(), 64);
+    assert!(context_receipt.clear_inherited);
     assert!(events.contains("restart invalidated the in-memory one-use sandbox lease"));
 }
 

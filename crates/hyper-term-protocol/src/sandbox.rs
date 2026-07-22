@@ -219,6 +219,17 @@ pub struct CapabilityLease {
     pub one_use: bool,
 }
 
+/// Binds an existing one-use sandbox lease to the exact resolved execution
+/// context that supplied its environment and enforcement inputs.
+///
+/// This is a new wrapper instead of a field added to `CapabilityLease`, so
+/// older durable lease events retain their versioned serialized shape.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExecutionCapabilityLease {
+    pub context_digest: ContextDigest,
+    pub lease: CapabilityLease,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxOutcome {

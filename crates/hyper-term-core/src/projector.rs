@@ -292,6 +292,7 @@ impl BlockProjector {
                 vec![self.upsert(block, event.sequence)?]
             }
             DomainEvent::SandboxProfileCompiled { .. }
+            | DomainEvent::OperationExecutionContextCompiled { .. }
             | DomainEvent::SandboxLeaseIssued { .. }
             | DomainEvent::SandboxReceiptRecorded { .. }
             | DomainEvent::SandboxViolationObserved { .. }

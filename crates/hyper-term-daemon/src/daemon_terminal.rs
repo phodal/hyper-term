@@ -182,6 +182,7 @@ impl DaemonState {
             operation_revision: record.revision,
             action_digest: authorized.plan.compiled.action_digest.clone(),
             profile_digest: authorized.plan.compiled.profile_digest.clone(),
+            context_digest: authorized.context_digest.clone(),
             actor: Actor::System,
         };
         lock(&self.inner.sandbox_leases)?.consume(authorized.lease_id, &expected, now_ms()?)?;

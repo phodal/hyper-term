@@ -2,17 +2,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use hyper_term_protocol::{
-    BindingLifetime, BindingScope, CollisionPolicy, ContextBindingReceipt, ContextDigest,
-    ContextReceipt, CredentialRequirement, DerivedBinding, EXECUTION_CONTEXT_SCHEMA_VERSION,
-    EnvironmentBindingOrigin, EnvironmentBindingSpec, EnvironmentClass, EnvironmentPlanDigest,
-    EnvironmentSource, ExecutionContextSpec, ExecutionMode, OverridePolicy,
-    ResolvedEnvironmentBinding, ResolvedEnvironmentPlan, ResolvedExecutionContext,
+    Actor, BindingLifetime, BindingScope, CapabilityLease, CollisionPolicy, ContextBindingReceipt,
+    ContextDigest, ContextReceipt, CredentialRequirement, DerivedBinding,
+    EXECUTION_CONTEXT_SCHEMA_VERSION, EnvironmentBindingOrigin, EnvironmentBindingSpec,
+    EnvironmentClass, EnvironmentPlanDigest, EnvironmentSource, ExecutionCapabilityLease,
+    ExecutionContextSpec, ExecutionMode, OperationId, OverridePolicy, ResolvedEnvironmentBinding,
+    ResolvedEnvironmentPlan, ResolvedExecutionContext, SandboxLeaseId, TerminalCommand,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::canonicalize_sandbox_profile;
+use crate::{
+    SandboxCompileRequest, SandboxLaunchPlan, SandboxLauncher, canonicalize_sandbox_profile,
+    canonicalize_terminal_command,
+};
 
 const MAX_CONTEXT_ID_BYTES: usize = 128;
 const MAX_ENVIRONMENT_BINDINGS: usize = 128;
@@ -34,6 +38,26 @@ pub struct ExecutionContextInputs {
     pub allow_user_mode: bool,
     pub host_environment: BTreeMap<String, String>,
     pub environment_files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionAuthorizationRequest {
+    pub operation_id: OperationId,
+    pub operation_revision: u64,
+    pub actor: Actor,
+    pub context: ExecutionContextSpec,
+    pub command: TerminalCommand,
+    pub lease_id: SandboxLeaseId,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedExecutionPlan {
+    pub context: ResolvedExecutionContext,
+    pub context_receipt: ContextReceipt,
+    pub sandbox: SandboxLaunchPlan,
+    pub capability_lease: ExecutionCapabilityLease,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +182,81 @@ pub fn compile_execution_context(
         credential_bindings: canonical.credentials,
     };
     Ok((resolved, receipt))
+}
+
+/// Compiles metadata-only context intent into one immutable, operation-scoped
+/// local launch. Raw credentials are deliberately unsupported until the daemon
+/// owns an opaque materialization boundary.
+pub fn compile_authorized_execution_plan(
+    request: ExecutionAuthorizationRequest,
+    inputs: &ExecutionContextInputs,
+    launcher: &dyn SandboxLauncher,
+) -> Result<AuthorizedExecutionPlan, ExecutionAuthorizationError> {
+    if request.expires_at_ms <= request.issued_at_ms {
+        return Err(ExecutionAuthorizationError::InvalidLeaseLifetime);
+    }
+    let (context, context_receipt) = compile_execution_context(&request.context, inputs)?;
+    if context.mode == ExecutionMode::User {
+        return Err(ExecutionAuthorizationError::UserModeDenied);
+    }
+    if !context.credential_bindings.is_empty() {
+        return Err(ExecutionAuthorizationError::CredentialsNotMaterialized);
+    }
+    let shell = context
+        .shell
+        .as_ref()
+        .ok_or(ExecutionAuthorizationError::ShellRequired)?;
+    let mut command = canonicalize_terminal_command(&request.command)?;
+    if Path::new(&command.program) != shell.executable {
+        return Err(ExecutionAuthorizationError::ShellExecutableMismatch);
+    }
+    if command.cwd.as_ref() != Some(&context.workspace.working_directory) {
+        return Err(ExecutionAuthorizationError::WorkingDirectoryMismatch);
+    }
+    for (name, value) in &command.env {
+        if context.environment.variables.get(name) != Some(value) {
+            return Err(ExecutionAuthorizationError::EnvironmentNotInContext(
+                name.clone(),
+            ));
+        }
+    }
+    command.env = context.environment.variables.clone();
+    let profile = context
+        .requested_sandbox
+        .clone()
+        .ok_or(ExecutionAuthorizationError::SandboxRequired)?;
+    let sandbox = launcher.compile(&SandboxCompileRequest {
+        operation_id: request.operation_id,
+        operation_revision: request.operation_revision,
+        actor: request.actor.clone(),
+        command,
+        profile,
+    })?;
+    if sandbox.compiled.profile.environment.clear_inherited != context.environment.clear_inherited
+        || sandbox.compiled.profile.environment.variables != context.environment.variables
+    {
+        return Err(ExecutionAuthorizationError::CompiledEnvironmentMismatch);
+    }
+    let lease = CapabilityLease {
+        lease_id: request.lease_id,
+        operation_id: request.operation_id,
+        operation_revision: request.operation_revision,
+        action_digest: sandbox.compiled.action_digest.clone(),
+        profile_digest: sandbox.compiled.profile_digest.clone(),
+        actor: request.actor,
+        issued_at_ms: request.issued_at_ms,
+        expires_at_ms: request.expires_at_ms,
+        one_use: true,
+    };
+    Ok(AuthorizedExecutionPlan {
+        capability_lease: ExecutionCapabilityLease {
+            context_digest: context.context_digest.clone(),
+            lease,
+        },
+        context,
+        context_receipt,
+        sandbox,
+    })
 }
 
 pub fn classify_environment_name(name: &str) -> EnvironmentClass {
@@ -666,6 +765,32 @@ fn sha256_json(value: &impl Serialize) -> Result<String, ExecutionContextError> 
 }
 
 #[derive(Debug, Error)]
+pub enum ExecutionAuthorizationError {
+    #[error("execution capability lease must expire after it is issued")]
+    InvalidLeaseLifetime,
+    #[error("user execution mode cannot become an Agent capability")]
+    UserModeDenied,
+    #[error("credential requirements need daemon-owned materialization")]
+    CredentialsNotMaterialized,
+    #[error("authorized local execution requires an explicit shell identity")]
+    ShellRequired,
+    #[error("command executable does not match the execution context")]
+    ShellExecutableMismatch,
+    #[error("command working directory does not match the execution context")]
+    WorkingDirectoryMismatch,
+    #[error("command environment {0} is not present in the execution context")]
+    EnvironmentNotInContext(String),
+    #[error("compiled sandbox environment differs from the execution context")]
+    CompiledEnvironmentMismatch,
+    #[error("authorized local execution requires a sandbox")]
+    SandboxRequired,
+    #[error(transparent)]
+    Context(#[from] ExecutionContextError),
+    #[error(transparent)]
+    Sandbox(#[from] crate::SandboxError),
+}
+
+#[derive(Debug, Error)]
 pub enum ExecutionContextError {
     #[error("unsupported execution-context schema {0}")]
     UnsupportedSchema(u16),
@@ -957,6 +1082,119 @@ mod tests {
         assert!(matches!(
             compile_execution_context(&credential, &ExecutionContextInputs::default()),
             Err(ExecutionContextError::CredentialLiteral(_))
+        ));
+    }
+
+    #[test]
+    fn authorized_plan_binds_context_and_replaces_the_launch_environment() {
+        let root = PathBuf::from("/tmp/hyper-context");
+        let mut context = spec(&root);
+        context.shell = Some(hyper_term_protocol::ShellContextSpec {
+            executable: "/bin/sh".into(),
+            invocation: "command".into(),
+            startup_files: false,
+            pty: true,
+        });
+        context.environment.bindings.push(literal(
+            "MODEL",
+            "gpt-test",
+            EnvironmentBindingOrigin::Invocation,
+        ));
+        let request = ExecutionAuthorizationRequest {
+            operation_id: OperationId::new(),
+            operation_revision: 3,
+            actor: Actor::System,
+            context,
+            command: TerminalCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "true".into()],
+                cwd: Some(root),
+                env: BTreeMap::from([("MODEL".into(), "gpt-test".into())]),
+            },
+            lease_id: SandboxLeaseId::new(),
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+        };
+        let plan = compile_authorized_execution_plan(
+            request,
+            &ExecutionContextInputs::default(),
+            &crate::TestOnlyUnenforcedSandboxLauncher,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.capability_lease.context_digest,
+            plan.context.context_digest
+        );
+        assert_eq!(plan.sandbox.command.env, plan.context.environment.variables);
+        assert_eq!(
+            plan.context_receipt.context_digest,
+            plan.context.context_digest
+        );
+        assert_eq!(
+            plan.sandbox.command.env.get("MODEL").map(String::as_str),
+            Some("gpt-test")
+        );
+        assert_eq!(
+            plan.sandbox.command.env.get("HOME").map(String::as_str),
+            Some("/tmp/hyper-context/home")
+        );
+    }
+
+    #[test]
+    fn authorized_plan_rejects_uncompiled_environment_and_credentials() {
+        let root = PathBuf::from("/tmp/hyper-context");
+        let mut context = spec(&root);
+        context.shell = Some(hyper_term_protocol::ShellContextSpec {
+            executable: "/bin/sh".into(),
+            invocation: "command".into(),
+            startup_files: false,
+            pty: true,
+        });
+        let base = ExecutionAuthorizationRequest {
+            operation_id: OperationId::new(),
+            operation_revision: 3,
+            actor: Actor::System,
+            context,
+            command: TerminalCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "true".into()],
+                cwd: Some(root),
+                env: BTreeMap::from([("UNBOUND".into(), "value".into())]),
+            },
+            lease_id: SandboxLeaseId::new(),
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+        };
+        assert!(matches!(
+            compile_authorized_execution_plan(
+                base.clone(),
+                &ExecutionContextInputs::default(),
+                &crate::TestOnlyUnenforcedSandboxLauncher,
+            ),
+            Err(ExecutionAuthorizationError::EnvironmentNotInContext(name)) if name == "UNBOUND"
+        ));
+
+        let mut credentials = base;
+        credentials.command.env.clear();
+        credentials.context.credentials.push(CredentialRequirement {
+            binding_id: "github".into(),
+            reference: hyper_term_protocol::SecretReference {
+                provider_id: "host".into(),
+                secret_id: "github".into(),
+                version: None,
+            },
+            target_name: "GITHUB_TOKEN".into(),
+            audience: "api.github.com".into(),
+            scope: BindingScope::Operation,
+            lifetime: BindingLifetime::Operation,
+        });
+        assert!(matches!(
+            compile_authorized_execution_plan(
+                credentials,
+                &ExecutionContextInputs::default(),
+                &crate::TestOnlyUnenforcedSandboxLauncher,
+            ),
+            Err(ExecutionAuthorizationError::CredentialsNotMaterialized)
         ));
     }
 

@@ -1,10 +1,10 @@
-use hyper_term_core::OperationRecord;
+use hyper_term_core::{OperationRecord, classify_environment_name};
 use hyper_term_drivers::{McpToolClass, validate_brokered_mcp_tool};
 use hyper_term_protocol::{
     APPROVAL_DETAIL_SCHEMA_VERSION, ActionDigest, ApprovalActionDetail, ApprovalDetail,
     ApprovalDetailDigest, BROKERED_MCP_TOOL_CALL_SCHEMA_VERSION, BoundApprovalDetail,
-    BrokeredMcpToolCall, McpArgumentsDigest, OperationAction, OperationId, OperationKind,
-    PermissionDecision, RiskClass, TaskId, canonical_mcp_json_bytes,
+    BrokeredMcpToolCall, EnvironmentClass, McpArgumentsDigest, OperationAction, OperationId,
+    OperationKind, PermissionDecision, RiskClass, TaskId, canonical_mcp_json_bytes,
 };
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -19,7 +19,10 @@ pub(crate) fn validate_action_kind(
     action: &OperationAction,
 ) -> Result<(), DaemonError> {
     let valid = match (kind, action) {
-        (OperationKind::Shell, OperationAction::Shell { .. }) => true,
+        (OperationKind::Shell, OperationAction::Shell { command }) => {
+            validate_operation_environment(command)?;
+            true
+        }
         (OperationKind::McpServerLaunch, OperationAction::McpServerLaunch { launch }) => {
             return validate_mcp_server_launch(launch);
         }
@@ -42,6 +45,24 @@ pub(crate) fn validate_action_kind(
     };
     if !valid {
         return Err(DaemonError::ActionKindMismatch);
+    }
+    Ok(())
+}
+
+fn validate_operation_environment(
+    command: &hyper_term_protocol::TerminalCommand,
+) -> Result<(), DaemonError> {
+    for name in command.env.keys() {
+        if matches!(
+            classify_environment_name(name),
+            EnvironmentClass::Credential
+                | EnvironmentClass::ShellStartup
+                | EnvironmentClass::LoaderInjection
+                | EnvironmentClass::NetworkControl
+                | EnvironmentClass::AuthorityHandle
+        ) {
+            return Err(DaemonError::UnsafeOperationEnvironment(name.clone()));
+        }
     }
     Ok(())
 }
@@ -375,5 +396,39 @@ mod tests {
             ]
         );
         assert_eq!(environment_keys, ["API_TOKEN", "LANG"]);
+    }
+
+    #[test]
+    fn agent_shell_environment_requires_opaque_brokers_for_authority_classes() {
+        for name in [
+            "OPENAI_API_KEY",
+            "BASH_ENV",
+            "DYLD_INSERT_LIBRARIES",
+            "HTTPS_PROXY",
+            "SSH_AUTH_SOCK",
+        ] {
+            let action = OperationAction::Shell {
+                command: TerminalCommand {
+                    program: "/bin/sh".into(),
+                    args: Vec::new(),
+                    cwd: Some("/workspace".into()),
+                    env: BTreeMap::from([(name.into(), "value".into())]),
+                },
+            };
+            assert!(matches!(
+                validate_action_kind(&OperationKind::Shell, &action),
+                Err(DaemonError::UnsafeOperationEnvironment(rejected)) if rejected == name
+            ));
+        }
+
+        let safe = OperationAction::Shell {
+            command: TerminalCommand {
+                program: "/bin/sh".into(),
+                args: Vec::new(),
+                cwd: Some("/workspace".into()),
+                env: BTreeMap::from([("MODEL_CONFIG".into(), "value".into())]),
+            },
+        };
+        validate_action_kind(&OperationKind::Shell, &safe).unwrap();
     }
 }
