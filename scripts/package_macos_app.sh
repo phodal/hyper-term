@@ -3,6 +3,9 @@ set -euo pipefail
 
 hyper_repo_root=$(cd "$(dirname "$0")/.." && pwd)
 hyper_output=${1:-"$hyper_repo_root/dist/macos/Hyper Term.app"}
+if [[ "$hyper_output" != /* ]]; then
+  hyper_output="$PWD/$hyper_output"
+fi
 
 if [[ $(uname -s) != Darwin ]]; then
   echo "macOS application packaging requires a macOS host" >&2
