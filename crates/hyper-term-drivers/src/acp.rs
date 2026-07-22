@@ -249,6 +249,7 @@ impl AcpAgentClient {
                     &containment.proxy_url,
                     &containment.allowed_hosts,
                     &containment.allowed_unix_sockets,
+                    &containment.allowed_macos_mach_services,
                     read_paths,
                     containment.write_paths.clone(),
                 )?;
@@ -259,6 +260,7 @@ impl AcpAgentClient {
                     &environment,
                     profile,
                     &containment.proxy_url,
+                    &containment.credential_bindings,
                 )?;
                 let profile = context.requested_sandbox.clone().ok_or_else(|| {
                     AcpAdapterError::InvalidConfig(
@@ -282,6 +284,17 @@ impl AcpAgentClient {
                     &mut environment,
                     &containment.credentialed_proxy_url,
                 );
+                for binding in &containment.credential_bindings {
+                    if environment
+                        .insert(binding.target_name.clone(), binding.value.clone())
+                        .is_some()
+                    {
+                        return Err(AcpAdapterError::InvalidConfig(format!(
+                            "credential target {} collides with the Agent environment",
+                            binding.target_name
+                        )));
+                    }
+                }
                 let sandbox = compile_agent_task_sandbox_from_profile(
                     driver_id,
                     &config.executable,

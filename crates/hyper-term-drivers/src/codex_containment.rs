@@ -6,7 +6,8 @@ use hyper_term_core::{SandboxCompileRequest, SandboxLaunchPlan, SandboxLauncher}
 use hyper_term_protocol::{
     Actor, OperationId, SandboxEnforcement, SandboxEnvironmentPolicy, SandboxFileSystemPolicy,
     SandboxLifetime, SandboxNetworkPolicy, SandboxPathAccess, SandboxPathRule,
-    SandboxProcessPolicy, SandboxProfile, SandboxResourceLimits, TerminalCommand,
+    SandboxPlatformPolicy, SandboxProcessPolicy, SandboxProfile, SandboxResourceLimits,
+    TerminalCommand,
 };
 use hyper_term_sandbox::MacOsSeatbeltLauncher;
 use uuid::Uuid;
@@ -24,8 +25,21 @@ pub struct AgentContainmentConfig {
     pub credentialed_proxy_url: String,
     pub allowed_hosts: Vec<String>,
     pub allowed_unix_sockets: Vec<PathBuf>,
+    pub allowed_macos_mach_services: Vec<String>,
+    pub credential_bindings: Vec<AgentCredentialBinding>,
     pub read_paths: Vec<PathBuf>,
     pub write_paths: Vec<PathBuf>,
+}
+
+/// A credential resolved by Rust and attached only after the serializable
+/// execution context and sandbox profile have been compiled.
+#[derive(Clone, Debug)]
+pub struct AgentCredentialBinding {
+    pub target_name: String,
+    pub provider_id: String,
+    pub secret_id: String,
+    pub audience: String,
+    pub value: OsString,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -39,6 +53,7 @@ pub(crate) fn compile_agent_task_sandbox(
     proxy_url: &str,
     allowed_hosts: &[String],
     allowed_unix_sockets: &[PathBuf],
+    allowed_macos_mach_services: &[String],
     read_paths: impl IntoIterator<Item = PathBuf>,
     write_paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<SandboxLaunchPlan, DriverError> {
@@ -49,6 +64,7 @@ pub(crate) fn compile_agent_task_sandbox(
         proxy_url,
         allowed_hosts,
         allowed_unix_sockets,
+        allowed_macos_mach_services,
         read_paths,
         write_paths,
     )?;
@@ -70,6 +86,7 @@ pub(crate) fn agent_task_sandbox_profile(
     proxy_url: &str,
     allowed_hosts: &[String],
     allowed_unix_sockets: &[PathBuf],
+    allowed_macos_mach_services: &[String],
     read_paths: impl IntoIterator<Item = PathBuf>,
     write_paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<SandboxProfile, DriverError> {
@@ -107,6 +124,9 @@ pub(crate) fn agent_task_sandbox_profile(
         environment: SandboxEnvironmentPolicy {
             clear_inherited: true,
             variables: utf8_environment(authority_environment)?,
+        },
+        platform: SandboxPlatformPolicy {
+            macos_mach_services: allowed_macos_mach_services.to_vec(),
         },
         process: SandboxProcessPolicy {
             allow_child_processes: true,
@@ -211,6 +231,7 @@ mod tests {
             &authority_environment,
             &endpoint,
             &["api.openai.com".into()],
+            &[],
             &[],
             [],
             [runtime],

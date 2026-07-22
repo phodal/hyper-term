@@ -160,6 +160,23 @@ pub struct SandboxResourceLimits {
     pub max_output_bytes: Option<u64>,
 }
 
+/// Platform capabilities that cannot be expressed through portable
+/// filesystem, network, environment, or process rules.
+///
+/// These capabilities are deny-by-default and must be selected by Rust for an
+/// exact provider. Presentation code cannot add them at launch time.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SandboxPlatformPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macos_mach_services: Vec<String>,
+}
+
+impl SandboxPlatformPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.macos_mach_services.is_empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxLifetime {
@@ -173,6 +190,8 @@ pub struct SandboxProfile {
     pub filesystem: SandboxFileSystemPolicy,
     pub network: SandboxNetworkPolicy,
     pub environment: SandboxEnvironmentPolicy,
+    #[serde(default, skip_serializing_if = "SandboxPlatformPolicy::is_empty")]
+    pub platform: SandboxPlatformPolicy,
     pub process: SandboxProcessPolicy,
     pub resources: SandboxResourceLimits,
     pub lifetime: SandboxLifetime,

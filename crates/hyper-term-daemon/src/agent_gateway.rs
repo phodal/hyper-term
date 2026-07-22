@@ -2274,10 +2274,10 @@ fn acp_provider_read_paths(provider: &AcpAgentProviderConfig) -> Vec<PathBuf> {
     let credential_paths: &[&str] = match provider.provider_id.as_str() {
         "codex-acp" => &[".codex/auth.json", ".codex/config.toml", ".codex/AGENTS.md"],
         "claude-acp" => &[
-            ".claude",
-            ".claude.json",
-            ".config/claude",
-            "Library/Keychains",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude/CLAUDE.md",
+            ".claude/skills",
         ],
         "copilot-acp" => &[".config/github-copilot", ".config/gh", "Library/Keychains"],
         _ => &[],

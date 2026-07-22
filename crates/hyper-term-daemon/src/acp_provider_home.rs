@@ -66,6 +66,7 @@ pub(crate) fn stage_acp_codex_preferences(
 pub(crate) fn stage_acp_claude_home(
     home: &Path,
     isolated_home: &Path,
+    keychain_credentials: Option<&[u8]>,
 ) -> Result<(), std::io::Error> {
     use std::fs::OpenOptions;
     use std::io::{Error, ErrorKind, Write};
@@ -142,7 +143,9 @@ pub(crate) fn stage_acp_claude_home(
         }
 
         let credentials = source_claude_home.join(".credentials.json");
-        if let Ok(metadata) = std::fs::symlink_metadata(&credentials) {
+        if keychain_credentials.is_none()
+            && let Ok(metadata) = std::fs::symlink_metadata(&credentials)
+        {
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
                 || metadata.uid() != unsafe { libc::geteuid() }
@@ -157,14 +160,17 @@ pub(crate) fn stage_acp_claude_home(
             copy_private_file(&credentials, &claude_home.join(".credentials.json"))?;
         }
     }
-
-    stage_keychains(home, isolated_home, "ACP Claude")
+    if let Some(credentials) = keychain_credentials {
+        write_private_file(credentials, &claude_home.join(".credentials.json"))?;
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
 pub(crate) fn stage_acp_claude_home(
     _home: &Path,
     _isolated_home: &Path,
+    _keychain_credentials: Option<&[u8]>,
 ) -> Result<(), std::io::Error> {
     Ok(())
 }
@@ -237,6 +243,11 @@ fn require_absolute_homes(
 
 #[cfg(unix)]
 fn copy_private_file(source: &Path, target: &Path) -> Result<(), std::io::Error> {
+    write_private_file(&std::fs::read(source)?, target)
+}
+
+#[cfg(unix)]
+fn write_private_file(source: &[u8], target: &Path) -> Result<(), std::io::Error> {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -246,7 +257,7 @@ fn copy_private_file(source: &Path, target: &Path) -> Result<(), std::io::Error>
         .create_new(true)
         .mode(0o600)
         .open(target)?;
-    target.write_all(&std::fs::read(source)?)?;
+    target.write_all(source)?;
     target.sync_all()
 }
 
@@ -287,7 +298,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_home_stages_only_auth_metadata_and_read_only_preferences() {
+    fn claude_home_prefers_bounded_keychain_credentials_without_keychain_access() {
         let root = TempDir::new().unwrap();
         let home = root.path().join("provider-home");
         let source_config = home.join(".claude");
@@ -311,7 +322,8 @@ mod tests {
         fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600)).unwrap();
 
         let isolated_home = root.path().join("runtime/home");
-        stage_acp_claude_home(&home, &isolated_home).unwrap();
+        let keychain_credentials = br#"{"claudeAiOauth":{"accessToken":"keychain-fixture"}}"#;
+        stage_acp_claude_home(&home, &isolated_home, Some(keychain_credentials)).unwrap();
 
         let staged: serde_json::Value =
             serde_json::from_slice(&fs::read(isolated_home.join(".claude.json")).unwrap()).unwrap();
@@ -331,6 +343,18 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        let staged_credentials: serde_json::Value = serde_json::from_slice(
+            &fs::read(isolated_home.join(".claude/.credentials.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            staged_credentials["claudeAiOauth"]["accessToken"],
+            "keychain-fixture"
+        );
+        assert!(
+            fs::symlink_metadata(isolated_home.join("Library/Keychains")).is_err(),
+            "Claude receives a bounded private credential file, not host Keychain access"
+        );
         assert!(
             fs::symlink_metadata(isolated_home.join(".claude/skills"))
                 .unwrap()
@@ -343,15 +367,28 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    fn claude_home_falls_back_to_a_private_credential_file() {
+        let root = TempDir::new().unwrap();
+        let home = root.path().join("provider-home");
+        let source_config = home.join(".claude");
+        fs::create_dir_all(&source_config).unwrap();
+        let credentials = source_config.join(".credentials.json");
+        fs::write(
+            &credentials,
+            r#"{"claudeAiOauth":{"accessToken":"file-fixture"}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let isolated_home = root.path().join("runtime/home");
+        stage_acp_claude_home(&home, &isolated_home, None).unwrap();
+
         assert_eq!(
             fs::read(isolated_home.join(".claude/.credentials.json")).unwrap(),
             fs::read(credentials).unwrap()
-        );
-        assert!(
-            fs::symlink_metadata(isolated_home.join("Library/Keychains"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
         );
     }
 

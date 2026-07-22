@@ -48,6 +48,7 @@
             filesystem: SandboxFileSystemPolicy::default(),
             network: SandboxNetworkPolicy::Offline,
             environment: SandboxEnvironmentPolicy::default(),
+            platform: Default::default(),
             process: SandboxProcessPolicy::default(),
             resources: SandboxResourceLimits::default(),
             lifetime: SandboxLifetime::OneTask,
@@ -563,6 +564,61 @@ done
             acp_network_allowed_hosts("codex-acp").unwrap(),
             CODEX_NETWORK_ALLOWED_HOSTS
         );
+    }
+
+    #[test]
+    fn claude_containment_reads_preferences_but_not_host_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = temporary.path().join("runtime");
+        let executable = runtime.join("deno");
+        let adapter = runtime.join("acp/claude-agent-acp.js");
+        let provider_root = temporary.path().join("provider");
+        let provider_executable = provider_root.join("claude");
+        let home = temporary.path().join("home");
+        let claude_home = home.join(".claude");
+        let settings = claude_home.join("settings.json");
+        let skills = claude_home.join("skills");
+        let credentials = claude_home.join(".credentials.json");
+        let keychains = home.join("Library/Keychains");
+        for directory in [
+            &runtime,
+            adapter.parent().unwrap(),
+            &provider_root,
+            &skills,
+            &keychains,
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for file in [
+            &executable,
+            &adapter,
+            &provider_executable,
+            &settings,
+            &credentials,
+        ] {
+            std::fs::write(file, "fixture").unwrap();
+        }
+        let provider = AcpAgentProviderConfig {
+            provider_id: "claude-acp".into(),
+            executable,
+            arguments: vec!["run".into(), adapter.into_os_string()],
+            environment: BTreeMap::from([
+                ("HOME".into(), home.into_os_string()),
+                ("PATH".into(), provider_root.into_os_string()),
+                (
+                    "CLAUDE_CODE_EXECUTABLE".into(),
+                    provider_executable.into_os_string(),
+                ),
+            ]),
+            implementation_version: "fixture-1".into(),
+        };
+
+        let paths = acp_provider_read_paths(&provider);
+        assert!(paths.contains(&settings.canonicalize().unwrap()));
+        assert!(paths.contains(&skills.canonicalize().unwrap()));
+        assert!(!paths.contains(&claude_home.canonicalize().unwrap()));
+        assert!(!paths.contains(&credentials.canonicalize().unwrap()));
+        assert!(!paths.contains(&keychains.canonicalize().unwrap()));
     }
 
     #[test]

@@ -5,8 +5,8 @@ use hyper_term_protocol::OperationId;
 use tempfile::TempDir;
 
 use super::*;
-use crate::AgentSessionConfigKind;
 use crate::acp_capabilities::MAX_AVAILABLE_COMMANDS;
+use crate::{AgentCredentialBinding, AgentSessionConfigKind};
 
 fn fake_agent(script: &str) -> (TempDir, PathBuf) {
     let temporary = TempDir::new().unwrap();
@@ -804,7 +804,7 @@ fn contained_acp_can_handshake_but_cannot_read_host_or_write_workspace() {
     std::fs::create_dir_all(&scratch).unwrap();
     std::fs::write(&secret, "must stay outside the ACP sandbox").unwrap();
     let script = format!(
-        "#!/bin/sh\nif /bin/cat {secret} >/dev/null 2>&1; then host=allowed; else host=denied; fi\nif /usr/bin/touch {forbidden} >/dev/null 2>&1; then workspace=allowed; else workspace=denied; fi\nprintf '%s,%s\\n' \"$host\" \"$workspace\" > {marker}\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{}},\"authMethods\":[]}}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"contained-session\"}}}}' ;;\n  esac\ndone\n",
+        "#!/bin/sh\nif /bin/cat {secret} >/dev/null 2>&1; then host=allowed; else host=denied; fi\nif /usr/bin/touch {forbidden} >/dev/null 2>&1; then workspace=allowed; else workspace=denied; fi\nif [ \"$COPILOT_GITHUB_TOKEN\" = contained-provider-token ]; then credential=present; else credential=missing; fi\nprintf '%s,%s,%s\\n' \"$host\" \"$workspace\" \"$credential\" > {marker}\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{}},\"authMethods\":[]}}}}' ;;\n    *'\"method\":\"session/new\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"contained-session\"}}}}' ;;\n  esac\ndone\n",
         secret = secret.display(),
         forbidden = forbidden.display(),
         marker = marker.display(),
@@ -838,6 +838,14 @@ fn contained_acp_can_handshake_but_cannot_read_host_or_write_workspace() {
             credentialed_proxy_url,
             allowed_hosts: vec!["api.example.com".into()],
             allowed_unix_sockets: Vec::new(),
+            allowed_macos_mach_services: Vec::new(),
+            credential_bindings: vec![AgentCredentialBinding {
+                target_name: "COPILOT_GITHUB_TOKEN".into(),
+                provider_id: "github-cli".into(),
+                secret_id: "fixture".into(),
+                audience: "contained-acp".into(),
+                value: OsString::from("contained-provider-token"),
+            }],
             read_paths: Vec::new(),
             write_paths: vec![scratch.canonicalize().unwrap()],
         }),
@@ -852,11 +860,13 @@ fn contained_acp_can_handshake_but_cannot_read_host_or_write_workspace() {
     );
     assert_eq!(
         std::fs::read_to_string(marker).unwrap().trim(),
-        "denied,denied"
+        "denied,denied,present"
     );
     let receipt = serde_json::to_string(client.context_receipt().unwrap()).unwrap();
     assert!(receipt.contains("managed-connect-proxy-session"));
+    assert!(receipt.contains("github-cli"));
     assert!(!receipt.contains("contained-test-token"));
+    assert!(!receipt.contains("contained-provider-token"));
     assert!(client.mcp_context_receipt().is_none());
     assert!(!forbidden.exists());
     assert_eq!(client.close().unwrap(), DriverState::Closed);

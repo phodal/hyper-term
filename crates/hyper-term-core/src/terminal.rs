@@ -758,6 +758,7 @@ mod tests {
                 filesystem: SandboxFileSystemPolicy::default(),
                 network: SandboxNetworkPolicy::Offline,
                 environment: SandboxEnvironmentPolicy::default(),
+                platform: Default::default(),
                 process: SandboxProcessPolicy::default(),
                 resources: SandboxResourceLimits::default(),
                 lifetime: SandboxLifetime::OneOperation,

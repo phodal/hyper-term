@@ -14,6 +14,7 @@ use hyper_term_protocol::{
 };
 use uuid::Uuid;
 
+use crate::AgentCredentialBinding;
 use crate::DriverError;
 
 pub(crate) fn compile_agent_execution_context(
@@ -23,6 +24,7 @@ pub(crate) fn compile_agent_execution_context(
     environment: &BTreeMap<String, OsString>,
     sandbox: SandboxProfile,
     managed_proxy_url: &str,
+    credential_bindings: &[AgentCredentialBinding],
 ) -> Result<(ResolvedExecutionContext, ContextReceipt), DriverError> {
     let home =
         environment_path(environment, "HOME").unwrap_or_else(|| workspace.join(".agent-home"));
@@ -90,7 +92,7 @@ pub(crate) fn compile_agent_execution_context(
             bindings,
             collision_policy: CollisionPolicy::Deny,
         },
-        credentials: vec![CredentialRequirement {
+        credentials: std::iter::once(CredentialRequirement {
             binding_id: "managed-connect-proxy".into(),
             reference: SecretReference {
                 provider_id: "hyper-term-daemon".into(),
@@ -101,7 +103,24 @@ pub(crate) fn compile_agent_execution_context(
             audience: managed_proxy_url.into(),
             scope: BindingScope::ProcessTree,
             lifetime: BindingLifetime::Task,
-        }],
+        })
+        .chain(
+            credential_bindings
+                .iter()
+                .map(|binding| CredentialRequirement {
+                    binding_id: format!("provider-credential:{}", binding.target_name),
+                    reference: SecretReference {
+                        provider_id: binding.provider_id.clone(),
+                        secret_id: binding.secret_id.clone(),
+                        version: None,
+                    },
+                    target_name: binding.target_name.clone(),
+                    audience: binding.audience.clone(),
+                    scope: BindingScope::ProcessTree,
+                    lifetime: BindingLifetime::Task,
+                }),
+        )
+        .collect(),
         sandbox: Some(sandbox),
     };
     compile_execution_context(&spec, &ExecutionContextInputs::default())
@@ -174,6 +193,7 @@ mod tests {
             filesystem: SandboxFileSystemPolicy::default(),
             network: SandboxNetworkPolicy::Offline,
             environment: SandboxEnvironmentPolicy::default(),
+            platform: Default::default(),
             process: SandboxProcessPolicy::default(),
             resources: SandboxResourceLimits::default(),
             lifetime: SandboxLifetime::OneTask,
@@ -185,6 +205,7 @@ mod tests {
             &BTreeMap::from([("ACP_MODE".into(), OsString::from("stdio"))]),
             profile,
             "http://127.0.0.1:43128",
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -208,6 +229,7 @@ mod tests {
             filesystem: SandboxFileSystemPolicy::default(),
             network: SandboxNetworkPolicy::Offline,
             environment: SandboxEnvironmentPolicy::default(),
+            platform: Default::default(),
             process: SandboxProcessPolicy::default(),
             resources: SandboxResourceLimits::default(),
             lifetime: SandboxLifetime::OneTask,
@@ -219,6 +241,7 @@ mod tests {
             &BTreeMap::new(),
             profile.clone(),
             "http://127.0.0.1:43128",
+            &[],
         )
         .unwrap();
         let (mcp, receipt) = compile_mcp_execution_context(

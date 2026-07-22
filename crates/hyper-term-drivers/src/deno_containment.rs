@@ -63,6 +63,7 @@ pub(crate) fn compile_deno_task_sandbox(
             clear_inherited: true,
             variables: command.env.clone(),
         },
+        platform: Default::default(),
         process: SandboxProcessPolicy {
             allow_child_processes: false,
             allow_any_executable: false,

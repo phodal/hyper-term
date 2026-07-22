@@ -323,6 +323,15 @@ fn compile_policy(
         policy.push_str("(allow process-fork)\n");
     }
 
+    if !profile.platform.macos_mach_services.is_empty() {
+        policy.push_str("\n; exact provider-scoped macOS services\n");
+        for service in &profile.platform.macos_mach_services {
+            policy.push_str(&format!(
+                "(allow mach-lookup (global-name \"{service}\"))\n"
+            ));
+        }
+    }
+
     if let Some(port) = proxy_loopback_port(&profile.network)? {
         policy.push_str("\n; exact Rust-owned proxy endpoint\n");
         policy.push_str(&format!(
@@ -516,6 +525,7 @@ mod tests {
                     ("TERM".into(), "xterm-256color".into()),
                 ]),
             },
+            platform: Default::default(),
             process: SandboxProcessPolicy {
                 allow_child_processes: true,
                 allow_any_executable: false,
@@ -616,6 +626,31 @@ mod tests {
                 .artifact
                 .policy
                 .contains(&fixture.workspace.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn policy_grants_only_explicit_provider_mach_services() {
+        let fixture = Fixture::new();
+        let mut sandbox = fixture.profile();
+        sandbox.platform.macos_mach_services = vec!["com.apple.securityd.xpc".into()];
+        let compiled = MacOsSeatbeltLauncher
+            .compile_inspectable(&request(sandbox, "printf ok", Vec::new()))
+            .unwrap();
+        assert!(
+            compiled
+                .artifact
+                .policy
+                .contains("(allow mach-lookup (global-name \"com.apple.securityd.xpc\"))")
+        );
+        assert_eq!(
+            compiled
+                .launch_plan
+                .compiled
+                .profile
+                .platform
+                .macos_mach_services,
+            ["com.apple.securityd.xpc"]
         );
     }
 

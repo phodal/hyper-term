@@ -105,6 +105,19 @@ pub fn canonicalize_sandbox_profile(
     executables.dedup();
     canonical.process.allowed_executables = executables;
 
+    for service in &profile.platform.macos_mach_services {
+        if service.is_empty()
+            || service.len() > 128
+            || !service
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            return Err(SandboxError::InvalidMacOsMachService(service.clone()));
+        }
+    }
+    canonical.platform.macos_mach_services.sort();
+    canonical.platform.macos_mach_services.dedup();
+
     if let hyper_term_protocol::SandboxNetworkPolicy::ProxyOnly {
         proxy_url,
         allowed_hosts,
@@ -326,6 +339,8 @@ pub enum SandboxError {
     EmptyProxyUrl,
     #[error("invalid proxy allow-list host {0:?}")]
     InvalidAllowedHost(String),
+    #[error("invalid macOS Mach service {0:?}")]
+    InvalidMacOsMachService(String),
     #[error("failed to serialize sandbox digest input: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("invalid sandbox digest: {0}")]
@@ -381,6 +396,7 @@ mod tests {
             filesystem: SandboxFileSystemPolicy { rules },
             network: SandboxNetworkPolicy::Offline,
             environment: SandboxEnvironmentPolicy::default(),
+            platform: Default::default(),
             process: SandboxProcessPolicy::default(),
             resources: SandboxResourceLimits::default(),
             lifetime: SandboxLifetime::OneOperation,
@@ -494,6 +510,34 @@ mod tests {
             canonicalize_sandbox_profile(&profile),
             Err(SandboxError::AnyExecutableRequiresChildProcesses)
         ));
+    }
+
+    #[test]
+    fn macos_mach_services_are_explicit_canonical_authority() {
+        let mut sandbox = profile(Vec::new());
+        sandbox.platform.macos_mach_services = vec![
+            "com.apple.securityd.xpc".into(),
+            "com.apple.securityd.xpc".into(),
+            "com.example.agent-helper".into(),
+        ];
+        let canonical = canonicalize_sandbox_profile(&sandbox).unwrap();
+        assert_eq!(
+            canonical.platform.macos_mach_services,
+            ["com.apple.securityd.xpc", "com.example.agent-helper"]
+        );
+
+        sandbox.platform.macos_mach_services =
+            vec!["com.apple.securityd.xpc\") (allow default".into()];
+        assert!(matches!(
+            canonicalize_sandbox_profile(&sandbox),
+            Err(SandboxError::InvalidMacOsMachService(_))
+        ));
+    }
+
+    #[test]
+    fn empty_platform_policy_preserves_the_serialized_contract() {
+        let serialized = serde_json::to_value(profile(Vec::new())).unwrap();
+        assert!(serialized.get("platform").is_none());
     }
 
     #[test]

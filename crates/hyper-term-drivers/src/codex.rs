@@ -202,6 +202,7 @@ impl CodexAppServerClient {
                     &containment.proxy_url,
                     &containment.allowed_hosts,
                     &containment.allowed_unix_sockets,
+                    &containment.allowed_macos_mach_services,
                     read_paths,
                     containment.write_paths.clone(),
                 ) {
@@ -1368,6 +1369,8 @@ mod tests {
                 credentialed_proxy_url: proxy_url,
                 allowed_hosts: vec!["api.openai.com".into()],
                 allowed_unix_sockets: Vec::new(),
+                allowed_macos_mach_services: Vec::new(),
+                credential_bindings: Vec::new(),
                 read_paths: Vec::new(),
                 write_paths: vec![runtime],
             }),

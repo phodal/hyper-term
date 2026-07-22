@@ -50,6 +50,7 @@ mod artifact_editor_store;
 mod artifact_runtime_trace_store;
 mod artifact_store;
 mod artifact_visual_quality_store;
+mod claude_credentials;
 #[cfg(unix)]
 mod client;
 mod copilot_credentials;
@@ -1020,6 +1021,7 @@ impl DaemonState {
                         ("TERM".into(), "xterm-256color".into()),
                     ]),
                 },
+                platform: Default::default(),
                 process: SandboxProcessPolicy {
                     allow_child_processes: true,
                     allow_any_executable: true,

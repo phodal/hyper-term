@@ -1,4 +1,5 @@
 use super::*;
+use hyper_term_drivers::AgentCredentialBinding;
 
 impl AgentGatewayRuntime {
     pub(super) fn launch_provider(
@@ -53,6 +54,8 @@ impl AgentGatewayRuntime {
                     credentialed_proxy_url: managed_proxy.credentialed_proxy_url().to_owned(),
                     allowed_hosts: endpoint.allowed_hosts.clone(),
                     allowed_unix_sockets,
+                    allowed_macos_mach_services: Vec::new(),
+                    credential_bindings: Vec::new(),
                     read_paths,
                     write_paths: vec![session_root.to_path_buf()],
                 }),
@@ -92,6 +95,7 @@ impl AgentGatewayRuntime {
             .unwrap_or_default();
         let mut read_paths = acp_provider_read_paths(provider);
         let mut environment = provider.environment.clone();
+        let mut credential_bindings = Vec::new();
         if provider.provider_id == "codex-acp" {
             let isolated_home = session_root.join("home");
             let codex_home = session_root.join("codex-home");
@@ -122,10 +126,22 @@ impl AgentGatewayRuntime {
             for directory in [&isolated_home, &scratch] {
                 create_private_runtime_root(directory).map_err(|_| StartError::Driver)?;
             }
-            if let Some(home) = provider.environment.get("HOME") {
-                stage_acp_claude_home(Path::new(home), &isolated_home)
+            let mut keychain_credentials =
+                crate::claude_credentials::read_claude_keychain_credentials()
                     .map_err(|_| StartError::Driver)?;
+            let staged = if let Some(home) = provider.environment.get("HOME") {
+                stage_acp_claude_home(
+                    Path::new(home),
+                    &isolated_home,
+                    keychain_credentials.as_deref(),
+                )
+            } else {
+                Ok(())
+            };
+            if let Some(credentials) = keychain_credentials.as_mut() {
+                credentials.fill(0);
             }
+            staged.map_err(|_| StartError::Driver)?;
             environment.insert("HOME".into(), isolated_home.into_os_string());
             environment.remove("CLAUDE_CONFIG_DIR");
             environment.insert("TMPDIR".into(), scratch.clone().into_os_string());
@@ -142,6 +158,20 @@ impl AgentGatewayRuntime {
             if let Some(home) = provider.environment.get("HOME") {
                 stage_acp_copilot_home(Path::new(home), &isolated_home)
                     .map_err(|_| StartError::Driver)?;
+                if let Some(token) = crate::copilot_credentials::read_github_cli_token(
+                    Path::new(home),
+                    provider.environment.get("PATH").map(OsString::as_os_str),
+                )
+                .map_err(|_| StartError::Driver)?
+                {
+                    credential_bindings.push(AgentCredentialBinding {
+                        target_name: "COPILOT_GITHUB_TOKEN".into(),
+                        provider_id: "github-cli".into(),
+                        secret_id: "github.com:active-account".into(),
+                        audience: "copilot-acp:github.com".into(),
+                        value: token,
+                    });
+                }
             }
             environment.insert("HOME".into(), isolated_home.clone().into_os_string());
             environment.insert(
@@ -171,6 +201,8 @@ impl AgentGatewayRuntime {
                 credentialed_proxy_url: managed_proxy.credentialed_proxy_url().to_owned(),
                 allowed_hosts: endpoint.allowed_hosts.clone(),
                 allowed_unix_sockets,
+                allowed_macos_mach_services: Vec::new(),
+                credential_bindings,
                 read_paths,
                 write_paths: vec![session_root.to_path_buf()],
             }),
