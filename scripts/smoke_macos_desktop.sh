@@ -148,7 +148,13 @@ smoke_cleanup() {
   fi
   if [[ $smoke_status -ne 0 ]]; then
     echo "Hyper Term desktop smoke failed; supervisor log follows:" >&2
+    grep -E 'ACP fixture|brokered GenUI|compile failed|timed out|Agent exited|provider' \
+      "$smoke_log" | tail -n 40 >&2 || true
     tail -n 80 "$smoke_log" >&2 || true
+    if [[ -n "$smoke_artifact_dir" ]]; then
+      mkdir -p "$smoke_artifact_dir"
+      cp "$smoke_log" "$smoke_artifact_dir/hyper-term-smoke.log"
+    fi
   fi
   rm -rf "$smoke_root"
   exit "$smoke_status"

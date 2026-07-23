@@ -307,7 +307,7 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
     let _server = spawn_agent_capability_server(&socket, state.clone(), agent_task_id).unwrap();
     let (mut client_io, mut gateway_io) = UnixStream::pair().unwrap();
     client_io
-        .set_read_timeout(Some(Duration::from_secs(20)))
+        .set_read_timeout(Some(Duration::from_secs(40)))
         .unwrap();
     let gateway_input = gateway_io.try_clone().unwrap();
     let config = McpStdioConfig::new(socket.canonicalize().unwrap(), true)
@@ -386,16 +386,26 @@ fn approved_genui_tool_compiles_through_the_brokered_deno_runtime() {
             .len(),
         36
     );
-    assert!(
-        result["result"]["structuredContent"]["bundle"]
-            .as_str()
-            .unwrap()
-            .contains("data-brokered")
-    );
     assert_eq!(
-        result["result"]["structuredContent"]["source_files"]["/App.tsx"],
-        "export default function App(){ return <main data-brokered=\"true\">Ready</main>; }"
+        result["result"]["structuredContent"]["entrypoint"],
+        "/App.tsx"
     );
+    assert!(
+        result["result"]["structuredContent"]
+            .get("bundle")
+            .is_none()
+    );
+    assert!(
+        result["result"]["structuredContent"]
+            .get("source_map")
+            .is_none()
+    );
+    assert!(
+        result["result"]["structuredContent"]
+            .get("source_files")
+            .is_none()
+    );
+    assert!(serde_json::to_vec(&result).unwrap().len() < 4 * 1024);
     assert!(
         state
             .block_snapshot(task_id)

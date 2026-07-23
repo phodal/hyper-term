@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::{ControlClient, ControlClientError};
 
 const AUTHORITY_TIMEOUT: Duration = Duration::from_secs(3);
+const AUTHORITY_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_INPUT_CAPACITY: usize = 64;
 const AUTHORITY_EVENT_CAPACITY: usize = 512;
 const MAX_DIFF_OUTPUT_BYTES: usize = 800 * 1024;
@@ -462,13 +463,22 @@ fn authority_request(
     socket: &Path,
     request: ControlRequest,
 ) -> Result<ControlResponse, McpGatewayError> {
+    let request_timeout = authority_request_timeout(&request);
     let mut client = ControlClient::connect(socket, AUTHORITY_TIMEOUT)?;
-    let response = client.request(request, AUTHORITY_TIMEOUT)?;
+    let response = client.request(request, request_timeout)?;
     match response {
         ControlResponse::Error { code, message } => {
             Err(McpGatewayError::AuthorityRejected { code, message })
         }
         response => Ok(response),
+    }
+}
+
+fn authority_request_timeout(request: &ControlRequest) -> Duration {
+    if matches!(request, ControlRequest::RunAuthorizedBrokeredMcpTool { .. }) {
+        AUTHORITY_EXECUTION_TIMEOUT
+    } else {
+        AUTHORITY_TIMEOUT
     }
 }
 
@@ -1024,6 +1034,24 @@ pub enum McpGatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorized_tool_execution_uses_the_bounded_runtime_deadline() {
+        let request = ControlRequest::RunAuthorizedBrokeredMcpTool {
+            task_id: TaskId::new(),
+            operation_id: OperationId::new(),
+            expected_revision: 3,
+            tool_name: "hyper_term.genui.compile".into(),
+            proposal_digest: "0".repeat(64),
+            arguments: json!({"source": "export default 1"}),
+        };
+
+        assert_eq!(
+            authority_request_timeout(&request),
+            AUTHORITY_EXECUTION_TIMEOUT
+        );
+        assert!(AUTHORITY_EXECUTION_TIMEOUT > AUTHORITY_TIMEOUT);
+    }
 
     #[test]
     fn diff_review_emits_a_bounded_single_hunk() {

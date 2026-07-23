@@ -289,6 +289,7 @@ impl DaemonState {
         let Some(candidate) = candidate else {
             return failed_execution("GenUI compiler returned an invalid artifact candidate");
         };
+        let schema_version = candidate.schema_version;
         let accepted = match self.accept_genui_artifact(
             task_id,
             operation_id,
@@ -302,16 +303,15 @@ impl DaemonState {
                 ));
             }
         };
-        if let Some(serde_json::Value::Object(structured)) = execution.structured_content.as_mut() {
-            structured.insert(
-                "artifact_id".into(),
-                serde_json::Value::String(accepted.artifact_id.to_string()),
-            );
-            structured.insert(
-                "accepted_by".into(),
-                serde_json::Value::String("rust_host".into()),
-            );
-        }
+        execution.structured_content = Some(serde_json::json!({
+            "schema_version": schema_version,
+            "artifact_id": accepted.artifact_id,
+            "source_revision": accepted.source_revision,
+            "entrypoint": accepted.entrypoint,
+            "content_digest": accepted.content_digest,
+            "compiler": accepted.compiler,
+            "accepted_by": "rust_host",
+        }));
         execution.text = format!(
             "Accepted GenUI revision {} as artifact {} ({}).",
             accepted.source_revision, accepted.artifact_id, accepted.content_digest

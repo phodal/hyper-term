@@ -71,13 +71,11 @@ compile_genui() {
 
   local response=''
   local response_received=0
-  local attempt
-  for attempt in {1..15}; do
-    if IFS= read -r -t 1 -p response && [[ "$response" == *'"id":19'* ]]; then
+  if IFS= read -r -t 30 -p response; then
+    if [[ "$response" == *'"id":19'* ]]; then
       response_received=1
-      break
     fi
-  done
+  fi
   if (( ! response_received )); then
     print -u2 -r -- "brokered GenUI compile response timed out; last frame: $response"
     return 1
