@@ -774,26 +774,33 @@ full request vocabulary to an Agent process.
 
 ## Implementation evidence (2026-07-23)
 
-The first Phase 4 environment slices are implemented as objective checker v3:
+The first Phase 4 environment slices are implemented as objective checker v4:
 
-- Rust owns an ordered six-capture manifest for narrow, tablet, desktop,
-  desktop-dark, desktop-reduced-motion, and desktop-focus-first evidence. It
-  rejects substituted or reordered environments before persisting a report.
+- Rust owns an ordered seven-capture manifest for narrow, tablet, desktop,
+  desktop-dark, desktop-reduced-motion, desktop-focus-first, and narrow
+  `zh-CN` content-stress evidence. It rejects substituted or reordered
+  environments before persisting a report.
 - Each capture receives a new token-bound isolated preview URL with explicit
   color-scheme and motion preferences. The preview fixes `matchMedia` and
   supported CSS preference queries before importing the accepted artifact.
 - Reports remain bound to the artifact revision, accepted bundle digest, and
-  packaged preview runtime. A digest-valid v1 report is treated as stale and
-  triggers recapture instead of blocking the Workbench upgrade.
+  packaged preview runtime. A digest-valid pre-v3 report is treated as stale
+  and triggers recapture instead of blocking the Workbench upgrade.
 - The browser verification drives the real Rust Gateway and Deno Workbench
-  through all six environments. The focus-first scenario selects the first
+  through all seven environments. The focus-first scenario selects the first
   visible keyboard target, requires a real `:focus-visible` style change, and
   records a stable semantic location when the indicator is missing. The gate
-  also retains the Deno LSP, keyboard tab, and hostile-preview assertions.
+  also applies a digest-bound host fixture to an existing text-bearing control
+  and content element, then proves the Chinese long label and long body remain
+  present after layout settles. Existing overflow, clipping, contrast, target,
+  and primary-action checks run against that stressed 390 px render. The real
+  browser verifier reads the persisted Rust report and asserts both fixture
+  legs, in addition to retaining the Deno LSP, keyboard tab, and
+  hostile-preview assertions.
 
-These slices do not claim host-pixel equivalence. Host screenshots,
-CJK/long-content fixtures, and declared loading/error/disabled states remain
-explicit coverage gaps, so a clean objective report is still `NeedsReview`.
+These slices do not claim host-pixel equivalence. Host screenshots and declared
+loading/error/disabled states remain explicit coverage gaps, so a clean
+objective report is still `NeedsReview`.
 
 ## Validation gates
 
