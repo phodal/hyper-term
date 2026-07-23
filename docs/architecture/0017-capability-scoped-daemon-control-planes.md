@@ -324,6 +324,14 @@ The connector does not receive generic authority to call `CreateTask`,
 `CompleteOperation`, or `AcceptGenUiArtifact`. Those become daemon-internal
 steps for this flow.
 
+Fast control requests retain a three-second deadline, while the exact
+`RunAuthorizedBrokeredMcpTool` exchange has a separate bounded 30-second
+deadline for pinned runtime startup and execution. A successful GenUI call
+returns only an artifact receipt: schema, artifact ID, revision, entrypoint,
+content digest, and compiler identity. Bundle bytes, source maps, CSS, and the
+source tree remain in the Rust-owned artifact store and are never copied back
+through the provider coprocess pipe.
+
 During migration, if the existing control protocol is temporarily reused, its
 server-side `AgentMcpConnector` matrix is:
 
@@ -774,20 +782,21 @@ full request vocabulary to an Agent process.
 
 ## Implementation evidence (2026-07-23)
 
-The first Phase 4 environment slices are implemented as objective checker v4:
+The first Phase 4 environment slices are implemented as objective checker v5:
 
-- Rust owns an ordered seven-capture manifest for narrow, tablet, desktop,
+- Rust owns an ordered eleven-capture manifest for narrow, tablet, desktop,
   desktop-dark, desktop-reduced-motion, desktop-focus-first, and narrow
-  `zh-CN` content-stress evidence. It rejects substituted or reordered
-  environments before persisting a report.
+  `zh-CN` content-stress evidence, plus empty, loading, error, and disabled
+  state evidence. It rejects substituted or reordered environments before
+  persisting a report.
 - Each capture receives a new token-bound isolated preview URL with explicit
   color-scheme and motion preferences. The preview fixes `matchMedia` and
   supported CSS preference queries before importing the accepted artifact.
 - Reports remain bound to the artifact revision, accepted bundle digest, and
-  packaged preview runtime. A digest-valid pre-v3 report is treated as stale
+  packaged preview runtime. A digest-valid pre-v4 report is treated as stale
   and triggers recapture instead of blocking the Workbench upgrade.
 - The browser verification drives the real Rust Gateway and Deno Workbench
-  through all seven environments. The focus-first scenario selects the first
+  through all eleven environments. The focus-first scenario selects the first
   visible keyboard target, requires a real `:focus-visible` style change, and
   records a stable semantic location when the indicator is missing. The gate
   also applies a digest-bound host fixture to an existing text-bearing control
@@ -797,10 +806,27 @@ The first Phase 4 environment slices are implemented as objective checker v4:
   browser verifier reads the persisted Rust report and asserts both fixture
   legs, in addition to retaining the Deno LSP, keyboard tab, and
   hostile-preview assertions.
+- The state contract is declarative markup, not generated test code. An
+  artifact may expose one bounded block for each `data-hyper-state` value;
+  optional `data-hyper-state="default"` markup remains active for normal,
+  focus, and content captures. The host hides inactive blocks, activates the
+  requested state, and requires visible `data-hyper-state-feedback`. Loading
+  also requires `aria-busy` or `role=status`, error requires alert semantics,
+  and disabled requires a native or ARIA-disabled control. Rust binds each
+  selected subtree digest to the accepted artifact report and retains a
+  coverage gap when a declaration is absent, duplicated, hidden, or
+  semantically incomplete.
+- The strict ACP fixture exposed a control-plane deadline bug after the Rust
+  broker had already accepted a GenUI artifact. Authorized runtime execution
+  now uses the separate bounded 30-second deadline, and the MCP response is a
+  sub-4 KiB receipt rather than a second copy of executable artifact content.
+  The real macOS desktop smoke proves the Agent message and artifact editor are
+  reached after approval.
 
-These slices do not claim host-pixel equivalence. Host screenshots and declared
-loading/error/disabled states remain explicit coverage gaps, so a clean
-objective report is still `NeedsReview`.
+These slices do not claim host-pixel equivalence. Native SDK automation can
+capture its retained native canvas but explicitly cannot capture WebView
+pixels, so host screenshot evidence remains the one explicit coverage gap and
+a clean objective report is still `NeedsReview`.
 
 ## Validation gates
 

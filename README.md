@@ -47,10 +47,12 @@ CLIs. They present plans and tool calls as structured, searchable blocks, and
 can open generated React/TypeScript artifacts in an isolated editor and preview.
 For each accepted artifact revision, the Workbench measures a Rust-owned matrix
 covering narrow, tablet, desktop, dark-theme, reduced-motion, keyboard-focus,
-and fixed `zh-CN` long-content environments, then persists a revision-bound
-visual quality report. The checker remains explicitly `needs review` until
-host-pixel and declared-state coverage exists; browser observations cannot mark
-their own output ready.
+fixed `zh-CN` long-content, and declarative empty/loading/error/disabled
+environments, then persists a revision-bound visual quality report. Generated
+artifacts expose state blocks through bounded `data-hyper-state` markup; the
+host selects and measures those blocks without executing artifact-supplied test
+code. The checker remains explicitly `needs review` until host-pixel evidence
+exists; browser observations cannot mark their own output ready.
 
 Press `Command-F` in an Agent tab to filter its retained messages, tools, files,
 and approvals; ordinary Terminal tabs keep terminal-native find.
@@ -206,7 +208,7 @@ containment, and signed macOS distribution.
   authority.
 - Complete the Deno/esbuild-wasm Agentic UI loop: React editing, bounded Diff,
   live preview, runtime traces, semantic Time Travel, and the remaining
-  host-owned pixel and declared-state visual evidence.
+  host-owned pixel visual evidence.
 - Keep every source file within 2,000 lines by extracting cohesive View, Model,
   protocol, and test modules before a responsibility becomes a new hotspot.
 - Harden sandboxing, accessibility, crash recovery, signing, notarization, and
