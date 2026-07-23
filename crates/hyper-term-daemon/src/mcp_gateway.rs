@@ -713,6 +713,7 @@ impl DenoLspExecutor {
             workspace_snapshot: workspace_snapshot.clone(),
             cache_directory: config.cache_directory,
             scratch_directory: config.scratch_directory,
+            config_file: None,
         })
         .map_err(|error| error.to_string())?;
         client

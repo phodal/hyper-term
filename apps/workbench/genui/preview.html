@@ -6,10 +6,39 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
     />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="dark light" />
     <meta name="referrer" content="no-referrer" />
     <title>Hyper Term isolated preview</title>
     <style>
+    :root {
+      color-scheme: dark;
+      --preview-background: #0d0f0b;
+      --preview-text: #e6e9dd;
+      --preview-error-background: #321e1b;
+      --preview-error-border: #74433d;
+      --preview-error-text: #ff8d83;
+    }
+    @media (prefers-color-scheme: light) {
+      :root:not([data-hyper-color-scheme]) {
+        color-scheme: light;
+        --preview-background: #f7f9f1;
+        --preview-text: #171a14;
+        --preview-error-background: #fae8e6;
+        --preview-error-border: #d49d98;
+        --preview-error-text: #a6312b;
+      }
+    }
+    :root[data-hyper-color-scheme="light"] {
+      color-scheme: light;
+      --preview-background: #f7f9f1;
+      --preview-text: #171a14;
+      --preview-error-background: #fae8e6;
+      --preview-error-border: #d49d98;
+      --preview-error-text: #a6312b;
+    }
+    :root[data-hyper-color-scheme="dark"] {
+      color-scheme: dark;
+    }
     html,
     body,
     #root {
@@ -17,8 +46,8 @@
       margin: 0;
     }
     body {
-      color: #e8eadf;
-      background: #11140f;
+      color: var(--preview-text);
+      background: var(--preview-background);
       font: 14px system-ui;
     }
     #runtime-error {
@@ -29,10 +58,10 @@
       box-sizing: border-box;
       margin: 0;
       padding: 12px;
-      border: 1px solid #a84f46;
+      border: 1px solid var(--preview-error-border);
       border-radius: 8px;
-      color: #ffc2ba;
-      background: #211310;
+      color: var(--preview-error-text);
+      background: var(--preview-error-background);
       white-space: pre-wrap;
       font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
     }

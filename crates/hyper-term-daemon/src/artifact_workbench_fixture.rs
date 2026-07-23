@@ -103,6 +103,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let dispatching =
         daemon.begin_operation(task_id, proposed.operation_id, authorized.revision)?;
 
+    let source = concat!(
+        "export default function App() {\n",
+        "  const panel = {\n",
+        "    border: \"1px solid #526048\", borderRadius: 18, padding: 22,\n",
+        "    color: \"#f4f7ef\", background: \"linear-gradient(145deg, #1c2118, #12150f)\",\n",
+        "    boxShadow: \"0 18px 48px rgba(0, 0, 0, 0.24)\",\n",
+        "  };\n",
+        "  return (\n",
+        "    <main style={{ boxSizing: \"border-box\", minHeight: \"100%\", padding: 24 }}>\n",
+        "      <section data-hyper-state=\"default\" style={panel}>\n",
+        "        <small style={{ color: \"#b9ca9f\", letterSpacing: \"0.12em\" }}>GENUI · LIVE</small>\n",
+        "        <h1 style={{ margin: \"10px 0 8px\", fontSize: 24 }}>Artifact quality summary</h1>\n",
+        "        <p style={{ margin: 0, color: \"#c8d0bd\", lineHeight: 1.55 }}>\n",
+        "          Edit this TSX and the isolated preview rebuilds immediately.\n",
+        "        </p>\n",
+        "        <button data-primary-action=\"true\" type=\"button\" style={{\n",
+        "          marginTop: 18, minWidth: 120, minHeight: 34, borderRadius: 8,\n",
+        "          border: \"1px solid #9fca48\", color: \"#11140e\", background: \"#d7ff72\",\n",
+        "        }}>Run fixture</button>\n",
+        "      </section>\n",
+        "      <section hidden data-hyper-state=\"empty\"><p data-hyper-state-feedback=\"true\">No generated results yet.</p></section>\n",
+        "      <section hidden data-hyper-state=\"loading\" aria-busy=\"true\"><p role=\"status\" data-hyper-state-feedback=\"true\">Loading generated results.</p></section>\n",
+        "      <section hidden data-hyper-state=\"error\"><p role=\"alert\" data-hyper-state-feedback=\"true\">Generated results could not be loaded.</p></section>\n",
+        "      <section hidden data-hyper-state=\"disabled\"><p data-hyper-state-feedback=\"true\">Generation is unavailable.</p><button type=\"button\" disabled>Generate</button></section>\n",
+        "    </main>\n",
+        "  );\n",
+        "}\n",
+    );
     let bundle = concat!(
         "globalThis.hyperTermArtifactWorkbenchFixture = true;",
         "globalThis.__HYPER_MOUNT__(function Fixture(){",
@@ -140,16 +168,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         GenUiArtifactCandidate {
             schema_version: 1,
             source_revision: 1,
-            entrypoint: "/main.ts".into(),
-            source_files: BTreeMap::from([(
-                "/main.ts".into(),
-                concat!(
-                    "const value = \"ok\";\n",
-                    "value.toUpperCase();\n",
-                    "export default value;\n"
-                )
-                .into(),
-            )]),
+            entrypoint: "/App.tsx".into(),
+            source_files: BTreeMap::from([("/App.tsx".into(), source.into())]),
             bundle: bundle.into(),
             css: css.into(),
             source_map: "{\"version\":3,\"sources\":[],\"names\":[],\"mappings\":\"\"}".into(),

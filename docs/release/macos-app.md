@@ -12,6 +12,19 @@ Release frequency is therefore independent from validation frequency: ordinary
 development stays continuously checked while only an explicit release tag can
 publish application archives.
 
+The same release also publishes
+`Hyper-Term-<version>-web-renderers.zip`. It contains a responsive static
+launcher, the exact verified Terminal and Workbench browser assets,
+`esbuild.wasm`, and a SHA-256 inventory. The Workbench is a standalone demo;
+the Terminal renderer requires the token-bound Rust PTY gateway. This is a
+Deno-built Web/WASM renderer kit, not a Native SDK Web target: Native SDK 0.5.3
+does not expose a Web packaging target. Rust remains the authority for PTYs,
+ACP/MCP sessions, approvals, filesystem writes, and accepted artifacts.
+CI serves the assembled kit, verifies its file inventory, renders the
+responsive launcher in wide and narrow system-light modes, and boots the
+copied Workbench through its real Worker/WebAssembly Preview path before the
+release archive is created.
+
 Release candidates are intentionally limited to one published GitHub Release
 per `Asia/Shanghai` calendar day. Commits and validation may continue normally,
 but a second tag on the same day fails before the expensive build begins. A
@@ -32,8 +45,12 @@ WebView, exposes accessible Terminal and Agent creation controls, and handles
 screenshot, and supervisor log are retained as the `macos-desktop-smoke`
 workflow artifact.
 
-The release job also serves the exact built Workbench to a pinned headless
-browser. It edits the CodeMirror document with CJK content, waits for the
+The release job serves both exact built WebView renderers to a pinned headless
+browser. The Terminal gate exercises a real zsh PTY, input, selection, search,
+IME, screen-reader mode, resizing, burst output, and live light/dark system
+appearance without recreating the PTY. Its screenshots are retained as
+`terminal-browser-smoke`. The Workbench gate edits the CodeMirror document with
+CJK content, waits for the
 esbuild-wasm Worker and isolated preview handshake, opens the editable Diff,
 then repeats twelve warm edits. The gate rejects warm edit-to-preview p95 above
 100 ms or any overlapping main-thread task of at least 50 ms. A separate
@@ -46,6 +63,12 @@ timing evidence is printed in the release log, while wide and narrow
 screenshots are retained as `workbench-browser-smoke`; this complements Native
 automation because Native SDK snapshots deliberately cannot inspect WebView
 DOM content.
+
+The same browser release surface also opens the authenticated Artifact
+Workbench at its real Native pane width. It requires `/App.tsx` on the left,
+zero false-positive JSX diagnostics from the Rust-supervised Deno LSP, a visible
+isolated Preview on the right, and a newer accepted Preview revision after a
+CodeMirror edit. Dark, system-light, and live-edit screenshots are retained.
 
 The pinned Deno runtime is also exercised through three real LSP layers before
 packaging: the driver must initialize and shut down `deno lsp`, the editor

@@ -145,6 +145,7 @@ jobs:
           deno task build:terminal
           deno task build:workbench
           deno task build:runtime
+          deno task assemble:web
           deno_path="$(command -v deno)"
           deno_sha256="$(shasum -a 256 "$deno_path" | awk '{print $1}')"
           HYPER_TERM_ACP_RUNTIME_ROOT="$GITHUB_WORKSPACE/dist/runtime/acp" \
@@ -173,7 +174,7 @@ jobs:
               --ignored \
               --exact
 
-      - name: Run the built Workbench browser gate
+      - name: Run the built renderer browser gates
         run: |
           browser_prefix="$RUNNER_TEMP/agent-browser"
           npm install \
@@ -184,7 +185,9 @@ jobs:
           export PATH="$browser_prefix/node_modules/.bin:$PATH"
           agent-browser --version
           agent-browser install
+          deno task verify:terminal-browser
           deno task verify:workbench-browser
+          deno task verify:web-browser
           deno_path="$(command -v deno)"
           deno_sha256="$(shasum -a 256 "$deno_path" | awk '{print $1}')"
           HYPER_TERM_DENO_PATH="$deno_path" \
@@ -248,6 +251,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Upload Terminal browser evidence
+        if: ${{ always() && hashFiles('.zig-cache/terminal-browser/*.png') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: terminal-browser-smoke
+          path: .zig-cache/terminal-browser/*.png
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload Workbench browser evidence
         if: ${{ always() && hashFiles('.zig-cache/workbench-browser/*.png') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -266,6 +278,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Upload Web Renderer Kit browser evidence
+        if: ${{ always() && hashFiles('.zig-cache/web-renderer-kit-browser/*.png') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-renderer-kit-browser-smoke
+          path: .zig-cache/web-renderer-kit-browser/*.png
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload verified GenUI runtime assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -273,6 +294,24 @@ jobs:
           path: dist/runtime
           if-no-files-found: error
           include-hidden-files: true
+          retention-days: 7
+
+      - name: Create Web Renderer Kit release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          mkdir -p dist/release
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/web-renderers \
+            "dist/release/Hyper-Term-${version}-web-renderers.zip"
+
+      - name: Upload Web Renderer Kit release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hyper-term-web-renderers
+          path: dist/release/*-web-renderers.zip
+          if-no-files-found: error
           retention-days: 7
 
   package-macos:
@@ -646,7 +685,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: package-macos
+    needs: [validate, package-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -658,6 +697,12 @@ jobs:
           pattern: hyper-term-macos-*
           path: release-assets
           merge-multiple: true
+
+      - name: Download Web Renderer Kit archive
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: hyper-term-web-renderers
+          path: release-assets
 
       - name: Generate checksums
         shell: bash

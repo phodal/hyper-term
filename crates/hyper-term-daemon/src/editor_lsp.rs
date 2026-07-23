@@ -30,6 +30,57 @@ const MAX_EDITOR_COMPLETIONS: usize = 128;
 const MAX_EDITOR_DIAGNOSTICS: usize = 256;
 const MAX_EDITOR_LABEL_BYTES: usize = 512;
 const MAX_EDITOR_DETAIL_BYTES: usize = 4 * 1024;
+const EDITOR_SDK_CONFIG: &str = r#"{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "react"
+  },
+  "imports": {
+    "react": "./sdk/react.d.ts",
+    "react/jsx-runtime": "./sdk/react-jsx-runtime.d.ts",
+    "react/jsx-dev-runtime": "./sdk/react-jsx-runtime.d.ts",
+    "@hyper/runtime": "./sdk/hyper-runtime.d.ts"
+  }
+}
+"#;
+const EDITOR_REACT_TYPES: &str = r#"export type Dispatch<Action> = (action: Action) => void;
+export type SetStateAction<State> = State | ((current: State) => State);
+export interface MutableRefObject<Value> { current: Value; }
+export function useState<State>(initial: State | (() => State)): [State, Dispatch<SetStateAction<State>>];
+export function useEffect(effect: () => void | (() => void), dependencies?: readonly unknown[]): void;
+export function useMemo<Value>(factory: () => Value, dependencies: readonly unknown[]): Value;
+export function useRef<Value>(initial: Value): MutableRefObject<Value>;
+export function useCallback<Callback extends (...arguments_: never[]) => unknown>(callback: Callback, dependencies: readonly unknown[]): Callback;
+export function createElement(type: unknown, props?: unknown, ...children: unknown[]): unknown;
+export const Fragment: unknown;
+declare const React: {
+  createElement: typeof createElement;
+  Fragment: typeof Fragment;
+  useState: typeof useState;
+  useEffect: typeof useEffect;
+  useMemo: typeof useMemo;
+  useRef: typeof useRef;
+  useCallback: typeof useCallback;
+};
+export default React;
+"#;
+const EDITOR_REACT_JSX_TYPES: &str = r#"export namespace JSX {
+  interface Element {}
+  interface IntrinsicAttributes { key?: unknown; }
+  interface IntrinsicElements { [elementName: string]: Record<string, unknown>; }
+}
+export const Fragment: unknown;
+export function jsx(type: unknown, props: unknown, key?: unknown): JSX.Element;
+export function jsxs(type: unknown, props: unknown, key?: unknown): JSX.Element;
+export function jsxDEV(type: unknown, props: unknown, key?: unknown): JSX.Element;
+"#;
+const EDITOR_HYPER_RUNTIME_TYPES: &str = r#"import type { Dispatch } from "react";
+export function mount(component: unknown): void;
+export function traceAction(name: string, payload?: unknown): void;
+export function traceCheckpoint(name: string, payload?: unknown): void;
+export function useReplayReducer<State, Action>(name: string, reducer: (state: State, action: Action) => State, initialState: State): [State, Dispatch<Action>];
+export function replayableEffect<Result>(name: string, input: unknown, invoke: () => Result | Promise<Result>): Promise<Result>;
+"#;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -302,6 +353,7 @@ impl ArtifactLspSession {
         for directory in [&workspace, &cache, &scratch] {
             create_private_directory(directory)?;
         }
+        let sdk_config = write_editor_sdk(&scratch)?;
         let mut documents = HashMap::new();
         for (virtual_path, source) in source_files {
             validate_virtual_path(virtual_path)?;
@@ -337,6 +389,7 @@ impl ArtifactLspSession {
             workspace_snapshot: workspace.canonicalize()?,
             cache_directory: cache.canonicalize()?,
             scratch_directory: scratch.canonicalize()?,
+            config_file: Some(sdk_config),
         })
         .map_err(|error| EditorLspError::Driver(error.to_string()))?;
         client
@@ -678,6 +731,23 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn write_editor_sdk(scratch: &Path) -> Result<PathBuf, std::io::Error> {
+    let sdk = scratch.join("sdk");
+    create_private_directory(&sdk)?;
+    let config = scratch.join("hyper-term-deno.json");
+    write_private_file(&config, EDITOR_SDK_CONFIG.as_bytes())?;
+    write_private_file(&sdk.join("react.d.ts"), EDITOR_REACT_TYPES.as_bytes())?;
+    write_private_file(
+        &sdk.join("react-jsx-runtime.d.ts"),
+        EDITOR_REACT_JSX_TYPES.as_bytes(),
+    )?;
+    write_private_file(
+        &sdk.join("hyper-runtime.d.ts"),
+        EDITOR_HYPER_RUNTIME_TYPES.as_bytes(),
+    )?;
+    config.canonicalize()
+}
+
 fn close_lsp_sessions(sessions: Vec<Arc<Mutex<ArtifactLspSession>>>) {
     for session in sessions {
         if let Ok(session) = session.lock() {
@@ -747,6 +817,23 @@ mod tests {
         assert!(validate_draft_inventory(&accepted, &accepted).is_ok());
         assert!(validate_draft_inventory(&missing, &accepted).is_err());
         assert!(validate_draft_inventory(&additional, &accepted).is_err());
+    }
+
+    #[test]
+    fn editor_sdk_pins_the_compiler_capsule_modules_for_deno_lsp() {
+        let temporary = tempfile::tempdir().unwrap();
+        let scratch = temporary.path().join("scratch");
+        create_private_directory(&scratch).unwrap();
+        let config = write_editor_sdk(&scratch).unwrap();
+        let parsed: Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
+        assert_eq!(parsed["compilerOptions"]["jsx"], "react-jsx");
+        assert_eq!(parsed["compilerOptions"]["jsxImportSource"], "react");
+        assert_eq!(parsed["imports"]["react"], "./sdk/react.d.ts");
+        assert_eq!(
+            parsed["imports"]["@hyper/runtime"],
+            "./sdk/hyper-runtime.d.ts"
+        );
+        assert!(scratch.join("sdk/react-jsx-runtime.d.ts").is_file());
     }
 
     #[test]

@@ -104,6 +104,26 @@ grep -q 'tab "Time Travel"' <<<"$verify_snapshot"
 grep -q 'Iframe "Accepted Agentic UI artifact"' <<<"$verify_snapshot"
 grep -q 'heading "Verification complete"' <<<"$verify_snapshot"
 
+# System appearance must retheme the trusted Workbench and CodeMirror in
+# place. Preserve a DOM marker so a passing palette assertion cannot hide an
+# editor remount that would discard selection, undo history, or local draft.
+verify_theme_probe=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const editor=document.querySelector(".cm-editor");if(!editor)return "FAIL";editor.dataset.appearanceProbe="preserved";return "OK"})()')
+grep -q '"OK"' <<<"$verify_theme_probe"
+agent-browser --session "$verify_session" set media light >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+verify_light_theme=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const root=document.documentElement;const style=getComputedStyle(root);const editor=document.querySelector(".cm-editor");return root.dataset.theme==="light"&&style.getPropertyValue("--workbench-background").trim()==="#f7f9f1"&&style.getPropertyValue("--workbench-accent").trim()==="#456109"&&editor?.dataset.appearanceProbe==="preserved"&&getComputedStyle(editor).color==="rgb(23, 26, 20)"?"OK":"FAIL"})()')
+grep -q '"OK"' <<<"$verify_light_theme"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/workbench-light.png" >/dev/null
+
+agent-browser --session "$verify_session" set media dark >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+verify_dark_theme=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const root=document.documentElement;const style=getComputedStyle(root);const editor=document.querySelector(".cm-editor");return root.dataset.theme==="dark"&&style.getPropertyValue("--workbench-background").trim()==="#0d0f0b"&&style.getPropertyValue("--workbench-accent").trim()==="#d7ff72"&&editor?.dataset.appearanceProbe==="preserved"&&getComputedStyle(editor).color==="rgb(230, 233, 221)"?"OK":"FAIL"})()')
+grep -q '"OK"' <<<"$verify_dark_theme"
+
 # Drive CodeMirror through its focus and text-input paths, then wait for the
 # real esbuild-wasm Worker and isolated preview handshake to accept the edit.
 verify_source='export default function App(){return <main><h1>实时预览 ✓</h1><p>Agentic UI</p></main>}'
@@ -331,6 +351,15 @@ verify_diff=$(agent-browser --session "$verify_session" eval \
 grep -q '"OK"' <<<"$verify_diff"
 agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/workbench-live-diff.png" >/dev/null
+agent-browser --session "$verify_session" set media light >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+verify_light_diff=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const editors=[...document.querySelectorAll(".cm-mergeView .cm-editor")];return document.documentElement.dataset.theme==="light"&&editors.length===2&&editors.every(editor=>getComputedStyle(editor).color==="rgb(23, 26, 20)")?"OK":"FAIL"})()')
+grep -q '"OK"' <<<"$verify_light_diff"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/workbench-light-diff.png" >/dev/null
+agent-browser --session "$verify_session" set media dark >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
 
 # The narrow layout intentionally scrolls inside workspace-grid because the
 # Native host remains a fixed desktop surface. Prove Studio is reachable and
@@ -349,5 +378,7 @@ if [[ -n "$verify_errors" ]]; then
 fi
 
 echo "Workbench browser verified: CodeMirror edit, esbuild-wasm live reload, 100/500/1000-module rebuilds, cancellation, isolated preview, warm p95 budget, editable Diff, and narrow Studio reachability"
+echo "Workbench light appearance screenshot: $verify_artifact_dir/workbench-light.png"
 echo "Workbench live Diff screenshot: $verify_artifact_dir/workbench-live-diff.png"
+echo "Workbench light Diff screenshot: $verify_artifact_dir/workbench-light-diff.png"
 echo "Workbench narrow screenshot: $verify_artifact_dir/workbench-narrow-studio.png"

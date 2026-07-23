@@ -9,6 +9,11 @@
   [ADR 0011](0011-versioned-block-render-document.md), and
   [ADR 0012](0012-native-sdk-renderer-spike.md)
 
+> Native SDK 0.5.3 has no Web target. Hyper Term therefore shares Design
+> System tokens and browser renderer contracts with a separately packaged
+> Deno/WebAssembly renderer kit; it does not claim that Native scenes compile
+> to the browser. The kit keeps PTY and Agent authority behind a Rust host.
+
 ## Context
 
 ADR 0012 kept Tauri as the reference adapter while Native SDK was evaluated. The
@@ -255,6 +260,33 @@ search, per-tab draft isolation, Goal-edit autofocus, ordinary Terminal tab
 behavior, renderer restart, and application restart. This evidence covers the
 Native Agent composer; terminal-grid IME and system-WebView capture use the
 separate browser and host gates below.
+
+## Design system adapter evidence (2026-07-23)
+
+`deno task check:design` now validates the root `DESIGN.md` with the pinned
+Google `@google/design.md` parser and then verifies the concrete Native SDK,
+Workbench, Terminal CSS, and xterm adapters. The gate covers both Native color
+schemes, semantic Web colors, typography sizes, spacing, radii, and the
+Terminal status palette. A token change that is not reflected in every owned
+adapter fails with the exact file and missing mapping; regression fixtures
+prove Native and CSS drift are both detected.
+
+The Terminal WebView now listens to the real `prefers-color-scheme` media query
+and updates both xterm's canvas theme and the responsive search/status chrome
+without recreating the terminal or PTY. The browser gate changes the live page
+from light to dark, checks the exact DESIGN.md background tokens, retains a
+light-theme screenshot, and then continues through real zsh input, search, IME,
+screen-reader projection, resize, and the 8 MiB burst path. Native continues to
+derive light, dark, high-contrast, and reduced-motion state from its system
+appearance callback, so the product has one semantic theme contract across the
+native canvas and terminal island.
+
+The Workbench follows that same system appearance contract through DESIGN.md
+semantic tokens. CodeMirror and editable Diff update in place without losing
+their DOM/editor state; the isolated Preview shell follows system appearance
+until a deterministic visual-quality capture explicitly selects light or dark.
+Browser evidence retains light Code, light Diff, and Native-pane source/Preview
+captures in addition to the dark desktop working set.
 
 ## Terminal input focus evidence (2026-07-21)
 

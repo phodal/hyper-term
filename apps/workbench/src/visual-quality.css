@@ -7,7 +7,7 @@
   border: 1px solid var(--line-strong);
   border-radius: 9px;
   background: color-mix(in srgb, var(--panel-raised) 94%, transparent);
-  box-shadow: 0 12px 34px rgba(0, 0, 0, .34);
+  box-shadow: 0 12px 34px var(--workbench-shadow);
   color: var(--muted);
   font: 9px ui-monospace, SFMono-Regular, Menlo, monospace;
   backdrop-filter: blur(12px);
@@ -20,7 +20,7 @@
   padding: 6px 8px;
 }
 .visual-quality-gate > header strong {
-  color: #dce3d2;
+  color: var(--workbench-text);
   font-size: 10px;
 }
 .visual-quality-gate > header > span:nth-of-type(2) {
@@ -52,7 +52,7 @@
   border: 1px solid var(--line-strong);
   border-radius: 5px;
   background: var(--panel-soft);
-  color: #b9c2ae;
+  color: var(--workbench-text);
   cursor: pointer;
   font: inherit;
 }
@@ -70,7 +70,7 @@
 }
 .visual-quality-gate summary {
   padding: 7px 9px;
-  color: #aeb7a3;
+  color: var(--workbench-text);
   cursor: pointer;
 }
 .visual-quality-findings {
@@ -88,7 +88,7 @@
   background: var(--panel);
 }
 .visual-quality-findings article strong {
-  color: #c8d0be;
+  color: var(--workbench-text);
   text-transform: capitalize;
 }
 .visual-quality-findings article[data-severity="blocking"] strong {

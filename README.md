@@ -106,6 +106,21 @@ deno task build:workbench
 (cd apps/desktop && native build --release=fast)
 ```
 
+Build the static Web Renderer Kit separately when embedding the same Terminal
+and Agentic UI surfaces in another host:
+
+```bash
+deno task package:web
+```
+
+The generated `dist/web-renderers` has a responsive launcher, the Terminal
+renderer, the standalone TSX/Preview Workbench, `esbuild.wasm`, and a
+SHA-256 file inventory. Native SDK 0.5.3 does not provide a Web target, so this
+is deliberately a Deno-built Web/WASM renderer kit rather than a false claim
+that the Native canvas compiles to a browser. The Terminal renderer still needs
+the authenticated Rust PTY gateway; the Workbench demo can run from any static
+HTTP server.
+
 Start Hyper Term:
 
 ```bash
@@ -131,7 +146,11 @@ open "dist/macos/Hyper Term.app"
 ```
 
 This creates an ad-hoc signed development build. Public signed and notarized
-releases are not available yet.
+builds are published by the tag-driven GitHub Release workflow after its
+protected `Release` environment supplies the Apple credentials documented in
+[the macOS release guide](docs/release/macos-app.md). Suffixed tags can publish
+an explicitly unsigned prerelease when those credentials are intentionally
+absent.
 
 ## Development
 
@@ -149,7 +168,11 @@ deno task verify:runtime
 deno task verify:deno-lsp
 deno task check
 deno task test
+deno task build:terminal
 deno task build:workbench
+deno task assemble:web
+deno task verify:web-browser
+deno task verify:terminal-browser
 deno task verify:workbench-browser
 ```
 
@@ -158,7 +181,12 @@ pnpm build. The optional browser gate requires `agent-browser`; it edits the
 built Workbench, waits for the esbuild-wasm live preview, opens the editable
 Diff, enforces a 100 ms warm edit-to-preview p95 with no main-thread long tasks,
 measures 100/500/1,000-module Worker slice rebuilds and cancellation, and
-verifies that Studio remains reachable at 480 px. Semantics-sensitive module
+verifies the Artifact editor and Preview remain side by side at the Native
+pane width, then become an editor-first stack below 640 px. The compact Agent
+Studio remains reachable at 480 px. The authenticated Artifact gate starts
+from visible `/App.tsx`, requires zero initial Deno LSP errors, edits the TSX
+through CodeMirror, and captures the newer live Preview revision.
+Semantics-sensitive module
 features fall back to a complete esbuild build, while authoritative artifact
 publication remains a Rust-supervised Deno build.
 
@@ -203,16 +231,17 @@ containment, and signed macOS distribution.
 
 - Keep zsh-compatible Terminal startup, input, resize, search, and burst output
   on a fast path independent from Agent availability.
-- Finish provider sign-in recovery, permission review, and real Codex, Claude,
-  and Copilot ACP compatibility without giving Native or WebViews process
-  authority.
-- Complete the Deno/esbuild-wasm Agentic UI loop: React editing, bounded Diff,
-  live preview, runtime traces, semantic Time Travel, and the remaining
-  host-owned pixel visual evidence.
+- Keep provider sign-in recovery, permission review, and real Codex, Claude,
+  and Copilot ACP compatibility release-gated without giving Native or WebViews
+  process authority.
+- Extend the Deno/esbuild-wasm Agentic UI loop beyond its React editing,
+  bounded Diff, live preview, runtime traces, semantic Time Travel, and
+  host-owned visual-evidence foundation.
 - Keep every source file within 2,000 lines by extracting cohesive View, Model,
   protocol, and test modules before a responsibility becomes a new hotspot.
-- Harden sandboxing, accessibility, crash recovery, signing, notarization, and
-  the once-daily prerelease pipeline before a stable public release.
+- Harden Tier 2 isolation and cross-platform packaging while keeping
+  accessibility, crash recovery, signing, notarization, and the once-daily
+  prerelease pipeline continuously verified.
 
 ## Contributing
 

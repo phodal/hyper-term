@@ -270,10 +270,45 @@ The CodeMirror content surface carries the active virtual path in its accessible
 name. Compiler and Rust-supervised Deno LSP changes use polite status semantics
 instead of relying on color alone. The authenticated Artifact Workbench browser
 gate drives the real key path through Code, Diff, and Time Travel, returns to a
-named `/main.ts` editor, then continues through live Deno diagnostics,
+named `/App.tsx` editor, then continues through live Deno diagnostics,
 completion, isolated preview, and hostile-preview denial. It retains a focused
 tab screenshot so focus visibility remains a release artifact rather than a
 DOM-only assertion.
+
+## GenUI authoring layout evidence (2026-07-23)
+
+The dedicated Artifact Workbench now treats editing and rendering as one
+continuous task: the active TSX/TypeScript source, Diff, and Time Travel stay in
+the left pane while the accepted isolated Preview remains visible in the right
+pane. This layout is scoped to the dedicated Artifact surface; the compact
+Studio inside an Agent timeline remains vertical so it does not compress a
+narrow inspector column.
+
+The Native editor split is GenUI-first. Its default assigns 34 percent to the
+Agent conversation and the remaining width to the Workbench, with a bounded
+30–52 percent draggable Agent range. At the default desktop size, the resulting
+Workbench is wide enough for the source/Preview split. Below 640 pixels the
+Workbench deliberately returns to an editor-first vertical flow. The
+authenticated browser gate measures real pane rectangles at 1,400, 680, and
+600 pixels, rejects horizontal overflow at the Native-size width, and retains
+screenshots for both split and stacked states.
+
+## GenUI SDK alignment evidence (2026-07-24)
+
+The authenticated Artifact fixture now opens a real `/App.tsx` component rather
+than a scalar TypeScript module. The first accepted local build must contain the
+visible component source, complete without Deno diagnostics, and reach the
+isolated Preview before the split-layout assertion can pass. The browser gate
+then edits that TSX through CodeMirror, requires a newer accepted revision and
+Preview handshake, and retains the resulting source-and-render screenshot. A
+blank renderer can no longer satisfy the GenUI authoring gate.
+
+The private Deno editor session also receives a host-owned configuration that
+matches the compiler capsule: automatic React JSX plus local, offline type
+surfaces for `react`, `react/jsx-runtime`, and `@hyper/runtime`. These files live
+under the session scratch root, are not Artifact source, and grant no workspace
+or network authority. This removes false JSX/import diagnostics without
+weakening real Deno diagnostics or changing the browser compiler boundary.
 
 ## Validation gates
 

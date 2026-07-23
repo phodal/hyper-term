@@ -63,49 +63,61 @@ const runtimeErrorLine = StateField.define({
   provide: (field) => EditorView.decorations.from(field),
 });
 
-const editorTheme = EditorView.theme({
-  "&": { height: "100%", background: "transparent", color: "#e9ebdf" },
-  ".cm-content": { padding: "16px 0", caretColor: "#d7ff72" },
+export const editorTheme = EditorView.theme({
+  "&": {
+    height: "100%",
+    background: "transparent",
+    color: "var(--workbench-text)",
+  },
+  ".cm-content": {
+    padding: "16px 0",
+    caretColor: "var(--workbench-accent)",
+  },
   ".cm-gutters": {
     background: "transparent",
-    color: "#68705d",
+    color: "var(--workbench-text-muted)",
     border: "none",
   },
-  ".cm-activeLine": { background: "rgba(215, 255, 114, .035)" },
+  ".cm-activeLine": { background: "var(--workbench-editor-active-line)" },
   ".cm-runtime-error-line": {
-    background: "rgba(255, 141, 131, .09)",
-    boxShadow: "inset 2px 0 #ff8d83",
+    background: "var(--workbench-editor-error-line)",
+    boxShadow: "inset 2px 0 var(--workbench-destructive)",
   },
-  ".cm-activeLineGutter": { background: "transparent", color: "#b7c190" },
+  ".cm-activeLineGutter": {
+    background: "transparent",
+    color: "var(--workbench-accent)",
+  },
   ".cm-selectionBackground, ::selection": {
-    background: "rgba(167, 215, 83, .22) !important",
+    background: "var(--workbench-editor-selection) !important",
   },
   ".cm-scroller": {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
   },
   ".cm-tooltip": {
-    border: "1px solid #465238",
+    border: "1px solid var(--workbench-border-strong)",
     borderRadius: "6px",
-    background: "#171b14",
-    color: "#e9ebdf",
-    boxShadow: "0 12px 32px rgba(0, 0, 0, .48)",
+    background: "var(--workbench-surface)",
+    color: "var(--workbench-text)",
+    boxShadow: "0 12px 32px var(--workbench-shadow)",
   },
   ".cm-tooltip-autocomplete > ul": {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
   },
   ".cm-tooltip-autocomplete > ul > li": {
-    color: "#dce4d2",
+    color: "var(--workbench-text)",
   },
   ".cm-tooltip-autocomplete > ul > li[aria-selected]": {
-    background: "#344525",
-    color: "#f5ffd8",
+    background: "var(--workbench-surface-pressed)",
+    color: "var(--workbench-accent)",
   },
-  ".cm-completionDetail": { color: "#89917e" },
+  ".cm-completionDetail": { color: "var(--workbench-text-muted)" },
   ".cm-tooltip-lint .cm-diagnostic": {
-    borderLeftColor: "#ff8d83",
-    color: "#f2d5d1",
+    borderLeftColor: "var(--workbench-destructive)",
+    color: "var(--workbench-text)",
   },
-  ".cm-tooltip-lint .cm-diagnosticSource": { color: "#a8b29a" },
+  ".cm-tooltip-lint .cm-diagnosticSource": {
+    color: "var(--workbench-text-muted)",
+  },
 });
 
 export function CodeEditor(

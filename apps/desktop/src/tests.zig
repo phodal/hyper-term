@@ -1,6 +1,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
+const desktop_model = @import("desktop_model.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1274,6 +1275,28 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
 
     try testing.expect(!model.canOpenAgentEditor());
     try testing.expect(model.hasAgentEditor());
+    try testing.expectApproxEqAbs(
+        desktop_model.agent_split_default,
+        model.agent_split,
+        0.0001,
+    );
+    main.update(&model, .{ .agent_split_resized = 0.1 }, &fx);
+    try testing.expectApproxEqAbs(
+        desktop_model.agent_split_min,
+        model.agent_split,
+        0.0001,
+    );
+    main.update(&model, .{ .agent_split_resized = 0.9 }, &fx);
+    try testing.expectApproxEqAbs(
+        desktop_model.agent_split_max,
+        model.agent_split,
+        0.0001,
+    );
+    main.update(
+        &model,
+        .{ .agent_split_resized = desktop_model.agent_split_default },
+        &fx,
+    );
     model.genui_webview_mounted = true;
     try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
     try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);

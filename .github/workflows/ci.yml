@@ -85,6 +85,7 @@ jobs:
           deno task build:terminal
           deno task build:workbench
           deno task build:runtime
+          deno task assemble:web
 
       - name: Verify real Deno LSP and packaged ACP adapters
         run: |
@@ -117,7 +118,7 @@ jobs:
               --ignored \
               --exact
 
-      - name: Verify the built Workbench in a browser
+      - name: Verify the built renderers in a browser
         run: |
           browser_prefix="$RUNNER_TEMP/agent-browser"
           npm install \
@@ -127,7 +128,9 @@ jobs:
             "agent-browser@$AGENT_BROWSER_VERSION"
           export PATH="$browser_prefix/node_modules/.bin:$PATH"
           agent-browser install
+          deno task verify:terminal-browser
           deno task verify:workbench-browser
+          deno task verify:web-browser
           deno_path="$(command -v deno)"
           deno_sha256="$(shasum -a 256 "$deno_path" | awk '{print $1}')"
           HYPER_TERM_DENO_PATH="$deno_path" \
@@ -170,13 +173,24 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload Workbench browser evidence
-        if: ${{ always() && hashFiles('.zig-cache/workbench-browser/*.png', '.zig-cache/artifact-workbench-browser/*.png') != '' }}
+      - name: Upload renderer browser evidence
+        if: ${{ always() && hashFiles('.zig-cache/terminal-browser/*.png', '.zig-cache/workbench-browser/*.png', '.zig-cache/artifact-workbench-browser/*.png', '.zig-cache/web-renderer-kit-browser/*.png') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: workbench-browser-ci-${{ github.run_attempt }}
+          name: renderer-browser-ci-${{ github.run_attempt }}
           path: |
+            .zig-cache/terminal-browser/*.png
             .zig-cache/workbench-browser/*.png
             .zig-cache/artifact-workbench-browser/*.png
+            .zig-cache/web-renderer-kit-browser/*.png
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload verified Web Renderer Kit
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-renderers-ci-${{ github.run_attempt }}
+          path: dist/web-renderers
+          if-no-files-found: error
+          include-hidden-files: true
           retention-days: 7

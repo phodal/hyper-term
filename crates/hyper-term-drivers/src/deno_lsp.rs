@@ -27,6 +27,7 @@ pub struct DenoLspConfig {
     pub workspace_snapshot: PathBuf,
     pub cache_directory: PathBuf,
     pub scratch_directory: PathBuf,
+    pub config_file: Option<PathBuf>,
 }
 
 pub struct DenoLspClient {
@@ -35,6 +36,7 @@ pub struct DenoLspClient {
     request_gate: Mutex<()>,
     inbox: Mutex<BoundedDriverInbox>,
     workspace_uri: String,
+    config_file: Option<String>,
 }
 
 impl DenoLspClient {
@@ -43,6 +45,10 @@ impl DenoLspClient {
             || !config.workspace_snapshot.is_absolute()
             || !config.cache_directory.is_absolute()
             || !config.scratch_directory.is_absolute()
+            || config
+                .config_file
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
         {
             return Err(DenoLspError::InvalidConfig(
                 "Deno LSP directories must be absolute".into(),
@@ -53,6 +59,10 @@ impl DenoLspClient {
         let workspace = config.workspace_snapshot.canonicalize()?;
         let cache = config.cache_directory.canonicalize()?;
         let scratch = config.scratch_directory.canonicalize()?;
+        let config_file = config
+            .config_file
+            .map(|path| path.canonicalize())
+            .transpose()?;
         let workspace_uri = path_to_file_uri(&workspace)?;
         let environment = BTreeMap::from([
             ("DENO_DIR".into(), cache.clone().into_os_string()),
@@ -64,13 +74,17 @@ impl DenoLspClient {
         ]);
         let arguments = vec![OsString::from("lsp"), OsString::from("--quiet")];
         let driver_id = Uuid::new_v4();
+        let mut read_paths = vec![workspace.clone()];
+        if let Some(path) = &config_file {
+            read_paths.push(path.clone());
+        }
         let sandbox = compile_deno_task_sandbox(
             driver_id,
             &config.executable,
             &arguments,
             &workspace,
             &environment,
-            [workspace.clone()],
+            read_paths,
             [cache, scratch],
         )?;
         let permission_profile = sandbox_permission_profile(&sandbox);
@@ -108,11 +122,20 @@ impl DenoLspClient {
                 MAX_BUFFERED_LSP_OUTPUT_BYTES,
             )),
             workspace_uri,
+            config_file: config_file.as_deref().map(path_text).transpose()?,
         })
     }
 
     pub fn initialize(&self, timeout: Duration) -> Result<Value, DenoLspError> {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let mut initialization_options = json!({
+            "enable": true,
+            "lint": true,
+            "unstable": false
+        });
+        if let Some(config_file) = &self.config_file {
+            initialization_options["config"] = Value::String(config_file.clone());
+        }
         if let Err(error) = self.process.send_json(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -124,11 +147,7 @@ impl DenoLspClient {
                 "rootUri": self.workspace_uri,
                 "workspaceFolders": [{"uri": self.workspace_uri, "name": "workspace-snapshot"}],
                 "capabilities": {},
-                "initializationOptions": {
-                    "enable": true,
-                    "lint": true,
-                    "unstable": false
-                }
+                "initializationOptions": initialization_options
             }
         })) {
             let _ = self.process.stop(Duration::from_millis(100));
@@ -277,10 +296,19 @@ impl DenoLspClient {
             };
             match event {
                 DriverEvent::Message { ref payload, .. }
-                    if server_request_response(payload, &self.workspace_uri).is_some() =>
+                    if server_request_response(
+                        payload,
+                        &self.workspace_uri,
+                        self.config_file.as_deref(),
+                    )
+                    .is_some() =>
                 {
-                    let response = server_request_response(payload, &self.workspace_uri)
-                        .expect("guard checked the response");
+                    let response = server_request_response(
+                        payload,
+                        &self.workspace_uri,
+                        self.config_file.as_deref(),
+                    )
+                    .expect("guard checked the response");
                     self.process.send_json(&response)?;
                 }
                 DriverEvent::Message { payload, .. }
@@ -333,10 +361,19 @@ impl DenoLspClient {
             };
             match event {
                 DriverEvent::Message { ref payload, .. }
-                    if server_request_response(payload, &self.workspace_uri).is_some() =>
+                    if server_request_response(
+                        payload,
+                        &self.workspace_uri,
+                        self.config_file.as_deref(),
+                    )
+                    .is_some() =>
                 {
-                    let response = server_request_response(payload, &self.workspace_uri)
-                        .expect("guard checked the response");
+                    let response = server_request_response(
+                        payload,
+                        &self.workspace_uri,
+                        self.config_file.as_deref(),
+                    )
+                    .expect("guard checked the response");
                     self.process.send_json(&response)?;
                 }
                 DriverEvent::Message { ref payload, .. }
@@ -364,7 +401,11 @@ impl DenoLspClient {
     }
 }
 
-fn server_request_response(payload: &Value, workspace_uri: &str) -> Option<Value> {
+fn server_request_response(
+    payload: &Value,
+    workspace_uri: &str,
+    config_file: Option<&str>,
+) -> Option<Value> {
     let id = payload.get("id")?;
     if !(id.is_string() || id.is_i64() || id.is_u64()) {
         return None;
@@ -377,7 +418,13 @@ fn server_request_response(payload: &Value, workspace_uri: &str) -> Option<Value
                 .map_or(1, Vec::len);
             Value::Array(
                 (0..count)
-                    .map(|_| json!({"enable": true, "lint": true, "unstable": false}))
+                    .map(|_| {
+                        let mut settings = json!({"enable": true, "lint": true, "unstable": false});
+                        if let Some(config_file) = config_file {
+                            settings["config"] = Value::String(config_file.to_owned());
+                        }
+                        settings
+                    })
                     .collect(),
             )
         }
@@ -414,6 +461,12 @@ pub fn path_to_file_uri(path: &Path) -> Result<String, DenoLspError> {
         }
     }
     Ok(result)
+}
+
+fn path_text(path: &Path) -> Result<String, DenoLspError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| DenoLspError::InvalidConfig("config path is not UTF-8".into()))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, DenoLspError> {
@@ -466,10 +519,15 @@ mod tests {
                 "params": {"items": [{"section": "deno"}, {"section": "typescript"}]}
             }),
             "file:///snapshot",
+            Some("/private/tmp/hyper-term-deno.json"),
         )
         .unwrap();
         assert_eq!(response["id"], 4);
         assert_eq!(response["result"].as_array().unwrap().len(), 2);
         assert_eq!(response["result"][0]["enable"], true);
+        assert_eq!(
+            response["result"][0]["config"],
+            "/private/tmp/hyper-term-deno.json"
+        );
     }
 }

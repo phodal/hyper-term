@@ -97,7 +97,7 @@ agent-browser --session "$verify_session" wait --load networkidle >/dev/null
 agent-browser --session "$verify_session" set viewport 1400 1000 >/dev/null
 
 verify_ready=$(agent-browser --session "$verify_session" eval \
-  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const status=document.querySelector(".language-status")?.textContent||"";const source=document.querySelector(".cm-content")?.textContent||"";if(status.includes("Deno LSP · ready")&&source.includes("value.toUpperCase")){clearInterval(poll);resolve("OK");}else if(performance.now()-started>20000){clearInterval(poll);reject(new Error(JSON.stringify({status,source})));}},50)})')
+  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const language=document.querySelector(".language-status")?.textContent||"";const compiler=document.querySelector(".compiler-status")?.textContent||"";const preview=document.querySelector(".preview-badges")?.textContent||"";const source=document.querySelector(".cm-content")?.textContent||"";const lintErrors=document.querySelectorAll(".cm-lintRange-error").length;if(language.includes("Deno LSP · ready")&&compiler.includes("Preview ready")&&preview.includes("ready")&&source.includes("export default function App")&&source.includes("Artifact quality summary")&&lintErrors===0){clearInterval(poll);resolve("OK");}else if(performance.now()-started>20000){clearInterval(poll);reject(new Error(JSON.stringify({language,compiler,preview,source,lintErrors})));}},50)})')
 grep -q '"OK"' <<<"$verify_ready"
 
 verify_shell=$(agent-browser --session "$verify_session" eval \
@@ -108,6 +108,50 @@ grep -q 'tab "Code"' <<<"$verify_snapshot"
 grep -q 'tab "Diff"' <<<"$verify_snapshot"
 grep -q 'tab "Time Travel"' <<<"$verify_snapshot"
 grep -q 'Iframe "Accepted Agentic UI artifact"' <<<"$verify_snapshot"
+
+# The dedicated GenUI workbench keeps real editable TSX and its accepted local
+# Preview in one desktop working set. The fixture returns visible UI, so a
+# runtime-ready result cannot be satisfied by the old scalar-module sample.
+# This is a geometry assertion, not a class-name proxy: both panes must have
+# useful width and overlap vertically.
+verify_wide_split=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const editor=document.querySelector(".studio-editor")?.getBoundingClientRect();const preview=document.querySelector(".preview-frame")?.getBoundingClientRect();if(!editor||!preview)return "MISSING";const overlap=Math.min(editor.bottom,preview.bottom)-Math.max(editor.top,preview.top);return editor.right<=preview.left+2&&editor.width>=520&&preview.width>=520&&overlap>=500?"OK":JSON.stringify({editor:{x:editor.x,y:editor.y,width:editor.width,height:editor.height},preview:{x:preview.x,y:preview.y,width:preview.width,height:preview.height},overlap});})()')
+grep -q '"OK"' <<<"$verify_wide_split"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/artifact-workbench-split.png" >/dev/null
+
+# The Native editor receives roughly two thirds of the default desktop window.
+# Prove that real pane width still preserves the TSX + Preview work surface.
+agent-browser --session "$verify_session" set viewport 680 900 >/dev/null
+verify_native_split=$(agent-browser --session "$verify_session" eval \
+  'new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>{const editor=document.querySelector(".studio-editor")?.getBoundingClientRect();const preview=document.querySelector(".preview-frame")?.getBoundingClientRect();const header=document.querySelector(".preview-header");if(!editor||!preview||!header){resolve("MISSING");return;}const overlap=Math.min(editor.bottom,preview.bottom)-Math.max(editor.top,preview.top);const noOverflow=document.documentElement.scrollWidth<=innerWidth+1&&header.scrollWidth<=header.clientWidth+1;resolve(editor.right<=preview.left+2&&editor.width>=300&&preview.width>=300&&overlap>=400&&noOverflow?"OK":JSON.stringify({editor:{x:editor.x,y:editor.y,width:editor.width,height:editor.height},preview:{x:preview.x,y:preview.y,width:preview.width,height:preview.height},overlap,noOverflow,documentWidth:document.documentElement.scrollWidth,headerWidth:[header.clientWidth,header.scrollWidth]}));})))')
+grep -q '"OK"' <<<"$verify_native_split"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/artifact-workbench-native-split.png" >/dev/null
+agent-browser --session "$verify_session" set media light >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+verify_native_light_split=$(agent-browser --session "$verify_session" eval \
+  '(()=>{const root=document.documentElement;const editor=document.querySelector(".studio-editor")?.getBoundingClientRect();const preview=document.querySelector(".preview-frame")?.getBoundingClientRect();const style=getComputedStyle(root);return root.dataset.theme==="light"&&style.getPropertyValue("--workbench-background").trim()==="#f7f9f1"&&editor&&preview&&editor.right<=preview.left+2&&document.documentElement.scrollWidth<=innerWidth+1?"OK":"FAIL"})()')
+grep -q '"OK"' <<<"$verify_native_light_split"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/artifact-workbench-native-split-light.png" >/dev/null
+agent-browser --session "$verify_session" set media dark >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+agent-browser --session "$verify_session" set viewport 1400 1000 >/dev/null
+
+# Edit the authenticated Artifact Workbench through CodeMirror and require a
+# newer accepted local build before capturing the visible TSX + Preview pair.
+verify_live_source=$'export default function App() {\n  return (\n    <main style={{ padding: 28, fontFamily: "system-ui" }}>\n      <section style={{ border: "1px solid #526048", borderRadius: 18, padding: 24 }}>\n        <small>GENUI · LIVE RELOAD</small>\n        <h1>Live TSX edit applied</h1>\n        <p>The right-hand Preview was rebuilt from this editor revision.</p>\n      </section>\n    </main>\n  );\n}\n'
+verify_before_revision=$(agent-browser --session "$verify_session" eval \
+  'Number((document.querySelector(".compiler-status")?.textContent||"").match(/r(\d+)/)?.[1]||0)')
+agent-browser --session "$verify_session" focus '.cm-content' >/dev/null
+agent-browser --session "$verify_session" press Meta+a >/dev/null
+agent-browser --session "$verify_session" keyboard inserttext "$verify_live_source" >/dev/null
+verify_live_reload=$(agent-browser --session "$verify_session" eval \
+  "new Promise((resolve,reject)=>{const baseline=Number($verify_before_revision);const started=performance.now();const poll=setInterval(()=>{const compiler=document.querySelector('.compiler-status')?.textContent||'';const preview=document.querySelector('.preview-badges')?.textContent||'';const source=document.querySelector('.cm-content')?.textContent||'';const revision=Number(compiler.match(/r(\\d+)/)?.[1]||0);if(source.includes('Live TSX edit applied')&&source.includes('right-hand Preview')&&revision>baseline&&compiler.includes('Preview ready')&&preview.includes('ready')){clearInterval(poll);resolve('OK');}else if(performance.now()-started>15000){clearInterval(poll);reject(new Error(JSON.stringify({baseline,revision,compiler,preview,source})));}},50)})")
+grep -q '"OK"' <<<"$verify_live_reload"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/artifact-workbench-live-edit.png" >/dev/null
 
 # The IDE tabs must use the standard horizontal roving-focus interaction, not
 # only expose role=tab as presentation metadata. Drive the real keyboard path
@@ -124,7 +168,7 @@ verify_trace_tab=$(agent-browser --session "$verify_session" eval \
 grep -q '"OK"' <<<"$verify_trace_tab"
 agent-browser --session "$verify_session" press Home >/dev/null
 verify_code_tab=$(agent-browser --session "$verify_session" eval \
-  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const editor=document.querySelector(".cm-content");const view=document.activeElement?.getAttribute("data-view");const panel=document.querySelector(".studio-editor")?.id;if(view==="code"&&panel==="artifact-code-panel"&&editor?.getAttribute("aria-label")==="Artifact source /main.ts"){clearInterval(poll);resolve("OK");}else if(performance.now()-started>5000){clearInterval(poll);reject(new Error(JSON.stringify({view,panel,label:editor?.getAttribute("aria-label")})));}},25)})')
+  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const editor=document.querySelector(".cm-content");const view=document.activeElement?.getAttribute("data-view");const panel=document.querySelector(".studio-editor")?.id;if(view==="code"&&panel==="artifact-code-panel"&&editor?.getAttribute("aria-label")==="Artifact source /App.tsx"){clearInterval(poll);resolve("OK");}else if(performance.now()-started>5000){clearInterval(poll);reject(new Error(JSON.stringify({view,panel,label:editor?.getAttribute("aria-label")})));}},25)})')
 grep -q '"OK"' <<<"$verify_code_tab"
 agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-keyboard-tabs.png" >/dev/null
@@ -214,6 +258,15 @@ grep -q '"OK"' <<<"$verify_hostile"
 agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-hostile-denied.png" >/dev/null
 
+# Below the responsive breakpoint the same workbench becomes a readable
+# vertical flow, preserving editor-first order instead of squeezing two panes.
+agent-browser --session "$verify_session" set viewport 600 900 >/dev/null
+verify_narrow_stack=$(agent-browser --session "$verify_session" eval \
+  'new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>{const editor=document.querySelector(".studio-editor")?.getBoundingClientRect();const preview=document.querySelector(".preview-frame")?.getBoundingClientRect();if(!editor||!preview){resolve("MISSING");return;}resolve(preview.top>=editor.bottom-2&&editor.width>=550&&preview.width>=550?"OK":JSON.stringify({editor:{x:editor.x,y:editor.y,width:editor.width,height:editor.height},preview:{x:preview.x,y:preview.y,width:preview.width,height:preview.height}}));})))')
+grep -q '"OK"' <<<"$verify_narrow_stack"
+agent-browser --session "$verify_session" \
+  screenshot "$verify_artifact_dir/artifact-workbench-narrow.png" >/dev/null
+
 verify_errors=$(agent-browser --session "$verify_session" errors)
 if [[ -n "$verify_errors" ]]; then
   echo "$verify_errors" >&2
@@ -225,5 +278,10 @@ echo "Artifact Workbench diagnostic screenshot: $verify_artifact_dir/artifact-wo
 echo "Artifact Workbench completion screenshot: $verify_artifact_dir/artifact-workbench-deno-completion.png"
 echo "Artifact Workbench keyboard tabs screenshot: $verify_artifact_dir/artifact-workbench-keyboard-tabs.png"
 echo "Artifact Workbench visual quality screenshot: $verify_artifact_dir/artifact-workbench-visual-quality.png"
+echo "Artifact Workbench desktop split screenshot: $verify_artifact_dir/artifact-workbench-split.png"
+echo "Artifact Workbench live TSX edit screenshot: $verify_artifact_dir/artifact-workbench-live-edit.png"
+echo "Artifact Workbench Native-size split screenshot: $verify_artifact_dir/artifact-workbench-native-split.png"
+echo "Artifact Workbench Native-size light split screenshot: $verify_artifact_dir/artifact-workbench-native-split-light.png"
+echo "Artifact Workbench narrow stack screenshot: $verify_artifact_dir/artifact-workbench-narrow.png"
 echo "Artifact Workbench hostile preview denied native, cross-origin, popup, clipboard, network, and oversized status injection"
 echo "Artifact Workbench hostile screenshot: $verify_artifact_dir/artifact-workbench-hostile-denied.png"

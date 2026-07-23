@@ -483,7 +483,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 requestAgentComposerFocus(model);
             }
         },
-        .agent_split_resized => |fraction| model.agent_split = std.math.clamp(fraction, 0.48, 0.76),
+        .agent_split_resized => |fraction| model.agent_split = std.math.clamp(
+            fraction,
+            desktop_model.agent_split_min,
+            desktop_model.agent_split_max,
+        ),
         .system_appearance => |appearance| {
             model.system_scheme = appearance.scheme;
             model.high_contrast = appearance.high_contrast;

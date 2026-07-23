@@ -76,6 +76,23 @@ verify_boot=$(agent-browser --session "$verify_session" eval \
   'document.querySelector(".xterm-helper-textarea") === document.activeElement && document.querySelector("#terminal")?.dataset.renderer === "webgl" && !document.querySelector(".xterm-accessibility-tree") ? "OK" : "FAIL"')
 grep -q '"OK"' <<<"$verify_boot"
 
+# The WebView follows the host appearance without recreating the PTY or xterm.
+# Exercise both media-query transitions before the terminal begins producing
+# evidence so the light palette is a real browser render, not a static token.
+mkdir -p "$verify_artifact_dir"
+agent-browser --session "$verify_session" set media light >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+verify_light_theme=$(agent-browser --session "$verify_session" eval \
+  'document.documentElement.dataset.theme==="light"&&getComputedStyle(document.documentElement).getPropertyValue("--terminal-background").trim()==="#f7f9f1"?"OK":"FAIL"')
+grep -q '"OK"' <<<"$verify_light_theme"
+agent-browser --session "$verify_session" screenshot "$verify_artifact_dir/terminal-light.png" >/dev/null
+
+agent-browser --session "$verify_session" set media dark >/dev/null
+agent-browser --session "$verify_session" wait 100 >/dev/null
+verify_dark_theme=$(agent-browser --session "$verify_session" eval \
+  'document.documentElement.dataset.theme==="dark"&&getComputedStyle(document.documentElement).getPropertyValue("--terminal-background").trim()==="#0d0f0b"?"OK":"FAIL"')
+grep -q '"OK"' <<<"$verify_dark_theme"
+
 # Standard OSC title and cwd sequences stay display-only, but must cross the
 # real xterm -> authenticated WebSocket -> Rust projection path.
 agent-browser --session "$verify_session" keyboard type \
@@ -120,7 +137,6 @@ agent-browser --session "$verify_session" press Control+c >/dev/null
 agent-browser --session "$verify_session" keyboard inserttext '中文输入' >/dev/null
 agent-browser --session "$verify_session" press Enter >/dev/null
 agent-browser --session "$verify_session" wait 200 >/dev/null
-mkdir -p "$verify_artifact_dir"
 agent-browser --session "$verify_session" screenshot "$verify_artifact_dir/terminal-input.png" >/dev/null
 
 # Select the shell's rendered diagnostic to prove the committed CJK text made
@@ -179,7 +195,8 @@ if [[ -n "$verify_errors" ]]; then
   exit 1
 fi
 
-echo "Terminal browser verified: WebGL xterm, zsh input, selection, search focus, IME, accessibility, resize, and 8 MiB burst"
+echo "Terminal browser verified: responsive light/dark themes, WebGL xterm, zsh input, selection, search focus, IME, accessibility, resize, and 8 MiB burst"
+echo "Terminal light-theme screenshot: $verify_artifact_dir/terminal-light.png"
 echo "Terminal browser screenshot: $verify_artifact_dir/terminal-input.png"
 echo "Terminal accessibility screenshot: $verify_artifact_dir/terminal-screen-reader-toggle.png"
 echo "Terminal burst result: $verify_burst"

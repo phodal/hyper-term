@@ -37,6 +37,7 @@ import {
   type TerminalMetadataSnapshot,
   TerminalMetadataState,
 } from "./terminal-metadata.ts";
+import { terminalColorScheme, terminalTheme } from "./terminal-theme.ts";
 import "./styles.css";
 
 const attachmentStorageKey = terminalAttachmentStorageKey(
@@ -60,6 +61,9 @@ const searchClose = requiredElement<HTMLButtonElement>(
   "#terminal-search-close",
 );
 const diagnostics = terminalDiagnostics(globalThis.location.href);
+const appearanceQuery = globalThis.matchMedia("(prefers-color-scheme: light)");
+const initialColorScheme = terminalColorScheme(appearanceQuery.matches);
+document.documentElement.dataset.theme = initialColorScheme;
 
 const terminal = new Terminal({
   allowProposedApi: false,
@@ -82,30 +86,7 @@ const terminal = new Terminal({
   screenReaderMode: readScreenReaderMode(),
   scrollback: 20_000,
   smoothScrollDuration: 0,
-  theme: {
-    background: "#0d0f0b",
-    foreground: "#e6e9dd",
-    cursor: "#d7ff72",
-    cursorAccent: "#11140d",
-    selectionBackground: "#465a2b",
-    selectionForeground: "#ffffff",
-    black: "#0d0f0b",
-    red: "#ff8d83",
-    green: "#9bcf5d",
-    yellow: "#f0bf68",
-    blue: "#8bc6ff",
-    magenta: "#d5a6ff",
-    cyan: "#7dd7d0",
-    white: "#e6e9dd",
-    brightBlack: "#89917e",
-    brightRed: "#ffb3ac",
-    brightGreen: "#d7ff72",
-    brightYellow: "#ffd797",
-    brightBlue: "#b9ddff",
-    brightMagenta: "#e9cfff",
-    brightCyan: "#a9fff5",
-    brightWhite: "#ffffff",
-  },
+  theme: terminalTheme(initialColorScheme),
 });
 const fit = new FitAddon();
 const search = new SearchAddon();
@@ -122,6 +103,12 @@ installGpuRenderer(
 fitTerminal();
 inputFocus.claimTerminal();
 updateScreenReaderToggle(terminal.options.screenReaderMode ?? false);
+
+appearanceQuery.addEventListener("change", (event) => {
+  const scheme = terminalColorScheme(event.matches);
+  document.documentElement.dataset.theme = scheme;
+  terminal.options.theme = terminalTheme(scheme);
+});
 
 let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;

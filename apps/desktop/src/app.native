@@ -51,7 +51,7 @@
 </template>
 
 <template name="agent-thread">
-  <column min-width="400" grow="1" background="surface" label="Agent conversation">
+  <column min-width="320" grow="1" background="surface" label="Agent conversation">
     <if test="{hasAgentThreadToolbar}">
       <if test="{agentSearchOpen}">
         <row gap="6" padding="3" cross="center" label="Agent history search">

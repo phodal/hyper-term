@@ -26,6 +26,7 @@ fn pinned_deno_lsp_completes_a_real_initialize_handshake() {
         workspace_snapshot: workspace.path().canonicalize().unwrap(),
         cache_directory: cache.path().canonicalize().unwrap(),
         scratch_directory: scratch.path().canonicalize().unwrap(),
+        config_file: None,
     })
     .unwrap();
     let response = client.initialize(Duration::from_secs(10)).unwrap();

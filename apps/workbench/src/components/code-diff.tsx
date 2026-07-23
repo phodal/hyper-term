@@ -4,6 +4,7 @@ import { javascript } from "@codemirror/lang-javascript";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { basicSetup } from "codemirror";
+import { editorTheme } from "./code-editor.tsx";
 
 interface CodeDiffProps {
   original: string;
@@ -38,6 +39,7 @@ export function CodeDiff({
         extensions: [
           basicSetup,
           javascript({ jsx: true, typescript: true }),
+          editorTheme,
           EditorState.readOnly.of(true),
           EditorView.editable.of(false),
         ],
@@ -47,6 +49,7 @@ export function CodeDiff({
         extensions: [
           basicSetup,
           javascript({ jsx: true, typescript: true }),
+          editorTheme,
           ...(readOnlyModified
             ? [
               EditorState.readOnly.of(true),

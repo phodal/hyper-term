@@ -2,7 +2,39 @@
   color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  background: #0d0f0b;
+  --terminal-background: #0d0f0b;
+  --terminal-surface: #12150f;
+  --terminal-surface-subtle: #181c15;
+  --terminal-surface-pressed: #242b1d;
+  --terminal-text: #e6e9dd;
+  --terminal-text-muted: #89917e;
+  --terminal-border: #292f24;
+  --terminal-border-strong: #39432f;
+  --terminal-accent: #d7ff72;
+  --terminal-focus: #a8d558;
+  --terminal-scrollbar: #46513a;
+  --terminal-overlay: rgb(18 21 15 / 97%);
+  --terminal-status-overlay: rgb(24 28 21 / 94%);
+  --terminal-shadow: rgb(0 0 0 / 35%);
+  background: var(--terminal-background);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --terminal-background: #f7f9f1;
+  --terminal-surface: #ffffff;
+  --terminal-surface-subtle: #eef2e5;
+  --terminal-surface-pressed: #e1e7d4;
+  --terminal-text: #171a14;
+  --terminal-text-muted: #626a5b;
+  --terminal-border: #d5dcc9;
+  --terminal-border-strong: #aab49d;
+  --terminal-accent: #456109;
+  --terminal-focus: #5c7d10;
+  --terminal-scrollbar: #8b967f;
+  --terminal-overlay: rgb(255 255 255 / 97%);
+  --terminal-status-overlay: rgb(238 242 229 / 96%);
+  --terminal-shadow: rgb(13 15 11 / 18%);
 }
 
 * {
@@ -20,7 +52,7 @@ body,
 
 body {
   position: relative;
-  background: #0d0f0b;
+  background: var(--terminal-background);
 }
 
 button,
@@ -46,12 +78,12 @@ input {
   width: auto;
   height: 30px;
   padding: 0 9px;
-  border: 1px solid #a8d558;
+  border: 1px solid var(--terminal-focus);
   border-radius: 5px;
   clip-path: none;
   outline: none;
-  background: #181c15;
-  color: #e6e9dd;
+  background: var(--terminal-surface-subtle);
+  color: var(--terminal-text);
   font: 600 12px/1 Inter, -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
@@ -65,7 +97,7 @@ input {
 
 #terminal .xterm-viewport {
   overscroll-behavior: contain;
-  scrollbar-color: #46513a transparent;
+  scrollbar-color: var(--terminal-scrollbar) transparent;
   scrollbar-width: thin;
 }
 
@@ -80,11 +112,11 @@ input {
   gap: 5px;
   min-height: 34px;
   padding: 4px 5px 4px 8px;
-  border: 1px solid #39432f;
+  border: 1px solid var(--terminal-border-strong);
   border-radius: 6px;
-  background: rgb(18 21 15 / 97%);
-  box-shadow: 0 8px 28px rgb(0 0 0 / 35%);
-  color: #89917e;
+  background: var(--terminal-overlay);
+  box-shadow: 0 8px 28px var(--terminal-shadow);
+  color: var(--terminal-text-muted);
   font: 600 11px/1.3 Inter, -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
@@ -96,21 +128,21 @@ input {
   min-width: 0;
   height: 25px;
   padding: 0 7px;
-  border: 1px solid #3f4937;
+  border: 1px solid var(--terminal-border-strong);
   border-radius: 4px;
   outline: none;
-  background: #0d0f0b;
-  color: #e6e9dd;
+  background: var(--terminal-background);
+  color: var(--terminal-text);
 }
 
 #terminal-search input:focus-visible {
-  border-color: #a8d558;
-  box-shadow: 0 0 0 1px #a8d558;
+  border-color: var(--terminal-focus);
+  box-shadow: 0 0 0 1px var(--terminal-focus);
 }
 
 #terminal-search output {
   min-width: 62px;
-  color: #89917e;
+  color: var(--terminal-text-muted);
   text-align: right;
   white-space: nowrap;
 }
@@ -122,16 +154,16 @@ input {
   border: 1px solid transparent;
   border-radius: 4px;
   background: transparent;
-  color: #b7bead;
+  color: var(--terminal-text-muted);
   cursor: pointer;
 }
 
 #terminal-search button:hover,
 #terminal-search button:focus-visible {
-  border-color: #46513a;
+  border-color: var(--terminal-scrollbar);
   outline: none;
-  background: #242b1d;
-  color: #d7ff72;
+  background: var(--terminal-surface-pressed);
+  color: var(--terminal-accent);
 }
 
 #connection-status {
@@ -140,11 +172,11 @@ input {
   bottom: 10px;
   max-width: min(480px, calc(100% - 24px));
   padding: 5px 8px;
-  border: 1px solid #293024;
+  border: 1px solid var(--terminal-border);
   border-radius: 4px;
   opacity: 0;
-  color: #e6e9dd;
-  background: rgb(24 28 21 / 94%);
+  color: var(--terminal-text);
+  background: var(--terminal-status-overlay);
   font: 600 11px/1.3 Inter, -apple-system, BlinkMacSystemFont, sans-serif;
   pointer-events: none;
   transform: translateY(3px);
