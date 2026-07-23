@@ -46,16 +46,18 @@ Agent tabs can connect to locally installed Codex, Claude, and GitHub Copilot
 CLIs. They present plans and tool calls as structured, searchable blocks, and
 can open generated React/TypeScript artifacts in an isolated editor and preview.
 For each accepted artifact revision, the Workbench measures a Rust-owned matrix
-covering narrow, tablet, desktop, dark-theme, and reduced-motion environments,
-then persists a revision-bound visual quality report. The checker remains
-explicitly `needs review` until host-pixel, content-fixture, and focus/state
-coverage exists; browser observations cannot mark their own output ready.
+covering narrow, tablet, desktop, dark-theme, reduced-motion, and keyboard-focus
+environments, then persists a revision-bound visual quality report. The checker
+remains explicitly `needs review` until host-pixel, content-fixture, and
+declared-state coverage exists; browser observations cannot mark their own
+output ready.
+
 Press `Command-F` in an Agent tab to filter its retained messages, tools, files,
-and approvals; ordinary Terminal tabs keep terminal-native find. Terminal
-rendering stays on the fast WebGL path by default. Screen-reader users can press
-`Shift-Tab` from Terminal input to reveal **Enable screen reader mode**, then
-press `Enter`; the preference is local and adds xterm's navigable row list and
-live output region without slowing every terminal session.
+and approvals; ordinary Terminal tabs keep terminal-native find.
+Terminal rendering stays on the fast WebGL path by default. Screen-reader users
+can press `Shift-Tab` from Terminal input to reveal **Enable screen reader
+mode**, then press `Enter`; the preference is local and adds xterm's navigable
+row list and live output region without slowing every terminal session.
 
 ## How it works
 
@@ -203,8 +205,8 @@ containment, and signed macOS distribution.
   and Copilot ACP compatibility without giving Native or WebViews process
   authority.
 - Complete the Deno/esbuild-wasm Agentic UI loop: React editing, bounded Diff,
-  live preview, runtime traces, semantic Time Travel, and host-owned pixel,
-  theme, content, motion, and focus-state visual evidence.
+  live preview, runtime traces, semantic Time Travel, and the remaining
+  host-owned pixel, content-fixture, and declared-state visual evidence.
 - Keep every source file within 2,000 lines by extracting cohesive View, Model,
   protocol, and test modules before a responsibility becomes a new hotspot.
 - Harden sandboxing, accessibility, crash recovery, signing, notarization, and

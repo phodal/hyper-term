@@ -774,11 +774,11 @@ full request vocabulary to an Agent process.
 
 ## Implementation evidence (2026-07-23)
 
-The first Phase 4 environment slice is implemented as objective checker v2:
+The first Phase 4 environment slices are implemented as objective checker v3:
 
-- Rust owns an ordered five-capture manifest for narrow, tablet, desktop,
-  desktop-dark, and desktop-reduced-motion evidence. It rejects substituted or
-  reordered environments before persisting a report.
+- Rust owns an ordered six-capture manifest for narrow, tablet, desktop,
+  desktop-dark, desktop-reduced-motion, and desktop-focus-first evidence. It
+  rejects substituted or reordered environments before persisting a report.
 - Each capture receives a new token-bound isolated preview URL with explicit
   color-scheme and motion preferences. The preview fixes `matchMedia` and
   supported CSS preference queries before importing the accepted artifact.
@@ -786,11 +786,13 @@ The first Phase 4 environment slice is implemented as objective checker v2:
   packaged preview runtime. A digest-valid v1 report is treated as stale and
   triggers recapture instead of blocking the Workbench upgrade.
 - The browser verification drives the real Rust Gateway and Deno Workbench
-  through all five environments. It also retains the Deno LSP, keyboard tab,
-  and hostile-preview isolation assertions.
+  through all six environments. The focus-first scenario selects the first
+  visible keyboard target, requires a real `:focus-visible` style change, and
+  records a stable semantic location when the indicator is missing. The gate
+  also retains the Deno LSP, keyboard tab, and hostile-preview assertions.
 
-This slice does not claim host-pixel equivalence. Host screenshots,
-CJK/long-content fixtures, and declared focus/loading/error states remain
+These slices do not claim host-pixel equivalence. Host screenshots,
+CJK/long-content fixtures, and declared loading/error/disabled states remain
 explicit coverage gaps, so a clean objective report is still `NeedsReview`.
 
 ## Validation gates
