@@ -79,6 +79,42 @@ const CAPTURE_MATRIX = [
     scenario: "content-stress",
     reducedMotion: false,
   },
+  {
+    id: "desktop-light-state-empty",
+    width: 1_280,
+    height: 800,
+    colorScheme: "light",
+    locale: "en",
+    scenario: "state-empty",
+    reducedMotion: false,
+  },
+  {
+    id: "desktop-light-state-loading",
+    width: 1_280,
+    height: 800,
+    colorScheme: "light",
+    locale: "en",
+    scenario: "state-loading",
+    reducedMotion: false,
+  },
+  {
+    id: "desktop-light-state-error",
+    width: 1_280,
+    height: 800,
+    colorScheme: "light",
+    locale: "en",
+    scenario: "state-error",
+    reducedMotion: false,
+  },
+  {
+    id: "desktop-light-state-disabled",
+    width: 1_280,
+    height: 800,
+    colorScheme: "light",
+    locale: "en",
+    scenario: "state-disabled",
+    reducedMotion: false,
+  },
 ] as const;
 
 interface CaptureRun {

@@ -517,7 +517,11 @@ function isVisualQualityMeasureMessage(
       message.capture.locale === "zh-CN") &&
     (message.capture.scenario === "default" ||
       message.capture.scenario === "focus-first" ||
-      message.capture.scenario === "content-stress") &&
+      message.capture.scenario === "content-stress" ||
+      message.capture.scenario === "state-empty" ||
+      message.capture.scenario === "state-loading" ||
+      message.capture.scenario === "state-error" ||
+      message.capture.scenario === "state-disabled") &&
     typeof message.capture.reduced_motion === "boolean";
 }
 

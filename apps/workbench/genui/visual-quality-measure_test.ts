@@ -2,6 +2,7 @@ import { assertAlmostEquals, assertEquals } from "@std/assert";
 import {
   binaryEvidence,
   contrastRatio,
+  declaredStateSemanticEvidence,
   focusIndicatorChanged,
   parseCssColor,
   viewportMatches,
@@ -11,6 +12,28 @@ Deno.test("visual quality optional evidence always serializes as a finite count"
   assertEquals(binaryEvidence(undefined), 0);
   assertEquals(binaryEvidence(false), 0);
   assertEquals(binaryEvidence(true), 1);
+});
+
+Deno.test("declared visual states require state-specific accessible feedback", () => {
+  const base = { feedback: true, busy: false, alert: false, disabled: false };
+  assertEquals(declaredStateSemanticEvidence("empty", base), 1);
+  assertEquals(declaredStateSemanticEvidence("loading", base), 0);
+  assertEquals(
+    declaredStateSemanticEvidence("loading", { ...base, busy: true }),
+    1,
+  );
+  assertEquals(
+    declaredStateSemanticEvidence("error", { ...base, alert: true }),
+    1,
+  );
+  assertEquals(
+    declaredStateSemanticEvidence("disabled", { ...base, disabled: true }),
+    1,
+  );
+  assertEquals(
+    declaredStateSemanticEvidence("error", { ...base, feedback: false }),
+    0,
+  );
 });
 
 Deno.test("visual quality contrast checker is deterministic", () => {

@@ -41,7 +41,7 @@ export interface VisualQualityFinding {
 }
 
 export interface VisualQualityReport {
-  schema_version: 3;
+  schema_version: 4;
   artifact_id: string;
   source_revision: number;
   artifact_digest: string;
@@ -114,7 +114,7 @@ export class VisualQualityClient {
         Accept: "application/json",
       },
       body: JSON.stringify({
-        schema_version: 3,
+        schema_version: 4,
         source_revision: payload.source_revision,
         artifact_digest: payload.content_digest,
         captures,
@@ -162,7 +162,7 @@ function validReport(
   const states = new Set(["needs_revision", "needs_review", "review_ready"]);
   const objective = new Set(["passed", "failed"]);
   const advisory = new Set(["not_run", "needs_review", "clear"]);
-  return value.schema_version === 3 &&
+  return value.schema_version === 4 &&
     value.artifact_id === context.artifactId &&
     value.source_revision === context.sourceRevision &&
     sha256(value.artifact_digest) &&
@@ -174,7 +174,7 @@ function validReport(
     objective.has(value.objective_status) &&
     typeof value.advisory_status === "string" &&
     advisory.has(value.advisory_status) &&
-    Array.isArray(value.captures) && value.captures.length === 7 &&
+    Array.isArray(value.captures) && value.captures.length === 11 &&
     value.captures.every(validCapture) &&
     Array.isArray(value.findings) && value.findings.length <= 64 &&
     value.findings.every(validFinding);
@@ -185,11 +185,12 @@ function validCapture(value: unknown): boolean {
   return sha256(value.observation_digest) &&
     boundedString(value.capture_id, 64) && sha256(value.semantic_digest) &&
     (value.scenario === "default" || value.scenario === "focus-first" ||
-      value.scenario === "content-stress") &&
+      value.scenario === "content-stress" ||
+      isDeclaredStateScenario(value.scenario)) &&
     nonNegativeInteger(value.focus_target_count, 1) &&
     nonNegativeInteger(value.focus_visible_count, 1) &&
     Number(value.focus_visible_count) <= Number(value.focus_target_count) &&
-    validContentFixtureCapture(value) &&
+    validContentFixtureCapture(value) && validDeclaredStateCapture(value) &&
     (value.pixel_digest === undefined || sha256(value.pixel_digest));
 }
 
@@ -210,6 +211,28 @@ function validContentFixtureCapture(value: Record<string, unknown>): boolean {
   }
   return value.content_fixture_digest === undefined && targets === 0 &&
     applied === 0 && cjk === 0 && longContent === 0;
+}
+
+function validDeclaredStateCapture(value: Record<string, unknown>): boolean {
+  if (
+    !nonNegativeInteger(value.declared_state_target_count, 32) ||
+    !nonNegativeInteger(value.declared_state_applied_count, 32) ||
+    !nonNegativeInteger(value.declared_state_semantic_count, 32)
+  ) return false;
+  const targets = Number(value.declared_state_target_count);
+  const applied = Number(value.declared_state_applied_count);
+  const semantic = Number(value.declared_state_semantic_count);
+  if (applied > targets || semantic > applied) return false;
+  if (isDeclaredStateScenario(value.scenario)) {
+    return value.locale === "en" && sha256(value.declared_state_digest);
+  }
+  return value.declared_state_digest === undefined && targets === 0 &&
+    applied === 0 && semantic === 0;
+}
+
+function isDeclaredStateScenario(value: unknown): boolean {
+  return value === "state-empty" || value === "state-loading" ||
+    value === "state-error" || value === "state-disabled";
 }
 
 function validFinding(value: unknown): boolean {

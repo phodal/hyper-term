@@ -17,7 +17,14 @@ const observation = (
   height: number,
   color_scheme: "light" | "dark" = "light",
   reduced_motion = false,
-  scenario: "default" | "focus-first" | "content-stress" = "default",
+  scenario:
+    | "default"
+    | "focus-first"
+    | "content-stress"
+    | "state-empty"
+    | "state-loading"
+    | "state-error"
+    | "state-disabled" = "default",
   locale: "en" | "zh-CN" = "en",
 ) => ({
   capture_id,
@@ -43,6 +50,12 @@ const observation = (
   content_fixture_applied_count: scenario === "content-stress" ? 2 : 0,
   content_fixture_cjk_label_count: scenario === "content-stress" ? 1 : 0,
   content_fixture_long_content_count: scenario === "content-stress" ? 1 : 0,
+  ...(scenario.startsWith("state-")
+    ? { declared_state_digest: "8".repeat(64) }
+    : {}),
+  declared_state_target_count: scenario.startsWith("state-") ? 1 : 0,
+  declared_state_applied_count: scenario.startsWith("state-") ? 1 : 0,
+  declared_state_semantic_count: scenario.startsWith("state-") ? 1 : 0,
   console_error_count: 0,
   resource_failure_count: 0,
   layout_shift_milli: 0,
@@ -73,17 +86,49 @@ const captures = [
     "content-stress",
     "zh-CN",
   ),
+  observation(
+    "desktop-light-state-empty",
+    1_280,
+    800,
+    "light",
+    false,
+    "state-empty",
+  ),
+  observation(
+    "desktop-light-state-loading",
+    1_280,
+    800,
+    "light",
+    false,
+    "state-loading",
+  ),
+  observation(
+    "desktop-light-state-error",
+    1_280,
+    800,
+    "light",
+    false,
+    "state-error",
+  ),
+  observation(
+    "desktop-light-state-disabled",
+    1_280,
+    800,
+    "light",
+    false,
+    "state-disabled",
+  ),
 ];
 
 function report(): VisualQualityReport {
   return {
-    schema_version: 3,
+    schema_version: 4,
     artifact_id: context.artifactId,
     source_revision: context.sourceRevision,
     artifact_digest: "a".repeat(64),
     preview_runtime_digest: "c".repeat(64),
     capture_manifest_digest: "d".repeat(64),
-    checker_version: "hyper-term-objective-v4",
+    checker_version: "hyper-term-objective-v5",
     captures: captures.map((observation) => ({
       ...observation,
       observation_digest: "e".repeat(64),
@@ -128,7 +173,7 @@ Deno.test("visual quality client loads exact accepted payload and submits observ
   assertEquals(requests[1].method, "POST");
   assertEquals(new URL(requests[1].url).searchParams.get("session_id"), "3");
   const body = await requests[1].json();
-  assertEquals(body.captures.length, 7);
+  assertEquals(body.captures.length, 11);
   assertEquals(body.artifact_digest, "a".repeat(64));
 });
 

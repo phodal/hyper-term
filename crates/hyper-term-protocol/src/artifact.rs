@@ -8,8 +8,8 @@ use uuid::Uuid;
 pub const MAX_GENUI_SOURCE_FILES: usize = 1_000;
 pub const MAX_GENUI_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_GENUI_VIRTUAL_PATH_BYTES: usize = 4 * 1024;
-pub const GENUI_VISUAL_QUALITY_SCHEMA_VERSION: u16 = 3;
-pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v4";
+pub const GENUI_VISUAL_QUALITY_SCHEMA_VERSION: u16 = 4;
+pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v5";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenUiCompilerIdentity {
@@ -180,6 +180,17 @@ pub struct GenUiVisualCaptureObservation {
     pub content_fixture_cjk_label_count: u32,
     #[serde(default)]
     pub content_fixture_long_content_count: u32,
+    /// Digest of the selected declarative `data-hyper-state` subtree. The
+    /// generated artifact can provide markup and data, but never imperative
+    /// host test code or a replacement quality status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_state_digest: Option<String>,
+    #[serde(default)]
+    pub declared_state_target_count: u32,
+    #[serde(default)]
+    pub declared_state_applied_count: u32,
+    #[serde(default)]
+    pub declared_state_semantic_count: u32,
     pub console_error_count: u32,
     pub resource_failure_count: u32,
     pub layout_shift_milli: u32,

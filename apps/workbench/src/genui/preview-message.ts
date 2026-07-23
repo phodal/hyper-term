@@ -130,6 +130,9 @@ function validVisualObservation(value: unknown): boolean {
     capture.content_fixture_applied_count,
     capture.content_fixture_cjk_label_count,
     capture.content_fixture_long_content_count,
+    capture.declared_state_target_count,
+    capture.declared_state_applied_count,
+    capture.declared_state_semantic_count,
     capture.console_error_count,
     capture.resource_failure_count,
     capture.layout_shift_milli,
@@ -140,11 +143,13 @@ function validVisualObservation(value: unknown): boolean {
     (capture.color_scheme === "light" || capture.color_scheme === "dark") &&
     (capture.locale === "en" || capture.locale === "zh-CN") &&
     (capture.scenario === "default" || capture.scenario === "focus-first" ||
-      capture.scenario === "content-stress") &&
+      capture.scenario === "content-stress" ||
+      isDeclaredStateScenario(capture.scenario)) &&
     typeof capture.reduced_motion === "boolean" &&
     boundedCounts.every((count) =>
       nonNegativeBoundedInteger(count, 1_000_000)
     ) && validContentFixtureObservation(capture) &&
+    validDeclaredStateObservation(capture) &&
     sha256(capture.semantic_digest) && Array.isArray(samples) &&
     samples.length <= 24 && samples.every(validVisualSample);
 }
@@ -165,6 +170,25 @@ function validContentFixtureObservation(
   }
   return capture.content_fixture_digest === undefined && targets === 0 &&
     applied === 0 && cjk === 0 && longContent === 0;
+}
+
+function validDeclaredStateObservation(
+  capture: Record<string, unknown>,
+): boolean {
+  const targets = Number(capture.declared_state_target_count);
+  const applied = Number(capture.declared_state_applied_count);
+  const semantic = Number(capture.declared_state_semantic_count);
+  if (targets > 32 || applied > targets || semantic > applied) return false;
+  if (isDeclaredStateScenario(capture.scenario)) {
+    return capture.locale === "en" && sha256(capture.declared_state_digest);
+  }
+  return capture.declared_state_digest === undefined && targets === 0 &&
+    applied === 0 && semantic === 0;
+}
+
+function isDeclaredStateScenario(value: unknown): boolean {
+  return value === "state-empty" || value === "state-loading" ||
+    value === "state-error" || value === "state-disabled";
 }
 
 function validVisualSample(value: unknown): boolean {

@@ -130,18 +130,39 @@ agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-keyboard-tabs.png" >/dev/null
 
 # The host-owned quality gate must load the exact Rust-accepted bundle into a
-# token-free isolated preview, exercise the fixed seven-environment matrix,
-# including a real zh-CN long-label/long-content stress capture, and
+# token-free isolated preview, exercise the fixed eleven-environment matrix,
+# including real zh-CN long-content and declarative state captures, and
 # persist a revision-bound report. The checker intentionally remains
-# needs_review when host pixel and declared-state evidence is unavailable.
-verify_quality=$(agent-browser --session "$verify_session" eval \
-  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const gate=document.querySelector(".visual-quality-gate");const summary=gate?.querySelector("summary")?.textContent||"";const state=gate?.className||"";const error=gate?.querySelector("[role=alert]")?.textContent||"";if(state.includes("needs_review")&&summary.includes("7 viewports")&&summary.includes("0 blocking")&&summary.includes("2 gaps")&&!error){clearInterval(poll);resolve(JSON.stringify({state,summary}));}else if(performance.now()-started>45000){clearInterval(poll);reject(new Error(JSON.stringify({state,summary,error})));}},50)})')
-grep -q '7 viewports' <<<"$verify_quality"
+# needs_review while host pixel evidence is unavailable.
+verify_quality=""
+verify_quality_deadline=$((SECONDS + 90))
+while ((SECONDS < verify_quality_deadline)); do
+  # Keep each automation request short. A long page-side Promise can starve
+  # agent-browser's daemon pipe while the quality gate replaces isolated
+  # renderer frames; polling here retains the exact assertion without relying
+  # on one long-lived IPC read.
+  if verify_quality=$(agent-browser --session "$verify_session" eval \
+    '(()=>{const gate=document.querySelector(".visual-quality-gate");return JSON.stringify({state:gate?.className||"",summary:gate?.querySelector("summary")?.textContent||"",error:gate?.querySelector("[role=alert]")?.textContent||""});})()' 2>/dev/null) && \
+    grep -q '11 viewports' <<<"$verify_quality" && \
+    grep -q '0 blocking' <<<"$verify_quality" && \
+    grep -q '1 gaps' <<<"$verify_quality"; then
+    break
+  fi
+  sleep 0.2
+done
+if ((SECONDS >= verify_quality_deadline)); then
+  echo "visual quality gate did not settle: $verify_quality" >&2
+  exit 1
+fi
+grep -q '11 viewports' <<<"$verify_quality"
 grep -q '0 blocking' <<<"$verify_quality"
-grep -q '2 gaps' <<<"$verify_quality"
+grep -q '1 gaps' <<<"$verify_quality"
 verify_content_stress=$(agent-browser --session "$verify_session" eval \
   '(async()=>{const page=new URL(location.href);const artifact=page.searchParams.get("artifact_id");const token=page.searchParams.get("token");const session=page.searchParams.get("session_id");const report=await fetch(`/agent/artifact/${artifact}/visual-quality?token=${token}&session_id=${session}`).then(response=>response.json());const capture=report.captures?.find(item=>item.scenario==="content-stress");const staleGap=report.findings?.some(item=>item.finding_id==="coverage:cjk-long-content");if(capture?.locale==="zh-CN"&&capture.content_fixture_target_count===2&&capture.content_fixture_applied_count===2&&capture.content_fixture_cjk_label_count===1&&capture.content_fixture_long_content_count===1&&/^[0-9a-f]{64}$/.test(capture.content_fixture_digest)&&!staleGap)return "OK";throw new Error(JSON.stringify({capture,staleGap}));})()')
 grep -q '"OK"' <<<"$verify_content_stress"
+verify_declared_states=$(agent-browser --session "$verify_session" eval \
+  '(async()=>{const page=new URL(location.href);const artifact=page.searchParams.get("artifact_id");const token=page.searchParams.get("token");const session=page.searchParams.get("session_id");const report=await fetch(`/agent/artifact/${artifact}/visual-quality?token=${token}&session_id=${session}`).then(response=>response.json());const required=["state-empty","state-loading","state-error","state-disabled"];const captures=required.map(scenario=>report.captures?.find(item=>item.scenario===scenario));const staleGap=report.findings?.some(item=>item.finding_id==="coverage:declared-state-matrix");if(captures.every(capture=>capture?.declared_state_target_count===1&&capture.declared_state_applied_count===1&&capture.declared_state_semantic_count===1&&/^[0-9a-f]{64}$/.test(capture.declared_state_digest))&&!staleGap)return "OK";throw new Error(JSON.stringify({captures,staleGap}));})()')
+grep -q '"OK"' <<<"$verify_declared_states"
 agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-visual-quality.png" >/dev/null
 

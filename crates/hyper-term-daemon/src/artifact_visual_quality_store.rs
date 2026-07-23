@@ -23,6 +23,13 @@ const MAX_ELEMENT_COUNT: u32 = 100_000;
 const BLOCKING_LAYOUT_SHIFT_MILLI: u32 = 100;
 const CONTENT_STRESS_FIXTURE_ID: &str = "hyper-term-cjk-long-content-v1";
 const MAX_CONTENT_FIXTURE_TARGETS: u32 = 2;
+const MAX_DECLARED_STATE_TARGETS: u32 = 32;
+const DECLARED_STATE_SCENARIOS: [&str; 4] = [
+    "state-empty",
+    "state-loading",
+    "state-error",
+    "state-disabled",
+];
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct ExpectedCapture {
@@ -35,7 +42,7 @@ struct ExpectedCapture {
     reduced_motion: bool,
 }
 
-const CAPTURE_MATRIX: [ExpectedCapture; 7] = [
+const CAPTURE_MATRIX: [ExpectedCapture; 11] = [
     ExpectedCapture {
         capture_id: "narrow-light-default",
         width: 390,
@@ -97,6 +104,42 @@ const CAPTURE_MATRIX: [ExpectedCapture; 7] = [
         color_scheme: "light",
         locale: "zh-CN",
         scenario: "content-stress",
+        reduced_motion: false,
+    },
+    ExpectedCapture {
+        capture_id: "desktop-light-state-empty",
+        width: 1_280,
+        height: 800,
+        color_scheme: "light",
+        locale: "en",
+        scenario: "state-empty",
+        reduced_motion: false,
+    },
+    ExpectedCapture {
+        capture_id: "desktop-light-state-loading",
+        width: 1_280,
+        height: 800,
+        color_scheme: "light",
+        locale: "en",
+        scenario: "state-loading",
+        reduced_motion: false,
+    },
+    ExpectedCapture {
+        capture_id: "desktop-light-state-error",
+        width: 1_280,
+        height: 800,
+        color_scheme: "light",
+        locale: "en",
+        scenario: "state-error",
+        reduced_motion: false,
+    },
+    ExpectedCapture {
+        capture_id: "desktop-light-state-disabled",
+        width: 1_280,
+        height: 800,
+        color_scheme: "light",
+        locale: "en",
+        scenario: "state-disabled",
         reduced_motion: false,
     },
 ];
@@ -203,8 +246,8 @@ impl ArtifactVisualQualityStore {
             GenUiObjectiveVisualStatus::Passed
         };
         // The objective checker has deterministic browser observations but no
-        // trusted host pixel capture or complete declared-state matrix. It must
-        // never self-promote to ReviewReady.
+        // trusted host pixel capture. It must never self-promote to
+        // ReviewReady.
         let advisory_status = GenUiAdvisoryVisualStatus::NotRun;
         let review_state = if objective_status == GenUiObjectiveVisualStatus::Failed {
             GenUiVisualReviewState::NeedsRevision
@@ -311,6 +354,9 @@ fn validate_capture(
         capture.content_fixture_applied_count,
         capture.content_fixture_cjk_label_count,
         capture.content_fixture_long_content_count,
+        capture.declared_state_target_count,
+        capture.declared_state_applied_count,
+        capture.declared_state_semantic_count,
         capture.console_error_count,
         capture.resource_failure_count,
     ];
@@ -330,7 +376,6 @@ fn validate_capture(
         || capture.clipped_count > capture.element_count
         || capture.low_contrast_count > capture.element_count
         || capture.undersized_target_count > capture.interactive_count
-        || capture.hidden_primary_action_count > capture.interactive_count
         || capture.focus_target_count > 1
         || capture.focus_target_count > capture.interactive_count
         || capture.focus_visible_count > capture.focus_target_count
@@ -340,6 +385,9 @@ fn validate_capture(
         || capture.content_fixture_applied_count > capture.content_fixture_target_count
         || capture.content_fixture_cjk_label_count > capture.content_fixture_applied_count
         || capture.content_fixture_long_content_count > capture.content_fixture_applied_count
+        || capture.declared_state_target_count > MAX_DECLARED_STATE_TARGETS
+        || capture.declared_state_applied_count > capture.declared_state_target_count
+        || capture.declared_state_semantic_count > capture.declared_state_applied_count
         || capture.layout_shift_milli > 10_000
         || capture.samples.len() > MAX_CAPTURE_SAMPLES
     {
@@ -355,6 +403,18 @@ fn validate_capture(
         || capture.content_fixture_applied_count != 0
         || capture.content_fixture_cjk_label_count != 0
         || capture.content_fixture_long_content_count != 0
+    {
+        return Err(VisualQualityStoreError::InvalidObservation);
+    }
+    if is_declared_state_scenario(expected.scenario) {
+        if capture.declared_state_digest.is_none() {
+            return Err(VisualQualityStoreError::InvalidObservation);
+        }
+        validate_sha256(capture.declared_state_digest.as_deref().unwrap())?;
+    } else if capture.declared_state_digest.is_some()
+        || capture.declared_state_target_count != 0
+        || capture.declared_state_applied_count != 0
+        || capture.declared_state_semantic_count != 0
     {
         return Err(VisualQualityStoreError::InvalidObservation);
     }
@@ -496,25 +556,38 @@ fn derive_findings(captures: &[GenUiVisualCaptureEvidence]) -> Vec<GenUiVisualQu
             sample: None,
         });
     }
-    for (id, explanation) in [
-        (
-            "host-pixel-capture",
-            "Host pixel captures are not available from the current sandboxed WebView path.",
-        ),
-        (
-            "declared-state-matrix",
-            "Empty, loading, error, and disabled states need declared scenarios.",
-        ),
-    ] {
+    let missing_states = captures
+        .iter()
+        .filter(|capture| is_declared_state_scenario(&capture.observation.scenario))
+        .filter(|capture| {
+            capture.observation.declared_state_target_count != 1
+                || capture.observation.declared_state_applied_count != 1
+                || capture.observation.declared_state_semantic_count != 1
+        })
+        .map(|capture| capture.observation.scenario.trim_start_matches("state-"))
+        .collect::<Vec<_>>();
+    if !missing_states.is_empty() {
         findings.push(GenUiVisualQualityFinding {
-            finding_id: format!("coverage:{id}"),
+            finding_id: "coverage:declared-state-matrix".into(),
             category: GenUiVisualFindingCategory::CoverageGap,
             severity: GenUiVisualFindingSeverity::Warning,
             capture_id: None,
-            explanation: explanation.into(),
+            explanation: format!(
+                "The declarative state contract is missing or semantically incomplete for: {}.",
+                missing_states.join(", ")
+            ),
             sample: None,
         });
     }
+    findings.push(GenUiVisualQualityFinding {
+        finding_id: "coverage:host-pixel-capture".into(),
+        category: GenUiVisualFindingCategory::CoverageGap,
+        severity: GenUiVisualFindingSeverity::Warning,
+        capture_id: None,
+        explanation:
+            "Host pixel captures are not available from the current sandboxed WebView path.".into(),
+        sample: None,
+    });
     findings
 }
 
@@ -614,6 +687,10 @@ fn content_stress_fixture_digest() -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn is_declared_state_scenario(scenario: &str) -> bool {
+    DECLARED_STATE_SCENARIOS.contains(&scenario)
 }
 
 fn validate_sha256(value: &str) -> Result<(), VisualQualityStoreError> {
@@ -720,6 +797,11 @@ mod tests {
             },
             content_fixture_cjk_label_count: u32::from(expected.scenario == "content-stress"),
             content_fixture_long_content_count: u32::from(expected.scenario == "content-stress"),
+            declared_state_digest: is_declared_state_scenario(expected.scenario)
+                .then(|| "c".repeat(64)),
+            declared_state_target_count: u32::from(is_declared_state_scenario(expected.scenario)),
+            declared_state_applied_count: u32::from(is_declared_state_scenario(expected.scenario)),
+            declared_state_semantic_count: u32::from(is_declared_state_scenario(expected.scenario)),
             console_error_count: 0,
             resource_failure_count: 0,
             layout_shift_milli: 0,
@@ -784,6 +866,7 @@ mod tests {
                     | "coverage:reduced-motion"
                     | "coverage:keyboard-focus-target"
                     | "coverage:cjk-long-content"
+                    | "coverage:declared-state-matrix"
             )
         }));
         assert_eq!(
@@ -856,6 +939,24 @@ mod tests {
                 .iter()
                 .any(|finding| finding.category == GenUiVisualFindingCategory::EmptyRender)
         );
+    }
+
+    #[test]
+    fn hidden_primary_action_is_evidence_even_without_visible_controls() {
+        let temporary = tempdir().unwrap();
+        let store = ArtifactVisualQualityStore::open(temporary.path()).unwrap();
+        let artifact = artifact(16);
+        let mut input = submission(&artifact);
+        input.captures[0].interactive_count = 0;
+        input.captures[0].hidden_primary_action_count = 1;
+
+        let report = store
+            .submit(TaskId::new(), &artifact, &"a".repeat(64), input)
+            .unwrap();
+        assert_eq!(report.objective_status, GenUiObjectiveVisualStatus::Failed);
+        assert!(report.findings.iter().any(|finding| {
+            finding.category == GenUiVisualFindingCategory::HiddenPrimaryAction
+        }));
     }
 
     #[test]
@@ -960,6 +1061,21 @@ mod tests {
             ),
             Err(VisualQualityStoreError::InvalidObservation)
         ));
+
+        let mut forged_default_state = submission(&artifact);
+        forged_default_state.captures[0].declared_state_digest = Some("d".repeat(64));
+        forged_default_state.captures[0].declared_state_target_count = 1;
+        forged_default_state.captures[0].declared_state_applied_count = 1;
+        forged_default_state.captures[0].declared_state_semantic_count = 1;
+        assert!(matches!(
+            store.submit(
+                TaskId::new(),
+                &artifact,
+                &"f".repeat(64),
+                forged_default_state
+            ),
+            Err(VisualQualityStoreError::InvalidObservation)
+        ));
     }
 
     #[test]
@@ -984,6 +1100,29 @@ mod tests {
         assert!(report.findings.iter().any(|finding| {
             finding.finding_id == "coverage:cjk-long-content"
                 && finding.capture_id.as_deref() == Some("narrow-zh-content-stress")
+        }));
+    }
+
+    #[test]
+    fn incomplete_declared_state_remains_an_explicit_coverage_gap() {
+        let temporary = tempdir().unwrap();
+        let store = ArtifactVisualQualityStore::open(temporary.path()).unwrap();
+        let artifact = artifact(14);
+        let mut input = submission(&artifact);
+        let loading = input
+            .captures
+            .iter_mut()
+            .find(|capture| capture.scenario == "state-loading")
+            .unwrap();
+        loading.declared_state_semantic_count = 0;
+
+        let report = store
+            .submit(TaskId::new(), &artifact, &"e".repeat(64), input)
+            .unwrap();
+        assert_eq!(report.objective_status, GenUiObjectiveVisualStatus::Passed);
+        assert!(report.findings.iter().any(|finding| {
+            finding.finding_id == "coverage:declared-state-matrix"
+                && finding.explanation.contains("loading")
         }));
     }
 

@@ -15,7 +15,7 @@ export interface VisualQualityMeasureRequest {
   viewport: { width: number; height: number };
   color_scheme: "light" | "dark";
   locale: "en" | "zh-CN";
-  scenario: "default" | "focus-first" | "content-stress";
+  scenario: VisualQualityScenario;
   reduced_motion: boolean;
 }
 
@@ -38,7 +38,7 @@ export interface VisualCaptureObservation {
   viewport: { width: number; height: number };
   color_scheme: "light" | "dark";
   locale: "en" | "zh-CN";
-  scenario: "default" | "focus-first" | "content-stress";
+  scenario: VisualQualityScenario;
   reduced_motion: boolean;
   document_width: number;
   document_height: number;
@@ -55,12 +55,25 @@ export interface VisualCaptureObservation {
   content_fixture_applied_count: number;
   content_fixture_cjk_label_count: number;
   content_fixture_long_content_count: number;
+  declared_state_digest?: string;
+  declared_state_target_count: number;
+  declared_state_applied_count: number;
+  declared_state_semantic_count: number;
   console_error_count: number;
   resource_failure_count: number;
   layout_shift_milli: number;
   semantic_digest: string;
   samples: VisualIssueSample[];
 }
+
+export type VisualQualityScenario =
+  | "default"
+  | "focus-first"
+  | "content-stress"
+  | "state-empty"
+  | "state-loading"
+  | "state-error"
+  | "state-disabled";
 
 const INTERACTIVE_SELECTOR =
   "button,a[href],input,select,textarea,[role=button],[tabindex]";
@@ -78,8 +91,10 @@ export async function measureVisualQuality(
 ): Promise<VisualCaptureObservation> {
   document.documentElement.lang = request.locale;
   const contentFixture = applyContentStressFixture(root, request.scenario);
+  const declaredState = applyDeclaredStateScenario(root, request.scenario);
   await settleLayout(request.viewport);
   const contentCoverage = inspectContentStressFixture(contentFixture);
+  const stateCoverage = await inspectDeclaredStateScenario(declaredState);
   const focus = await measureFocusScenario(root, request.scenario);
   const viewport = {
     width: Math.max(1, Math.round(globalThis.innerWidth)),
@@ -115,8 +130,9 @@ export async function measureVisualQuality(
     ...root.querySelectorAll<HTMLElement>(PRIMARY_SELECTOR),
   ]
     .filter((element) =>
-      !isVisible(element) ||
-      isViewportClipped(element.getBoundingClientRect(), viewport)
+      !belongsToInactiveDeclaredState(element) &&
+      (!isVisible(element) ||
+        isViewportClipped(element.getBoundingClientRect(), viewport))
     );
   const samples: VisualIssueSample[] = [];
   sampleElements(samples, "clipped_content", clipped);
@@ -186,6 +202,12 @@ export async function measureVisualQuality(
     content_fixture_applied_count: contentCoverage.appliedCount,
     content_fixture_cjk_label_count: contentCoverage.cjkLabelCount,
     content_fixture_long_content_count: contentCoverage.longContentCount,
+    ...(stateCoverage.digest
+      ? { declared_state_digest: stateCoverage.digest }
+      : {}),
+    declared_state_target_count: stateCoverage.targetCount,
+    declared_state_applied_count: stateCoverage.appliedCount,
+    declared_state_semantic_count: stateCoverage.semanticCount,
     console_error_count: Math.min(counters.consoleErrors, 100_000),
     resource_failure_count: Math.min(counters.resourceFailures, 100_000),
     layout_shift_milli: Math.min(counters.layoutShiftMilli, 10_000),
@@ -259,6 +281,149 @@ function replaceDirectText(element: HTMLElement, value: string): void {
     node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.trim())
   );
   if (textNode) textNode.textContent = value;
+}
+
+type DeclaredStateName = "empty" | "loading" | "error" | "disabled";
+
+interface DeclaredStateFixture {
+  state?: DeclaredStateName;
+  targets: HTMLElement[];
+}
+
+function applyDeclaredStateScenario(
+  root: HTMLElement,
+  scenario: VisualQualityScenario,
+): DeclaredStateFixture {
+  const state = declaredStateName(scenario);
+  if (!state) return { targets: [] };
+  const declared = [
+    root,
+    ...root.querySelectorAll<HTMLElement>(
+      "[data-hyper-state]",
+    ),
+  ].filter((element): element is HTMLElement =>
+    element instanceof HTMLElement && element.hasAttribute("data-hyper-state")
+  );
+  const targets = declared.filter((element) =>
+    element.dataset.hyperState === state
+  );
+  if (targets.length > 32) {
+    throw new Error(`Declared state ${state} exceeds the 32 target bound.`);
+  }
+  for (const element of declared) {
+    const active = targets.includes(element);
+    element.hidden = !active;
+    if (active) element.dataset.hyperStateActive = "true";
+    else delete element.dataset.hyperStateActive;
+  }
+  return { state, targets };
+}
+
+async function inspectDeclaredStateScenario(
+  fixture: DeclaredStateFixture,
+): Promise<{
+  digest?: string;
+  targetCount: number;
+  appliedCount: number;
+  semanticCount: number;
+}> {
+  if (!fixture.state) {
+    return { targetCount: 0, appliedCount: 0, semanticCount: 0 };
+  }
+  const applied = fixture.targets.filter((target) =>
+    target.isConnected && target.dataset.hyperStateActive === "true" &&
+    isVisible(target)
+  );
+  const semantic = applied.filter((target) =>
+    declaredStateSemanticsPresent(fixture.state!, target)
+  );
+  const digestRows = fixture.targets.map((target) =>
+    [
+      fixture.state,
+      semanticPath(target),
+      target.textContent?.trim().length ?? 0,
+      target.getAttribute("role") ?? "",
+      target.getAttribute("aria-busy") ?? "",
+      target.dataset.hyperStateFeedback === "true" ? 1 : 0,
+    ].join(":")
+  );
+  return {
+    digest: await sha256([
+      fixture.state,
+      fixture.targets.length,
+      applied.length,
+      semantic.length,
+      ...digestRows,
+    ].join("\n")),
+    targetCount: fixture.targets.length,
+    appliedCount: applied.length,
+    semanticCount: semantic.length,
+  };
+}
+
+function declaredStateSemanticsPresent(
+  state: DeclaredStateName,
+  target: HTMLElement,
+): boolean {
+  const descendants = [target, ...target.querySelectorAll<HTMLElement>("*")]
+    .filter((element): element is HTMLElement =>
+      element instanceof HTMLElement && isVisible(element)
+    );
+  const feedback = descendants.some((element) =>
+    element.dataset.hyperStateFeedback === "true" &&
+    Boolean(element.textContent?.trim())
+  );
+  const busy = descendants.some((element) =>
+    element.getAttribute("aria-busy") === "true" ||
+    element.getAttribute("role") === "status"
+  );
+  const alert = descendants.some((element) =>
+    element.getAttribute("role") === "alert" ||
+    element.getAttribute("aria-live") === "assertive"
+  );
+  const disabled = descendants.some((element) =>
+    element.getAttribute("aria-disabled") === "true" ||
+    "disabled" in element && Boolean(element.disabled)
+  );
+  return declaredStateSemanticEvidence(state, {
+    feedback,
+    busy,
+    alert,
+    disabled,
+  }) === 1;
+}
+
+export function declaredStateSemanticEvidence(
+  state: DeclaredStateName,
+  evidence: {
+    feedback: boolean;
+    busy: boolean;
+    alert: boolean;
+    disabled: boolean;
+  },
+): 0 | 1 {
+  if (!evidence.feedback) return 0;
+  if (state === "loading") return binaryEvidence(evidence.busy);
+  if (state === "error") return binaryEvidence(evidence.alert);
+  if (state === "disabled") return binaryEvidence(evidence.disabled);
+  return 1;
+}
+
+function declaredStateName(
+  scenario: VisualQualityScenario,
+): DeclaredStateName | undefined {
+  if (!scenario.startsWith("state-")) return undefined;
+  const state = scenario.slice("state-".length);
+  if (
+    state === "empty" || state === "loading" || state === "error" ||
+    state === "disabled"
+  ) return state;
+  return undefined;
+}
+
+function belongsToInactiveDeclaredState(element: HTMLElement): boolean {
+  const owner = element.closest<HTMLElement>("[data-hyper-state]");
+  return Boolean(owner?.hidden);
 }
 
 interface FocusIndicatorStyle {
