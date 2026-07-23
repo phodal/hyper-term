@@ -25,6 +25,7 @@ export interface VisualQualityFinding {
     | "undersized_target"
     | "low_contrast"
     | "hidden_primary_action"
+    | "missing_focus_indicator"
     | "console_error"
     | "resource_failure"
     | "layout_instability"
@@ -40,7 +41,7 @@ export interface VisualQualityFinding {
 }
 
 export interface VisualQualityReport {
-  schema_version: 1;
+  schema_version: 2;
   artifact_id: string;
   source_revision: number;
   artifact_digest: string;
@@ -113,7 +114,7 @@ export class VisualQualityClient {
         Accept: "application/json",
       },
       body: JSON.stringify({
-        schema_version: 1,
+        schema_version: 2,
         source_revision: payload.source_revision,
         artifact_digest: payload.content_digest,
         captures,
@@ -161,7 +162,7 @@ function validReport(
   const states = new Set(["needs_revision", "needs_review", "review_ready"]);
   const objective = new Set(["passed", "failed"]);
   const advisory = new Set(["not_run", "needs_review", "clear"]);
-  return value.schema_version === 1 &&
+  return value.schema_version === 2 &&
     value.artifact_id === context.artifactId &&
     value.source_revision === context.sourceRevision &&
     sha256(value.artifact_digest) &&
@@ -173,7 +174,7 @@ function validReport(
     objective.has(value.objective_status) &&
     typeof value.advisory_status === "string" &&
     advisory.has(value.advisory_status) &&
-    Array.isArray(value.captures) && value.captures.length === 5 &&
+    Array.isArray(value.captures) && value.captures.length === 6 &&
     value.captures.every(validCapture) &&
     Array.isArray(value.findings) && value.findings.length <= 64 &&
     value.findings.every(validFinding);
@@ -183,6 +184,10 @@ function validCapture(value: unknown): boolean {
   if (!record(value)) return false;
   return sha256(value.observation_digest) &&
     boundedString(value.capture_id, 64) && sha256(value.semantic_digest) &&
+    (value.scenario === "default" || value.scenario === "focus-first") &&
+    nonNegativeInteger(value.focus_target_count, 1) &&
+    nonNegativeInteger(value.focus_visible_count, 1) &&
+    Number(value.focus_visible_count) <= Number(value.focus_target_count) &&
     (value.pixel_digest === undefined || sha256(value.pixel_digest));
 }
 
@@ -200,6 +205,11 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function sha256(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function nonNegativeInteger(value: unknown, maximum: number): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 0 &&
+    Number(value) <= maximum;
 }
 
 function boundedString(

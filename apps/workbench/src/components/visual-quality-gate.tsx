@@ -21,6 +21,7 @@ const CAPTURE_MATRIX = [
     width: 390,
     height: 844,
     colorScheme: "light",
+    scenario: "default",
     reducedMotion: false,
   },
   {
@@ -28,6 +29,7 @@ const CAPTURE_MATRIX = [
     width: 768,
     height: 1_024,
     colorScheme: "light",
+    scenario: "default",
     reducedMotion: false,
   },
   {
@@ -35,6 +37,7 @@ const CAPTURE_MATRIX = [
     width: 1_280,
     height: 800,
     colorScheme: "light",
+    scenario: "default",
     reducedMotion: false,
   },
   {
@@ -42,6 +45,7 @@ const CAPTURE_MATRIX = [
     width: 1_280,
     height: 800,
     colorScheme: "dark",
+    scenario: "default",
     reducedMotion: false,
   },
   {
@@ -49,7 +53,16 @@ const CAPTURE_MATRIX = [
     width: 1_280,
     height: 800,
     colorScheme: "light",
+    scenario: "default",
     reducedMotion: true,
+  },
+  {
+    id: "desktop-light-focus-first",
+    width: 1_280,
+    height: 800,
+    colorScheme: "light",
+    scenario: "focus-first",
+    reducedMotion: false,
   },
 ] as const;
 
@@ -169,7 +182,7 @@ export function VisualQualityGate(props: VisualQualityContext) {
             viewport: { width: capture.width, height: capture.height },
             color_scheme: capture.colorScheme,
             locale: "en",
-            scenario: "default",
+            scenario: capture.scenario,
             reduced_motion: capture.reducedMotion,
           },
         }, "*");
@@ -197,6 +210,7 @@ export function VisualQualityGate(props: VisualQualityContext) {
         message.observation.viewport.width !== expected.width ||
         message.observation.viewport.height !== expected.height ||
         message.observation.color_scheme !== expected.colorScheme ||
+        message.observation.scenario !== expected.scenario ||
         message.observation.reduced_motion !== expected.reducedMotion
       ) {
         setStatus("failed");

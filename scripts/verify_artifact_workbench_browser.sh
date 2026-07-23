@@ -130,12 +130,14 @@ agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-keyboard-tabs.png" >/dev/null
 
 # The host-owned quality gate must load the exact Rust-accepted bundle into a
-# token-free isolated preview, exercise the fixed five-environment matrix, and
+# token-free isolated preview, exercise the fixed six-environment matrix, and
 # persist a revision-bound report. The checker intentionally remains
 # needs_review when host pixel/content/state evidence is unavailable.
 verify_quality=$(agent-browser --session "$verify_session" eval \
-  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const gate=document.querySelector(".visual-quality-gate");const summary=gate?.querySelector("summary")?.textContent||"";const state=gate?.className||"";const error=gate?.querySelector("[role=alert]")?.textContent||"";if((state.includes("needs_review")||state.includes("needs_revision"))&&summary.includes("5 viewports")&&!error){clearInterval(poll);resolve(JSON.stringify({state,summary}));}else if(performance.now()-started>30000){clearInterval(poll);reject(new Error(JSON.stringify({state,summary,error})));}},50)})')
-grep -q '5 viewports' <<<"$verify_quality"
+  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const gate=document.querySelector(".visual-quality-gate");const summary=gate?.querySelector("summary")?.textContent||"";const state=gate?.className||"";const error=gate?.querySelector("[role=alert]")?.textContent||"";if(state.includes("needs_review")&&summary.includes("6 viewports")&&summary.includes("0 blocking")&&summary.includes("3 gaps")&&!error){clearInterval(poll);resolve(JSON.stringify({state,summary}));}else if(performance.now()-started>40000){clearInterval(poll);reject(new Error(JSON.stringify({state,summary,error})));}},50)})')
+grep -q '6 viewports' <<<"$verify_quality"
+grep -q '0 blocking' <<<"$verify_quality"
+grep -q '3 gaps' <<<"$verify_quality"
 agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-visual-quality.png" >/dev/null
 

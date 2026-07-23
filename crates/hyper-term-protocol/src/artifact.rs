@@ -8,8 +8,8 @@ use uuid::Uuid;
 pub const MAX_GENUI_SOURCE_FILES: usize = 1_000;
 pub const MAX_GENUI_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_GENUI_VIRTUAL_PATH_BYTES: usize = 4 * 1024;
-pub const GENUI_VISUAL_QUALITY_SCHEMA_VERSION: u16 = 1;
-pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v2";
+pub const GENUI_VISUAL_QUALITY_SCHEMA_VERSION: u16 = 2;
+pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v3";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenUiCompilerIdentity {
@@ -71,8 +71,8 @@ pub struct AcceptedGenUiArtifact {
 /// Host-owned review state for one exact Rust-accepted GenUI revision.
 ///
 /// Browser observations can contribute bounded evidence, but only Rust derives
-/// this state. The first checker version deliberately remains `needs_review`
-/// when host pixel captures or required scenarios are absent.
+/// this state. The objective checker deliberately remains `needs_review` when
+/// host pixel captures or required declared scenarios are absent.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenUiVisualReviewState {
@@ -105,6 +105,7 @@ pub enum GenUiVisualFindingCategory {
     UndersizedTarget,
     LowContrast,
     HiddenPrimaryAction,
+    MissingFocusIndicator,
     ConsoleError,
     ResourceFailure,
     LayoutInstability,
@@ -163,6 +164,10 @@ pub struct GenUiVisualCaptureObservation {
     pub undersized_target_count: u32,
     pub low_contrast_count: u32,
     pub hidden_primary_action_count: u32,
+    #[serde(default)]
+    pub focus_target_count: u32,
+    #[serde(default)]
+    pub focus_visible_count: u32,
     pub console_error_count: u32,
     pub resource_failure_count: u32,
     pub layout_shift_milli: u32,

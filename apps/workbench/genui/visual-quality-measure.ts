@@ -5,6 +5,7 @@ export type VisualFindingCategory =
   | "undersized_target"
   | "low_contrast"
   | "hidden_primary_action"
+  | "missing_focus_indicator"
   | "console_error"
   | "resource_failure"
   | "layout_instability";
@@ -14,7 +15,7 @@ export interface VisualQualityMeasureRequest {
   viewport: { width: number; height: number };
   color_scheme: "light" | "dark";
   locale: "en";
-  scenario: "default";
+  scenario: "default" | "focus-first";
   reduced_motion: boolean;
 }
 
@@ -37,7 +38,7 @@ export interface VisualCaptureObservation {
   viewport: { width: number; height: number };
   color_scheme: "light" | "dark";
   locale: "en";
-  scenario: "default";
+  scenario: "default" | "focus-first";
   reduced_motion: boolean;
   document_width: number;
   document_height: number;
@@ -47,6 +48,8 @@ export interface VisualCaptureObservation {
   undersized_target_count: number;
   low_contrast_count: number;
   hidden_primary_action_count: number;
+  focus_target_count: number;
+  focus_visible_count: number;
   console_error_count: number;
   resource_failure_count: number;
   layout_shift_milli: number;
@@ -65,6 +68,7 @@ export async function measureVisualQuality(
   counters: VisualQualityRuntimeCounters,
 ): Promise<VisualCaptureObservation> {
   await settleLayout(request.viewport);
+  const focus = await measureFocusScenario(root, request.scenario);
   const viewport = {
     width: Math.max(1, Math.round(globalThis.innerWidth)),
     height: Math.max(1, Math.round(globalThis.innerHeight)),
@@ -107,6 +111,13 @@ export async function measureVisualQuality(
   sampleElements(samples, "undersized_target", undersized);
   sampleElements(samples, "low_contrast", lowContrast);
   sampleElements(samples, "hidden_primary_action", hiddenPrimary);
+  if (focus.target && !focus.visible) {
+    samples.push({
+      category: "missing_focus_indicator",
+      semantic_path: semanticPath(focus.target),
+      rect: roundedRect(focus.target.getBoundingClientRect()),
+    });
+  }
   if (counters.consoleErrors > 0) {
     samples.push({
       category: "console_error",
@@ -154,12 +165,81 @@ export async function measureVisualQuality(
     undersized_target_count: undersized.length,
     low_contrast_count: lowContrast.length,
     hidden_primary_action_count: hiddenPrimary.length,
+    focus_target_count: focus.target ? 1 : 0,
+    focus_visible_count: focus.visible ? 1 : 0,
     console_error_count: Math.min(counters.consoleErrors, 100_000),
     resource_failure_count: Math.min(counters.resourceFailures, 100_000),
     layout_shift_milli: Math.min(counters.layoutShiftMilli, 10_000),
     semantic_digest: await sha256(semanticRows.join("\n")),
     samples: samples.slice(0, MAX_SAMPLES),
   };
+}
+
+interface FocusIndicatorStyle {
+  outlineStyle: string;
+  outlineWidth: string;
+  outlineColor: string;
+  outlineOffset: string;
+  boxShadow: string;
+  borderColor: string;
+  backgroundColor: string;
+  color: string;
+}
+
+async function measureFocusScenario(
+  root: HTMLElement,
+  scenario: VisualQualityMeasureRequest["scenario"],
+): Promise<{ target?: HTMLElement; visible: boolean }> {
+  if (scenario !== "focus-first") return { visible: false };
+  const target = [
+    root,
+    ...root.querySelectorAll<HTMLElement>(INTERACTIVE_SELECTOR),
+  ].find((element): element is HTMLElement =>
+    element instanceof HTMLElement && isKeyboardFocusable(element) &&
+    isVisible(element)
+  );
+  if (!target) return { visible: false };
+  const before = focusIndicatorStyle(getComputedStyle(target));
+  target.focus(
+    {
+      preventScroll: true,
+      focusVisible: true,
+    } as FocusOptions & { focusVisible: boolean },
+  );
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const after = focusIndicatorStyle(getComputedStyle(target));
+  const visible = document.activeElement === target &&
+    target.matches(":focus-visible") && focusIndicatorChanged(before, after);
+  return { target, visible };
+}
+
+function isKeyboardFocusable(element: HTMLElement): boolean {
+  if (element.tabIndex < 0 || element.hasAttribute("inert")) return false;
+  if (element.getAttribute("aria-disabled") === "true") return false;
+  return !("disabled" in element && Boolean(element.disabled));
+}
+
+function focusIndicatorStyle(style: CSSStyleDeclaration): FocusIndicatorStyle {
+  return {
+    outlineStyle: style.outlineStyle,
+    outlineWidth: style.outlineWidth,
+    outlineColor: style.outlineColor,
+    outlineOffset: style.outlineOffset,
+    boxShadow: style.boxShadow,
+    borderColor: style.borderColor,
+    backgroundColor: style.backgroundColor,
+    color: style.color,
+  };
+}
+
+export function focusIndicatorChanged(
+  before: FocusIndicatorStyle,
+  after: FocusIndicatorStyle,
+): boolean {
+  return Object.keys(before).some((key) =>
+    before[key as keyof FocusIndicatorStyle] !==
+      after[key as keyof FocusIndicatorStyle]
+  );
 }
 
 async function settleLayout(

@@ -28,15 +28,17 @@ struct ExpectedCapture {
     width: u32,
     height: u32,
     color_scheme: &'static str,
+    scenario: &'static str,
     reduced_motion: bool,
 }
 
-const CAPTURE_MATRIX: [ExpectedCapture; 5] = [
+const CAPTURE_MATRIX: [ExpectedCapture; 6] = [
     ExpectedCapture {
         capture_id: "narrow-light-default",
         width: 390,
         height: 844,
         color_scheme: "light",
+        scenario: "default",
         reduced_motion: false,
     },
     ExpectedCapture {
@@ -44,6 +46,7 @@ const CAPTURE_MATRIX: [ExpectedCapture; 5] = [
         width: 768,
         height: 1_024,
         color_scheme: "light",
+        scenario: "default",
         reduced_motion: false,
     },
     ExpectedCapture {
@@ -51,6 +54,7 @@ const CAPTURE_MATRIX: [ExpectedCapture; 5] = [
         width: 1_280,
         height: 800,
         color_scheme: "light",
+        scenario: "default",
         reduced_motion: false,
     },
     ExpectedCapture {
@@ -58,6 +62,7 @@ const CAPTURE_MATRIX: [ExpectedCapture; 5] = [
         width: 1_280,
         height: 800,
         color_scheme: "dark",
+        scenario: "default",
         reduced_motion: false,
     },
     ExpectedCapture {
@@ -65,7 +70,16 @@ const CAPTURE_MATRIX: [ExpectedCapture; 5] = [
         width: 1_280,
         height: 800,
         color_scheme: "light",
+        scenario: "default",
         reduced_motion: true,
+    },
+    ExpectedCapture {
+        capture_id: "desktop-light-focus-first",
+        width: 1_280,
+        height: 800,
+        color_scheme: "light",
+        scenario: "focus-first",
+        reduced_motion: false,
     },
 ];
 
@@ -110,7 +124,13 @@ impl ArtifactVisualQualityStore {
             return Err(VisualQualityStoreError::TooLarge);
         }
         let report: GenUiVisualQualityReport = serde_json::from_slice(&encoded)?;
-        validate_report_artifact_context(&report, artifact, preview_runtime_digest)?;
+        validate_report_artifact_identity(&report, artifact, preview_runtime_digest)?;
+        if report.schema_version > GENUI_VISUAL_QUALITY_SCHEMA_VERSION {
+            return Err(VisualQualityStoreError::InvalidReport);
+        }
+        if report.schema_version < GENUI_VISUAL_QUALITY_SCHEMA_VERSION {
+            return Ok(None);
+        }
         let expected_digest = report_digest(&report)?;
         if report.report_digest != expected_digest {
             return Err(VisualQualityStoreError::DigestMismatch);
@@ -159,9 +179,9 @@ impl ArtifactVisualQualityStore {
         } else {
             GenUiObjectiveVisualStatus::Passed
         };
-        // Version 1 has deterministic layout observations but no trusted host
-        // pixel capture or scenario emulation. It must never self-promote to
-        // ReviewReady, even when the generated artifact reports clean metrics.
+        // The objective checker has deterministic browser observations but no
+        // trusted host pixel capture or complete declared-state matrix. It must
+        // never self-promote to ReviewReady.
         let advisory_status = GenUiAdvisoryVisualStatus::NotRun;
         let review_state = if objective_status == GenUiObjectiveVisualStatus::Failed {
             GenUiVisualReviewState::NeedsRevision
@@ -262,6 +282,8 @@ fn validate_capture(
         capture.undersized_target_count,
         capture.low_contrast_count,
         capture.hidden_primary_action_count,
+        capture.focus_target_count,
+        capture.focus_visible_count,
         capture.console_error_count,
         capture.resource_failure_count,
     ];
@@ -270,7 +292,7 @@ fn validate_capture(
         || capture.viewport.height != expected.height
         || capture.color_scheme != expected.color_scheme
         || capture.locale != "en"
-        || capture.scenario != "default"
+        || capture.scenario != expected.scenario
         || capture.reduced_motion != expected.reduced_motion
         || capture.document_width == 0
         || capture.document_height == 0
@@ -282,6 +304,11 @@ fn validate_capture(
         || capture.low_contrast_count > capture.element_count
         || capture.undersized_target_count > capture.interactive_count
         || capture.hidden_primary_action_count > capture.interactive_count
+        || capture.focus_target_count > 1
+        || capture.focus_target_count > capture.interactive_count
+        || capture.focus_visible_count > capture.focus_target_count
+        || expected.scenario == "default"
+            && (capture.focus_target_count != 0 || capture.focus_visible_count != 0)
         || capture.layout_shift_milli > 10_000
         || capture.samples.len() > MAX_CAPTURE_SAMPLES
     {
@@ -359,6 +386,15 @@ fn derive_findings(captures: &[GenUiVisualCaptureEvidence]) -> Vec<GenUiVisualQu
         add_count_finding(
             &mut findings,
             observation,
+            GenUiVisualFindingCategory::MissingFocusIndicator,
+            observation
+                .focus_target_count
+                .saturating_sub(observation.focus_visible_count),
+            "keyboard focus target(s) without a visible focus indicator",
+        );
+        add_count_finding(
+            &mut findings,
+            observation,
             GenUiVisualFindingCategory::ConsoleError,
             observation.console_error_count,
             "console error(s) during capture",
@@ -383,6 +419,18 @@ fn derive_findings(captures: &[GenUiVisualCaptureEvidence]) -> Vec<GenUiVisualQu
             );
         }
     }
+    if captures.iter().any(|capture| {
+        capture.observation.scenario == "focus-first" && capture.observation.focus_target_count == 0
+    }) {
+        findings.push(GenUiVisualQualityFinding {
+            finding_id: "coverage:keyboard-focus-target".into(),
+            category: GenUiVisualFindingCategory::CoverageGap,
+            severity: GenUiVisualFindingSeverity::Warning,
+            capture_id: Some("desktop-light-focus-first".into()),
+            explanation: "The accepted artifact exposed no keyboard-focusable target.".into(),
+            sample: None,
+        });
+    }
     for (id, explanation) in [
         (
             "host-pixel-capture",
@@ -393,8 +441,8 @@ fn derive_findings(captures: &[GenUiVisualCaptureEvidence]) -> Vec<GenUiVisualQu
             "CJK, long-label, and long-content fixtures have not been captured.",
         ),
         (
-            "state-focus-matrix",
-            "Empty, loading, error, disabled, and keyboard-focus states need declared scenarios.",
+            "declared-state-matrix",
+            "Empty, loading, error, and disabled states need declared scenarios.",
         ),
     ] {
         findings.push(GenUiVisualQualityFinding {
@@ -461,8 +509,9 @@ fn validate_report_context(
     artifact: &AcceptedGenUiArtifact,
     preview_runtime_digest: &str,
 ) -> Result<(), VisualQualityStoreError> {
-    validate_report_artifact_context(report, artifact, preview_runtime_digest)?;
-    if report.checker_version != GENUI_VISUAL_QUALITY_CHECKER_VERSION
+    validate_report_artifact_identity(report, artifact, preview_runtime_digest)?;
+    if report.schema_version != GENUI_VISUAL_QUALITY_SCHEMA_VERSION
+        || report.checker_version != GENUI_VISUAL_QUALITY_CHECKER_VERSION
         || report.captures.len() != CAPTURE_MATRIX.len()
     {
         return Err(VisualQualityStoreError::ContextMismatch);
@@ -470,13 +519,12 @@ fn validate_report_context(
     Ok(())
 }
 
-fn validate_report_artifact_context(
+fn validate_report_artifact_identity(
     report: &GenUiVisualQualityReport,
     artifact: &AcceptedGenUiArtifact,
     preview_runtime_digest: &str,
 ) -> Result<(), VisualQualityStoreError> {
-    if report.schema_version != GENUI_VISUAL_QUALITY_SCHEMA_VERSION
-        || report.artifact_id != artifact.artifact_id
+    if report.artifact_id != artifact.artifact_id
         || report.source_revision != artifact.source_revision
         || report.artifact_digest != artifact.content_digest
         || report.preview_runtime_digest != preview_runtime_digest
@@ -578,7 +626,7 @@ mod tests {
             },
             color_scheme: expected.color_scheme.into(),
             locale: "en".into(),
-            scenario: "default".into(),
+            scenario: expected.scenario.into(),
             reduced_motion: expected.reduced_motion,
             document_width: expected.width,
             document_height: expected.height,
@@ -588,6 +636,8 @@ mod tests {
             undersized_target_count: 0,
             low_contrast_count: 0,
             hidden_primary_action_count: 0,
+            focus_target_count: u32::from(expected.scenario == "focus-first"),
+            focus_visible_count: u32::from(expected.scenario == "focus-first"),
             console_error_count: 0,
             resource_failure_count: 0,
             layout_shift_milli: 0,
@@ -632,10 +682,17 @@ mod tests {
         assert!(report.captures.iter().any(|capture| {
             capture.observation.color_scheme == "light" && capture.observation.reduced_motion
         }));
+        assert!(report.captures.iter().any(|capture| {
+            capture.observation.scenario == "focus-first"
+                && capture.observation.focus_target_count == 1
+                && capture.observation.focus_visible_count == 1
+        }));
         assert!(!report.findings.iter().any(|finding| {
             matches!(
                 finding.finding_id.as_str(),
-                "coverage:dark-theme" | "coverage:reduced-motion"
+                "coverage:dark-theme"
+                    | "coverage:reduced-motion"
+                    | "coverage:keyboard-focus-target"
             )
         }));
         assert_eq!(
@@ -693,6 +750,8 @@ mod tests {
         for capture in &mut input.captures {
             capture.element_count = 0;
             capture.interactive_count = 0;
+            capture.focus_target_count = 0;
+            capture.focus_visible_count = 0;
         }
 
         let report = store
@@ -706,6 +765,39 @@ mod tests {
                 .iter()
                 .any(|finding| finding.category == GenUiVisualFindingCategory::EmptyRender)
         );
+    }
+
+    #[test]
+    fn missing_focus_indicator_is_a_blocking_objective_failure() {
+        let temporary = tempdir().unwrap();
+        let store = ArtifactVisualQualityStore::open(temporary.path()).unwrap();
+        let artifact = artifact(11);
+        let mut input = submission(&artifact);
+        let focus = input.captures.last_mut().unwrap();
+        focus.focus_visible_count = 0;
+        focus.samples.push(GenUiVisualIssueSample {
+            category: GenUiVisualFindingCategory::MissingFocusIndicator,
+            semantic_path: "main/button[0]".into(),
+            rect: Some(GenUiVisualRect {
+                x: 24,
+                y: 24,
+                width: 120,
+                height: 32,
+            }),
+        });
+
+        let report = store
+            .submit(TaskId::new(), &artifact, &"f".repeat(64), input)
+            .unwrap();
+        assert_eq!(report.objective_status, GenUiObjectiveVisualStatus::Failed);
+        assert_eq!(report.review_state, GenUiVisualReviewState::NeedsRevision);
+        assert!(report.findings.iter().any(|finding| {
+            finding.category == GenUiVisualFindingCategory::MissingFocusIndicator
+                && finding
+                    .sample
+                    .as_ref()
+                    .is_some_and(|sample| sample.semantic_path == "main/button[0]")
+        }));
     }
 
     #[test]
@@ -727,10 +819,23 @@ mod tests {
             store.submit(TaskId::new(), &artifact, &"f".repeat(64), reordered),
             Err(VisualQualityStoreError::InvalidObservation)
         ));
+
+        let mut forged_default_focus = submission(&artifact);
+        forged_default_focus.captures[0].focus_target_count = 1;
+        forged_default_focus.captures[0].focus_visible_count = 1;
+        assert!(matches!(
+            store.submit(
+                TaskId::new(),
+                &artifact,
+                &"f".repeat(64),
+                forged_default_focus
+            ),
+            Err(VisualQualityStoreError::InvalidObservation)
+        ));
     }
 
     #[test]
-    fn stale_checker_report_is_replaced_instead_of_blocking_recheck() {
+    fn stale_schema_and_checker_report_is_replaced_instead_of_blocking_recheck() {
         let temporary = tempdir().unwrap();
         let store = ArtifactVisualQualityStore::open(temporary.path()).unwrap();
         let artifact = artifact(12);
@@ -738,7 +843,9 @@ mod tests {
         let mut report = store
             .submit(task_id, &artifact, &"f".repeat(64), submission(&artifact))
             .unwrap();
-        report.checker_version = "hyper-term-objective-v1".into();
+        report.schema_version = 1;
+        report.checker_version = "hyper-term-objective-v2".into();
+        report.captures.pop();
         report.report_digest = report_digest(&report).unwrap();
         store.persist(task_id, &report).unwrap();
 
@@ -748,5 +855,27 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        let mut stale_checker = store
+            .submit(task_id, &artifact, &"f".repeat(64), submission(&artifact))
+            .unwrap();
+        stale_checker.checker_version = "hyper-term-objective-v2".into();
+        stale_checker.report_digest = report_digest(&stale_checker).unwrap();
+        store.persist(task_id, &stale_checker).unwrap();
+        assert!(
+            store
+                .load(task_id, &artifact, &"f".repeat(64))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut future = stale_checker;
+        future.schema_version = GENUI_VISUAL_QUALITY_SCHEMA_VERSION + 1;
+        future.report_digest = report_digest(&future).unwrap();
+        store.persist(task_id, &future).unwrap();
+        assert!(matches!(
+            store.load(task_id, &artifact, &"f".repeat(64)),
+            Err(VisualQualityStoreError::InvalidReport)
+        ));
     }
 }

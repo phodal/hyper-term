@@ -514,7 +514,8 @@ function isVisualQualityMeasureMessage(
     (message.capture.color_scheme === "light" ||
       message.capture.color_scheme === "dark") &&
     message.capture.locale === "en" &&
-    message.capture.scenario === "default" &&
+    (message.capture.scenario === "default" ||
+      message.capture.scenario === "focus-first") &&
     typeof message.capture.reduced_motion === "boolean";
 }
 

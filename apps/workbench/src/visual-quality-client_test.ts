@@ -17,12 +17,13 @@ const observation = (
   height: number,
   color_scheme: "light" | "dark" = "light",
   reduced_motion = false,
+  scenario: "default" | "focus-first" = "default",
 ) => ({
   capture_id,
   viewport: { width, height },
   color_scheme,
   locale: "en" as const,
-  scenario: "default" as const,
+  scenario,
   reduced_motion,
   document_width: width,
   document_height: height,
@@ -32,6 +33,8 @@ const observation = (
   undersized_target_count: 0,
   low_contrast_count: 0,
   hidden_primary_action_count: 0,
+  focus_target_count: scenario === "focus-first" ? 1 : 0,
+  focus_visible_count: scenario === "focus-first" ? 1 : 0,
   console_error_count: 0,
   resource_failure_count: 0,
   layout_shift_milli: 0,
@@ -45,17 +48,25 @@ const captures = [
   observation("desktop-light-default", 1_280, 800),
   observation("desktop-dark-default", 1_280, 800, "dark"),
   observation("desktop-light-reduced-motion", 1_280, 800, "light", true),
+  observation(
+    "desktop-light-focus-first",
+    1_280,
+    800,
+    "light",
+    false,
+    "focus-first",
+  ),
 ];
 
 function report(): VisualQualityReport {
   return {
-    schema_version: 1,
+    schema_version: 2,
     artifact_id: context.artifactId,
     source_revision: context.sourceRevision,
     artifact_digest: "a".repeat(64),
     preview_runtime_digest: "c".repeat(64),
     capture_manifest_digest: "d".repeat(64),
-    checker_version: "hyper-term-objective-v2",
+    checker_version: "hyper-term-objective-v3",
     captures: captures.map((observation) => ({
       ...observation,
       observation_digest: "e".repeat(64),
@@ -100,7 +111,7 @@ Deno.test("visual quality client loads exact accepted payload and submits observ
   assertEquals(requests[1].method, "POST");
   assertEquals(new URL(requests[1].url).searchParams.get("session_id"), "3");
   const body = await requests[1].json();
-  assertEquals(body.captures.length, 5);
+  assertEquals(body.captures.length, 6);
   assertEquals(body.artifact_digest, "a".repeat(64));
 });
 

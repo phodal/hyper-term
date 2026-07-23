@@ -1,6 +1,7 @@
 import { assertAlmostEquals, assertEquals } from "@std/assert";
 import {
   contrastRatio,
+  focusIndicatorChanged,
   parseCssColor,
   viewportMatches,
 } from "./visual-quality-measure.ts";
@@ -17,6 +18,29 @@ Deno.test("visual quality contrast checker is deterministic", () => {
     contrastRatio([119, 119, 119], [255, 255, 255]),
     4.478,
     0.01,
+  );
+});
+
+Deno.test("visual quality focus evidence requires a visible style change", () => {
+  const idle = {
+    outlineStyle: "none",
+    outlineWidth: "0px",
+    outlineColor: "rgb(0, 0, 0)",
+    outlineOffset: "0px",
+    boxShadow: "none",
+    borderColor: "rgb(80, 80, 80)",
+    backgroundColor: "rgb(255, 255, 255)",
+    color: "rgb(0, 0, 0)",
+  };
+  assertEquals(focusIndicatorChanged(idle, idle), false);
+  assertEquals(
+    focusIndicatorChanged(idle, {
+      ...idle,
+      outlineStyle: "solid",
+      outlineWidth: "3px",
+      outlineColor: "rgb(132, 204, 22)",
+    }),
+    true,
   );
 });
 

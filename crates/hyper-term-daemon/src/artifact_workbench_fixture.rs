@@ -103,8 +103,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let dispatching =
         daemon.begin_operation(task_id, proposed.operation_id, authorized.revision)?;
 
-    let bundle = "globalThis.hyperTermArtifactWorkbenchFixture = true;";
-    let css = "";
+    let bundle = concat!(
+        "globalThis.hyperTermArtifactWorkbenchFixture = true;",
+        "globalThis.__HYPER_MOUNT__(function Fixture(){",
+        "return globalThis.__HYPER_REACT__.createElement('button',",
+        "{type:'button','data-primary-action':'true'},'Run fixture');",
+        "});"
+    );
+    let css = concat!(
+        "#root{box-sizing:border-box;padding:24px;}",
+        "button{min-width:120px;min-height:32px;border:1px solid #3f4b38;",
+        "border-radius:6px;color:#f4f7ef;background:#1f291b;}",
+        "button:focus-visible{outline:3px solid #84cc16;outline-offset:3px;}"
+    );
     let accepted = daemon.accept_genui_artifact(
         task_id,
         proposed.operation_id,

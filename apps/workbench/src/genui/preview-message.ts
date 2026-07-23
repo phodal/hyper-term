@@ -124,6 +124,8 @@ function validVisualObservation(value: unknown): boolean {
     capture.undersized_target_count,
     capture.low_contrast_count,
     capture.hidden_primary_action_count,
+    capture.focus_target_count,
+    capture.focus_visible_count,
     capture.console_error_count,
     capture.resource_failure_count,
     capture.layout_shift_milli,
@@ -132,7 +134,8 @@ function validVisualObservation(value: unknown): boolean {
     viewport !== undefined && positiveSafeInteger(viewport.width) &&
     positiveSafeInteger(viewport.height) &&
     (capture.color_scheme === "light" || capture.color_scheme === "dark") &&
-    capture.locale === "en" && capture.scenario === "default" &&
+    capture.locale === "en" &&
+    (capture.scenario === "default" || capture.scenario === "focus-first") &&
     typeof capture.reduced_motion === "boolean" &&
     boundedCounts.every((count) =>
       nonNegativeBoundedInteger(count, 1_000_000)
@@ -151,6 +154,7 @@ function validVisualSample(value: unknown): boolean {
     "undersized_target",
     "low_contrast",
     "hidden_primary_action",
+    "missing_focus_indicator",
     "console_error",
     "resource_failure",
     "layout_instability",
