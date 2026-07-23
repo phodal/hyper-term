@@ -45,11 +45,11 @@ structured messages, approvals, diffs, and generated interfaces.
 Agent tabs can connect to locally installed Codex, Claude, and GitHub Copilot
 CLIs. They present plans and tool calls as structured, searchable blocks, and
 can open generated React/TypeScript artifacts in an isolated editor and preview.
-For each accepted artifact revision, the Workbench can measure a fixed narrow,
-tablet, and desktop viewport matrix and persist a Rust-derived visual quality
-report. The first checker remains explicitly `needs review` until host pixel,
-theme, motion, content, and focus-state coverage exists; browser observations
-cannot mark their own output ready.
+For each accepted artifact revision, the Workbench measures a Rust-owned matrix
+covering narrow, tablet, desktop, dark-theme, and reduced-motion environments,
+then persists a revision-bound visual quality report. The checker remains
+explicitly `needs review` until host-pixel, content-fixture, and focus/state
+coverage exists; browser observations cannot mark their own output ready.
 Press `Command-F` in an Agent tab to filter its retained messages, tools, files,
 and approvals; ordinary Terminal tabs keep terminal-native find. Terminal
 rendering stays on the fast WebGL path by default. Screen-reader users can press

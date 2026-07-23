@@ -11,13 +11,19 @@ const context = {
   token: "0123456789abcdef0123456789abcdef",
 };
 
-const observation = (capture_id: string, width: number, height: number) => ({
+const observation = (
+  capture_id: string,
+  width: number,
+  height: number,
+  color_scheme: "light" | "dark" = "light",
+  reduced_motion = false,
+) => ({
   capture_id,
   viewport: { width, height },
-  color_scheme: "light" as const,
+  color_scheme,
   locale: "en" as const,
   scenario: "default" as const,
-  reduced_motion: false as const,
+  reduced_motion,
   document_width: width,
   document_height: height,
   element_count: 8,
@@ -37,6 +43,8 @@ const captures = [
   observation("narrow-light-default", 390, 844),
   observation("tablet-light-default", 768, 1_024),
   observation("desktop-light-default", 1_280, 800),
+  observation("desktop-dark-default", 1_280, 800, "dark"),
+  observation("desktop-light-reduced-motion", 1_280, 800, "light", true),
 ];
 
 function report(): VisualQualityReport {
@@ -47,7 +55,7 @@ function report(): VisualQualityReport {
     artifact_digest: "a".repeat(64),
     preview_runtime_digest: "c".repeat(64),
     capture_manifest_digest: "d".repeat(64),
-    checker_version: "hyper-term-objective-v1",
+    checker_version: "hyper-term-objective-v2",
     captures: captures.map((observation) => ({
       ...observation,
       observation_digest: "e".repeat(64),
@@ -92,7 +100,7 @@ Deno.test("visual quality client loads exact accepted payload and submits observ
   assertEquals(requests[1].method, "POST");
   assertEquals(new URL(requests[1].url).searchParams.get("session_id"), "3");
   const body = await requests[1].json();
-  assertEquals(body.captures.length, 3);
+  assertEquals(body.captures.length, 5);
   assertEquals(body.artifact_digest, "a".repeat(64));
 });
 

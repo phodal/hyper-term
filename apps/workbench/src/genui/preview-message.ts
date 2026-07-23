@@ -130,9 +130,10 @@ function validVisualObservation(value: unknown): boolean {
   ];
   return boundedString(capture.capture_id, 64) &&
     viewport !== undefined && positiveSafeInteger(viewport.width) &&
-    positiveSafeInteger(viewport.height) && capture.color_scheme === "light" &&
+    positiveSafeInteger(viewport.height) &&
+    (capture.color_scheme === "light" || capture.color_scheme === "dark") &&
     capture.locale === "en" && capture.scenario === "default" &&
-    capture.reduced_motion === false &&
+    typeof capture.reduced_motion === "boolean" &&
     boundedCounts.every((count) =>
       nonNegativeBoundedInteger(count, 1_000_000)
     ) &&

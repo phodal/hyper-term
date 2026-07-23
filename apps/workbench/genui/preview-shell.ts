@@ -23,6 +23,11 @@ import {
   type VisualQualityMeasureRequest,
   type VisualQualityRuntimeCounters,
 } from "./visual-quality-measure.ts";
+import {
+  applyPreviewQualityEnvironment,
+  previewQualityEnvironment,
+  rewritePreferenceMediaStyle,
+} from "./preview-environment.ts";
 
 interface RenderArtifactMessage {
   type: "hyper_term_render_artifact";
@@ -93,6 +98,8 @@ const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 const MAX_RUNTIME_TRACE_BYTES = 32 * 1024;
 const MAX_RUNTIME_TRACE_NAME_BYTES = 128;
 const channelToken = location.hash.slice(1);
+const qualityEnvironment = previewQualityEnvironment(new URL(location.href));
+if (qualityEnvironment) applyPreviewQualityEnvironment(qualityEnvironment);
 let runtimeTraceStreamId = crypto.randomUUID();
 let runtimeTraceSequence = 0;
 let replaySession: RuntimeReplaySession | undefined;
@@ -331,11 +338,19 @@ async function render(
     });
     return;
   }
-  const style = document.getElementById("artifact-style") ??
-    document.head.appendChild(Object.assign(document.createElement("style"), {
+  const existingStyle = document.getElementById("artifact-style");
+  if (existingStyle && !(existingStyle instanceof HTMLStyleElement)) {
+    throw new Error("artifact style boundary changed type");
+  }
+  const style = existingStyle ?? document.head.appendChild(
+    Object.assign(document.createElement("style"), {
       id: "artifact-style",
-    }));
+    }),
+  );
   style.textContent = artifact.css;
+  if (qualityEnvironment) {
+    rewritePreferenceMediaStyle(style, qualityEnvironment);
+  }
   if (currentModule) URL.revokeObjectURL(currentModule);
   currentModule = URL.createObjectURL(
     new Blob([artifact.bundle], { type: "text/javascript" }),
@@ -370,6 +385,13 @@ async function captureVisualQuality(
     message.source_revision !== activeArtifact.source_revision
   ) return;
   try {
+    if (
+      !qualityEnvironment ||
+      message.capture.color_scheme !== qualityEnvironment.colorScheme ||
+      message.capture.reduced_motion !== qualityEnvironment.reducedMotion
+    ) {
+      throw new Error("visual quality environment changed before capture");
+    }
     const observation = await measureVisualQuality(
       rootElement,
       message.capture,
@@ -489,10 +511,11 @@ function isVisualQualityMeasureMessage(
     Number.isSafeInteger(message.capture.viewport?.height) &&
     message.capture.viewport.height > 0 &&
     message.capture.viewport.height <= 4_096 &&
-    message.capture.color_scheme === "light" &&
+    (message.capture.color_scheme === "light" ||
+      message.capture.color_scheme === "dark") &&
     message.capture.locale === "en" &&
     message.capture.scenario === "default" &&
-    message.capture.reduced_motion === false;
+    typeof message.capture.reduced_motion === "boolean";
 }
 
 function validRuntimeTraceKind(value: string): value is RuntimeTraceKind {

@@ -12,10 +12,10 @@ export type VisualFindingCategory =
 export interface VisualQualityMeasureRequest {
   capture_id: string;
   viewport: { width: number; height: number };
-  color_scheme: "light";
+  color_scheme: "light" | "dark";
   locale: "en";
   scenario: "default";
-  reduced_motion: false;
+  reduced_motion: boolean;
 }
 
 export interface VisualQualityRuntimeCounters {
@@ -35,10 +35,10 @@ type VisualRect = NonNullable<VisualIssueSample["rect"]>;
 export interface VisualCaptureObservation {
   capture_id: string;
   viewport: { width: number; height: number };
-  color_scheme: "light";
+  color_scheme: "light" | "dark";
   locale: "en";
   scenario: "default";
-  reduced_motion: false;
+  reduced_motion: boolean;
   document_width: number;
   document_height: number;
   element_count: number;

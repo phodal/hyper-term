@@ -772,6 +772,27 @@ full request vocabulary to an Agent process.
 - Verify daemon, renderer, provider, and connector restart/revocation behavior.
 - Add the security suite to pull-request and release workflows.
 
+## Implementation evidence (2026-07-23)
+
+The first Phase 4 environment slice is implemented as objective checker v2:
+
+- Rust owns an ordered five-capture manifest for narrow, tablet, desktop,
+  desktop-dark, and desktop-reduced-motion evidence. It rejects substituted or
+  reordered environments before persisting a report.
+- Each capture receives a new token-bound isolated preview URL with explicit
+  color-scheme and motion preferences. The preview fixes `matchMedia` and
+  supported CSS preference queries before importing the accepted artifact.
+- Reports remain bound to the artifact revision, accepted bundle digest, and
+  packaged preview runtime. A digest-valid v1 report is treated as stale and
+  triggers recapture instead of blocking the Workbench upgrade.
+- The browser verification drives the real Rust Gateway and Deno Workbench
+  through all five environments. It also retains the Deno LSP, keyboard tab,
+  and hostile-preview isolation assertions.
+
+This slice does not claim host-pixel equivalence. Host screenshots,
+CJK/long-content fixtures, and declared focus/loading/error states remain
+explicit coverage gaps, so a clean objective report is still `NeedsReview`.
+
 ## Validation gates
 
 ### Protocol and role enforcement

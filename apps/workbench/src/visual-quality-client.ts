@@ -173,7 +173,7 @@ function validReport(
     objective.has(value.objective_status) &&
     typeof value.advisory_status === "string" &&
     advisory.has(value.advisory_status) &&
-    Array.isArray(value.captures) && value.captures.length === 3 &&
+    Array.isArray(value.captures) && value.captures.length === 5 &&
     value.captures.every(validCapture) &&
     Array.isArray(value.findings) && value.findings.length <= 64 &&
     value.findings.every(validFinding);

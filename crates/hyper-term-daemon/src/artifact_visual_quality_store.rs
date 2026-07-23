@@ -27,23 +27,45 @@ struct ExpectedCapture {
     capture_id: &'static str,
     width: u32,
     height: u32,
+    color_scheme: &'static str,
+    reduced_motion: bool,
 }
 
-const CAPTURE_MATRIX: [ExpectedCapture; 3] = [
+const CAPTURE_MATRIX: [ExpectedCapture; 5] = [
     ExpectedCapture {
         capture_id: "narrow-light-default",
         width: 390,
         height: 844,
+        color_scheme: "light",
+        reduced_motion: false,
     },
     ExpectedCapture {
         capture_id: "tablet-light-default",
         width: 768,
         height: 1_024,
+        color_scheme: "light",
+        reduced_motion: false,
     },
     ExpectedCapture {
         capture_id: "desktop-light-default",
         width: 1_280,
         height: 800,
+        color_scheme: "light",
+        reduced_motion: false,
+    },
+    ExpectedCapture {
+        capture_id: "desktop-dark-default",
+        width: 1_280,
+        height: 800,
+        color_scheme: "dark",
+        reduced_motion: false,
+    },
+    ExpectedCapture {
+        capture_id: "desktop-light-reduced-motion",
+        width: 1_280,
+        height: 800,
+        color_scheme: "light",
+        reduced_motion: true,
     },
 ];
 
@@ -88,11 +110,15 @@ impl ArtifactVisualQualityStore {
             return Err(VisualQualityStoreError::TooLarge);
         }
         let report: GenUiVisualQualityReport = serde_json::from_slice(&encoded)?;
-        validate_report_context(&report, artifact, preview_runtime_digest)?;
+        validate_report_artifact_context(&report, artifact, preview_runtime_digest)?;
         let expected_digest = report_digest(&report)?;
         if report.report_digest != expected_digest {
             return Err(VisualQualityStoreError::DigestMismatch);
         }
+        if report.checker_version != GENUI_VISUAL_QUALITY_CHECKER_VERSION {
+            return Ok(None);
+        }
+        validate_report_context(&report, artifact, preview_runtime_digest)?;
         Ok(Some(report))
     }
 
@@ -242,10 +268,10 @@ fn validate_capture(
     if capture.capture_id != expected.capture_id
         || capture.viewport.width != expected.width
         || capture.viewport.height != expected.height
-        || capture.color_scheme != "light"
+        || capture.color_scheme != expected.color_scheme
         || capture.locale != "en"
         || capture.scenario != "default"
-        || capture.reduced_motion
+        || capture.reduced_motion != expected.reduced_motion
         || capture.document_width == 0
         || capture.document_height == 0
         || capture.document_width > MAX_LAYOUT_EXTENT
@@ -363,14 +389,6 @@ fn derive_findings(captures: &[GenUiVisualCaptureEvidence]) -> Vec<GenUiVisualQu
             "Host pixel captures are not available from the current sandboxed WebView path.",
         ),
         (
-            "dark-theme",
-            "Dark color scheme has not been captured by checker version 1.",
-        ),
-        (
-            "reduced-motion",
-            "Reduced-motion behavior has not been captured by checker version 1.",
-        ),
-        (
             "cjk-long-content",
             "CJK, long-label, and long-content fixtures have not been captured.",
         ),
@@ -443,13 +461,25 @@ fn validate_report_context(
     artifact: &AcceptedGenUiArtifact,
     preview_runtime_digest: &str,
 ) -> Result<(), VisualQualityStoreError> {
+    validate_report_artifact_context(report, artifact, preview_runtime_digest)?;
+    if report.checker_version != GENUI_VISUAL_QUALITY_CHECKER_VERSION
+        || report.captures.len() != CAPTURE_MATRIX.len()
+    {
+        return Err(VisualQualityStoreError::ContextMismatch);
+    }
+    Ok(())
+}
+
+fn validate_report_artifact_context(
+    report: &GenUiVisualQualityReport,
+    artifact: &AcceptedGenUiArtifact,
+    preview_runtime_digest: &str,
+) -> Result<(), VisualQualityStoreError> {
     if report.schema_version != GENUI_VISUAL_QUALITY_SCHEMA_VERSION
         || report.artifact_id != artifact.artifact_id
         || report.source_revision != artifact.source_revision
         || report.artifact_digest != artifact.content_digest
         || report.preview_runtime_digest != preview_runtime_digest
-        || report.checker_version != GENUI_VISUAL_QUALITY_CHECKER_VERSION
-        || report.captures.len() != CAPTURE_MATRIX.len()
     {
         return Err(VisualQualityStoreError::ContextMismatch);
     }
@@ -546,10 +576,10 @@ mod tests {
                 width: expected.width,
                 height: expected.height,
             },
-            color_scheme: "light".into(),
+            color_scheme: expected.color_scheme.into(),
             locale: "en".into(),
             scenario: "default".into(),
-            reduced_motion: false,
+            reduced_motion: expected.reduced_motion,
             document_width: expected.width,
             document_height: expected.height,
             element_count: 12,
@@ -595,6 +625,18 @@ mod tests {
         assert!(report.findings.iter().any(|finding| {
             finding.category == GenUiVisualFindingCategory::CoverageGap
                 && finding.finding_id == "coverage:host-pixel-capture"
+        }));
+        assert!(report.captures.iter().any(|capture| {
+            capture.observation.color_scheme == "dark" && !capture.observation.reduced_motion
+        }));
+        assert!(report.captures.iter().any(|capture| {
+            capture.observation.color_scheme == "light" && capture.observation.reduced_motion
+        }));
+        assert!(!report.findings.iter().any(|finding| {
+            matches!(
+                finding.finding_id.as_str(),
+                "coverage:dark-theme" | "coverage:reduced-motion"
+            )
         }));
         assert_eq!(
             store
@@ -663,6 +705,48 @@ mod tests {
                 .findings
                 .iter()
                 .any(|finding| finding.category == GenUiVisualFindingCategory::EmptyRender)
+        );
+    }
+
+    #[test]
+    fn capture_environment_cannot_be_substituted_or_reordered() {
+        let temporary = tempdir().unwrap();
+        let store = ArtifactVisualQualityStore::open(temporary.path()).unwrap();
+        let artifact = artifact(10);
+
+        let mut wrong_environment = submission(&artifact);
+        wrong_environment.captures[3].color_scheme = "light".into();
+        assert!(matches!(
+            store.submit(TaskId::new(), &artifact, &"f".repeat(64), wrong_environment),
+            Err(VisualQualityStoreError::InvalidObservation)
+        ));
+
+        let mut reordered = submission(&artifact);
+        reordered.captures.swap(0, 1);
+        assert!(matches!(
+            store.submit(TaskId::new(), &artifact, &"f".repeat(64), reordered),
+            Err(VisualQualityStoreError::InvalidObservation)
+        ));
+    }
+
+    #[test]
+    fn stale_checker_report_is_replaced_instead_of_blocking_recheck() {
+        let temporary = tempdir().unwrap();
+        let store = ArtifactVisualQualityStore::open(temporary.path()).unwrap();
+        let artifact = artifact(12);
+        let task_id = TaskId::new();
+        let mut report = store
+            .submit(task_id, &artifact, &"f".repeat(64), submission(&artifact))
+            .unwrap();
+        report.checker_version = "hyper-term-objective-v1".into();
+        report.report_digest = report_digest(&report).unwrap();
+        store.persist(task_id, &report).unwrap();
+
+        assert!(
+            store
+                .load(task_id, &artifact, &"f".repeat(64))
+                .unwrap()
+                .is_none()
         );
     }
 }

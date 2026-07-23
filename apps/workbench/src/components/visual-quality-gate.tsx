@@ -16,9 +16,41 @@ import {
 } from "../visual-quality-client.ts";
 
 const CAPTURE_MATRIX = [
-  { id: "narrow-light-default", width: 390, height: 844 },
-  { id: "tablet-light-default", width: 768, height: 1_024 },
-  { id: "desktop-light-default", width: 1_280, height: 800 },
+  {
+    id: "narrow-light-default",
+    width: 390,
+    height: 844,
+    colorScheme: "light",
+    reducedMotion: false,
+  },
+  {
+    id: "tablet-light-default",
+    width: 768,
+    height: 1_024,
+    colorScheme: "light",
+    reducedMotion: false,
+  },
+  {
+    id: "desktop-light-default",
+    width: 1_280,
+    height: 800,
+    colorScheme: "light",
+    reducedMotion: false,
+  },
+  {
+    id: "desktop-dark-default",
+    width: 1_280,
+    height: 800,
+    colorScheme: "dark",
+    reducedMotion: false,
+  },
+  {
+    id: "desktop-light-reduced-motion",
+    width: 1_280,
+    height: 800,
+    colorScheme: "light",
+    reducedMotion: true,
+  },
 ] as const;
 
 interface CaptureRun {
@@ -135,10 +167,10 @@ export function VisualQualityGate(props: VisualQualityContext) {
           capture: {
             capture_id: capture.id,
             viewport: { width: capture.width, height: capture.height },
-            color_scheme: "light",
+            color_scheme: capture.colorScheme,
             locale: "en",
             scenario: "default",
-            reduced_motion: false,
+            reduced_motion: capture.reducedMotion,
           },
         }, "*");
         return;
@@ -163,11 +195,13 @@ export function VisualQualityGate(props: VisualQualityContext) {
       const expected = CAPTURE_MATRIX[run.index];
       if (
         message.observation.viewport.width !== expected.width ||
-        message.observation.viewport.height !== expected.height
+        message.observation.viewport.height !== expected.height ||
+        message.observation.color_scheme !== expected.colorScheme ||
+        message.observation.reduced_motion !== expected.reducedMotion
       ) {
         setStatus("failed");
         setError(
-          `Capture viewport ${message.observation.viewport.width}×${message.observation.viewport.height} did not match ${expected.width}×${expected.height}.`,
+          `Capture ${message.observation.capture_id} did not match its Rust-owned environment.`,
         );
         setRun(undefined);
         return;
@@ -205,8 +239,8 @@ export function VisualQualityGate(props: VisualQualityContext) {
   useEffect(() => () => submitController.current?.abort(), []);
 
   const capture = run ? CAPTURE_MATRIX[run.index] : undefined;
-  const previewUrl = capture
-    ? new URL(`./genui/preview.html#${run?.channel}`, document.baseURI).href
+  const previewUrl = capture && run
+    ? visualQualityPreviewUrl(capture, run.channel)
     : undefined;
   const blocking =
     report?.findings.filter((finding) => finding.severity === "blocking") ?? [];
@@ -292,9 +326,23 @@ function qualityLabel(
     return "review ready";
   }
   if (status === "capturing") {
-    return `checking ${Number(captureIndex ?? 0) + 1}/3`;
+    return `checking ${Number(captureIndex ?? 0) + 1}/${CAPTURE_MATRIX.length}`;
   }
   return status;
+}
+
+function visualQualityPreviewUrl(
+  capture: (typeof CAPTURE_MATRIX)[number],
+  channel: string,
+): string {
+  const url = new URL("./genui/preview.html", document.baseURI);
+  url.searchParams.set("quality_color_scheme", capture.colorScheme);
+  url.searchParams.set(
+    "quality_reduced_motion",
+    capture.reducedMotion ? "reduce" : "no-preference",
+  );
+  url.hash = channel;
+  return url.href;
 }
 
 function messageOf(error: unknown): string {

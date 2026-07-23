@@ -9,7 +9,7 @@ pub const MAX_GENUI_SOURCE_FILES: usize = 1_000;
 pub const MAX_GENUI_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_GENUI_VIRTUAL_PATH_BYTES: usize = 4 * 1024;
 pub const GENUI_VISUAL_QUALITY_SCHEMA_VERSION: u16 = 1;
-pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v1";
+pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v2";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenUiCompilerIdentity {
