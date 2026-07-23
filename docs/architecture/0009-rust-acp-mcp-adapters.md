@@ -203,6 +203,13 @@ set is enabled per release.
   Codex fallback, so a machine without an installed adapter still works when
   the matching Codex CLI is authenticated. The selected executable digest and
   package/version identity are recorded in the driver manifest.
+- A 2026-07-23 real-provider probe kept the bundled Codex adapter as the
+  automatic default. Both installed Zed ACP 0.15.0 and a clean Zed ACP 0.16.0
+  platform binary completed ACP initialization, but their embedded Codex core
+  rejected the current `gpt-5.6-sol` model metadata and `max` reasoning value
+  during a harmless authenticated prompt. Explicit Zed paths remain supported
+  for compatibility testing, but successful initialization alone is not a
+  sufficient default-selection gate.
 - Ignored, credential-using integration gates completed a harmless real prompt
   through official Codex ACP 1.1.4 and Claude Agent ACP 0.59.0 artifacts. Claude
   subscription authentication on macOS requires the exact Claude executable
