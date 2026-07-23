@@ -14,8 +14,8 @@ export interface VisualQualityMeasureRequest {
   capture_id: string;
   viewport: { width: number; height: number };
   color_scheme: "light" | "dark";
-  locale: "en";
-  scenario: "default" | "focus-first";
+  locale: "en" | "zh-CN";
+  scenario: "default" | "focus-first" | "content-stress";
   reduced_motion: boolean;
 }
 
@@ -37,8 +37,8 @@ export interface VisualCaptureObservation {
   capture_id: string;
   viewport: { width: number; height: number };
   color_scheme: "light" | "dark";
-  locale: "en";
-  scenario: "default" | "focus-first";
+  locale: "en" | "zh-CN";
+  scenario: "default" | "focus-first" | "content-stress";
   reduced_motion: boolean;
   document_width: number;
   document_height: number;
@@ -50,6 +50,11 @@ export interface VisualCaptureObservation {
   hidden_primary_action_count: number;
   focus_target_count: number;
   focus_visible_count: number;
+  content_fixture_digest?: string;
+  content_fixture_target_count: number;
+  content_fixture_applied_count: number;
+  content_fixture_cjk_label_count: number;
+  content_fixture_long_content_count: number;
   console_error_count: number;
   resource_failure_count: number;
   layout_shift_milli: number;
@@ -61,13 +66,20 @@ const INTERACTIVE_SELECTOR =
   "button,a[href],input,select,textarea,[role=button],[tabindex]";
 const PRIMARY_SELECTOR = '[data-primary-action="true"]';
 const MAX_SAMPLES = 24;
+export const CONTENT_STRESS_FIXTURE_ID = "hyper-term-cjk-long-content-v1";
+const CONTENT_STRESS_CJK_LABEL = "运行完整的生成式界面验证流程并查看所有更改";
+const CONTENT_STRESS_LONG_BODY =
+  "这是由宿主注入的中文长内容验证文本，用于检查人工智能生成界面在窄窗口中的换行、行高、可读性和布局稳定性。内容需要自然折行，不能遮挡主要操作，也不能让页面产生水平滚动。终端用户可能同时查看命令结果、代码差异、审批信息和代理执行状态，因此界面必须在有限空间内保持清晰的阅读顺序。";
 
 export async function measureVisualQuality(
   root: HTMLElement,
   request: VisualQualityMeasureRequest,
   counters: VisualQualityRuntimeCounters,
 ): Promise<VisualCaptureObservation> {
+  document.documentElement.lang = request.locale;
+  const contentFixture = applyContentStressFixture(root, request.scenario);
   await settleLayout(request.viewport);
+  const contentCoverage = inspectContentStressFixture(contentFixture);
   const focus = await measureFocusScenario(root, request.scenario);
   const viewport = {
     width: Math.max(1, Math.round(globalThis.innerWidth)),
@@ -167,12 +179,86 @@ export async function measureVisualQuality(
     hidden_primary_action_count: hiddenPrimary.length,
     focus_target_count: focus.target ? 1 : 0,
     focus_visible_count: focus.visible ? 1 : 0,
+    ...(request.scenario === "content-stress"
+      ? { content_fixture_digest: await sha256(CONTENT_STRESS_FIXTURE_ID) }
+      : {}),
+    content_fixture_target_count: contentCoverage.targetCount,
+    content_fixture_applied_count: contentCoverage.appliedCount,
+    content_fixture_cjk_label_count: contentCoverage.cjkLabelCount,
+    content_fixture_long_content_count: contentCoverage.longContentCount,
     console_error_count: Math.min(counters.consoleErrors, 100_000),
     resource_failure_count: Math.min(counters.resourceFailures, 100_000),
     layout_shift_milli: Math.min(counters.layoutShiftMilli, 10_000),
     semantic_digest: await sha256(semanticRows.join("\n")),
     samples: samples.slice(0, MAX_SAMPLES),
   };
+}
+
+interface ContentStressFixture {
+  cjkLabelTarget?: HTMLElement;
+  longContentTarget?: HTMLElement;
+}
+
+function applyContentStressFixture(
+  root: HTMLElement,
+  scenario: VisualQualityMeasureRequest["scenario"],
+): ContentStressFixture {
+  if (scenario !== "content-stress") return {};
+  const visible = [root, ...root.querySelectorAll<HTMLElement>("*")]
+    .filter((element): element is HTMLElement =>
+      element instanceof HTMLElement && isVisible(element)
+    );
+  const cjkLabelTarget = visible.find((element) =>
+    element.matches(INTERACTIVE_SELECTOR) && hasDirectText(element)
+  );
+  const longContentTarget = visible.find((element) =>
+    element !== cjkLabelTarget && !element.matches(INTERACTIVE_SELECTOR) &&
+    hasDirectText(element)
+  );
+  if (cjkLabelTarget) {
+    replaceDirectText(cjkLabelTarget, CONTENT_STRESS_CJK_LABEL);
+  }
+  if (longContentTarget) {
+    replaceDirectText(longContentTarget, CONTENT_STRESS_LONG_BODY);
+  }
+  return { cjkLabelTarget, longContentTarget };
+}
+
+function inspectContentStressFixture(fixture: ContentStressFixture): {
+  targetCount: number;
+  appliedCount: number;
+  cjkLabelCount: number;
+  longContentCount: number;
+} {
+  const targets = [fixture.cjkLabelTarget, fixture.longContentTarget]
+    .filter((target): target is HTMLElement => Boolean(target));
+  const cjkLabelCount = binaryEvidence(Boolean(
+    fixture.cjkLabelTarget?.isConnected &&
+      fixture.cjkLabelTarget.textContent?.includes(CONTENT_STRESS_CJK_LABEL),
+  ));
+  const longContentCount = binaryEvidence(Boolean(
+    fixture.longContentTarget?.isConnected &&
+      fixture.longContentTarget.textContent?.includes(
+        CONTENT_STRESS_LONG_BODY,
+      ),
+  ));
+  return {
+    targetCount: targets.length,
+    appliedCount: cjkLabelCount + longContentCount,
+    cjkLabelCount,
+    longContentCount,
+  };
+}
+
+export function binaryEvidence(value: unknown): 0 | 1 {
+  return value === true ? 1 : 0;
+}
+
+function replaceDirectText(element: HTMLElement, value: string): void {
+  const textNode = [...element.childNodes].find((node) =>
+    node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.trim())
+  );
+  if (textNode) textNode.textContent = value;
 }
 
 interface FocusIndicatorStyle {

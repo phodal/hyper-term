@@ -8,8 +8,8 @@ use uuid::Uuid;
 pub const MAX_GENUI_SOURCE_FILES: usize = 1_000;
 pub const MAX_GENUI_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_GENUI_VIRTUAL_PATH_BYTES: usize = 4 * 1024;
-pub const GENUI_VISUAL_QUALITY_SCHEMA_VERSION: u16 = 2;
-pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v3";
+pub const GENUI_VISUAL_QUALITY_SCHEMA_VERSION: u16 = 3;
+pub const GENUI_VISUAL_QUALITY_CHECKER_VERSION: &str = "hyper-term-objective-v4";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GenUiCompilerIdentity {
@@ -168,6 +168,18 @@ pub struct GenUiVisualCaptureObservation {
     pub focus_target_count: u32,
     #[serde(default)]
     pub focus_visible_count: u32,
+    /// Digest of the fixed host-owned content fixture applied by the trusted
+    /// preview. It is absent for ordinary and focus-only captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_fixture_digest: Option<String>,
+    #[serde(default)]
+    pub content_fixture_target_count: u32,
+    #[serde(default)]
+    pub content_fixture_applied_count: u32,
+    #[serde(default)]
+    pub content_fixture_cjk_label_count: u32,
+    #[serde(default)]
+    pub content_fixture_long_content_count: u32,
     pub console_error_count: u32,
     pub resource_failure_count: u32,
     pub layout_shift_milli: u32,

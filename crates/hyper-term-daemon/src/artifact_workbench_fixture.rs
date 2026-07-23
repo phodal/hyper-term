@@ -106,14 +106,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bundle = concat!(
         "globalThis.hyperTermArtifactWorkbenchFixture = true;",
         "globalThis.__HYPER_MOUNT__(function Fixture(){",
-        "return globalThis.__HYPER_REACT__.createElement('button',",
-        "{type:'button','data-primary-action':'true'},'Run fixture');",
+        "const h=globalThis.__HYPER_REACT__.createElement;",
+        "return h('main',null,",
+        "h('button',{type:'button','data-primary-action':'true'},'Run fixture'),",
+        "h('p',null,'Artifact quality summary'));",
         "});"
     );
     let css = concat!(
         "#root{box-sizing:border-box;padding:24px;}",
+        "main{display:flex;flex-direction:column;align-items:flex-start;gap:16px;",
+        "max-width:100%;}",
         "button{min-width:120px;min-height:32px;border:1px solid #3f4b38;",
-        "border-radius:6px;color:#f4f7ef;background:#1f291b;}",
+        "border-radius:6px;color:#f4f7ef;background:#1f291b;max-width:100%;",
+        "white-space:normal;overflow-wrap:anywhere;}",
+        "p{max-width:min(100%,640px);margin:0;line-height:1.55;overflow-wrap:anywhere;}",
         "button:focus-visible{outline:3px solid #84cc16;outline-offset:3px;}"
     );
     let accepted = daemon.accept_genui_artifact(

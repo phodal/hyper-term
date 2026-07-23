@@ -21,6 +21,8 @@ const MAX_SEMANTIC_PATH_BYTES: usize = 256;
 const MAX_LAYOUT_EXTENT: u32 = 1_000_000;
 const MAX_ELEMENT_COUNT: u32 = 100_000;
 const BLOCKING_LAYOUT_SHIFT_MILLI: u32 = 100;
+const CONTENT_STRESS_FIXTURE_ID: &str = "hyper-term-cjk-long-content-v1";
+const MAX_CONTENT_FIXTURE_TARGETS: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct ExpectedCapture {
@@ -28,16 +30,18 @@ struct ExpectedCapture {
     width: u32,
     height: u32,
     color_scheme: &'static str,
+    locale: &'static str,
     scenario: &'static str,
     reduced_motion: bool,
 }
 
-const CAPTURE_MATRIX: [ExpectedCapture; 6] = [
+const CAPTURE_MATRIX: [ExpectedCapture; 7] = [
     ExpectedCapture {
         capture_id: "narrow-light-default",
         width: 390,
         height: 844,
         color_scheme: "light",
+        locale: "en",
         scenario: "default",
         reduced_motion: false,
     },
@@ -46,6 +50,7 @@ const CAPTURE_MATRIX: [ExpectedCapture; 6] = [
         width: 768,
         height: 1_024,
         color_scheme: "light",
+        locale: "en",
         scenario: "default",
         reduced_motion: false,
     },
@@ -54,6 +59,7 @@ const CAPTURE_MATRIX: [ExpectedCapture; 6] = [
         width: 1_280,
         height: 800,
         color_scheme: "light",
+        locale: "en",
         scenario: "default",
         reduced_motion: false,
     },
@@ -62,6 +68,7 @@ const CAPTURE_MATRIX: [ExpectedCapture; 6] = [
         width: 1_280,
         height: 800,
         color_scheme: "dark",
+        locale: "en",
         scenario: "default",
         reduced_motion: false,
     },
@@ -70,6 +77,7 @@ const CAPTURE_MATRIX: [ExpectedCapture; 6] = [
         width: 1_280,
         height: 800,
         color_scheme: "light",
+        locale: "en",
         scenario: "default",
         reduced_motion: true,
     },
@@ -78,7 +86,17 @@ const CAPTURE_MATRIX: [ExpectedCapture; 6] = [
         width: 1_280,
         height: 800,
         color_scheme: "light",
+        locale: "en",
         scenario: "focus-first",
+        reduced_motion: false,
+    },
+    ExpectedCapture {
+        capture_id: "narrow-zh-content-stress",
+        width: 390,
+        height: 844,
+        color_scheme: "light",
+        locale: "zh-CN",
+        scenario: "content-stress",
         reduced_motion: false,
     },
 ];
@@ -151,11 +169,16 @@ impl ArtifactVisualQualityStore {
     ) -> Result<GenUiVisualQualityReport, VisualQualityStoreError> {
         validate_sha256(preview_runtime_digest)?;
         validate_submission(artifact, &submission)?;
+        let content_fixture_digest = content_stress_fixture_digest();
         let capture_manifest_digest = digest_json(&serde_json::json!({
             "schema_version": GENUI_VISUAL_QUALITY_SCHEMA_VERSION,
             "checker_version": GENUI_VISUAL_QUALITY_CHECKER_VERSION,
             "artifact_digest": artifact.content_digest,
             "preview_runtime_digest": preview_runtime_digest,
+            "content_fixture": {
+                "id": CONTENT_STRESS_FIXTURE_ID,
+                "digest": content_fixture_digest,
+            },
             "captures": CAPTURE_MATRIX,
         }))?;
         let captures = submission
@@ -284,6 +307,10 @@ fn validate_capture(
         capture.hidden_primary_action_count,
         capture.focus_target_count,
         capture.focus_visible_count,
+        capture.content_fixture_target_count,
+        capture.content_fixture_applied_count,
+        capture.content_fixture_cjk_label_count,
+        capture.content_fixture_long_content_count,
         capture.console_error_count,
         capture.resource_failure_count,
     ];
@@ -291,7 +318,7 @@ fn validate_capture(
         || capture.viewport.width != expected.width
         || capture.viewport.height != expected.height
         || capture.color_scheme != expected.color_scheme
-        || capture.locale != "en"
+        || capture.locale != expected.locale
         || capture.scenario != expected.scenario
         || capture.reduced_motion != expected.reduced_motion
         || capture.document_width == 0
@@ -307,10 +334,27 @@ fn validate_capture(
         || capture.focus_target_count > 1
         || capture.focus_target_count > capture.interactive_count
         || capture.focus_visible_count > capture.focus_target_count
-        || expected.scenario == "default"
+        || expected.scenario != "focus-first"
             && (capture.focus_target_count != 0 || capture.focus_visible_count != 0)
+        || capture.content_fixture_target_count > MAX_CONTENT_FIXTURE_TARGETS
+        || capture.content_fixture_applied_count > capture.content_fixture_target_count
+        || capture.content_fixture_cjk_label_count > capture.content_fixture_applied_count
+        || capture.content_fixture_long_content_count > capture.content_fixture_applied_count
         || capture.layout_shift_milli > 10_000
         || capture.samples.len() > MAX_CAPTURE_SAMPLES
+    {
+        return Err(VisualQualityStoreError::InvalidObservation);
+    }
+    let expected_fixture_digest = content_stress_fixture_digest();
+    if expected.scenario == "content-stress" {
+        if capture.content_fixture_digest.as_deref() != Some(expected_fixture_digest.as_str()) {
+            return Err(VisualQualityStoreError::InvalidObservation);
+        }
+    } else if capture.content_fixture_digest.is_some()
+        || capture.content_fixture_target_count != 0
+        || capture.content_fixture_applied_count != 0
+        || capture.content_fixture_cjk_label_count != 0
+        || capture.content_fixture_long_content_count != 0
     {
         return Err(VisualQualityStoreError::InvalidObservation);
     }
@@ -431,14 +475,31 @@ fn derive_findings(captures: &[GenUiVisualCaptureEvidence]) -> Vec<GenUiVisualQu
             sample: None,
         });
     }
+    if let Some(capture) = captures
+        .iter()
+        .find(|capture| capture.observation.scenario == "content-stress")
+        && (capture.observation.content_fixture_cjk_label_count == 0
+            || capture.observation.content_fixture_long_content_count == 0)
+    {
+        findings.push(GenUiVisualQualityFinding {
+            finding_id: "coverage:cjk-long-content".into(),
+            category: GenUiVisualFindingCategory::CoverageGap,
+            severity: GenUiVisualFindingSeverity::Warning,
+            capture_id: Some(capture.observation.capture_id.clone()),
+            explanation: format!(
+                "The content stress fixture reached {}/{} targets; CJK label coverage={} and long-content coverage={}.",
+                capture.observation.content_fixture_applied_count,
+                capture.observation.content_fixture_target_count,
+                capture.observation.content_fixture_cjk_label_count,
+                capture.observation.content_fixture_long_content_count,
+            ),
+            sample: None,
+        });
+    }
     for (id, explanation) in [
         (
             "host-pixel-capture",
             "Host pixel captures are not available from the current sandboxed WebView path.",
-        ),
-        (
-            "cjk-long-content",
-            "CJK, long-label, and long-content fixtures have not been captured.",
         ),
         (
             "declared-state-matrix",
@@ -548,6 +609,13 @@ fn digest_json(value: &impl Serialize) -> Result<String, VisualQualityStoreError
         .collect())
 }
 
+fn content_stress_fixture_digest() -> String {
+    Sha256::digest(CONTENT_STRESS_FIXTURE_ID.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn validate_sha256(value: &str) -> Result<(), VisualQualityStoreError> {
     if value.len() != 64
         || !value
@@ -625,7 +693,7 @@ mod tests {
                 height: expected.height,
             },
             color_scheme: expected.color_scheme.into(),
-            locale: "en".into(),
+            locale: expected.locale.into(),
             scenario: expected.scenario.into(),
             reduced_motion: expected.reduced_motion,
             document_width: expected.width,
@@ -638,6 +706,20 @@ mod tests {
             hidden_primary_action_count: 0,
             focus_target_count: u32::from(expected.scenario == "focus-first"),
             focus_visible_count: u32::from(expected.scenario == "focus-first"),
+            content_fixture_digest: (expected.scenario == "content-stress")
+                .then(content_stress_fixture_digest),
+            content_fixture_target_count: if expected.scenario == "content-stress" {
+                2
+            } else {
+                0
+            },
+            content_fixture_applied_count: if expected.scenario == "content-stress" {
+                2
+            } else {
+                0
+            },
+            content_fixture_cjk_label_count: u32::from(expected.scenario == "content-stress"),
+            content_fixture_long_content_count: u32::from(expected.scenario == "content-stress"),
             console_error_count: 0,
             resource_failure_count: 0,
             layout_shift_milli: 0,
@@ -687,12 +769,21 @@ mod tests {
                 && capture.observation.focus_target_count == 1
                 && capture.observation.focus_visible_count == 1
         }));
+        assert!(report.captures.iter().any(|capture| {
+            capture.observation.scenario == "content-stress"
+                && capture.observation.locale == "zh-CN"
+                && capture.observation.content_fixture_target_count == 2
+                && capture.observation.content_fixture_applied_count == 2
+                && capture.observation.content_fixture_cjk_label_count == 1
+                && capture.observation.content_fixture_long_content_count == 1
+        }));
         assert!(!report.findings.iter().any(|finding| {
             matches!(
                 finding.finding_id.as_str(),
                 "coverage:dark-theme"
                     | "coverage:reduced-motion"
                     | "coverage:keyboard-focus-target"
+                    | "coverage:cjk-long-content"
             )
         }));
         assert_eq!(
@@ -773,7 +864,11 @@ mod tests {
         let store = ArtifactVisualQualityStore::open(temporary.path()).unwrap();
         let artifact = artifact(11);
         let mut input = submission(&artifact);
-        let focus = input.captures.last_mut().unwrap();
+        let focus = input
+            .captures
+            .iter_mut()
+            .find(|capture| capture.scenario == "focus-first")
+            .unwrap();
         focus.focus_visible_count = 0;
         focus.samples.push(GenUiVisualIssueSample {
             category: GenUiVisualFindingCategory::MissingFocusIndicator,
@@ -832,6 +927,64 @@ mod tests {
             ),
             Err(VisualQualityStoreError::InvalidObservation)
         ));
+
+        let mut forged_default_fixture = submission(&artifact);
+        forged_default_fixture.captures[0].content_fixture_digest =
+            Some(content_stress_fixture_digest());
+        forged_default_fixture.captures[0].content_fixture_target_count = 1;
+        forged_default_fixture.captures[0].content_fixture_applied_count = 1;
+        forged_default_fixture.captures[0].content_fixture_cjk_label_count = 1;
+        assert!(matches!(
+            store.submit(
+                TaskId::new(),
+                &artifact,
+                &"f".repeat(64),
+                forged_default_fixture
+            ),
+            Err(VisualQualityStoreError::InvalidObservation)
+        ));
+
+        let mut forged_fixture_digest = submission(&artifact);
+        forged_fixture_digest
+            .captures
+            .iter_mut()
+            .find(|capture| capture.scenario == "content-stress")
+            .unwrap()
+            .content_fixture_digest = Some("0".repeat(64));
+        assert!(matches!(
+            store.submit(
+                TaskId::new(),
+                &artifact,
+                &"f".repeat(64),
+                forged_fixture_digest
+            ),
+            Err(VisualQualityStoreError::InvalidObservation)
+        ));
+    }
+
+    #[test]
+    fn unavailable_content_fixture_targets_remain_an_explicit_coverage_gap() {
+        let temporary = tempdir().unwrap();
+        let store = ArtifactVisualQualityStore::open(temporary.path()).unwrap();
+        let artifact = artifact(13);
+        let mut input = submission(&artifact);
+        let content = input
+            .captures
+            .iter_mut()
+            .find(|capture| capture.scenario == "content-stress")
+            .unwrap();
+        content.content_fixture_target_count = 1;
+        content.content_fixture_applied_count = 1;
+        content.content_fixture_long_content_count = 0;
+
+        let report = store
+            .submit(TaskId::new(), &artifact, &"f".repeat(64), input)
+            .unwrap();
+        assert_eq!(report.objective_status, GenUiObjectiveVisualStatus::Passed);
+        assert!(report.findings.iter().any(|finding| {
+            finding.finding_id == "coverage:cjk-long-content"
+                && finding.capture_id.as_deref() == Some("narrow-zh-content-stress")
+        }));
     }
 
     #[test]

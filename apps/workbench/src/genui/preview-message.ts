@@ -126,6 +126,10 @@ function validVisualObservation(value: unknown): boolean {
     capture.hidden_primary_action_count,
     capture.focus_target_count,
     capture.focus_visible_count,
+    capture.content_fixture_target_count,
+    capture.content_fixture_applied_count,
+    capture.content_fixture_cjk_label_count,
+    capture.content_fixture_long_content_count,
     capture.console_error_count,
     capture.resource_failure_count,
     capture.layout_shift_milli,
@@ -134,14 +138,33 @@ function validVisualObservation(value: unknown): boolean {
     viewport !== undefined && positiveSafeInteger(viewport.width) &&
     positiveSafeInteger(viewport.height) &&
     (capture.color_scheme === "light" || capture.color_scheme === "dark") &&
-    capture.locale === "en" &&
-    (capture.scenario === "default" || capture.scenario === "focus-first") &&
+    (capture.locale === "en" || capture.locale === "zh-CN") &&
+    (capture.scenario === "default" || capture.scenario === "focus-first" ||
+      capture.scenario === "content-stress") &&
     typeof capture.reduced_motion === "boolean" &&
     boundedCounts.every((count) =>
       nonNegativeBoundedInteger(count, 1_000_000)
-    ) &&
+    ) && validContentFixtureObservation(capture) &&
     sha256(capture.semantic_digest) && Array.isArray(samples) &&
     samples.length <= 24 && samples.every(validVisualSample);
+}
+
+function validContentFixtureObservation(
+  capture: Record<string, unknown>,
+): boolean {
+  const targets = Number(capture.content_fixture_target_count);
+  const applied = Number(capture.content_fixture_applied_count);
+  const cjk = Number(capture.content_fixture_cjk_label_count);
+  const longContent = Number(capture.content_fixture_long_content_count);
+  if (
+    targets > 2 || applied > targets || cjk > applied ||
+    longContent > applied
+  ) return false;
+  if (capture.scenario === "content-stress") {
+    return capture.locale === "zh-CN" && sha256(capture.content_fixture_digest);
+  }
+  return capture.content_fixture_digest === undefined && targets === 0 &&
+    applied === 0 && cjk === 0 && longContent === 0;
 }
 
 function validVisualSample(value: unknown): boolean {

@@ -130,14 +130,18 @@ agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-keyboard-tabs.png" >/dev/null
 
 # The host-owned quality gate must load the exact Rust-accepted bundle into a
-# token-free isolated preview, exercise the fixed six-environment matrix, and
+# token-free isolated preview, exercise the fixed seven-environment matrix,
+# including a real zh-CN long-label/long-content stress capture, and
 # persist a revision-bound report. The checker intentionally remains
-# needs_review when host pixel/content/state evidence is unavailable.
+# needs_review when host pixel and declared-state evidence is unavailable.
 verify_quality=$(agent-browser --session "$verify_session" eval \
-  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const gate=document.querySelector(".visual-quality-gate");const summary=gate?.querySelector("summary")?.textContent||"";const state=gate?.className||"";const error=gate?.querySelector("[role=alert]")?.textContent||"";if(state.includes("needs_review")&&summary.includes("6 viewports")&&summary.includes("0 blocking")&&summary.includes("3 gaps")&&!error){clearInterval(poll);resolve(JSON.stringify({state,summary}));}else if(performance.now()-started>40000){clearInterval(poll);reject(new Error(JSON.stringify({state,summary,error})));}},50)})')
-grep -q '6 viewports' <<<"$verify_quality"
+  'new Promise((resolve,reject)=>{const started=performance.now();const poll=setInterval(()=>{const gate=document.querySelector(".visual-quality-gate");const summary=gate?.querySelector("summary")?.textContent||"";const state=gate?.className||"";const error=gate?.querySelector("[role=alert]")?.textContent||"";if(state.includes("needs_review")&&summary.includes("7 viewports")&&summary.includes("0 blocking")&&summary.includes("2 gaps")&&!error){clearInterval(poll);resolve(JSON.stringify({state,summary}));}else if(performance.now()-started>45000){clearInterval(poll);reject(new Error(JSON.stringify({state,summary,error})));}},50)})')
+grep -q '7 viewports' <<<"$verify_quality"
 grep -q '0 blocking' <<<"$verify_quality"
-grep -q '3 gaps' <<<"$verify_quality"
+grep -q '2 gaps' <<<"$verify_quality"
+verify_content_stress=$(agent-browser --session "$verify_session" eval \
+  '(async()=>{const page=new URL(location.href);const artifact=page.searchParams.get("artifact_id");const token=page.searchParams.get("token");const session=page.searchParams.get("session_id");const report=await fetch(`/agent/artifact/${artifact}/visual-quality?token=${token}&session_id=${session}`).then(response=>response.json());const capture=report.captures?.find(item=>item.scenario==="content-stress");const staleGap=report.findings?.some(item=>item.finding_id==="coverage:cjk-long-content");if(capture?.locale==="zh-CN"&&capture.content_fixture_target_count===2&&capture.content_fixture_applied_count===2&&capture.content_fixture_cjk_label_count===1&&capture.content_fixture_long_content_count===1&&/^[0-9a-f]{64}$/.test(capture.content_fixture_digest)&&!staleGap)return "OK";throw new Error(JSON.stringify({capture,staleGap}));})()')
+grep -q '"OK"' <<<"$verify_content_stress"
 agent-browser --session "$verify_session" \
   screenshot "$verify_artifact_dir/artifact-workbench-visual-quality.png" >/dev/null
 

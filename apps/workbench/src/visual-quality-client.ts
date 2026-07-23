@@ -41,7 +41,7 @@ export interface VisualQualityFinding {
 }
 
 export interface VisualQualityReport {
-  schema_version: 2;
+  schema_version: 3;
   artifact_id: string;
   source_revision: number;
   artifact_digest: string;
@@ -114,7 +114,7 @@ export class VisualQualityClient {
         Accept: "application/json",
       },
       body: JSON.stringify({
-        schema_version: 2,
+        schema_version: 3,
         source_revision: payload.source_revision,
         artifact_digest: payload.content_digest,
         captures,
@@ -162,7 +162,7 @@ function validReport(
   const states = new Set(["needs_revision", "needs_review", "review_ready"]);
   const objective = new Set(["passed", "failed"]);
   const advisory = new Set(["not_run", "needs_review", "clear"]);
-  return value.schema_version === 2 &&
+  return value.schema_version === 3 &&
     value.artifact_id === context.artifactId &&
     value.source_revision === context.sourceRevision &&
     sha256(value.artifact_digest) &&
@@ -174,7 +174,7 @@ function validReport(
     objective.has(value.objective_status) &&
     typeof value.advisory_status === "string" &&
     advisory.has(value.advisory_status) &&
-    Array.isArray(value.captures) && value.captures.length === 6 &&
+    Array.isArray(value.captures) && value.captures.length === 7 &&
     value.captures.every(validCapture) &&
     Array.isArray(value.findings) && value.findings.length <= 64 &&
     value.findings.every(validFinding);
@@ -184,11 +184,32 @@ function validCapture(value: unknown): boolean {
   if (!record(value)) return false;
   return sha256(value.observation_digest) &&
     boundedString(value.capture_id, 64) && sha256(value.semantic_digest) &&
-    (value.scenario === "default" || value.scenario === "focus-first") &&
+    (value.scenario === "default" || value.scenario === "focus-first" ||
+      value.scenario === "content-stress") &&
     nonNegativeInteger(value.focus_target_count, 1) &&
     nonNegativeInteger(value.focus_visible_count, 1) &&
     Number(value.focus_visible_count) <= Number(value.focus_target_count) &&
+    validContentFixtureCapture(value) &&
     (value.pixel_digest === undefined || sha256(value.pixel_digest));
+}
+
+function validContentFixtureCapture(value: Record<string, unknown>): boolean {
+  if (
+    !nonNegativeInteger(value.content_fixture_target_count, 2) ||
+    !nonNegativeInteger(value.content_fixture_applied_count, 2) ||
+    !nonNegativeInteger(value.content_fixture_cjk_label_count, 2) ||
+    !nonNegativeInteger(value.content_fixture_long_content_count, 2)
+  ) return false;
+  const targets = Number(value.content_fixture_target_count);
+  const applied = Number(value.content_fixture_applied_count);
+  const cjk = Number(value.content_fixture_cjk_label_count);
+  const longContent = Number(value.content_fixture_long_content_count);
+  if (applied > targets || cjk > applied || longContent > applied) return false;
+  if (value.scenario === "content-stress") {
+    return value.locale === "zh-CN" && sha256(value.content_fixture_digest);
+  }
+  return value.content_fixture_digest === undefined && targets === 0 &&
+    applied === 0 && cjk === 0 && longContent === 0;
 }
 
 function validFinding(value: unknown): boolean {

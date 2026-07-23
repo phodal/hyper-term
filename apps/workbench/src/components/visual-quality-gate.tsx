@@ -21,6 +21,7 @@ const CAPTURE_MATRIX = [
     width: 390,
     height: 844,
     colorScheme: "light",
+    locale: "en",
     scenario: "default",
     reducedMotion: false,
   },
@@ -29,6 +30,7 @@ const CAPTURE_MATRIX = [
     width: 768,
     height: 1_024,
     colorScheme: "light",
+    locale: "en",
     scenario: "default",
     reducedMotion: false,
   },
@@ -37,6 +39,7 @@ const CAPTURE_MATRIX = [
     width: 1_280,
     height: 800,
     colorScheme: "light",
+    locale: "en",
     scenario: "default",
     reducedMotion: false,
   },
@@ -45,6 +48,7 @@ const CAPTURE_MATRIX = [
     width: 1_280,
     height: 800,
     colorScheme: "dark",
+    locale: "en",
     scenario: "default",
     reducedMotion: false,
   },
@@ -53,6 +57,7 @@ const CAPTURE_MATRIX = [
     width: 1_280,
     height: 800,
     colorScheme: "light",
+    locale: "en",
     scenario: "default",
     reducedMotion: true,
   },
@@ -61,7 +66,17 @@ const CAPTURE_MATRIX = [
     width: 1_280,
     height: 800,
     colorScheme: "light",
+    locale: "en",
     scenario: "focus-first",
+    reducedMotion: false,
+  },
+  {
+    id: "narrow-zh-content-stress",
+    width: 390,
+    height: 844,
+    colorScheme: "light",
+    locale: "zh-CN",
+    scenario: "content-stress",
     reducedMotion: false,
   },
 ] as const;
@@ -181,7 +196,7 @@ export function VisualQualityGate(props: VisualQualityContext) {
             capture_id: capture.id,
             viewport: { width: capture.width, height: capture.height },
             color_scheme: capture.colorScheme,
-            locale: "en",
+            locale: capture.locale,
             scenario: capture.scenario,
             reduced_motion: capture.reducedMotion,
           },
@@ -210,6 +225,7 @@ export function VisualQualityGate(props: VisualQualityContext) {
         message.observation.viewport.width !== expected.width ||
         message.observation.viewport.height !== expected.height ||
         message.observation.color_scheme !== expected.colorScheme ||
+        message.observation.locale !== expected.locale ||
         message.observation.scenario !== expected.scenario ||
         message.observation.reduced_motion !== expected.reducedMotion
       ) {

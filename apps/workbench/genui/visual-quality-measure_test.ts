@@ -1,10 +1,17 @@
 import { assertAlmostEquals, assertEquals } from "@std/assert";
 import {
+  binaryEvidence,
   contrastRatio,
   focusIndicatorChanged,
   parseCssColor,
   viewportMatches,
 } from "./visual-quality-measure.ts";
+
+Deno.test("visual quality optional evidence always serializes as a finite count", () => {
+  assertEquals(binaryEvidence(undefined), 0);
+  assertEquals(binaryEvidence(false), 0);
+  assertEquals(binaryEvidence(true), 1);
+});
 
 Deno.test("visual quality contrast checker is deterministic", () => {
   assertEquals(parseCssColor("rgb(255, 255, 255)"), [255, 255, 255]);

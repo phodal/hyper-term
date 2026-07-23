@@ -17,12 +17,13 @@ const observation = (
   height: number,
   color_scheme: "light" | "dark" = "light",
   reduced_motion = false,
-  scenario: "default" | "focus-first" = "default",
+  scenario: "default" | "focus-first" | "content-stress" = "default",
+  locale: "en" | "zh-CN" = "en",
 ) => ({
   capture_id,
   viewport: { width, height },
   color_scheme,
-  locale: "en" as const,
+  locale,
   scenario,
   reduced_motion,
   document_width: width,
@@ -35,6 +36,13 @@ const observation = (
   hidden_primary_action_count: 0,
   focus_target_count: scenario === "focus-first" ? 1 : 0,
   focus_visible_count: scenario === "focus-first" ? 1 : 0,
+  ...(scenario === "content-stress"
+    ? { content_fixture_digest: "9".repeat(64) }
+    : {}),
+  content_fixture_target_count: scenario === "content-stress" ? 2 : 0,
+  content_fixture_applied_count: scenario === "content-stress" ? 2 : 0,
+  content_fixture_cjk_label_count: scenario === "content-stress" ? 1 : 0,
+  content_fixture_long_content_count: scenario === "content-stress" ? 1 : 0,
   console_error_count: 0,
   resource_failure_count: 0,
   layout_shift_milli: 0,
@@ -56,17 +64,26 @@ const captures = [
     false,
     "focus-first",
   ),
+  observation(
+    "narrow-zh-content-stress",
+    390,
+    844,
+    "light",
+    false,
+    "content-stress",
+    "zh-CN",
+  ),
 ];
 
 function report(): VisualQualityReport {
   return {
-    schema_version: 2,
+    schema_version: 3,
     artifact_id: context.artifactId,
     source_revision: context.sourceRevision,
     artifact_digest: "a".repeat(64),
     preview_runtime_digest: "c".repeat(64),
     capture_manifest_digest: "d".repeat(64),
-    checker_version: "hyper-term-objective-v3",
+    checker_version: "hyper-term-objective-v4",
     captures: captures.map((observation) => ({
       ...observation,
       observation_digest: "e".repeat(64),
@@ -111,7 +128,7 @@ Deno.test("visual quality client loads exact accepted payload and submits observ
   assertEquals(requests[1].method, "POST");
   assertEquals(new URL(requests[1].url).searchParams.get("session_id"), "3");
   const body = await requests[1].json();
-  assertEquals(body.captures.length, 6);
+  assertEquals(body.captures.length, 7);
   assertEquals(body.artifact_digest, "a".repeat(64));
 });
 
