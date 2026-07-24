@@ -154,7 +154,24 @@ pub(super) fn recover_completed_isolated_results(
                 return Err(DaemonError::InvalidIsolatedResultStore);
             }
             let receipt = read_isolated_task_receipt(&environment)?;
-            if manager.inspect_changes(&environment)? != receipt.changes {
+            let live_changes = match manager.inspect_changes(&environment) {
+                Ok(changes) => changes,
+                Err(error) => {
+                    // The source repository may have been a temporary
+                    // workspace that no longer exists after a restart. The
+                    // retained result is not safe to review or accept without
+                    // a live Git binding, but it must not prevent the daemon
+                    // (and therefore the whole desktop app) from starting.
+                    // Keep the durable directory in place so a restored
+                    // source workspace can be validated on a later launch.
+                    eprintln!(
+                        "hyper-term: Tier 2 result {operation_id} is unavailable and remains preserved at {}: {error}",
+                        environment.environment_root.display()
+                    );
+                    continue;
+                }
+            };
+            if live_changes != receipt.changes {
                 return Err(DaemonError::IsolatedResultDigestMismatch);
             }
             completed = Some(IsolatedResult {
@@ -238,9 +255,18 @@ pub(super) fn recover_isolated_acceptances(
             .records()
             .find(|record| record.operation_id == stored.source_operation_id)
             .ok_or(DaemonError::InvalidIsolatedAcceptanceStore)?;
-        let result = results
-            .get(&stored.source_operation_id)
-            .ok_or(DaemonError::InvalidIsolatedAcceptanceStore)?;
+        let Some(result) = results.get(&stored.source_operation_id) else {
+            // A result whose Git binding is temporarily unavailable is not
+            // recovered above. Preserve its reviewed acceptance too, but do
+            // not expose either object as executable state until the result
+            // can be validated again.
+            eprintln!(
+                "hyper-term: Tier 2 acceptance {operation_id} is unavailable because result {} could not be recovered; preserving {}",
+                stored.source_operation_id,
+                entry.path().display()
+            );
+            continue;
+        };
         if source_operation.task_id != stored.task_id
             || result.environment.manifest.source_workspace != stored.workspace
             || isolated_acceptance_digest(

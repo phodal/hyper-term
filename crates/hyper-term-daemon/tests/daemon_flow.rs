@@ -602,6 +602,25 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
         "validate\nstart\nshell\nstop\ndelete\n"
     );
     drop(state);
+
+    let detached_workspace = directory.path().join("repository-detached");
+    std::fs::rename(&workspace, &detached_workspace).unwrap();
+    let state = DaemonState::open(&state_path)
+        .expect("an unavailable retained Tier 2 result must not block daemon startup");
+    assert!(matches!(
+        state.isolated_result_receipt(operation.operation_id),
+        Err(DaemonError::IsolatedResultMissing(id)) if id == operation.operation_id
+    ));
+    assert!(
+        state_path
+            .join("isolated-results")
+            .join(operation.operation_id.to_string())
+            .is_dir(),
+        "the unavailable result remains durable for later recovery"
+    );
+    drop(state);
+    std::fs::rename(&detached_workspace, &workspace).unwrap();
+
     let state = DaemonState::open(&state_path).unwrap();
     let recovered = state
         .isolated_result_receipt(operation.operation_id)
@@ -675,6 +694,24 @@ fn tier2_dispatch_consumes_approval_retains_review_result_and_never_edits_worksp
     assert!(!workspace.join("data.bin").exists());
     assert!(!workspace.join("generated.txt").exists());
     drop(state);
+
+    std::fs::rename(&workspace, &detached_workspace).unwrap();
+    let state = DaemonState::open(&state_path)
+        .expect("an unavailable reviewed Tier 2 result must not block daemon startup");
+    assert!(
+        state
+            .isolated_acceptance_reviews(task_id)
+            .unwrap()
+            .is_empty(),
+        "an acceptance without a validated source result is not actionable"
+    );
+    assert!(
+        acceptance_path.is_file(),
+        "the unavailable acceptance remains durable for later recovery"
+    );
+    drop(state);
+    std::fs::rename(&detached_workspace, &workspace).unwrap();
+
     let stored_acceptance = std::fs::read_to_string(&acceptance_path).unwrap();
     let mut tampered: serde_json::Value = serde_json::from_str(&stored_acceptance).unwrap();
     tampered["workspace"] =
