@@ -344,7 +344,7 @@ PY
   if [[ "$real_genui" == 1 && "$real_decision" == allow_once ]]; then
     native automate assert 'succeeded' 'Allowed once'
     grep -q '"type":"artifact_accepted"' "$real_root/state/events.jsonl"
-    grep -q '"executor":"hyper-term-mcp","succeeded":true' \
+    grep -q '"executor":"hyper-term-daemon","succeeded":true' \
       "$real_root/state/events.jsonl"
 
     native automate assert --timeout-ms 30000 \
