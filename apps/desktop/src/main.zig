@@ -1352,6 +1352,11 @@ fn refreshTerminalUrl(model: *Model) void {
         model.terminal_url_len = 0;
         return;
     }
+    // Agent and Capsule tabs are rendered by the Native canvas. Keep the
+    // already-mounted Terminal WebView on its last terminal namespace while
+    // it is hidden so changing surfaces does not navigate it, tear down its
+    // WebSocket, or expose a reconnect flash when the user returns.
+    if (!model.isTerminal()) return;
     const formatted = std.fmt.bufPrint(
         model.terminal_url_storage[0..],
         "{s}&tab={d}",
@@ -1386,7 +1391,7 @@ pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize 
         } else .{
             .label = terminal_view_label,
             .frame = geometry.RectF.init(0, 0, 1, 1),
-            .url = "zero://inline",
+            .url = model.terminalUrl(),
         };
         count += 1;
     }

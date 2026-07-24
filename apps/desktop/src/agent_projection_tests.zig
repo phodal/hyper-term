@@ -1279,7 +1279,7 @@ test "Rust-verified Bug Capsule opens as a dedicated read-only Native tab" {
     model.terminal_webview_mounted = true;
     model.genui_webview_mounted = true;
     try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
-    try testing.expectEqualStrings("zero://inline", panes[0].url);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", panes[0].url);
     try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
     try testing.expectEqualStrings(capsule_url, panes[1].url);
 
@@ -1330,6 +1330,35 @@ test "new terminal tabs switch reconnect namespaces without exceeding the bound"
 
     for (0..main.max_sessions + 2) |_| main.update(&model, .choose_terminal, &fx);
     try testing.expectEqual(main.max_sessions, model.openSessions().len);
+}
+
+test "Agent tab switches preserve the mounted Terminal WebView namespace" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    model.terminal_webview_mounted = true;
+    var panes: [2]main.HyperTermApp.WebViewPane = undefined;
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", panes[0].url);
+
+    main.update(&model, .choose_agent, &fx);
+    try testing.expectEqual(main.SessionMode.agent, model.activeSession().mode);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", model.terminalUrl());
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", panes[0].url);
+    try testing.expectEqual(@as(f32, 1), panes[0].frame.width);
+    try testing.expectEqual(@as(f32, 1), panes[0].frame.height);
+
+    main.update(&model, .{ .select_session = 1 }, &fx);
+    try testing.expectEqual(main.SessionMode.terminal, model.activeSession().mode);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", model.terminalUrl());
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings(main.terminal_view_anchor, panes[0].anchor.?);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", panes[0].url);
 }
 
 test "Rust desktop workspace restores Terminal and Agent tabs with their active selection" {

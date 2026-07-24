@@ -190,12 +190,16 @@ test "desktop focus lease follows Terminal tabs and returns to Native Agent canv
     var views_buffer: [4]native_sdk.ViewInfo = undefined;
     var views = harness.runtime.listViews(1, &views_buffer);
     try testing.expect(views[1].focused);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", views[1].url);
 
     main.update(&app_state.model, .choose_agent, &app_state.effects);
     try app.event(&harness.runtime, .{ .lifecycle = .frame });
     views = harness.runtime.listViews(1, &views_buffer);
     try testing.expect(views[0].focused);
     try testing.expect(!views[1].focused);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", views[1].url);
+    try testing.expectEqual(@as(f32, 1), views[1].frame.width);
+    try testing.expectEqual(@as(f32, 1), views[1].frame.height);
 
     main.update(&app_state.model, .{ .select_session = 1 }, &app_state.effects);
     try app.event(&harness.runtime, .{ .lifecycle = .frame });
@@ -1202,7 +1206,7 @@ test "direct Codex artifacts never expose the ACP editor panel" {
     try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &panes));
     model.terminal_webview_mounted = true;
     try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
-    try testing.expectEqualStrings("zero://inline", panes[0].url);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", panes[0].url);
     try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
 }
 
@@ -1227,7 +1231,7 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
     try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &initial_panes));
     model.terminal_webview_mounted = true;
     try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &initial_panes));
-    try testing.expectEqualStrings("zero://inline", initial_panes[0].url);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", initial_panes[0].url);
     try testing.expectEqualStrings(main.terminal_view_label, initial_panes[0].label);
 
     var initial_arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1262,7 +1266,7 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
     try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
     try testing.expectEqualStrings(main.terminal_view_label, panes[0].label);
-    try testing.expectEqualStrings("zero://inline", panes[0].url);
+    try testing.expectEqualStrings(terminal_url ++ "&tab=1", panes[0].url);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
