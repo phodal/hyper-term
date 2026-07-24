@@ -3,7 +3,7 @@
     grid-template-columns: 48px 184px minmax(0, 1fr);
   }
   .workspace-grid {
-    grid-template-columns: minmax(500px, 1.35fr) minmax(390px, .8fr);
+    grid-template-columns: minmax(440px, 1.05fr) minmax(420px, 1fr);
   }
   .approval-panel {
     align-items: stretch;

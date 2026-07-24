@@ -62,9 +62,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| ArtifactEditorError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(ArtifactEditorError::AcpRequired);
-        }
         let artifact = self
             .config
             .daemon
@@ -94,9 +91,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| ArtifactEditorError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(ArtifactEditorError::AcpRequired);
-        }
         let artifact = self
             .config
             .daemon
@@ -128,9 +122,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| RuntimeTraceError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(RuntimeTraceError::AcpRequired);
-        }
         let artifact = self
             .config
             .daemon
@@ -158,9 +149,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| RuntimeTraceError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(RuntimeTraceError::AcpRequired);
-        }
         let artifact = self
             .config
             .daemon
@@ -191,9 +179,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| BugCapsuleRequestError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(BugCapsuleRequestError::AcpRequired);
-        }
         let artifact = self
             .config
             .daemon
@@ -299,9 +284,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| ArtifactDraftError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(ArtifactDraftError::AcpRequired);
-        }
         if self.artifact_draft_compiler.is_none() {
             return Err(ArtifactDraftError::RuntimeUnavailable);
         }

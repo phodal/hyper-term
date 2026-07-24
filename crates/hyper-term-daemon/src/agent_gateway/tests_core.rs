@@ -1445,6 +1445,22 @@ done
             block["payload"]["role"] == "agent"
                 && block["payload"]["text"] == "Hyper Term Agent is live."
         }));
+        let journal = std::fs::read_to_string(temporary.path().join("daemon-state/events.jsonl"))
+            .expect("durable Agent journal");
+        let durable_agent_chunks = journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| {
+                event["task_id"] == task_id.to_string()
+                    && event["payload"]["type"] == "message_appended"
+                    && event["payload"]["role"] == "agent"
+                    && event["payload"]["external_message_id"] == "turn-1-message-0"
+            })
+            .count();
+        assert_eq!(
+            durable_agent_chunks, 1,
+            "adjacent provider token deltas should be durably journaled as one bounded chunk"
+        );
 
         assert_eq!(
             request(gateway.address(), &token, 3, "DELETE").await.0,

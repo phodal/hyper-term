@@ -1,5 +1,7 @@
 use super::*;
 
+const MIN_JOURNALED_AGENT_CHUNK_BYTES: usize = 128;
+
 #[derive(Clone)]
 pub(super) struct AgentTurnProjection {
     turn_id: String,
@@ -11,6 +13,7 @@ pub(super) struct AgentTurnProjection {
     agent_message_phase: u32,
     plan_block_id: BlockId,
     agent_message_bytes: usize,
+    agent_message_buffer: String,
     agent_message_interrupted: bool,
     plan_bytes: usize,
 }
@@ -57,6 +60,7 @@ pub(super) fn run_turn(session: Arc<AgentSession>, daemon: DaemonState, prompt: 
             agent_message_phase: 0,
             plan_block_id: BlockId::new(),
             agent_message_bytes: 0,
+            agent_message_buffer: String::new(),
             agent_message_interrupted: false,
             plan_bytes: 0,
         },
@@ -72,6 +76,7 @@ pub(super) fn continue_turn(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            let _ = flush_agent_message(&session, &daemon, &mut projection);
             set_progress_failed(&session, "Agent turn exceeded its five-minute bound");
             let _ = session.client.close();
             return;
@@ -79,10 +84,22 @@ pub(super) fn continue_turn(
         let event = match session.client.next_event(remaining) {
             Ok(event) => event,
             Err(error) => {
+                let _ = flush_agent_message(&session, &daemon, &mut projection);
                 set_progress_failed(&session, &agent_error_summary(&error.to_string()));
                 return;
             }
         };
+        let is_current_agent_delta = matches!(
+            &event,
+            AgentDriverEvent::MessageDelta {
+                thread_id,
+                turn_id,
+                ..
+            } if thread_id == &session.thread_id && turn_id == &projection.turn_id
+        );
+        if !is_current_agent_delta && !flush_agent_message(&session, &daemon, &mut projection) {
+            return;
+        }
         match event {
             AgentDriverEvent::UserMessageDelta {
                 thread_id,
@@ -158,21 +175,10 @@ pub(super) fn continue_turn(
                         return;
                     }
                 };
-                if daemon
-                    .append_message(
-                        session.task_id,
-                        projection.agent_block_id,
-                        MessageRole::Agent,
-                        Some(format!(
-                            "{}-message-{}",
-                            projection.turn_id, projection.agent_message_phase
-                        )),
-                        text,
-                    )
-                    .is_err()
+                projection.agent_message_buffer.push_str(&text);
+                if projection.agent_message_buffer.len() >= MIN_JOURNALED_AGENT_CHUNK_BYTES
+                    && !flush_agent_message(&session, &daemon, &mut projection)
                 {
-                    set_progress_failed(&session, "Agent response could not be journaled");
-                    let _ = session.client.close();
                     return;
                 }
                 projection.agent_message_interrupted = false;
@@ -448,6 +454,35 @@ pub(super) fn continue_turn(
             _ => {}
         }
     }
+}
+
+fn flush_agent_message(
+    session: &AgentSession,
+    daemon: &DaemonState,
+    projection: &mut AgentTurnProjection,
+) -> bool {
+    if projection.agent_message_buffer.is_empty() {
+        return true;
+    }
+    let text = std::mem::take(&mut projection.agent_message_buffer);
+    if daemon
+        .append_message(
+            session.task_id,
+            projection.agent_block_id,
+            MessageRole::Agent,
+            Some(format!(
+                "{}-message-{}",
+                projection.turn_id, projection.agent_message_phase
+            )),
+            text,
+        )
+        .is_err()
+    {
+        set_progress_failed(session, "Agent response could not be journaled");
+        let _ = session.client.close();
+        return false;
+    }
+    true
 }
 
 fn resolve_terminal_host_request(session: &AgentSession, request: AgentHostRequest) -> bool {

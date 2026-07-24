@@ -721,7 +721,6 @@ enum SessionError {
 #[derive(Debug)]
 enum EditorRequestError {
     SessionUnavailable,
-    AcpRequired,
     ArtifactUnavailable,
     StaleRevision,
     InvalidRequest,
@@ -732,7 +731,6 @@ enum EditorRequestError {
 #[derive(Debug)]
 enum ArtifactDraftError {
     SessionUnavailable,
-    AcpRequired,
     ArtifactUnavailable,
     StaleRevision,
     InvalidRequest,
@@ -746,7 +744,6 @@ enum ArtifactDraftError {
 #[derive(Debug)]
 enum ArtifactEditorError {
     SessionUnavailable,
-    AcpRequired,
     ArtifactUnavailable,
     StaleRevision,
     InvalidRequest,
@@ -757,7 +754,6 @@ enum ArtifactEditorError {
 #[derive(Debug)]
 enum RuntimeTraceError {
     SessionUnavailable,
-    AcpRequired,
     ArtifactUnavailable,
     StaleRevision,
     InvalidRequest,
@@ -769,7 +765,6 @@ enum RuntimeTraceError {
 #[derive(Debug)]
 enum BugCapsuleRequestError {
     SessionUnavailable,
-    AcpRequired,
     ArtifactUnavailable,
     Lock,
     Store,
@@ -778,7 +773,6 @@ enum BugCapsuleRequestError {
 #[derive(Debug)]
 enum WorkspaceProposalError {
     SessionUnavailable,
-    AcpRequired,
     ArtifactUnavailable,
     StaleRevision,
     InvalidRequest,

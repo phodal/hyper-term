@@ -85,11 +85,13 @@ cannot capture system WebView pixels, so this gate deliberately pairs the
 Native view/sizing snapshot with HTTP and Rust projection checks instead of
 claiming unsupported DOM screenshot coverage.
 
-The repository also provides `scripts/smoke_macos_real_codex_acp.sh` as an
-explicit developer-only post-package gate for authenticated Codex, Claude, and
-GitHub Copilot accounts. It launches the assembled app with an
-automation-enabled Native renderer and proves Native composer input reaches
-the selected ACP provider, enters the streaming/stop state, and returns to an
+The repository also provides `scripts/smoke_macos_real_codex.sh` and
+`scripts/smoke_macos_real_codex_acp.sh` as explicit developer-only post-package
+gates for authenticated Codex, Claude, and GitHub Copilot accounts. The first
+exercises the direct Codex app-server path; the second defaults to Codex ACP
+and can select the other ACP providers. They launch the assembled app with an
+automation-enabled Native renderer and prove Native composer input reaches
+the selected provider, enters the streaming/stop state, and returns to an
 enabled composer with the expected Agent Block. This account-using gate is
 intentionally excluded from CI and never invokes login. By default it does not
 authorize a tool call. Select Claude with
@@ -120,6 +122,11 @@ automation-enabled test renderer:
 
 ```bash
 (cd apps/desktop && native build -Dautomation=true)
+HYPER_TERM_REAL_ACP_GENUI=1 \
+./scripts/smoke_macos_real_codex.sh \
+  "dist/macos/Hyper Term.app" \
+  "apps/desktop/zig-out/bin/hyper-term"
+
 HYPER_TERM_REAL_ACP_PROVIDER=claude \
 HYPER_TERM_REAL_ACP_GENUI=1 \
 ./scripts/smoke_macos_real_codex_acp.sh \

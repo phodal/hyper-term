@@ -34,9 +34,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| WorkspaceProposalError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(WorkspaceProposalError::AcpRequired);
-        }
         let artifact = self
             .config
             .daemon
@@ -489,9 +486,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| EditorRequestError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(EditorRequestError::AcpRequired);
-        }
         let artifact = self
             .config
             .daemon

@@ -217,6 +217,7 @@ pub const Msg = union(enum) {
     toggle_agent_provider_picker,
     dismiss_agent_provider_picker,
     refresh_agent_providers,
+    retry_agent_session,
     agent_providers_refreshed: native_sdk.EffectResponse,
     open_codex_login_terminal,
     open_claude_login_terminal,
@@ -347,6 +348,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_agent_provider_picker => toggleAgentProviderPicker(model, fx),
         .dismiss_agent_provider_picker => model.agent_provider_picker_open = false,
         .refresh_agent_providers => requestAgentProviderRefresh(model, fx),
+        .retry_agent_session => {
+            const session_id = model.activeSession().id;
+            if (model.hasRetryableAgentStart()) requestAgentStart(model, session_id, fx);
+        },
         .agent_providers_refreshed => |response| applyAgentProviderRefresh(model, response),
         .open_codex_login_terminal => openProviderLoginTerminal(model, .codex, fx),
         .open_claude_login_terminal => openProviderLoginTerminal(model, .claude_acp, fx),

@@ -323,6 +323,14 @@ textarea:focus-visible {
   font-size: 11px;
   cursor: pointer;
 }
+.demo-boundary {
+  padding: 3px 6px;
+  border: 1px solid var(--workbench-warning-border);
+  border-radius: 999px;
+  font: 800 9px ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .06em;
+  white-space: nowrap;
+}
 .attention-pulse {
   width: 7px;
   height: 7px;
@@ -333,7 +341,7 @@ textarea:focus-visible {
 .workspace-grid {
   display: grid;
   min-height: 0;
-  grid-template-columns: minmax(500px, 1.4fr) minmax(390px, .8fr);
+  grid-template-columns: minmax(460px, 1.12fr) minmax(440px, 1fr);
 }
 
 .timeline {
@@ -1953,4 +1961,28 @@ textarea:focus-visible {
   box-shadow: 0 12px 30px var(--workbench-shadow);
   color: var(--workbench-text);
   font-size: 10px;
+}
+
+/* The overview is a product preview, so keep its evidence legible at a glance. */
+[data-authority="demo_broker"] .terminal-chrome code,
+[data-authority="demo_broker"] .pty-status,
+[data-authority="demo_broker"] .terminal-task-bar,
+[data-authority="demo_broker"] .agent-chip,
+[data-authority="demo_broker"] .terminal-prelude p > span,
+[data-authority="demo_broker"] .block-meta {
+  font-size: 9px;
+}
+[data-authority="demo_broker"] .session-tab,
+[data-authority="demo_broker"] .terminal-prelude,
+[data-authority="demo_broker"] .block-body > p,
+[data-authority="demo_broker"] .block-body > strong,
+[data-authority="demo_broker"] .command-line,
+[data-authority="demo_broker"] .approval-panel p,
+[data-authority="demo_broker"] .approval-actions button,
+[data-authority="demo_broker"] .receipt-panel p {
+  font-size: 11px;
+}
+[data-authority="demo_broker"] .approval-panel strong,
+[data-authority="demo_broker"] .receipt-panel strong {
+  font-size: 12px;
 }

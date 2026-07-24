@@ -75,7 +75,7 @@
           </if>
           <spacer grow="1" />
           <if test="{canOpenAgentEditor}">
-            <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open ACP artifact editor">Edit</button>
+            <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open Agent artifact editor">Edit</button>
           </if>
         </row>
       </if>
@@ -99,6 +99,27 @@
          builder vocabulary is contract-checked in agent_block_contract.native. -->
     <column grow="1" label="Agent blocks"></column>
     <separator />
+    <if test="{hasAgentStatusNotice}">
+      <row gap="8" padding="8" cross="center" background="surface_subtle" label="Agent failure recovery">
+        <icon name="circle-dot" width="13" height="13" foreground="accent" />
+        <column gap="2" grow="1">
+          <text><span weight="medium">Agent needs attention</span></text>
+          <text foreground="text_muted">{agentStatus}</text>
+        </column>
+        <if test="{hasRetryableAgentTurn}">
+          <button size="sm" variant="outline" icon="refresh-cw" on-press="send_agent_prompt" disabled="{agentRetryDisabled}" label="Retry failed Agent turn">Retry turn</button>
+        </if>
+        <else>
+          <if test="{hasRetryableAgentStart}">
+            <button size="sm" variant="outline" icon="refresh-cw" on-press="retry_agent_session" label="Retry Agent connection">Retry connection</button>
+          </if>
+          <else>
+            <button size="sm" variant="outline" icon="refresh-cw" on-press="refresh_agent_providers" disabled="{agent_provider_refresh_in_flight}" label="Refresh Agent providers">Refresh providers</button>
+          </else>
+        </else>
+      </row>
+      <separator />
+    </if>
     <if test="{hasAgentEditor}">
       <use template="agent-composer" />
     </if>
@@ -107,20 +128,17 @@
         <use template="agent-composer" />
       </column>
     </else>
-    <if test="{hasAgentStatusNotice}">
-      <status-bar>{agentStatus}</status-bar>
-    </if>
   </column>
 </template>
 
 <template name="agent-editor">
-  <column global-key="{genUiArtifactLabel}" min-width="360" grow="1" background="background" label="ACP artifact editor">
+  <column global-key="{genUiArtifactLabel}" min-width="360" grow="1" background="background" label="Agent artifact editor">
     <row gap="8" padding="9" cross="center" background="surface_subtle">
       <icon name="edit" width="13" height="13" foreground="accent" />
       <text grow="1"><span weight="medium">Edit</span></text>
       <text foreground="text_muted"><span mono="true">{genUiArtifactLabel}</span></text>
       <badge variant="secondary">draft</badge>
-      <button size="icon" variant="ghost" icon="x" on-press="close_agent_editor" label="Close ACP artifact editor"></button>
+      <button size="icon" variant="ghost" icon="x" on-press="close_agent_editor" label="Close Agent artifact editor"></button>
     </row>
     <separator />
     <column grow="1" background="background" label="Agent artifact editor viewport"></column>

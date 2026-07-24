@@ -1,5 +1,5 @@
     #[tokio::test(flavor = "multi_thread")]
-    async fn accepted_artifact_preview_is_authenticated_current_and_network_closed() {
+    async fn direct_codex_artifact_editor_is_authenticated_current_and_network_closed() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
         let gateway_state = temporary.path().join("gateway-state");
@@ -227,6 +227,17 @@
             source["files"]["/App.tsx"],
             "export default () => <main>ready</main>;"
         );
+        let editor_state_path = format!(
+            "/agent/artifact/{}/editor-state?token={token}&session_id=6",
+            accepted.artifact_id
+        );
+        let (status, editor_state) =
+            request_path(gateway.address(), &editor_state_path, "GET", b"").await;
+        assert_eq!(status, StatusCode::OK.as_u16());
+        let editor_state: serde_json::Value = serde_json::from_slice(&editor_state).unwrap();
+        assert_eq!(editor_state["artifact_id"], accepted.artifact_id.to_string());
+        assert_eq!(editor_state["base_source_revision"], 9);
+        assert_eq!(editor_state["entrypoint"], "/App.tsx");
         let lsp_path = format!(
             "/agent/artifact/{}/lsp?token={token}&session_id=6",
             accepted.artifact_id
@@ -240,7 +251,7 @@
             "kind": "diagnostics"
         }))
         .unwrap();
-        assert_eq!(
+        assert_ne!(
             request_path(gateway.address(), &lsp_path, "POST", &lsp_request,)
                 .await
                 .0,

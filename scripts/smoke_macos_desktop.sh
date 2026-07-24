@@ -470,7 +470,7 @@ PY
     'role=button name="Inspect Agent execution context"' \
     'role=button name="Send prompt".*enabled=true'
   native automate assert --absent \
-    'name="ACP artifact editor"' \
+    'name="Agent artifact editor"' \
     'name="Agent execution context details"' \
     'view @w1/hyper-term-genui-view' \
     'error event=' \
@@ -557,12 +557,12 @@ PY
   native automate assert --timeout-ms 5000 'role=button name="Allowed once"'
   native automate assert --timeout-ms 30000 \
     'The Agentic UI was compiled by the brokered Deno runtime\.' \
-    'role=button name="Open ACP artifact editor".*enabled=true'
-  smoke_open_editor_id=$(smoke_widget_id 'role=button name="Open ACP artifact editor".*enabled=true')
+    'role=button name="Open Agent artifact editor".*enabled=true'
+  smoke_open_editor_id=$(smoke_widget_id 'role=button name="Open Agent artifact editor".*enabled=true')
   native automate widget-click hyper-term-canvas "$smoke_open_editor_id"
   native automate assert --timeout-ms 30000 \
-    'name="ACP artifact editor"' \
-    'role=button name="Close ACP artifact editor".*enabled=true' \
+    'name="Agent artifact editor"' \
+    'role=button name="Close Agent artifact editor".*enabled=true' \
     'view @w1/hyper-term-genui-view.*surface=artifact'
   python3 - .zig-cache/native-sdk-automation/snapshot.txt <<'PY'
 import json
@@ -607,13 +607,13 @@ PY
   smoke_genui_screenshot=.zig-cache/native-sdk-automation/screenshot-hyper-term-genui.png
   cp "$smoke_screenshot" "$smoke_genui_screenshot"
   native automate snapshot >/dev/null
-  smoke_close_editor_id=$(smoke_widget_id 'role=button name="Close ACP artifact editor".*enabled=true')
+  smoke_close_editor_id=$(smoke_widget_id 'role=button name="Close Agent artifact editor".*enabled=true')
   native automate widget-click hyper-term-canvas "$smoke_close_editor_id"
   native automate assert --absent \
-    'name="ACP artifact editor"' \
+    'name="Agent artifact editor"' \
     'view @w1/hyper-term-genui-view'
   native automate assert \
-    'role=button name="Open ACP artifact editor".*enabled=true' \
+    'role=button name="Open Agent artifact editor".*enabled=true' \
     'role=textbox name="Agent prompt".*focused=true'
   native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
 

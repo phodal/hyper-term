@@ -867,10 +867,22 @@ test "Agent start failures keep the tab inert and explain the gateway result" {
     try testing.expectEqual(main.AgentTurnStatus.failed, model.agent_turn_status);
     try testing.expect(model.agentSubmitDisabled());
     try testing.expect(model.hasAgentStatusNotice());
+    try testing.expect(model.hasRetryableAgentStart());
+    try testing.expect(!model.hasRetryableAgentTurn());
     try testing.expectEqualStrings(
         "Agent session limit reached · close a tab and retry",
         model.agentStatus(),
     );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const failed_tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByLabel(failed_tree.root, "Agent failure recovery") != null);
+    try testing.expect(findByLabel(failed_tree.root, "Retry Agent connection") != null);
+
+    main.update(&model, .retry_agent_session, &fx);
+    try testing.expectEqual(main.AgentConnection.connecting, model.activeSession().agent_connection);
+    try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
 }
 
 test "Agent composer posts a bounded prompt to the active Codex turn" {
@@ -1066,6 +1078,8 @@ test "failed Agent turns restore the submitted prompt without replacing a newer 
         ,
     } }, &fx);
     try testing.expectEqualStrings("Keep my failed prompt", model.agentComposerText());
+    try testing.expect(model.hasRetryableAgentTurn());
+    try testing.expect(!model.agentRetryDisabled());
     try testing.expectEqualStrings(
         "Model gpt-test requires a newer Codex CLI · choose another model or update Codex",
         model.agentStatus(),
@@ -1184,7 +1198,7 @@ test "direct Codex capabilities insert skill mentions instead of fake slash comm
     try testing.expectEqualStrings("$native-sdk ", model.agentComposerText());
 }
 
-test "direct Codex artifacts never expose the ACP editor panel" {
+test "direct Codex accepted artifacts expose the editor on demand" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     var model = main.initialModelWithServices(terminal_url, agent_url);
@@ -1210,10 +1224,10 @@ test "direct Codex artifacts never expose the ACP editor panel" {
     try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
     try testing.expect(model.hasGenUiArtifact());
-    try testing.expect(!model.hasEditableAgentArtifact());
-    try testing.expect(!model.canOpenAgentEditor());
+    try testing.expect(model.hasEditableAgentArtifact());
+    try testing.expect(model.canOpenAgentEditor());
     try testing.expect(!model.hasAgentEditor());
-    try testing.expect(findByLabel(tree.root, "Open ACP artifact editor") == null);
+    try testing.expect(findByLabel(tree.root, "Open Agent artifact editor") != null);
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
     try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &panes));
@@ -1221,7 +1235,7 @@ test "direct Codex artifacts never expose the ACP editor panel" {
     try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &panes));
 }
 
-test "accepted ACP artifact stays single-pane until the user enters editing" {
+test "accepted Agent artifact stays single-pane until the user enters editing" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
     var model = main.initialModelWithProviders(
@@ -1281,7 +1295,7 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
     var tree = try buildTree(arena, &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
     try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
-    const open_editor = findByLabel(tree.root, "Open ACP artifact editor").?;
+    const open_editor = findByLabel(tree.root, "Open Agent artifact editor").?;
     main.update(&model, tree.msgForPointer(open_editor.id, .up).?, &fx);
 
     try testing.expect(!model.canOpenAgentEditor());
@@ -1316,11 +1330,11 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
 
     tree = try buildTree(arena, &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) != null);
-    try testing.expect(findByLabel(tree.root, "Open ACP artifact editor") == null);
+    try testing.expect(findByLabel(tree.root, "Open Agent artifact editor") == null);
     try testing.expect(containsText(tree.root, "Edit"));
     try testing.expect(containsText(tree.root, "draft"));
     try testing.expect(containsText(tree.root, "55555555"));
-    const close_editor = findByLabel(tree.root, "Close ACP artifact editor").?;
+    const close_editor = findByLabel(tree.root, "Close Agent artifact editor").?;
     main.update(&model, tree.msgForPointer(close_editor.id, .up).?, &fx);
     try testing.expect(!model.hasAgentEditor());
     try testing.expect(model.canOpenAgentEditor());
@@ -1328,7 +1342,7 @@ test "accepted ACP artifact stays single-pane until the user enters editing" {
 
     tree = try buildTree(arena, &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
-    try testing.expect(findByLabel(tree.root, "Open ACP artifact editor") != null);
+    try testing.expect(findByLabel(tree.root, "Open Agent artifact editor") != null);
     const tokens = main.hyperTermTokens(&model);
     const sweep = canvas.LayoutAuditSweepOptions{
         .tokens = tokens,

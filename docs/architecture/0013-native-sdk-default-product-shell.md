@@ -125,7 +125,7 @@ Agent mode may own a second system WebView for the current accepted Agentic UI
 artifact. The startup scene itself contains only the Metal canvas. After its
 first present, a one-shot Native timer mounts the Terminal WebView on the next
 run-loop turn; the GenUI/Workbench WebView is not created until the user opens
-an ACP artifact editor or a verified Bug Capsule. Once mounted, the compositor
+an Agent artifact editor or a verified Bug Capsule. Once mounted, the compositor
 derives its URL from a validated isolated Artifact Block, uses the artifact
 source revision as a reload token, and collapses it to 1-by-1 when inactive.
 This keeps ordinary Terminal and Agent launches free of an unused WKWebView

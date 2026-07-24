@@ -3,10 +3,11 @@ import type { BlockDocument, BlockEnvelope, UiIntent } from "../protocol.ts";
 interface BlockWorkbenchProps {
   document: BlockDocument;
   submitIntent(intent: UiIntent): Promise<void>;
+  isDemo?: boolean;
 }
 
 export function BlockWorkbench(
-  { document, submitIntent }: BlockWorkbenchProps,
+  { document, submitIntent, isDemo = false }: BlockWorkbenchProps,
 ) {
   return (
     <section className="timeline" aria-label="Terminal transcript">
@@ -42,6 +43,7 @@ export function BlockWorkbench(
             key={block.block_id}
             block={block}
             submitIntent={submitIntent}
+            isDemo={isDemo}
           />
         ))}
       </div>
@@ -79,9 +81,11 @@ function TerminalPrelude() {
 function BlockCard({
   block,
   submitIntent,
+  isDemo,
 }: {
   block: BlockEnvelope;
   submitIntent(intent: UiIntent): Promise<void>;
+  isDemo: boolean;
 }) {
   const payload = block.payload;
   const receiptOutcome = payload.type === "operation_receipt"
@@ -139,9 +143,21 @@ function BlockCard({
                     decision: "allow_once",
                   })}
               >
-                Allow once
+                {isDemo ? "Preview allow" : "Allow once"}
               </button>
-              <button type="button">Reject</button>
+              <button
+                type="button"
+                onClick={() =>
+                  void submitIntent({
+                    type: "decide_permission",
+                    task_id: block.task_id,
+                    operation_id: String(payload.operation_id),
+                    expected_revision: Number(payload.operation_revision),
+                    decision: "reject_once",
+                  })}
+              >
+                {isDemo ? "Preview reject" : "Reject"}
+              </button>
             </div>
           </div>
         )}

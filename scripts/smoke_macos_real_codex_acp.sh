@@ -49,6 +49,14 @@ if [[ "$real_hostile" == 1 && "$real_decision" != allow_once ]]; then
   exit 1
 fi
 case "$real_provider" in
+  codex_direct)
+    real_provider_label="Codex"
+    real_provider_shortcut="hyper-term.new-codex-agent"
+    real_provider_flag="--codex"
+    real_agent_command="codex"
+    real_adapter_package=""
+    real_genui_tool_label="hyper_term.genui.compile"
+    ;;
   codex)
     real_provider_label="Codex ACP"
     real_provider_shortcut="hyper-term.new-codex-acp-agent"
@@ -74,7 +82,7 @@ case "$real_provider" in
     real_genui_tool_label="hyper_term-hyper_term-genui-compile"
     ;;
   *)
-    echo "HYPER_TERM_REAL_ACP_PROVIDER must be codex, claude, or copilot" >&2
+    echo "HYPER_TERM_REAL_ACP_PROVIDER must be codex_direct, codex, claude, or copilot" >&2
     exit 1
     ;;
 esac
@@ -92,7 +100,7 @@ for real_command in "$real_agent_command" grep native python3 sed stat tail; do
 done
 
 real_agent=$(command -v "$real_agent_command")
-if [[ "$real_provider" == codex ]]; then
+if [[ "$real_provider" == codex || "$real_provider" == codex_direct ]]; then
   if ! "$real_agent" login status 2>&1 | grep -q '^Logged in'; then
     echo "Codex is not authenticated; run 'codex login' before this opt-in smoke" >&2
     exit 1
@@ -314,8 +322,12 @@ if decision == "allow_once":
     for payload in payloads:
         if payload.get("type") == "message_appended" and payload.get("role") == "agent":
             messages[payload.get("block_id")] += payload.get("text", "")
-    if not any(message.strip() == expected for message in messages.values()):
-        raise SystemExit("Agent event stream did not contain the exact expected response")
+    # Providers may attach pre-tool progress and the final response to the same
+    # semantic message ID. The prompt requires the post-tool response to end in
+    # the exact marker; do not mistake a legitimate progress prefix for loss of
+    # the final durable response.
+    if not any(message.rstrip().endswith(expected) for message in messages.values()):
+        raise SystemExit("Agent event stream did not end with the expected response")
 
 if genui == "1":
     if not any(
@@ -348,17 +360,17 @@ PY
       "$real_root/state/events.jsonl"
 
     native automate assert --timeout-ms 30000 \
-      'role=button name="Open ACP artifact editor".*enabled=true'
+      'role=button name="Open Agent artifact editor".*enabled=true'
     real_editor_id=$(real_widget_id \
-      'role=button name="Open ACP artifact editor".*enabled=true')
+      'role=button name="Open Agent artifact editor".*enabled=true')
     if [[ -z "$real_editor_id" ]]; then
       echo "real $real_provider_label artifact editor control is unavailable" >&2
       exit 1
     fi
     native automate widget-click hyper-term-canvas "$real_editor_id"
     native automate assert --timeout-ms 30000 \
-      'role=group name="ACP artifact editor"' \
-      'role=button name="Close ACP artifact editor".*enabled=true' \
+      'role=group name="Agent artifact editor"' \
+      'role=button name="Close Agent artifact editor".*enabled=true' \
       'hyper-term-genui-view.*surface=artifact.*artifact_id=.*token=[0-9a-f]'
 
     python3 - \
@@ -511,9 +523,9 @@ evidence = {
     "native_preview_denied": native_preview_denied,
 }
 pathlib.Path(evidence_path).write_text(json.dumps(evidence, indent=2) + "\n")
-print("Native ACP artifact editor: opened on demand")
+print("Native Agent artifact editor: opened on demand")
 print("artifact Workbench: index and built assets returned HTTP 200")
-print("Rust source/checkpoint: bound to the accepted ACP artifact")
+print("Rust source/checkpoint: bound to the accepted Agent artifact")
 print("Rust-managed Deno LSP: diagnostics response matched editor context")
 if native_preview_denied:
     print("Native bridge: denied inside the isolated Artifact iframe and journaled by Rust")

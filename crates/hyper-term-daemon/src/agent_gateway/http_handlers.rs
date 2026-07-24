@@ -601,10 +601,6 @@ pub(super) fn artifact_editor_response(
             StatusCode::NOT_FOUND,
             "Artifact editor state is unavailable",
         ),
-        Ok(Err(ArtifactEditorError::AcpRequired)) => status_response(
-            StatusCode::FORBIDDEN,
-            "Artifact editor state is available only for ACP Agent artifacts",
-        ),
         Ok(Err(ArtifactEditorError::StaleRevision)) => status_response(
             StatusCode::CONFLICT,
             "Artifact editor checkpoint no longer matches the current revision",
@@ -677,10 +673,6 @@ pub(super) fn artifact_runtime_trace_response(
         Ok(Err(RuntimeTraceError::SessionUnavailable | RuntimeTraceError::ArtifactUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Runtime trace is unavailable")
         }
-        Ok(Err(RuntimeTraceError::AcpRequired)) => status_response(
-            StatusCode::FORBIDDEN,
-            "Runtime trace is available only for ACP Agent artifacts",
-        ),
         Ok(Err(RuntimeTraceError::StaleRevision | RuntimeTraceError::Sequence)) => status_response(
             StatusCode::CONFLICT,
             "Runtime trace no longer matches the current Artifact stream",
@@ -719,10 +711,6 @@ pub(super) async fn artifact_debug_capsule(
             BugCapsuleRequestError::SessionUnavailable
             | BugCapsuleRequestError::ArtifactUnavailable,
         )) => status_response(StatusCode::NOT_FOUND, "Bug capsule is unavailable"),
-        Ok(Err(BugCapsuleRequestError::AcpRequired)) => status_response(
-            StatusCode::FORBIDDEN,
-            "Bug capsules are available only for ACP Agent artifacts",
-        ),
         Ok(Err(BugCapsuleRequestError::Lock | BugCapsuleRequestError::Store)) | Err(_) => {
             status_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -830,10 +818,6 @@ pub(super) async fn artifact_editor_lsp(
         Ok(Err(EditorRequestError::SessionUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
         }
-        Ok(Err(EditorRequestError::AcpRequired)) => status_response(
-            StatusCode::FORBIDDEN,
-            "Editor LSP is available only for ACP Agent artifacts",
-        ),
         Ok(Err(EditorRequestError::ArtifactUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
         }
@@ -881,10 +865,6 @@ pub(super) async fn propose_artifact_draft(
         Ok(Err(ArtifactDraftError::SessionUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
         }
-        Ok(Err(ArtifactDraftError::AcpRequired)) => status_response(
-            StatusCode::FORBIDDEN,
-            "Artifact publishing is available only for ACP Agent artifacts",
-        ),
         Ok(Err(ArtifactDraftError::ArtifactUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
         }
@@ -977,10 +957,6 @@ pub(super) async fn propose_workspace_apply(
         Ok(Err(WorkspaceProposalError::SessionUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
         }
-        Ok(Err(WorkspaceProposalError::AcpRequired)) => status_response(
-            StatusCode::FORBIDDEN,
-            "Workspace apply is available only for ACP Agent artifacts",
-        ),
         Ok(Err(WorkspaceProposalError::ArtifactUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
         }
@@ -1045,10 +1021,6 @@ pub(super) async fn preview_workspace_apply(
         Ok(Err(WorkspaceProposalError::SessionUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Agent session does not exist")
         }
-        Ok(Err(WorkspaceProposalError::AcpRequired)) => status_response(
-            StatusCode::FORBIDDEN,
-            "Workspace preview is available only for ACP Agent artifacts",
-        ),
         Ok(Err(WorkspaceProposalError::ArtifactUnavailable)) => {
             status_response(StatusCode::NOT_FOUND, "Artifact source is unavailable")
         }

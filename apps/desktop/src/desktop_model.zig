@@ -851,6 +851,24 @@ pub const Model = struct {
             model.agent_turn_status == .failed;
     }
 
+    pub fn hasRetryableAgentTurn(model: *const Model) bool {
+        return model.activeSession().mode == .agent and
+            model.activeSession().agent_connection == .ready and
+            model.agent_turn_status == .failed;
+    }
+
+    pub fn hasRetryableAgentStart(model: *const Model) bool {
+        const session = model.activeSession();
+        return session.mode == .agent and
+            session.agent_connection == .failed and
+            model.agentProviderReady(session.agent_provider);
+    }
+
+    pub fn agentRetryDisabled(model: *const Model) bool {
+        return model.agentSubmitDisabled() or
+            std.mem.trim(u8, model.agent_composer_buffer.text(), " \t\r\n").len == 0;
+    }
+
     pub fn agentComposerHeight(model: *const Model) f32 {
         const text = model.agent_composer_buffer.text();
         const visual_lines = utf8VisualLineCount(text, 96);
@@ -1016,11 +1034,7 @@ pub const Model = struct {
     }
 
     pub fn hasEditableAgentArtifact(model: *const Model) bool {
-        if (!model.hasGenUiArtifact()) return false;
-        return switch (model.activeSession().agent_provider) {
-            .codex => false,
-            .codex_acp, .claude_acp, .copilot_acp => true,
-        };
+        return model.hasGenUiArtifact();
     }
 
     pub fn canOpenAgentEditor(model: *const Model) bool {

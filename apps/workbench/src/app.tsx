@@ -21,6 +21,7 @@ export function App() {
 function DemoWorkbench() {
   const host = useMemo(resolveHost, []);
   const [notice, setNotice] = useState<string>();
+  const isDemoBroker = host.authority === "demo_broker";
 
   async function submitIntent(intent: UiIntent): Promise<void> {
     await host.submitIntent(intent);
@@ -33,7 +34,7 @@ function DemoWorkbench() {
   }
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-authority={host.authority}>
       <nav className="activity-bar" aria-label="Workbench activity">
         <div className="brand-mark">H</div>
         <button className="active" type="button" aria-label="Terminal sessions">
@@ -97,14 +98,35 @@ function DemoWorkbench() {
       <main className="workspace">
         <div className="attention-bar">
           <span className="attention-pulse" />
-          <strong>1 operation needs approval</strong>
-          <span>The exact command and base revision are locked.</span>
-          <button type="button">Review</button>
+          <strong>
+            {isDemoBroker
+              ? "Static product preview"
+              : "1 operation needs approval"}
+          </strong>
+          <span>
+            {isDemoBroker
+              ? "Controls emit inert demo intents; they cannot execute commands or write files."
+              : "The exact command and base revision are locked."}
+          </span>
+          {isDemoBroker && (
+            <span className="demo-boundary">NO MACHINE EFFECT</span>
+          )}
+          <button
+            type="button"
+            onClick={() =>
+              document.querySelector(".approval-panel")?.scrollIntoView({
+                behavior: "smooth",
+                block: "center",
+              })}
+          >
+            Review preview
+          </button>
         </div>
         <div className="workspace-grid">
           <BlockWorkbench
             document={sampleDocument}
             submitIntent={submitIntent}
+            isDemo={isDemoBroker}
           />
           <GenUiStudio host={host} />
         </div>

@@ -13,17 +13,23 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[path = "codex_approval.rs"]
+mod codex_approval;
+
 use crate::codex_containment::{
     AgentContainmentConfig, apply_managed_proxy_environment, compile_agent_task_sandbox,
 };
 use crate::{
     AgentAvailableCommand, AgentClientError, AgentDriverEvent, AgentEffectAuthorization,
-    AgentEffectKind, AgentEffectProposal, AgentGoalStatus, AgentSessionCapabilities,
-    AgentSessionConfigChoice, AgentSessionConfigKind, AgentSessionConfigOption,
-    AgentSessionConfigValue, AgentThreadGoal, DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError,
-    DriverEvent, DriverFraming, DriverKind, DriverManifest, DriverProcess, DriverSpec, DriverState,
-    ExternalRequestId, StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox,
-    sha256_file,
+    AgentEffectProposal, AgentGoalStatus, AgentSessionCapabilities, AgentSessionConfigChoice,
+    AgentSessionConfigKind, AgentSessionConfigOption, AgentSessionConfigValue, AgentThreadGoal,
+    DEFAULT_MAX_PENDING_DRIVER_OUTPUT_BYTES, DriverError, DriverEvent, DriverFraming, DriverKind,
+    DriverManifest, DriverProcess, DriverSpec, DriverState, ExternalRequestId,
+    StructuredAgentClient, StructuredAgentProtocol, process::BoundedDriverInbox, sha256_file,
+};
+use codex_approval::{
+    brokered_mcp_elicitation_response, codex_approval_result, normalize_effect,
+    normalize_permission_profile,
 };
 
 const MAX_PENDING_APPROVALS: usize = 128;
@@ -66,13 +72,20 @@ pub struct CodexAppServerClient {
     next_request_id: AtomicU64,
     request_gate: Mutex<()>,
     inbox: Mutex<BoundedDriverInbox>,
-    pending: Mutex<HashMap<ExternalRequestId, AgentEffectProposal>>,
+    pending: Mutex<HashMap<ExternalRequestId, PendingCodexApproval>>,
     model_catalog: Mutex<Vec<CodexModelCapability>>,
     session_capabilities: Mutex<AgentSessionCapabilities>,
     turn_config: Mutex<CodexTurnConfig>,
     thread_goal: Mutex<Option<AgentThreadGoal>>,
     workspace: String,
+    trusted_brokered_mcp_server: bool,
     staged_auth_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCodexApproval {
+    proposal: AgentEffectProposal,
+    requested_permissions: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -182,6 +195,7 @@ impl CodexAppServerClient {
             apply_managed_proxy_environment(&mut environment, &containment.credentialed_proxy_url);
         }
         let driver_id = Uuid::new_v4();
+        let trusted_brokered_mcp_server = config.brokered_mcp_server.is_some();
         let arguments = codex_arguments(config.brokered_mcp_server.as_ref())?;
         let sandbox = match config.containment.as_ref() {
             Some(containment) => {
@@ -264,6 +278,7 @@ impl CodexAppServerClient {
             turn_config: Mutex::new(CodexTurnConfig::default()),
             thread_goal: Mutex::new(None),
             workspace: workspace_text,
+            trusted_brokered_mcp_server,
             staged_auth_file,
         })
     }
@@ -398,11 +413,11 @@ impl CodexAppServerClient {
                 "operation revision must be positive".into(),
             ));
         }
-        let proposal = lock(&self.pending)?
+        let pending = lock(&self.pending)?
             .get(request_id)
             .cloned()
             .ok_or(CodexAdapterError::UnknownApproval)?;
-        if authorization.proposal_sha256 != proposal.payload_sha256 {
+        if authorization.proposal_sha256 != pending.proposal.payload_sha256 {
             return Err(CodexAdapterError::InvalidAuthorization(
                 "proposal digest does not match the pending request".into(),
             ));
@@ -424,16 +439,20 @@ impl CodexAppServerClient {
                 state => return Err(CodexAdapterError::Exited(state)),
             }
         }
+        let result = codex_approval_result(&pending, authorization.decision, decision);
         self.process.send_json(&json!({
             "id": request_id_value(request_id),
-            "result": {"decision": decision}
+            "result": result
         }))?;
         lock(&self.pending)?.remove(request_id);
         Ok(())
     }
 
     pub fn pending_effects(&self) -> Result<Vec<AgentEffectProposal>, CodexAdapterError> {
-        Ok(lock(&self.pending)?.values().cloned().collect())
+        Ok(lock(&self.pending)?
+            .values()
+            .map(|pending| pending.proposal.clone())
+            .collect())
     }
 
     pub fn state(&self) -> Result<DriverState, CodexAdapterError> {
@@ -642,22 +661,54 @@ impl CodexAppServerClient {
         payload: Value,
     ) -> Result<AgentDriverEvent, CodexAdapterError> {
         let method = payload.get("method").and_then(Value::as_str);
+        if method == Some("mcpServer/elicitation/request") {
+            let request_id = external_request_id(payload.get("id"))?;
+            let params = payload.get("params").unwrap_or(&Value::Null);
+            let result =
+                brokered_mcp_elicitation_response(params, self.trusted_brokered_mcp_server)?;
+            self.process.send_json(&json!({
+                "id": request_id_value(&request_id),
+                "result": result
+            }))?;
+            return Ok(AgentDriverEvent::ProtocolNotice {
+                sequence,
+                method: method.map(ToOwned::to_owned),
+                payload_sha256: sha256_value(&payload)?,
+            });
+        }
         if let Some(
-            method @ ("item/commandExecution/requestApproval" | "item/fileChange/requestApproval"),
+            method @ ("item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"),
         ) = method
         {
             let request_id = external_request_id(payload.get("id"))?;
+            let params = payload.get("params").cloned().unwrap_or(Value::Null);
             let proposal = normalize_effect(
                 self.process.manifest().driver_id,
                 request_id.clone(),
                 method,
-                payload.get("params").cloned().unwrap_or(Value::Null),
+                params.clone(),
             )?;
+            let requested_permissions = if method == "item/permissions/requestApproval" {
+                Some(normalize_permission_profile(params.get("permissions"))?)
+            } else {
+                None
+            };
             let mut pending = lock(&self.pending)?;
             if pending.len() == MAX_PENDING_APPROVALS {
                 return Err(CodexAdapterError::ApprovalOverflow);
             }
-            if pending.insert(request_id, proposal.clone()).is_some() {
+            if pending
+                .insert(
+                    request_id,
+                    PendingCodexApproval {
+                        proposal: proposal.clone(),
+                        requested_permissions,
+                    },
+                )
+                .is_some()
+            {
                 return Err(CodexAdapterError::DuplicateApproval);
             }
             return Ok(AgentDriverEvent::EffectProposed { sequence, proposal });
@@ -967,49 +1018,6 @@ fn codex_arguments(
         arguments.push(OsString::from(value));
     }
     Ok(arguments)
-}
-
-fn normalize_effect(
-    driver_id: Uuid,
-    request_id: ExternalRequestId,
-    method: &str,
-    params: Value,
-) -> Result<AgentEffectProposal, CodexAdapterError> {
-    let command = params.get("command").and_then(Value::as_str);
-    let reason = params.get("reason").and_then(Value::as_str);
-    let (kind, summary, mut required_capabilities) = match method {
-        "item/commandExecution/requestApproval" => (
-            AgentEffectKind::Shell,
-            command
-                .unwrap_or("Codex requested command execution")
-                .to_owned(),
-            vec!["shell".into()],
-        ),
-        "item/fileChange/requestApproval" => (
-            AgentEffectKind::WorkspaceEdit,
-            reason
-                .unwrap_or("Codex requested a workspace change")
-                .to_owned(),
-            vec!["workspace_write".into()],
-        ),
-        _ => return Err(CodexAdapterError::UnsupportedApproval(method.into())),
-    };
-    if !params["networkApprovalContext"].is_null() {
-        required_capabilities.push("network".into());
-    }
-    Ok(AgentEffectProposal {
-        driver_id,
-        protocol: StructuredAgentProtocol::CodexAppServerV2,
-        request_id,
-        method: method.into(),
-        kind,
-        summary: bounded(summary, 16 * 1024)?,
-        required_capabilities,
-        payload_sha256: sha256_value(&params)?,
-        thread_id: optional_bounded_string(&params, "threadId")?,
-        turn_id: optional_bounded_string(&params, "turnId")?,
-        item_id: optional_bounded_string(&params, "itemId")?,
-    })
 }
 
 fn external_request_id(value: Option<&Value>) -> Result<ExternalRequestId, CodexAdapterError> {
@@ -1335,6 +1343,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::AgentEffectKind;
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -1400,6 +1409,155 @@ mod tests {
         assert_eq!(proposal.summary, "cargo test --workspace");
         assert_eq!(proposal.required_capabilities, vec!["shell", "network"]);
         assert_eq!(proposal.payload_sha256.len(), 64);
+    }
+
+    #[test]
+    fn permission_approval_preserves_the_reviewed_profile_and_capabilities() {
+        let params = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "permission-1",
+            "reason": "Allow the agent network and one writable path",
+            "permissions": {
+                "network": {"enabled": true},
+                "fileSystem": {
+                    "entries": [{
+                        "access": "write",
+                        "path": {"type": "special", "value": {"kind": "tmpdir"}}
+                    }]
+                }
+            }
+        });
+        let proposal = normalize_effect(
+            Uuid::nil(),
+            ExternalRequestId::Unsigned(8),
+            "item/permissions/requestApproval",
+            params.clone(),
+        )
+        .unwrap();
+        assert_eq!(proposal.kind, AgentEffectKind::Opaque);
+        assert_eq!(
+            proposal.summary,
+            "Allow the agent network and one writable path"
+        );
+        assert_eq!(
+            proposal.required_capabilities,
+            vec!["opaque_effect", "network", "workspace_write"]
+        );
+
+        let pending = PendingCodexApproval {
+            proposal,
+            requested_permissions: Some(
+                normalize_permission_profile(params.get("permissions")).unwrap(),
+            ),
+        };
+        assert_eq!(
+            codex_approval_result(&pending, PermissionDecision::AllowOnce, "accept"),
+            json!({
+                "permissions": params["permissions"],
+                "scope": "turn",
+                "strictAutoReview": false
+            })
+        );
+        assert_eq!(
+            codex_approval_result(&pending, PermissionDecision::RejectOnce, "decline"),
+            json!({
+                "permissions": {},
+                "scope": "turn",
+                "strictAutoReview": true
+            })
+        );
+    }
+
+    #[test]
+    fn only_private_brokered_mcp_tool_approvals_are_forwarded() {
+        let trusted = json!({
+            "serverName": "hyper_term",
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "mode": "form",
+            "message": "Allow this MCP tool call?",
+            "requestedSchema": {"type": "object", "properties": {}},
+            "_meta": {"codex_approval_kind": "mcp_tool_call", "persist": ["session"]}
+        });
+        assert_eq!(
+            brokered_mcp_elicitation_response(&trusted, true).unwrap(),
+            json!({"action": "accept", "content": null, "_meta": null})
+        );
+        assert_eq!(
+            brokered_mcp_elicitation_response(&trusted, false).unwrap(),
+            json!({"action": "cancel", "content": null, "_meta": null})
+        );
+
+        let mut unrelated = trusted;
+        unrelated["serverName"] = Value::String("third_party".into());
+        assert_eq!(
+            brokered_mcp_elicitation_response(&unrelated, true).unwrap(),
+            json!({"action": "cancel", "content": null, "_meta": null})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_brokered_mcp_elicitation_is_acknowledged_over_real_stdio() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let runtime = temporary.path().join("runtime");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        let executable = temporary.path().join("codex");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fake"}}'
+      printf '%s\n' '{"id":91,"method":"mcpServer/elicitation/request","params":{"serverName":"hyper_term","threadId":"thread-1","turnId":"turn-1","mode":"form","message":"Allow this MCP tool call?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call","persist":["session"]}}}'
+      ;;
+    *'"id":91'*'"action":"accept"'*)
+      printf '%s\n' '{"method":"fixture/brokeredMcpAccepted","params":{}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let mcp = Path::new("/usr/bin/true").canonicalize().unwrap();
+        let client = CodexAppServerClient::launch(CodexAppServerConfig {
+            executable: executable.clone(),
+            executable_sha256: sha256_file(&executable).unwrap(),
+            implementation_version: "test".into(),
+            workspace,
+            codex_home: runtime.join("codex-home"),
+            scratch_directory: runtime.join("scratch"),
+            auth_file: None,
+            brokered_mcp_server: Some(CodexMcpServerConfig {
+                executable: mcp.clone(),
+                executable_sha256: sha256_file(&mcp).unwrap(),
+                arguments: Vec::new(),
+            }),
+            containment: None,
+        })
+        .unwrap();
+
+        let timeout = Duration::from_secs(10);
+        client.initialize(timeout).unwrap();
+        assert!(matches!(
+            client.next_event(timeout).unwrap(),
+            AgentDriverEvent::ProtocolNotice { method: Some(method), .. }
+                if method == "mcpServer/elicitation/request"
+        ));
+        assert!(matches!(
+            client.next_event(timeout).unwrap(),
+            AgentDriverEvent::ProtocolNotice { method: Some(method), .. }
+                if method == "fixture/brokeredMcpAccepted"
+        ));
+        assert!(client.pending_effects().unwrap().is_empty());
+        assert_eq!(client.close().unwrap(), DriverState::Closed);
     }
 
     #[test]

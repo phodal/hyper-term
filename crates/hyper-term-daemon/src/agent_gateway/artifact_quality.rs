@@ -11,8 +11,8 @@ use hyper_term_protocol::{ArtifactId, GenUiVisualQualityReport, GenUiVisualQuali
 use serde::Serialize;
 
 use super::{
-    AgentGatewayRuntime, AgentSessionQuery, StructuredAgentProtocol, authorize, json_response,
-    parse_artifact_id, status_response,
+    AgentGatewayRuntime, AgentSessionQuery, authorize, json_response, parse_artifact_id,
+    status_response,
 };
 use crate::artifact_visual_quality_store::VisualQualityStoreError;
 
@@ -43,10 +43,6 @@ pub(super) async fn artifact_render_payload(
         Err(VisualQualityRequestError::SessionUnavailable) => status_response(
             StatusCode::NOT_FOUND,
             "Artifact render payload is unavailable",
-        ),
-        Err(VisualQualityRequestError::AcpRequired) => status_response(
-            StatusCode::FORBIDDEN,
-            "Artifact render payload is available only for ACP Agent artifacts",
         ),
         Err(_) => status_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -111,10 +107,6 @@ fn visual_quality_response(
         ) => status_response(
             StatusCode::NOT_FOUND,
             "Visual quality report is unavailable",
-        ),
-        Err(VisualQualityRequestError::AcpRequired) => status_response(
-            StatusCode::FORBIDDEN,
-            "Visual quality evidence is available only for ACP Agent artifacts",
         ),
         Err(VisualQualityRequestError::RuntimeUnavailable) => status_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -215,9 +207,6 @@ impl AgentGatewayRuntime {
         let session = self
             .session(session_id)
             .map_err(|_| VisualQualityRequestError::SessionUnavailable)?;
-        if session.protocol != StructuredAgentProtocol::Acp {
-            return Err(VisualQualityRequestError::AcpRequired);
-        }
         Ok(session)
     }
 }
@@ -241,7 +230,6 @@ enum VisualQualityRequestError {
     SessionUnavailable,
     ArtifactUnavailable,
     ReportUnavailable,
-    AcpRequired,
     RuntimeUnavailable,
     InvalidObservation,
     Lock,
