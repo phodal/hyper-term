@@ -383,6 +383,26 @@ done
                 .any(|block| block["payload"]["text"] == "Remember this durable prompt")
         );
 
+        let restart_path = format!(
+            "/agent/session/restart?token={token}&session_id=8&provider=fixture-acp"
+        );
+        let (restart_status, restart_body) =
+            request_path(second.address(), &restart_path, "POST", b"").await;
+        assert_eq!(restart_status, StatusCode::OK.as_u16());
+        let restarted: serde_json::Value = serde_json::from_slice(&restart_body).unwrap();
+        assert_eq!(restarted["history_restored"], true);
+        assert_eq!(restarted["task_id"], task_id);
+
+        let (_, body) = request(second.address(), token, 8, "GET").await;
+        let restarted_snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            restarted_snapshot["document"]["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block["payload"]["text"] == "Remember this durable prompt")
+        );
+
         assert_eq!(
             request_path(second.address(), &start_path, "DELETE", b"")
                 .await

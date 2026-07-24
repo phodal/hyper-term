@@ -436,7 +436,7 @@ pub(super) fn continue_turn(
                     set_progress_failed(&session, "Agent reported a failed turn");
                 } else if let Ok(mut progress) = session.progress.lock() {
                     progress.status = AgentStatus::Completed;
-                    progress.error = None;
+                    progress.failure = None;
                 }
                 return;
             }
@@ -682,7 +682,129 @@ pub(super) fn projected_agent_status(
 pub(super) fn set_progress_failed(session: &AgentSession, message: &str) {
     if let Ok(mut progress) = session.progress.lock() {
         progress.status = AgentStatus::Failed;
-        progress.error = Some(bounded_error(message));
+        progress.failure = Some(merge_agent_failure(
+            progress.failure.take(),
+            runtime_agent_failure(message),
+        ));
+    }
+}
+
+pub(super) fn permission_decision_failure(
+    decision: PermissionDecision,
+    operation_id: OperationId,
+) -> Option<AgentFailure> {
+    let (kind, message) = match decision {
+        PermissionDecision::RejectOnce => (
+            AgentFailureKind::UserRejected,
+            "The user rejected this exact operation",
+        ),
+        PermissionDecision::Cancelled => (
+            AgentFailureKind::UserCancelled,
+            "The user cancelled this exact operation",
+        ),
+        _ => return None,
+    };
+    Some(AgentFailure {
+        stage: AgentFailureStage::Approval,
+        kind,
+        recovery: AgentFailureRecovery::RetrySameTurn,
+        authority: AgentFailureAuthority::RustPermissionBroker,
+        retryable: true,
+        operation_id: Some(operation_id),
+        message: message.into(),
+    })
+}
+
+fn merge_agent_failure(existing: Option<AgentFailure>, next: AgentFailure) -> AgentFailure {
+    let Some(mut existing) = existing else {
+        return next;
+    };
+    if !matches!(
+        existing.kind,
+        AgentFailureKind::UserRejected | AgentFailureKind::UserCancelled
+    ) {
+        return next;
+    }
+    if next.recovery == AgentFailureRecovery::RestartProvider {
+        existing.recovery = AgentFailureRecovery::RestartProvider;
+        existing.message = match existing.kind {
+            AgentFailureKind::UserRejected => {
+                "The user rejected this exact operation; the provider then exited".into()
+            }
+            AgentFailureKind::UserCancelled => {
+                "The user cancelled this exact operation; the provider then exited".into()
+            }
+            _ => unreachable!("checked user decision kind"),
+        };
+    }
+    existing
+}
+
+fn runtime_agent_failure(message: &str) -> AgentFailure {
+    let bounded = bounded_error(message);
+    let stage = if message.contains("artifact") || message.contains("Artifact") {
+        if message.contains("compile") || message.contains("compiler") {
+            AgentFailureStage::Compile
+        } else {
+            AgentFailureStage::Artifact
+        }
+    } else if message.contains("MCP") || message.contains("tool call") {
+        AgentFailureStage::Mcp
+    } else if message.contains("approval")
+        || message.contains("permission")
+        || message.contains("effect decision")
+    {
+        AgentFailureStage::Approval
+    } else if message.contains("provider")
+        || message.contains("Agent exited")
+        || message.contains("Codex")
+        || message.contains("Claude")
+    {
+        AgentFailureStage::Provider
+    } else {
+        AgentFailureStage::Turn
+    };
+    let policy_rejected = message.contains("policy") || message.contains("not permitted");
+    let invalid_response = message.contains("invalid")
+        || message.contains("exceeded")
+        || message.contains("could not be journaled");
+    let authority = if matches!(
+        stage,
+        AgentFailureStage::Mcp
+            | AgentFailureStage::Approval
+            | AgentFailureStage::Compile
+            | AgentFailureStage::Artifact
+    ) {
+        AgentFailureAuthority::RustPermissionBroker
+    } else {
+        AgentFailureAuthority::ProposalOnly
+    };
+    let recovery = if message.contains("readiness") || message.contains("unavailable") {
+        AgentFailureRecovery::RefreshProvider
+    } else if stage == AgentFailureStage::Provider
+        || message.contains("Agent exited")
+        || message.contains("could not be returned")
+    {
+        AgentFailureRecovery::RestartProvider
+    } else if stage == AgentFailureStage::Approval {
+        AgentFailureRecovery::ReviewApproval
+    } else {
+        AgentFailureRecovery::RetrySameTurn
+    };
+    AgentFailure {
+        stage,
+        kind: if policy_rejected {
+            AgentFailureKind::PolicyRejected
+        } else if invalid_response {
+            AgentFailureKind::InvalidResponse
+        } else {
+            AgentFailureKind::RuntimeFailure
+        },
+        recovery,
+        authority,
+        retryable: true,
+        operation_id: None,
+        message: bounded,
     }
 }
 
@@ -721,4 +843,41 @@ pub(super) fn agent_error_summary(message: &str) -> String {
         };
     }
     bounded_error(message)
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn failure_schema_classifies_recovery_and_authority_without_frontend_inference() {
+        let provider = runtime_agent_failure("Agent exited before the turn completed");
+        assert_eq!(provider.stage, AgentFailureStage::Provider);
+        assert_eq!(provider.recovery, AgentFailureRecovery::RestartProvider);
+        assert_eq!(provider.authority, AgentFailureAuthority::ProposalOnly);
+
+        let approval = runtime_agent_failure("effect decision denied by policy");
+        assert_eq!(approval.stage, AgentFailureStage::Approval);
+        assert_eq!(approval.kind, AgentFailureKind::PolicyRejected);
+        assert_eq!(approval.recovery, AgentFailureRecovery::ReviewApproval);
+        assert_eq!(
+            approval.authority,
+            AgentFailureAuthority::RustPermissionBroker
+        );
+    }
+
+    #[test]
+    fn provider_exit_preserves_the_exact_rejected_operation_and_requires_restart() {
+        let operation_id = OperationId::new();
+        let rejected = permission_decision_failure(PermissionDecision::RejectOnce, operation_id);
+        let merged = merge_agent_failure(
+            rejected,
+            runtime_agent_failure("Agent exited before the turn completed"),
+        );
+
+        assert_eq!(merged.stage, AgentFailureStage::Approval);
+        assert_eq!(merged.kind, AgentFailureKind::UserRejected);
+        assert_eq!(merged.recovery, AgentFailureRecovery::RestartProvider);
+        assert_eq!(merged.operation_id, Some(operation_id));
+    }
 }

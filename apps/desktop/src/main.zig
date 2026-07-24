@@ -108,6 +108,7 @@ pub const agent_tier2_review_effect_key_base = agent_effects.agent_tier2_review_
 pub const agent_tier2_discard_effect_key_base = agent_effects.agent_tier2_discard_effect_key_base;
 pub const agent_provider_refresh_effect_key: u64 = 0x4854_4e00;
 pub const agent_goal_effect_key_base = agent_effects.agent_goal_effect_key_base;
+pub const agent_restart_effect_key_base = agent_effects.agent_restart_effect_key_base;
 pub const deferred_webview_timer_id: u64 = 0x4854_5100;
 pub const agent_attention_effect_key = agent_effects.agent_attention_effect_key;
 pub const agent_attention_poll_timer_key = agent_effects.agent_attention_poll_timer_key;
@@ -115,6 +116,7 @@ pub const desktop_workspace_effect_key: u64 = 0x4854_5400;
 pub const terminal_metadata_effect_key: u64 = 0x4854_5500;
 pub const terminal_metadata_poll_timer_key: u64 = 0x4854_5600;
 pub const provider_login_clipboard_effect_key: u64 = 0x4854_5700;
+pub const agent_diagnostic_clipboard_effect_key: u64 = 0x4854_5800;
 const deferred_webview_delay_ns: u64 = 1_000_000;
 pub const window_width: f32 = 1180;
 pub const window_height: f32 = 760;
@@ -218,12 +220,16 @@ pub const Msg = union(enum) {
     dismiss_agent_provider_picker,
     refresh_agent_providers,
     retry_agent_session,
+    retry_agent_turn,
     agent_providers_refreshed: native_sdk.EffectResponse,
     open_codex_login_terminal,
     open_claude_login_terminal,
     copy_provider_login_command,
     dismiss_provider_login_hint,
     provider_login_command_copied: native_sdk.EffectClipboardResult,
+    copy_agent_diagnostic,
+    agent_diagnostic_copied: native_sdk.EffectClipboardResult,
+    review_agent_failure_approval,
     agent_attention_received: native_sdk.EffectResponse,
     agent_attention_poll: native_sdk.EffectTimer,
     terminal_metadata_received: native_sdk.EffectResponse,
@@ -238,6 +244,7 @@ pub const Msg = union(enum) {
     terminal_session_closed: native_sdk.EffectResponse,
     desktop_workspace_persisted: native_sdk.EffectResponse,
     agent_session_started: native_sdk.EffectResponse,
+    agent_session_restarted: native_sdk.EffectResponse,
     agent_session_closed: native_sdk.EffectResponse,
     agent_composer_changed: canvas.TextInputEvent,
     open_agent_search,
@@ -288,7 +295,7 @@ pub const Msg = union(enum) {
     chrome_changed: native_sdk.WindowChrome,
 
     /// Platform callbacks dispatch these messages; markup never does.
-    pub const view_unbound = .{ "toggle_session_picker", "dismiss_session_picker", "select_session", "close_session", "close_active_session", "open_agent_search", "terminal_session_closed", "terminal_metadata_received", "terminal_metadata_poll", "desktop_workspace_persisted", "agent_providers_refreshed", "provider_login_command_copied", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
+    pub const view_unbound = .{ "toggle_session_picker", "dismiss_session_picker", "select_session", "close_session", "close_active_session", "open_agent_search", "terminal_session_closed", "terminal_metadata_received", "terminal_metadata_poll", "desktop_workspace_persisted", "agent_providers_refreshed", "provider_login_command_copied", "agent_diagnostic_copied", "agent_attention_received", "agent_attention_poll", "agent_session_started", "agent_session_restarted", "agent_session_closed", "agent_turn_started", "agent_turn_cancelled", "agent_snapshot_received", "agent_stream_line", "agent_stream_closed", "agent_config_updated", "agent_permission_decided", "agent_poll", "agent_tier2_results_received", "preview_agent_tier2_result", "agent_tier2_preview_received", "request_agent_tier2_review", "agent_tier2_review_requested", "discard_agent_tier2_result", "agent_tier2_result_discarded", "toggle_agent_goal", "toggle_agent_goal_menu", "dismiss_agent_goal_menu", "edit_agent_goal", "apply_agent_goal_action", "agent_goal_updated", "system_appearance", "chrome_changed" };
 };
 
 // Debug watches compiled markup as a fragment instead of installing it as the
@@ -304,6 +311,7 @@ const applyAgentAttentionResponse = AgentEffectRouter.applyAgentAttentionRespons
 const findSession = AgentEffectRouter.findSession;
 const acknowledgeSessionAttention = AgentEffectRouter.acknowledgeSessionAttention;
 const requestAgentStart = AgentEffectRouter.requestAgentStart;
+const requestAgentRestart = AgentEffectRouter.requestAgentRestart;
 const requestAgentClose = AgentEffectRouter.requestAgentClose;
 const requestAgentTier2Preview = AgentEffectRouter.requestAgentTier2Preview;
 const requestAgentTier2Review = AgentEffectRouter.requestAgentTier2Review;
@@ -358,6 +366,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .copy_provider_login_command => copyProviderLoginCommand(model, fx),
         .dismiss_provider_login_hint => model.provider_login.clear(),
         .provider_login_command_copied => |result| applyProviderLoginClipboardResult(model, result),
+        .copy_agent_diagnostic => copyAgentDiagnostic(model, fx),
+        .agent_diagnostic_copied => |result| applyAgentDiagnosticClipboardResult(model, result),
+        .review_agent_failure_approval => {
+            if (model.agent_failure_operation_len == 0) return;
+            const operation_id = model.agent_failure_operation_storage[0..model.agent_failure_operation_len];
+            for (model.agent_blocks[0..model.agent_block_count]) |*block| {
+                if (block.isApproval() and std.mem.eql(u8, block.operationId(), operation_id)) {
+                    block.expanded = true;
+                    break;
+                }
+            }
+        },
         .agent_attention_received => |response| applyAgentAttentionResponse(model, response, fx),
         .agent_attention_poll => |timer| {
             if (timer.outcome == .fired) requestAgentAttention(model, fx);
@@ -373,6 +393,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .select_session => |session_id| {
             model.session_picker_open = false;
             const previous = model.active_session_id;
+            model.agent_retry_after_restart_session_id = 0;
             saveActiveAgentComposer(model);
             selectSession(model, session_id);
             if (previous != model.active_session_id) {
@@ -393,7 +414,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_active_session => closeSession(model, model.active_session_id, fx),
         .terminal_session_closed => {},
         .desktop_workspace_persisted => |response| applyDesktopWorkspacePersisted(model, response, fx),
-        .agent_session_started => |response| applyAgentStartResponse(model, response, fx),
+        .agent_session_started => |response| applyAgentSessionStarted(model, response, fx),
+        .agent_session_restarted => |response| applyAgentSessionRestarted(model, response, fx),
         .agent_session_closed => {},
         .agent_composer_changed => |edit| {
             model.agent_goal_editing = false;
@@ -416,6 +438,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .send_agent_prompt => requestAgentTurn(model, fx),
+        .retry_agent_turn => retryAgentTurn(model, fx),
         .agent_turn_started => |response| applyAgentTurnResponse(model, response, fx),
         .cancel_agent_turn => requestAgentCancel(model, fx),
         .agent_turn_cancelled => |response| applyAgentCancelResponse(model, response, fx),
@@ -508,6 +531,39 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     }
 }
 
+fn retryAgentTurn(model: *Model, fx: *Effects) void {
+    if (!model.hasRetryableAgentTurn() or model.agentRetryDisabled()) return;
+    if (!model.agentRetryRequiresRestart()) {
+        requestAgentTurn(model, fx);
+        return;
+    }
+    const session_id = model.active_session_id;
+    model.agent_retry_after_restart_session_id = session_id;
+    requestAgentRestart(model, session_id, fx);
+}
+
+fn applyAgentSessionStarted(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    const retry_session_id = model.agent_retry_after_restart_session_id;
+    const is_retry = retry_session_id != 0 and
+        response.key == agent_start_effect_key_base + retry_session_id;
+    applyAgentStartResponse(model, response, fx);
+    if (!is_retry) return;
+    model.agent_retry_after_restart_session_id = 0;
+    const session = findSession(model, retry_session_id) orelse return;
+    if (retry_session_id == model.active_session_id and session.agent_connection == .ready) {
+        requestAgentTurn(model, fx);
+    }
+}
+
+fn applyAgentSessionRestarted(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    if (response.key <= agent_restart_effect_key_base) return;
+    const raw_session_id = response.key - agent_restart_effect_key_base;
+    if (raw_session_id > std.math.maxInt(u8)) return;
+    var start_response = response;
+    start_response.key = agent_start_effect_key_base + raw_session_id;
+    applyAgentSessionStarted(model, start_response, fx);
+}
+
 fn appendSession(model: *Model, mode: SessionMode) ?u8 {
     if (model.session_count >= max_sessions) return null;
     saveActiveAgentComposer(model);
@@ -568,6 +624,21 @@ fn applyProviderLoginClipboardResult(model: *Model, result: native_sdk.EffectCli
     model.provider_login.copy_state = if (result.outcome == .ok) .copied else .failed;
 }
 
+fn copyAgentDiagnostic(model: *Model, fx: *Effects) void {
+    if (!model.prepareAgentDiagnostic()) return;
+    model.agent_diagnostic_copy_state = .copying;
+    fx.writeClipboard(.{
+        .key = agent_diagnostic_clipboard_effect_key,
+        .text = model.agentDiagnostic(),
+        .on_result = Effects.clipboardMsg(.agent_diagnostic_copied),
+    });
+}
+
+fn applyAgentDiagnosticClipboardResult(model: *Model, result: native_sdk.EffectClipboardResult) void {
+    if (result.key != agent_diagnostic_clipboard_effect_key or result.op != .write) return;
+    model.agent_diagnostic_copy_state = if (result.outcome == .ok) .copied else .failed;
+}
+
 fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     model.session_picker_open = false;
     saveActiveAgentComposer(model);
@@ -587,6 +658,9 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
     }
     requestTerminalClose(model, session_id, fx);
     if (session.mode == .agent) {
+        if (model.agent_retry_after_restart_session_id == session_id) {
+            model.agent_retry_after_restart_session_id = 0;
+        }
         requestAgentClose(model, session_id, fx);
         fx.cancelTimer(agent_poll_timer_key_base + session_id);
         cancelAgentStream(model, session_id, fx);
@@ -598,8 +672,12 @@ fn closeSession(model: *Model, session_id: u8, fx: *Effects) void {
         fx.cancel(agent_tier2_review_effect_key_base + session_id);
         fx.cancel(agent_tier2_discard_effect_key_base + session_id);
         fx.cancel(agent_goal_effect_key_base + session_id);
+        fx.cancel(agent_restart_effect_key_base + session_id);
         if (model.agent_permission_in_flight_session_id == session_id) {
             model.agent_permission_in_flight_session_id = 0;
+        }
+        if (model.agent_rejection_in_flight_session_id == session_id) {
+            model.agent_rejection_in_flight_session_id = 0;
         }
         if (model.agent_config_in_flight_session_id == session_id) {
             model.agent_config_in_flight_session_id = 0;

@@ -31,6 +31,8 @@ pub const ExecutionContextReceipt = struct {
 
 pub const ExecutionContextEvent = struct {
     event_id: []const u8,
+    task_id: ?[]const u8 = null,
+    operation_id: ?[]const u8 = null,
     causation_id: ?[]const u8 = null,
     correlation_id: ?[]const u8 = null,
     payload: struct {
@@ -42,6 +44,21 @@ pub const ExecutionContextEvent = struct {
             receipts: []const ExecutionContextReceipt,
         },
     },
+};
+
+pub const Failure = struct {
+    stage: []const u8,
+    kind: []const u8,
+    recovery: []const u8,
+    authority: []const u8,
+    retryable: bool,
+    operation_id: ?[]const u8 = null,
+    message: []const u8,
+};
+
+pub const BuildIdentity = struct {
+    version: []const u8,
+    source_commit: []const u8,
 };
 
 pub const ConfigChoice = struct {
@@ -100,8 +117,11 @@ pub const Goal = struct {
 
 pub const StreamFrame = struct {
     type: []const u8,
+    task_id: ?[]const u8 = null,
+    build: ?BuildIdentity = null,
     status: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
+    failure: ?Failure = null,
     history_restored: ?bool = null,
     pending_operation_id: ?[]const u8 = null,
     document_revision: ?u64 = null,
@@ -226,8 +246,11 @@ pub const Block = struct {
 
 pub const Snapshot = struct {
     session_id: ?u8 = null,
+    task_id: ?[]const u8 = null,
+    build: ?BuildIdentity = null,
     status: []const u8,
     @"error": ?[]const u8 = null,
+    failure: ?Failure = null,
     history_restored: bool = false,
     pending_operation_id: ?[]const u8 = null,
     capabilities: Capabilities = .{},

@@ -2,6 +2,7 @@ import { assertEquals, assertThrows } from "@std/assert";
 import {
   terminalAttachmentStorageKey,
   TerminalConnectionState,
+  terminalReconnectPresentation,
   terminalSessionId,
 } from "./connection-state.ts";
 
@@ -12,6 +13,17 @@ Deno.test("an open socket cannot send terminal data before protocol ready", () =
   assertEquals(state.canSend(true), false);
   assertThrows(() => state.takeInputSequence(), Error, "not ready");
   assertThrows(() => state.takeResizeGeneration(), Error, "not ready");
+});
+
+Deno.test("an attached terminal reconnects quietly while a cold failure stays visible", () => {
+  assertEquals(terminalReconnectPresentation(true, 300), {
+    message: "Reattaching…",
+    visible: false,
+  });
+  assertEquals(terminalReconnectPresentation(false, 300), {
+    message: "Disconnected · retrying in 0.3s",
+    visible: true,
+  });
 });
 
 Deno.test("terminal tabs keep independent reconnect attachments", () => {

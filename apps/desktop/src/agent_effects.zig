@@ -39,6 +39,7 @@ const parseAgentTurnStatusStrict = agent_projection.parseAgentTurnStatusStrict;
 const pendingAgentPrompt = agent_projection.pendingAgentPrompt;
 const projectAgentCapabilities = agent_projection.projectAgentCapabilities;
 const projectAgentGoal = agent_projection.projectAgentGoal;
+const projectAgentStateMetadata = agent_projection.projectAgentStateMetadata;
 const projectPendingAgentOperation = agent_projection.projectPendingAgentOperation;
 const reconcilePendingAgentPrompt = agent_projection.reconcilePendingAgentPrompt;
 const resetAgentProjection = agent_projection.resetAgentProjection;
@@ -72,6 +73,7 @@ pub const agent_tier2_review_effect_key_base: u64 = 0x4854_4c00;
 pub const agent_tier2_discard_effect_key_base: u64 = 0x4854_4d00;
 pub const agent_cancel_effect_key_base: u64 = 0x4854_4f00;
 pub const agent_goal_effect_key_base: u64 = 0x4854_5000;
+pub const agent_restart_effect_key_base: u64 = 0x4854_5100;
 pub const agent_attention_effect_key: u64 = 0x4854_5200;
 pub const agent_attention_poll_timer_key: u64 = 0x4854_5300;
 
@@ -186,6 +188,44 @@ pub fn Router(comptime Effects: type) type {
                 .timeout_ms = agent_start_policy.timeoutMs(session.agent_provider.id()),
                 .on_response = Effects.responseMsg(.agent_session_started),
             });
+        }
+
+        pub fn requestAgentRestart(model: *Model, session_id: u8, fx: *Effects) void {
+            const session = findSession(model, session_id) orelse return;
+            var request_url_storage: [agent_effect_url_capacity]u8 = undefined;
+            const request_url = writeAgentRestartUrl(
+                model,
+                session_id,
+                session.agent_provider.id(),
+                &request_url_storage,
+            ) orelse return;
+            setAgentConnection(model, session_id, .connecting);
+            fx.fetch(.{
+                .key = agent_restart_effect_key_base + session_id,
+                .method = .POST,
+                .url = request_url,
+                .body = "{}",
+                .timeout_ms = agent_start_policy.timeoutMs(session.agent_provider.id()),
+                .on_response = Effects.responseMsg(.agent_session_restarted),
+            });
+        }
+
+        fn writeAgentRestartUrl(
+            model: *const Model,
+            session_id: u8,
+            provider_id: []const u8,
+            storage: []u8,
+        ) ?[]const u8 {
+            const base_url = model.agent_base_url_storage[0..model.agent_base_url_len];
+            const marker = "/?token=";
+            const marker_index = std.mem.indexOf(u8, base_url, marker) orelse return null;
+            const origin = base_url[0..marker_index];
+            const token = base_url[marker_index + marker.len ..];
+            return std.fmt.bufPrint(
+                storage,
+                "{s}/agent/session/restart?token={s}&session_id={d}&provider={s}",
+                .{ origin, token, session_id, provider_id },
+            ) catch null;
         }
 
         fn writeAgentStartUrl(model: *const Model, session_id: u8, storage: []u8) ?[]const u8 {
@@ -490,7 +530,10 @@ pub fn Router(comptime Effects: type) type {
             const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
             if (!accepted) {
                 model.agent_turn_status = .failed;
-                setAgentError(model, "Agent turn could not be started");
+                setAgentError(model, if (response.status == 409)
+                    "Agent is still finishing the previous turn · reconnect before retrying"
+                else
+                    "Agent turn could not be started");
                 restorePendingAgentPrompt(model, session_id);
                 return;
             }
@@ -563,6 +606,7 @@ pub fn Router(comptime Effects: type) type {
                 .on_response = Effects.responseMsg(.agent_permission_decided),
             });
             model.agent_permission_in_flight_session_id = session.id;
+            model.agent_rejection_in_flight_session_id = if (std.mem.eql(u8, decision, "reject_once")) session.id else 0;
             model.agent_error_len = 0;
         }
 
@@ -574,10 +618,15 @@ pub fn Router(comptime Effects: type) type {
             if (session_id != model.active_session_id) return;
             const accepted = response.outcome == .ok and response.status == 202 and !response.truncated;
             if (!accepted) {
+                model.agent_rejection_in_flight_session_id = 0;
                 model.agent_turn_status = .waiting_approval;
                 setAgentError(model, "Permission decision was not accepted; refresh before retrying");
                 return;
             }
+            if (model.agent_rejection_in_flight_session_id == session_id) {
+                restorePendingAgentPrompt(model, session_id);
+            }
+            model.agent_rejection_in_flight_session_id = 0;
             model.agent_turn_status = .running;
             requestAgentTier2Results(model, session_id, fx);
             scheduleAgentRefresh(session_id, fx);
@@ -1016,12 +1065,16 @@ pub fn Router(comptime Effects: type) type {
             defer parsed.deinit();
             const frame = parsed.value;
             if (std.mem.eql(u8, frame.type, "state")) {
+                if (!projectAgentStateMetadata(model, frame.task_id, frame.build, frame.failure, frame.@"error")) {
+                    setAgentError(model, "Agent state metadata was invalid; refreshing history");
+                    requestAgentSnapshot(model, session_id, fx);
+                    return;
+                }
                 if (frame.history_restored) |restored| model.agent_history_restored = restored;
                 projectPendingAgentOperation(model, frame.pending_operation_id);
                 projectAgentCapabilities(model, frame.capabilities);
                 projectAgentGoal(model, frame.goal);
                 if (frame.status) |status| model.agent_turn_status = parseAgentTurnStatus(status);
-                if (frame.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
                 if (frame.document_revision) |revision| {
                     if (revision > model.agent_document_revision) {
                         requestAgentPatchResync(model, session_id, revision, fx);

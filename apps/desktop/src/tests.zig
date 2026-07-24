@@ -65,6 +65,15 @@ fn pendingFetchIndexByKey(fx: *main.Effects, key: u64) ?usize {
     return null;
 }
 
+fn pendingFetchLastIndexByKey(fx: *main.Effects, key: u64) ?usize {
+    var index = fx.pendingFetchCount();
+    while (index > 0) {
+        index -= 1;
+        if (fx.pendingFetchAt(index).?.key == key) return index;
+    }
+    return null;
+}
+
 test "default session is an ordinary terminal" {
     var model = main.initialModel();
     try testing.expectEqualStrings("hidden_inset", @tagName(main.shell_scene.windows[0].titlebar));
@@ -873,16 +882,132 @@ test "Agent start failures keep the tab inert and explain the gateway result" {
         "Agent session limit reached · close a tab and retry",
         model.agentStatus(),
     );
+    try testing.expectEqualStrings("Agent connection", model.agentFailureStage());
+    try testing.expectEqualStrings(
+        "No command ran. Retry the provider connection without creating another tab.",
+        model.agentFailureRecovery(),
+    );
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const failed_tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(findByLabel(failed_tree.root, "Agent failure recovery") != null);
     try testing.expect(findByLabel(failed_tree.root, "Retry Agent connection") != null);
+    try testing.expect(containsText(failed_tree.root, "proposal-only authority"));
+    const copy_diagnostics = findByLabel(failed_tree.root, "Copy redacted Agent diagnostics").?;
+    main.update(&model, failed_tree.msgForPointer(copy_diagnostics.id, .up).?, &fx);
+    try testing.expectEqual(@as(usize, 1), fx.pendingClipboardCount());
+    const diagnostic = fx.pendingClipboardAt(0).?.text;
+    try testing.expect(std.mem.indexOf(u8, diagnostic, "schema_version: 2") != null);
+    try testing.expect(std.mem.indexOf(u8, diagnostic, "stage: Agent connection") != null);
+    try testing.expect(std.mem.indexOf(u8, diagnostic, "provider: codex") != null);
+    try testing.expect(std.mem.indexOf(u8, diagnostic, "token=") == null);
+
+    main.update(&model, .{ .agent_diagnostic_copied = .{
+        .key = main.agent_diagnostic_clipboard_effect_key,
+        .op = .write,
+        .outcome = .ok,
+    } }, &fx);
+    try testing.expectEqualStrings("Copied", model.agentDiagnosticCopyLabel());
 
     main.update(&model, .retry_agent_session, &fx);
     try testing.expectEqual(main.AgentConnection.connecting, model.activeSession().agent_connection);
     try testing.expectEqual(@as(usize, 1), fx.pendingFetchCount());
+}
+
+test "Agent empty state explains the approval and Artifact Workbench path" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_turn_status = .ready;
+    try testing.expect(model.hasAgentEmptyState());
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const tree = try buildTree(arena.allocator(), &model);
+    try testing.expect(findByLabel(tree.root, "Agent workspace guide") != null);
+    try testing.expect(containsText(tree.root, "Artifact Workbench"));
+    try testing.expect(findByLabel(tree.root, "Agent Artifact status") != null);
+    try testing.expect(containsText(tree.root, "No approved artifact"));
+}
+
+test "typed Agent failure metadata cannot be spoofed by provider prose" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"task_id":"11111111-1111-4111-8111-111111111111","build":{"version":"0.1.0","source_commit":"abc123"},"status":"failed","error":"Artifact compile permission rejected","failure":{"stage":"provider","kind":"runtime_failure","recovery":"restart_provider","authority":"proposal_only","retryable":true,"operation_id":null,"message":"Artifact compile permission rejected"},"document":{"revision":3,"blocks":[]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqualStrings("Provider", model.agentFailureStage());
+    try testing.expect(model.agentRetryRequiresRestart());
+    try testing.expectEqualStrings("Policy: provider process has proposal-only authority", model.agentFailurePolicy());
+    try testing.expectEqualStrings("11111111-1111-4111-8111-111111111111", model.agentTaskId());
+    try testing.expectEqualStrings("0.1.0", model.agentBuildVersion());
+}
+
+test "Agent failure recovery opens the exact related approval and clears stale operation ids" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    const operation_id = "22222222-2222-4222-8222-222222222222";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"failed","error":"The user rejected this exact operation","failure":{"stage":"approval","kind":"user_rejected","recovery":"retry_same_turn","authority":"rust_permission_broker","retryable":true,"operation_id":"22222222-2222-4222-8222-222222222222","message":"The user rejected this exact operation"},"document":{"revision":3,"blocks":[{"block_id":"33333333-3333-4333-8333-333333333333","kind":"approval","trust_class":"trusted_chrome","payload":{"type":"approval","operation_id":"22222222-2222-4222-8222-222222222222","operation_revision":2,"prompt":"Review command","decision":"reject_once"}}]}}
+        ,
+    } }, &fx);
+
+    try testing.expect(model.hasAgentFailureApproval());
+    try testing.expect(!model.agentBlocks()[0].expanded);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+    const review = findByLabel(tree.root, "Review failed Agent approval").?;
+    main.update(&model, tree.msgForPointer(review.id, .up).?, &fx);
+    try testing.expect(model.agentBlocks()[0].expanded);
+    try testing.expectEqualStrings(operation_id, model.agentDiagnosticOperationId());
+    const expanded_tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(
+        expanded_tree.root,
+        "The original prompt is restored in the composer so you can review and retry it.",
+    ));
+
+    model.agent_snapshot_in_flight_session_id = 2;
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"failed","error":"Agent exited","failure":{"stage":"provider","kind":"runtime_failure","recovery":"restart_provider","authority":"proposal_only","retryable":true,"operation_id":null,"message":"Agent exited"},"document":{"revision":4,"blocks":[]}}
+        ,
+    } }, &fx);
+    try testing.expect(!model.hasAgentFailureApproval());
+    try testing.expectEqualStrings("unknown", model.agentDiagnosticOperationId());
 }
 
 test "Agent composer posts a bounded prompt to the active Codex turn" {
@@ -1099,6 +1224,51 @@ test "failed Agent turns restore the submitted prompt without replacing a newer 
     try testing.expectEqualStrings("Newer draft wins", model.agentComposerText());
 }
 
+test "retrying an exited Agent restarts the provider without forgetting the prompt" {
+    const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
+    const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
+    var model = main.initialModelWithServices(terminal_url, agent_url);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .choose_agent, &fx);
+    model.session_slots[1].agent_connection = .ready;
+    model.agent_turn_status = .ready;
+    model.agent_composer_buffer.set("Retry this exact prompt");
+    main.update(&model, .send_agent_prompt, &fx);
+    main.update(&model, .{ .agent_snapshot_received = .{
+        .key = main.agent_snapshot_effect_key_base + 2,
+        .status = 200,
+        .body =
+        \\{"session_id":2,"status":"failed","error":"Agent exited before the turn completed","failure":{"stage":"provider","kind":"runtime_failure","recovery":"restart_provider","authority":"proposal_only","retryable":true,"operation_id":null,"message":"Agent exited before the turn completed"},"document":{"revision":1,"blocks":[]}}
+        ,
+    } }, &fx);
+
+    try testing.expectEqualStrings("Retry this exact prompt", model.agentComposerText());
+    main.update(&model, .retry_agent_turn, &fx);
+    try testing.expectEqual(main.AgentConnection.connecting, model.activeSession().agent_connection);
+    try testing.expectEqual(@as(u8, 2), model.agent_retry_after_restart_session_id);
+    const restart_index = pendingFetchLastIndexByKey(&fx, main.agent_restart_effect_key_base + 2).?;
+    const restart = fx.pendingFetchAt(restart_index).?;
+    try testing.expectEqual(std.http.Method.POST, restart.method);
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:55321/agent/session/restart?token=abcdef0123456789abcdef0123456789&session_id=2&provider=codex",
+        restart.url,
+    );
+
+    main.update(&model, .{ .agent_session_restarted = .{
+        .key = main.agent_restart_effect_key_base + 2,
+        .status = 200,
+        .body = "{\"session_id\":2,\"status\":\"ready\",\"history_restored\":true}",
+    } }, &fx);
+    try testing.expectEqual(@as(u8, 0), model.agent_retry_after_restart_session_id);
+    try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+    try testing.expectEqualStrings("", model.agentComposerText());
+    const retry_turn_index = pendingFetchLastIndexByKey(&fx, main.agent_turn_effect_key_base + 2).?;
+    try testing.expectEqualStrings("Retry this exact prompt", fx.pendingFetchAt(retry_turn_index).?.body);
+}
+
 test "ACP composer renders provider capabilities and routes configuration through Rust" {
     const terminal_url = "http://127.0.0.1:47437/?token=0123456789abcdef0123456789abcdef";
     const agent_url = "http://127.0.0.1:55321/?token=abcdef0123456789abcdef0123456789";
@@ -1227,7 +1397,7 @@ test "direct Codex accepted artifacts expose the editor on demand" {
     try testing.expect(model.hasEditableAgentArtifact());
     try testing.expect(model.canOpenAgentEditor());
     try testing.expect(!model.hasAgentEditor());
-    try testing.expect(findByLabel(tree.root, "Open Agent artifact editor") != null);
+    try testing.expect(findByLabel(tree.root, "Open Agent Artifact Workbench") != null);
 
     var panes: [2]main.HyperTermApp.WebViewPane = undefined;
     try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &panes));
@@ -1295,7 +1465,7 @@ test "accepted Agent artifact stays single-pane until the user enters editing" {
     var tree = try buildTree(arena, &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
     try testing.expect(findByLabel(tree.root, "Agent conversation") != null);
-    const open_editor = findByLabel(tree.root, "Open Agent artifact editor").?;
+    const open_editor = findByLabel(tree.root, "Open Agent Artifact Workbench").?;
     main.update(&model, tree.msgForPointer(open_editor.id, .up).?, &fx);
 
     try testing.expect(!model.canOpenAgentEditor());
@@ -1330,7 +1500,7 @@ test "accepted Agent artifact stays single-pane until the user enters editing" {
 
     tree = try buildTree(arena, &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) != null);
-    try testing.expect(findByLabel(tree.root, "Open Agent artifact editor") == null);
+    try testing.expect(findByLabel(tree.root, "Open Agent Artifact Workbench") == null);
     try testing.expect(containsText(tree.root, "Edit"));
     try testing.expect(containsText(tree.root, "draft"));
     try testing.expect(containsText(tree.root, "55555555"));
@@ -1342,7 +1512,7 @@ test "accepted Agent artifact stays single-pane until the user enters editing" {
 
     tree = try buildTree(arena, &model);
     try testing.expect(findByLabel(tree.root, main.genui_view_anchor) == null);
-    try testing.expect(findByLabel(tree.root, "Open Agent artifact editor") != null);
+    try testing.expect(findByLabel(tree.root, "Open Agent Artifact Workbench") != null);
     const tokens = main.hyperTermTokens(&model);
     const sweep = canvas.LayoutAuditSweepOptions{
         .tokens = tokens,

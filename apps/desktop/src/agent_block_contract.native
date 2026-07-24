@@ -75,7 +75,12 @@
                         </row>
                       </else>
                     </if>
-                    <else><text foreground="text_muted">Decision: {block.decisionLabel}</text></else>
+                    <else>
+                      <column gap="3">
+                        <text foreground="text_muted">Decision: {block.decisionLabel}</text>
+                        <if test="{block.wasRejected}"><text foreground="text_muted">The original prompt is restored in the composer so you can review and retry it.</text></if>
+                      </column>
+                    </else>
                   </column>
                 </card>
               </else>

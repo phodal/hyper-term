@@ -29,11 +29,15 @@ use hyper_term_sandbox::{LimaImage, LimaRunnerConfig, LimaTaskRunner};
 use serde::Deserialize;
 
 mod desktop_bundle;
+#[cfg(unix)]
+mod desktop_crash;
 
 use desktop_bundle::{
     AssetManifestKind, load_bundled_acp_runtime, validate_bundled_relative_path,
     verify_asset_manifest, verify_bundled_deno,
 };
+#[cfg(unix)]
+use desktop_crash::write_renderer_crash_report;
 
 const DESKTOP_TERMINAL_ADDRESS: &str = "127.0.0.1:47437";
 const TERMINAL_URL_ENV: &str = "HYPER_TERM_TERMINAL_URL";
@@ -77,6 +81,7 @@ struct RendererEnvironment {
     agent_provider_status: String,
     bug_capsule_url: String,
     desktop_workspace: DesktopWorkspaceStore,
+    crash_report_path: Option<PathBuf>,
 }
 
 fn main() {
@@ -215,6 +220,7 @@ fn run() -> Result<i32, String> {
             agent_provider_status: provider_status,
             bug_capsule_url: bug_capsule_url.unwrap_or_default(),
             desktop_workspace: gateway.desktop_workspace(),
+            crash_report_path: Some(resolved.state_directory.join("renderer-crash.json")),
         };
         let status = supervise_renderer(&resolved.ui, &renderer_environment).await?;
         agent_gateway
@@ -302,7 +308,23 @@ async fn supervise_renderer_until(
             }
         };
 
-        if status.success() || restart_count >= RENDERER_RESTART_LIMIT {
+        if status.success() {
+            return Ok(status);
+        }
+        let will_restart = restart_count < RENDERER_RESTART_LIMIT;
+        if let Some(path) = environment.crash_report_path.as_deref()
+            && let Err(error) = write_renderer_crash_report(
+                path,
+                status,
+                restart_count + 1,
+                restart_count,
+                RENDERER_RESTART_LIMIT,
+                will_restart,
+            )
+        {
+            eprintln!("hyper-term-desktop: cannot record renderer crash metadata: {error}");
+        }
+        if !will_restart {
             return Ok(status);
         }
         restart_count += 1;
@@ -1488,6 +1510,7 @@ exec /bin/sleep 30
     async fn renderer_restart_loop_is_bounded() {
         let temporary = tempfile::tempdir().expect("temporary renderer runtime");
         let count_file = temporary.path().join("launch-count");
+        let crash_report = temporary.path().join("renderer-crash.json");
         let body = format!(
             r#"
 count_file='{}'
@@ -1503,7 +1526,11 @@ exit 75
 
         let status = supervise_renderer_until(
             &executable,
-            &RendererEnvironment::default(),
+            &RendererEnvironment {
+                terminal_url: "http://127.0.0.1/?token=must-not-leak".into(),
+                crash_report_path: Some(crash_report.clone()),
+                ..RendererEnvironment::default()
+            },
             std::future::pending::<Result<(), String>>(),
         )
         .await
@@ -1512,18 +1539,38 @@ exit 75
         assert_eq!(status.code(), Some(75));
         let launches = std::fs::read_to_string(count_file).expect("renderer launch count");
         assert_eq!(launches.trim(), (RENDERER_RESTART_LIMIT + 1).to_string());
+        let report_bytes = std::fs::read(&crash_report).expect("renderer crash report");
+        let report: serde_json::Value =
+            serde_json::from_slice(&report_bytes).expect("crash report JSON");
+        assert_eq!(report["component"], "native_renderer");
+        assert_eq!(report["exit_code"], 75);
+        assert_eq!(report["will_restart"], false);
+        assert_eq!(report["restart_limit"], RENDERER_RESTART_LIMIT);
+        assert!(!String::from_utf8_lossy(&report_bytes).contains("token="));
+        assert_eq!(
+            std::fs::metadata(crash_report)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]
     async fn clean_renderer_exit_does_not_restart() {
         let temporary = tempfile::tempdir().expect("temporary renderer runtime");
         let count_file = temporary.path().join("launch-count");
+        let crash_report = temporary.path().join("renderer-crash.json");
         let body = format!("printf '%s\\n' 1 > '{}'\nexit 0", count_file.display());
         let executable = renderer_fixture(temporary.path(), &body);
 
         let status = supervise_renderer_until(
             &executable,
-            &RendererEnvironment::default(),
+            &RendererEnvironment {
+                crash_report_path: Some(crash_report.clone()),
+                ..RendererEnvironment::default()
+            },
             std::future::pending::<Result<(), String>>(),
         )
         .await
@@ -1536,6 +1583,7 @@ exit 75
                 .trim(),
             "1"
         );
+        assert!(!crash_report.exists());
     }
 
     #[test]

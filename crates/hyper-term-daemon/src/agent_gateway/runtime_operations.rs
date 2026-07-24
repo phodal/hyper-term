@@ -579,7 +579,7 @@ impl AgentGatewayRuntime {
             }
             progress.status = AgentStatus::Running;
             progress.turn_id = None;
-            progress.error = None;
+            progress.failure = None;
         }
         self.config
             .daemon
@@ -622,7 +622,7 @@ impl AgentGatewayRuntime {
             }
             let waiting_approval = progress.status == AgentStatus::WaitingApproval;
             progress.status = AgentStatus::Cancelling;
-            progress.error = None;
+            progress.failure = None;
             (progress.turn_id.clone(), waiting_approval)
         };
 
@@ -1078,11 +1078,9 @@ impl AgentGatewayRuntime {
                     request.decision,
                 )
                 .map_err(|_| SessionError::StalePermission)?;
-            let status = session
-                .progress
-                .lock()
-                .map_err(|_| SessionError::Lock)?
-                .status;
+            let mut progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
+            progress.failure = permission_decision_failure(request.decision, request.operation_id);
+            let status = progress.status;
             return Ok(AgentTurnResponse { session_id, status });
         }
         let effect = effect.expect("checked pending effect");
@@ -1114,7 +1112,7 @@ impl AgentGatewayRuntime {
             drop(pending);
             if let Ok(mut progress) = session.progress.lock() {
                 progress.status = AgentStatus::Running;
-                progress.error = None;
+                progress.failure = None;
             } else {
                 let _ = session.client.close();
                 return Err(SessionError::Lock);
@@ -1203,7 +1201,7 @@ impl AgentGatewayRuntime {
         drop(pending);
         if let Ok(mut progress) = session.progress.lock() {
             progress.status = AgentStatus::Running;
-            progress.error = None;
+            progress.failure = permission_decision_failure(request.decision, effect.operation_id);
         } else {
             let _ = session.client.close();
             return Err(SessionError::Lock);

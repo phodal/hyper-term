@@ -67,15 +67,21 @@
           <if test="{hasAgentRestoredHistory}">
             <row gap="5" cross="center" label="Recovered Agent history">
               <icon name="refresh-cw" width="11" height="11" foreground="text_muted" />
-              <text foreground="text_muted">History restored</text>
+              <text foreground="text_muted">Conversation restored · provider restarted</text>
             </row>
           </if>
           <if test="{hasAgentExecutionContext}">
             <button size="sm" variant="ghost" icon="circle-dot" on-press="toggle_agent_execution_context" label="Inspect Agent execution context">{agentExecutionContextSummary}</button>
           </if>
+          <if test="{hasAgentArtifactStatus}">
+            <row gap="5" cross="center" label="Agent Artifact status">
+              <icon name="file-text" width="11" height="11" foreground="text_muted" />
+              <text foreground="text_muted">{agentArtifactStatus}</text>
+            </row>
+          </if>
           <spacer grow="1" />
           <if test="{canOpenAgentEditor}">
-            <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open Agent artifact editor">Edit</button>
+            <button size="sm" variant="outline" icon="edit" on-press="open_agent_editor" label="Open Agent Artifact Workbench">Open Workbench</button>
           </if>
         </row>
       </if>
@@ -97,17 +103,34 @@
     </if>
     <!-- Zig replaces this slot with the virtualized Agent timeline. Its
          builder vocabulary is contract-checked in agent_block_contract.native. -->
+    <if test="{hasAgentEmptyState}">
+      <column gap="7" padding="16" background="surface_subtle" label="Agent workspace guide">
+        <text><span weight="medium">Ask the Agent, then review every effect</span></text>
+        <text foreground="text_muted">Commands and file changes stay behind Rust approval. Generated Artifacts open beside this conversation in the Workbench for Code, Diff, Preview, and runtime traces.</text>
+        <row gap="6" cross="center">
+          <badge variant="secondary">Conversation</badge>
+          <text foreground="text_muted">→ proposal → approval → Artifact Workbench</text>
+        </row>
+      </column>
+      <separator />
+    </if>
     <column grow="1" label="Agent blocks"></column>
     <separator />
     <if test="{hasAgentStatusNotice}">
       <row gap="8" padding="8" cross="center" background="surface_subtle" label="Agent failure recovery">
         <icon name="circle-dot" width="13" height="13" foreground="accent" />
         <column gap="2" grow="1">
-          <text><span weight="medium">Agent needs attention</span></text>
+          <text><span weight="medium">{agentFailureStage} needs attention</span></text>
           <text foreground="text_muted">{agentStatus}</text>
+          <text foreground="text_muted">{agentFailurePolicy}</text>
+          <text foreground="text_muted">{agentFailureRecovery}</text>
         </column>
+        <button size="sm" variant="ghost" icon="copy" on-press="copy_agent_diagnostic" disabled="{agentDiagnosticCopyDisabled}" label="Copy redacted Agent diagnostics">{agentDiagnosticCopyLabel}</button>
+        <if test="{hasAgentFailureApproval}">
+          <button size="sm" variant="outline" icon="edit" on-press="review_agent_failure_approval" label="Review failed Agent approval">Review approval</button>
+        </if>
         <if test="{hasRetryableAgentTurn}">
-          <button size="sm" variant="outline" icon="refresh-cw" on-press="send_agent_prompt" disabled="{agentRetryDisabled}" label="Retry failed Agent turn">Retry turn</button>
+          <button size="sm" variant="outline" icon="refresh-cw" on-press="retry_agent_turn" disabled="{agentRetryDisabled}" label="Retry failed Agent turn">Retry turn</button>
         </if>
         <else>
           <if test="{hasRetryableAgentStart}">

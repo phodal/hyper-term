@@ -131,7 +131,7 @@ impl AgentGatewayRuntime {
             progress: Mutex::new(AgentProgress {
                 status: AgentStatus::Ready,
                 turn_id: None,
-                error: None,
+                failure: None,
             }),
             pending_effect: Mutex::new(None),
             terminals: Mutex::new(HashMap::new()),
@@ -158,7 +158,8 @@ impl AgentGatewayRuntime {
         let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
         let progress_status = progress.status;
         let turn_id = progress.turn_id.clone();
-        let error = progress.error.clone();
+        let failure = progress.failure.clone();
+        let error = failure.as_ref().map(|failure| failure.message.clone());
         drop(progress);
         let pending_operation_id = self.pending_agent_operation(&session)?;
         let status = projected_agent_status(progress_status, pending_operation_id);
@@ -182,9 +183,12 @@ impl AgentGatewayRuntime {
             .map_err(|_| SessionError::Daemon)?;
         Ok(AgentSnapshotResponse {
             session_id,
+            task_id: session.task_id,
+            build: agent_build_identity(),
             status,
             turn_id,
             error,
+            failure,
             history_restored: session.history_restored,
             pending_operation_id,
             capabilities,
@@ -242,7 +246,8 @@ impl AgentGatewayRuntime {
         let progress = session.progress.lock().map_err(|_| SessionError::Lock)?;
         let progress_status = progress.status;
         let turn_id = progress.turn_id.clone();
-        let error = progress.error.clone();
+        let failure = progress.failure.clone();
+        let error = failure.as_ref().map(|failure| failure.message.clone());
         drop(progress);
         let pending_operation_id = self.pending_agent_operation(&session)?;
         let status = projected_agent_status(progress_status, pending_operation_id);
@@ -260,9 +265,12 @@ impl AgentGatewayRuntime {
             .thread_goal()
             .map_err(|_| SessionError::Driver)?;
         Ok(AgentStreamStateFrame {
+            task_id: session.task_id,
+            build: agent_build_identity(),
             status,
             turn_id,
             error,
+            failure,
             history_restored: session.history_restored,
             pending_operation_id,
             document_revision,

@@ -26,6 +26,7 @@ pub const max_agent_operation_id_bytes = agent_block_view.max_operation_id_bytes
 pub const max_agent_goal_objective_bytes: usize = 1024;
 pub const max_agent_goal_meta_bytes: usize = 128;
 pub const max_agent_error_bytes: usize = 512;
+pub const max_agent_diagnostic_bytes: usize = 1024;
 pub const max_agent_prompt_bytes: usize = 16 * 1024;
 pub const max_agent_config_options: usize = 4;
 pub const max_agent_config_choices: usize = 24;
@@ -40,6 +41,10 @@ pub const max_agent_execution_contexts: usize = 4;
 pub const max_agent_context_id_bytes: usize = 128;
 pub const agent_context_digest_bytes: usize = 64;
 pub const max_agent_context_summary_bytes: usize = 64;
+pub const max_agent_task_id_bytes: usize = 36;
+pub const max_agent_correlation_id_bytes: usize = 36;
+pub const max_agent_build_version_bytes: usize = 32;
+pub const max_agent_source_commit_bytes: usize = 64;
 pub const max_terminal_title_bytes: usize = 256;
 pub const max_terminal_cwd_bytes: usize = 512;
 pub const max_agent_goal_step_columns: usize = 42;
@@ -78,6 +83,53 @@ pub const AgentTurnStatus = enum {
     completed,
     waiting_approval,
     failed,
+};
+
+pub const AgentDiagnosticCopyState = enum {
+    idle,
+    copying,
+    copied,
+    failed,
+};
+
+pub const AgentFailureStage = enum {
+    provider,
+    mcp,
+    approval,
+    compile,
+    artifact,
+    turn,
+
+    pub fn label(stage: AgentFailureStage) []const u8 {
+        return switch (stage) {
+            .provider => "Provider",
+            .mcp => "Tool execution",
+            .approval => "Permission review",
+            .compile => "Artifact compile",
+            .artifact => "Artifact delivery",
+            .turn => "Agent turn",
+        };
+    }
+};
+
+pub const AgentFailureKind = enum {
+    user_rejected,
+    user_cancelled,
+    policy_rejected,
+    runtime_failure,
+    invalid_response,
+};
+
+pub const AgentFailureRecovery = enum {
+    retry_same_turn,
+    restart_provider,
+    review_approval,
+    refresh_provider,
+};
+
+pub const AgentFailureAuthority = enum {
+    proposal_only,
+    rust_permission_broker,
 };
 
 /// A bounded, semantic request for the native shell to get the user's
@@ -523,14 +575,35 @@ pub const Model = struct {
     agent_document_revision: u64 = 0,
     agent_stream_sequence: u64 = 0,
     agent_turn_status: AgentTurnStatus = .idle,
+    agent_failure_present: bool = false,
+    agent_failure_stage: AgentFailureStage = .turn,
+    agent_failure_kind: AgentFailureKind = .runtime_failure,
+    agent_failure_recovery: AgentFailureRecovery = .retry_same_turn,
+    agent_failure_authority: AgentFailureAuthority = .proposal_only,
+    agent_failure_retryable: bool = false,
+    agent_failure_operation_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
+    agent_failure_operation_len: usize = 0,
+    agent_task_id_storage: [max_agent_task_id_bytes]u8 = [_]u8{0} ** max_agent_task_id_bytes,
+    agent_task_id_len: usize = 0,
+    agent_correlation_id_storage: [max_agent_correlation_id_bytes]u8 = [_]u8{0} ** max_agent_correlation_id_bytes,
+    agent_correlation_id_len: usize = 0,
+    agent_build_version_storage: [max_agent_build_version_bytes]u8 = [_]u8{0} ** max_agent_build_version_bytes,
+    agent_build_version_len: usize = 0,
+    agent_source_commit_storage: [max_agent_source_commit_bytes]u8 = [_]u8{0} ** max_agent_source_commit_bytes,
+    agent_source_commit_len: usize = 0,
     agent_error_storage: [max_agent_error_bytes]u8 = [_]u8{0} ** max_agent_error_bytes,
     agent_error_len: usize = 0,
+    agent_diagnostic_storage: [max_agent_diagnostic_bytes]u8 = [_]u8{0} ** max_agent_diagnostic_bytes,
+    agent_diagnostic_len: usize = 0,
+    agent_diagnostic_copy_state: AgentDiagnosticCopyState = .idle,
     agent_pending_operation_storage: [max_agent_operation_id_bytes]u8 = [_]u8{0} ** max_agent_operation_id_bytes,
     agent_pending_operation_len: usize = 0,
     agent_snapshot_in_flight_session_id: u8 = 0,
     agent_snapshot_resync_revision: u64 = 0,
     agent_stream_session_id: u8 = 0,
     agent_permission_in_flight_session_id: u8 = 0,
+    agent_rejection_in_flight_session_id: u8 = 0,
+    agent_retry_after_restart_session_id: u8 = 0,
     agent_config_options: [max_agent_config_options]AgentConfigOptionView = [_]AgentConfigOptionView{.{}} ** max_agent_config_options,
     agent_config_option_count: usize = 0,
     agent_commands: [max_agent_commands]AgentCommandView = [_]AgentCommandView{.{}} ** max_agent_commands,
@@ -621,14 +694,35 @@ pub const Model = struct {
         "agent_document_revision",
         "agent_stream_sequence",
         "agent_turn_status",
+        "agent_failure_present",
+        "agent_failure_stage",
+        "agent_failure_kind",
+        "agent_failure_recovery",
+        "agent_failure_authority",
+        "agent_failure_retryable",
+        "agent_failure_operation_storage",
+        "agent_failure_operation_len",
+        "agent_task_id_storage",
+        "agent_task_id_len",
+        "agent_correlation_id_storage",
+        "agent_correlation_id_len",
+        "agent_build_version_storage",
+        "agent_build_version_len",
+        "agent_source_commit_storage",
+        "agent_source_commit_len",
         "agent_error_storage",
         "agent_error_len",
+        "agent_diagnostic_storage",
+        "agent_diagnostic_len",
+        "agent_diagnostic_copy_state",
         "agent_pending_operation_storage",
         "agent_pending_operation_len",
         "agent_snapshot_in_flight_session_id",
         "agent_snapshot_resync_revision",
         "agent_stream_session_id",
         "agent_permission_in_flight_session_id",
+        "agent_rejection_in_flight_session_id",
+        "agent_retry_after_restart_session_id",
         "agent_config_options",
         "agent_config_option_count",
         "agent_commands",
@@ -650,6 +744,13 @@ pub const Model = struct {
         "hasGenUiArtifact",
         "hasEditableAgentArtifact",
         "agentError",
+        "agentDiagnostic",
+        "agentTaskId",
+        "agentCorrelationId",
+        "agentBuildVersion",
+        "agentSourceCommit",
+        "agentDiagnosticOperationId",
+        "agentRetryRequiresRestart",
         "agentTier2Results",
         "agentTier2Diff",
         "openSessions",
@@ -851,10 +952,115 @@ pub const Model = struct {
             model.agent_turn_status == .failed;
     }
 
+    pub fn agentFailureStage(model: *const Model) []const u8 {
+        if (model.agent_failure_present) return model.agent_failure_stage.label();
+        return if (model.activeSession().agent_connection == .failed) "Agent connection" else "Agent turn";
+    }
+
+    pub fn agentFailureRecovery(model: *const Model) []const u8 {
+        if (model.agent_failure_present) return switch (model.agent_failure_recovery) {
+            .retry_same_turn => "The original prompt is restored below. Review it, then retry the same turn.",
+            .restart_provider => "The original prompt is restored. Restart the provider, then retry this same turn.",
+            .review_approval => "Review the denied operation and retry only if the requested authority is appropriate.",
+            .refresh_provider => "Refresh provider readiness before trying this turn again.",
+        };
+        if (model.hasRetryableAgentTurn()) return "The original prompt is restored below. Review it, then retry the same turn.";
+        if (model.hasRetryableAgentStart()) return "No command ran. Retry the provider connection without creating another tab.";
+        return "No command ran. Refresh provider readiness before trying again.";
+    }
+
+    pub fn agentFailurePolicy(model: *const Model) []const u8 {
+        if (model.agent_failure_present and model.agent_failure_authority == .rust_permission_broker)
+            return "Policy: Rust permission broker · no broader authority was granted";
+        return "Policy: provider process has proposal-only authority";
+    }
+
+    pub fn prepareAgentDiagnostic(model: *Model) bool {
+        if (!model.hasAgentStatusNotice()) return false;
+        const session = model.activeSession();
+        const diagnostic = std.fmt.bufPrint(
+            &model.agent_diagnostic_storage,
+            "Hyper Term Agent diagnostic\nschema_version: 2\nversion: {s}\nsource_commit: {s}\nstage: {s}\nkind: {s}\nrecovery: {s}\nprovider: {s}\nsession_id: {d}\ntask_id: {s}\noperation_id: {s}\ncorrelation_id: {s}\nturn_status: {s}\ndocument_revision: {d}\npolicy: {s}\nreason: {s}\n",
+            .{
+                model.agentBuildVersion(),
+                model.agentSourceCommit(),
+                model.agentFailureStage(),
+                if (model.agent_failure_present) @tagName(model.agent_failure_kind) else "unspecified",
+                if (model.agent_failure_present) @tagName(model.agent_failure_recovery) else "unspecified",
+                session.agent_provider.id(),
+                session.id,
+                model.agentTaskId(),
+                model.agentDiagnosticOperationId(),
+                model.agentCorrelationId(),
+                @tagName(model.agent_turn_status),
+                model.agent_document_revision,
+                model.agentFailurePolicy(),
+                model.agentStatus(),
+            },
+        ) catch return false;
+        model.agent_diagnostic_len = diagnostic.len;
+        return true;
+    }
+
+    pub fn agentDiagnostic(model: *const Model) []const u8 {
+        return model.agent_diagnostic_storage[0..model.agent_diagnostic_len];
+    }
+
+    pub fn agentTaskId(model: *const Model) []const u8 {
+        return if (model.agent_task_id_len > 0) model.agent_task_id_storage[0..model.agent_task_id_len] else "unknown";
+    }
+
+    pub fn agentCorrelationId(model: *const Model) []const u8 {
+        return if (model.agent_correlation_id_len > 0) model.agent_correlation_id_storage[0..model.agent_correlation_id_len] else "unknown";
+    }
+
+    pub fn agentBuildVersion(model: *const Model) []const u8 {
+        return if (model.agent_build_version_len > 0) model.agent_build_version_storage[0..model.agent_build_version_len] else "unknown";
+    }
+
+    pub fn agentSourceCommit(model: *const Model) []const u8 {
+        return if (model.agent_source_commit_len > 0) model.agent_source_commit_storage[0..model.agent_source_commit_len] else "unknown";
+    }
+
+    pub fn agentDiagnosticOperationId(model: *const Model) []const u8 {
+        if (model.agent_failure_operation_len > 0)
+            return model.agent_failure_operation_storage[0..model.agent_failure_operation_len];
+        if (model.agent_pending_operation_len > 0)
+            return model.agent_pending_operation_storage[0..model.agent_pending_operation_len];
+        var index = model.agent_block_count;
+        while (index > 0) {
+            index -= 1;
+            const operation_id = model.agent_blocks[index].operationId();
+            if (operation_id.len > 0) return operation_id;
+        }
+        return "unknown";
+    }
+
+    pub fn agentDiagnosticCopyLabel(model: *const Model) []const u8 {
+        return switch (model.agent_diagnostic_copy_state) {
+            .idle => "Copy diagnostics",
+            .copying => "Copying…",
+            .copied => "Copied",
+            .failed => "Copy failed",
+        };
+    }
+
+    pub fn agentDiagnosticCopyDisabled(model: *const Model) bool {
+        return model.agent_diagnostic_copy_state == .copying;
+    }
+
+    pub fn hasAgentEmptyState(model: *const Model) bool {
+        return model.activeSession().mode == .agent and
+            model.activeSession().agent_connection == .ready and
+            model.agent_block_count == 0 and
+            !model.hasAgentStatusNotice();
+    }
+
     pub fn hasRetryableAgentTurn(model: *const Model) bool {
         return model.activeSession().mode == .agent and
             model.activeSession().agent_connection == .ready and
-            model.agent_turn_status == .failed;
+            model.agent_turn_status == .failed and
+            (!model.agent_failure_present or model.agent_failure_retryable);
     }
 
     pub fn hasRetryableAgentStart(model: *const Model) bool {
@@ -865,8 +1071,23 @@ pub const Model = struct {
     }
 
     pub fn agentRetryDisabled(model: *const Model) bool {
-        return model.agentSubmitDisabled() or
+        return model.agent_retry_after_restart_session_id != 0 or
+            model.agentSubmitDisabled() or
             std.mem.trim(u8, model.agent_composer_buffer.text(), " \t\r\n").len == 0;
+    }
+
+    pub fn agentRetryRequiresRestart(model: *const Model) bool {
+        return model.agent_failure_present and
+            model.agent_failure_recovery == .restart_provider;
+    }
+
+    pub fn hasAgentFailureApproval(model: *const Model) bool {
+        if (!model.agent_failure_present or model.agent_failure_operation_len == 0) return false;
+        const operation_id = model.agent_failure_operation_storage[0..model.agent_failure_operation_len];
+        for (model.agent_blocks[0..model.agent_block_count]) |*block| {
+            if (block.isApproval() and std.mem.eql(u8, block.operationId(), operation_id)) return true;
+        }
+        return false;
     }
 
     pub fn agentComposerHeight(model: *const Model) f32 {
@@ -1041,6 +1262,17 @@ pub const Model = struct {
         return model.hasEditableAgentArtifact() and !model.hasAgentEditor();
     }
 
+    pub fn hasAgentArtifactStatus(model: *const Model) bool {
+        return model.activeSession().mode == .agent and
+            model.activeSession().agent_connection == .ready;
+    }
+
+    pub fn agentArtifactStatus(model: *const Model) []const u8 {
+        if (model.hasAgentEditor()) return "Workbench open";
+        if (model.hasGenUiArtifact()) return "Artifact ready";
+        return "No approved artifact";
+    }
+
     pub fn hasAgentExecutionContext(model: *const Model) bool {
         return model.activeSession().mode == .agent and
             model.agent_execution_context_session_id == model.active_session_id and
@@ -1053,7 +1285,7 @@ pub const Model = struct {
 
     pub fn hasAgentThreadActions(model: *const Model) bool {
         return model.hasAgentRestoredHistory() or
-            model.hasAgentExecutionContext() or model.canOpenAgentEditor();
+            model.hasAgentExecutionContext() or model.hasAgentArtifactStatus();
     }
 
     pub fn agentSearchOpen(model: *const Model) bool {

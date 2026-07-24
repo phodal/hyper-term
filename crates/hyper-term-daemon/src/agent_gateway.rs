@@ -85,7 +85,7 @@ use http_handlers::*;
 mod agent_turn;
 use agent_turn::{
     AgentTurnProjection, bounded_error, continue_turn, execute_agent_terminal_create,
-    projected_agent_status, run_turn, set_progress_failed,
+    permission_decision_failure, projected_agent_status, run_turn, set_progress_failed,
 };
 #[cfg(test)]
 use agent_turn::{agent_error_summary, retain_terminal_output};
@@ -365,7 +365,7 @@ struct BrokeredMcpLaunch {
 struct AgentProgress {
     status: AgentStatus,
     turn_id: Option<String>,
-    error: Option<String>,
+    failure: Option<AgentFailure>,
 }
 
 fn provider_probe_config(config: &AgentGatewayConfig) -> AgentProviderProbeConfig<'_> {
@@ -555,6 +555,7 @@ pub async fn spawn_agent_gateway(
                 .post(start_session)
                 .delete(close_session),
         )
+        .route("/agent/session/restart", post(restart_session))
         .route("/agent/session/turn", post(start_turn))
         .route("/agent/session/cancel", post(cancel_turn))
         .route("/agent/session/stream", get(stream_session))
@@ -648,9 +649,12 @@ pub async fn spawn_agent_gateway(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct AgentStreamStateFrame {
+    task_id: TaskId,
+    build: AgentBuildIdentity,
     status: AgentStatus,
     turn_id: Option<String>,
     error: Option<String>,
+    failure: Option<AgentFailure>,
     history_restored: bool,
     pending_operation_id: Option<OperationId>,
     document_revision: u64,

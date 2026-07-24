@@ -29,6 +29,67 @@ pub(super) enum AgentStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AgentFailureStage {
+    Provider,
+    Mcp,
+    Approval,
+    Compile,
+    Artifact,
+    Turn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AgentFailureKind {
+    UserRejected,
+    UserCancelled,
+    PolicyRejected,
+    RuntimeFailure,
+    InvalidResponse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AgentFailureRecovery {
+    RetrySameTurn,
+    RestartProvider,
+    ReviewApproval,
+    RefreshProvider,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AgentFailureAuthority {
+    ProposalOnly,
+    RustPermissionBroker,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct AgentFailure {
+    pub(super) stage: AgentFailureStage,
+    pub(super) kind: AgentFailureKind,
+    pub(super) recovery: AgentFailureRecovery,
+    pub(super) authority: AgentFailureAuthority,
+    pub(super) retryable: bool,
+    pub(super) operation_id: Option<OperationId>,
+    pub(super) message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct AgentBuildIdentity {
+    pub(super) version: &'static str,
+    pub(super) source_commit: &'static str,
+}
+
+pub(super) fn agent_build_identity() -> AgentBuildIdentity {
+    AgentBuildIdentity {
+        version: env!("CARGO_PKG_VERSION"),
+        source_commit: option_env!("HYPER_TERM_SOURCE_COMMIT").unwrap_or("unknown"),
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct AgentSessionQuery {
     pub(super) token: Option<String>,
@@ -50,9 +111,12 @@ pub(super) struct AgentSessionResponse {
 #[derive(Serialize)]
 pub(super) struct AgentSnapshotResponse {
     pub(super) session_id: u16,
+    pub(super) task_id: TaskId,
+    pub(super) build: AgentBuildIdentity,
     pub(super) status: AgentStatus,
     pub(super) turn_id: Option<String>,
     pub(super) error: Option<String>,
+    pub(super) failure: Option<AgentFailure>,
     pub(super) history_restored: bool,
     pub(super) pending_operation_id: Option<OperationId>,
     pub(super) capabilities: AgentSessionCapabilities,

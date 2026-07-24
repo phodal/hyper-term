@@ -183,6 +183,39 @@ pub(super) async fn close_session(
     )
 }
 
+pub(super) async fn restart_session(
+    State(runtime): State<AgentGatewayRuntime>,
+    Query(query): Query<AgentSessionQuery>,
+) -> Response {
+    let session_id = match authorize(&runtime, &query) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let provider = query.provider.unwrap_or_else(|| "codex".into());
+    if !valid_provider_id(&provider) {
+        return status_response(StatusCode::BAD_REQUEST, "Agent provider id is invalid");
+    }
+    let task_id = match runtime.close_session(session_id, false) {
+        Ok(task_id) => task_id,
+        Err(_) => {
+            return status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Agent session could not be restarted safely",
+            );
+        }
+    };
+    if let Some(task_id) = task_id {
+        runtime.local_mcp.close_task(task_id).await;
+    }
+    let result =
+        tokio::task::spawn_blocking(move || runtime.start_agent(session_id, &provider)).await;
+    match result {
+        Ok(Ok(response)) => json_response(StatusCode::OK, &response),
+        Ok(Err(error)) => agent_start_error_response(error),
+        Err(_) => status_response(StatusCode::BAD_GATEWAY, "Agent provider failed to restart"),
+    }
+}
+
 pub(super) async fn local_mcp_status(
     State(runtime): State<AgentGatewayRuntime>,
     Query(query): Query<AgentSessionQuery>,

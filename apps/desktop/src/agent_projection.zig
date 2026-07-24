@@ -11,8 +11,10 @@ const agent_wire = @import("agent_wire.zig");
 const desktop_model = @import("desktop_model.zig");
 
 const AgentBlockWire = agent_wire.Block;
+const AgentBuildIdentityWire = agent_wire.BuildIdentity;
 const AgentCapabilitiesWire = agent_wire.Capabilities;
 const AgentExecutionContextEventWire = agent_wire.ExecutionContextEvent;
+const AgentFailureWire = agent_wire.Failure;
 const AgentGoalWire = agent_wire.Goal;
 const AgentPlanEntryWire = agent_wire.PlanEntry;
 const AgentSnapshotWire = agent_wire.Snapshot;
@@ -22,6 +24,10 @@ const AgentBlockView = desktop_model.AgentBlockView;
 const AgentConnection = desktop_model.AgentConnection;
 const AgentDecision = desktop_model.AgentDecision;
 const AgentExecutionMode = desktop_model.AgentExecutionMode;
+const AgentFailureAuthority = desktop_model.AgentFailureAuthority;
+const AgentFailureKind = desktop_model.AgentFailureKind;
+const AgentFailureRecovery = desktop_model.AgentFailureRecovery;
+const AgentFailureStage = desktop_model.AgentFailureStage;
 const AgentGoalStatus = desktop_model.AgentGoalStatus;
 const AgentMessageRole = desktop_model.AgentMessageRole;
 const AgentOperationState = desktop_model.AgentOperationState;
@@ -37,9 +43,12 @@ const max_agent_activity_title_bytes = agent_block_view.max_activity_title_bytes
 const max_agent_blocks = desktop_model.max_agent_blocks;
 const max_agent_capability_id_bytes = desktop_model.max_agent_capability_id_bytes;
 const max_agent_context_id_bytes = desktop_model.max_agent_context_id_bytes;
+const max_agent_correlation_id_bytes = desktop_model.max_agent_correlation_id_bytes;
 const max_agent_execution_contexts = desktop_model.max_agent_execution_contexts;
+const max_agent_build_version_bytes = desktop_model.max_agent_build_version_bytes;
 const max_agent_goal_step_columns = desktop_model.max_agent_goal_step_columns;
 const max_agent_operation_id_bytes = desktop_model.max_agent_operation_id_bytes;
+const max_agent_source_commit_bytes = desktop_model.max_agent_source_commit_bytes;
 
 pub fn findAgentAppendTarget(model: *Model, block_id: []const u8) ?*AgentBlockView {
     const projected_id = stableAgentBlockId(block_id, 0);
@@ -74,6 +83,13 @@ pub fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8
     if (parsed.value.session_id) |wire_session_id| {
         if (wire_session_id != session_id) return false;
     }
+    if (!projectAgentStateMetadata(
+        model,
+        parsed.value.task_id,
+        parsed.value.build,
+        parsed.value.failure,
+        parsed.value.@"error",
+    )) return false;
     if (!projectAgentExecutionContext(model, session_id, parsed.value.context)) {
         model.agent_turn_status = .failed;
         setAgentError(model, "Agent execution context evidence was invalid");
@@ -87,8 +103,57 @@ pub fn applyAgentSnapshotPayload(model: *Model, session_id: u8, body: []const u8
     model.agent_document_revision = parsed.value.document.revision;
     model.agent_stream_sequence = parsed.value.document.revision;
     model.agent_turn_status = parseAgentTurnStatus(parsed.value.status);
-    if (parsed.value.@"error") |message| setAgentError(model, message) else model.agent_error_len = 0;
     reconcilePendingAgentPrompt(model, session_id);
+    return true;
+}
+
+pub fn projectAgentStateMetadata(
+    model: *Model,
+    task_id: ?[]const u8,
+    build: ?AgentBuildIdentityWire,
+    failure: ?AgentFailureWire,
+    legacy_error: ?[]const u8,
+) bool {
+    if (task_id) |value| {
+        if (!validOperationId(value)) return false;
+        @memcpy(model.agent_task_id_storage[0..value.len], value);
+        model.agent_task_id_len = value.len;
+    }
+    if (build) |identity| {
+        if (!validDiagnosticText(identity.version, max_agent_build_version_bytes) or
+            !validDiagnosticText(identity.source_commit, max_agent_source_commit_bytes)) return false;
+        @memcpy(model.agent_build_version_storage[0..identity.version.len], identity.version);
+        model.agent_build_version_len = identity.version.len;
+        @memcpy(model.agent_source_commit_storage[0..identity.source_commit.len], identity.source_commit);
+        model.agent_source_commit_len = identity.source_commit.len;
+    }
+    const wire = failure orelse {
+        clearAgentFailure(model);
+        if (legacy_error) |message| setAgentError(model, message) else model.agent_error_len = 0;
+        return true;
+    };
+    if (legacy_error) |message| {
+        if (!std.mem.eql(u8, message, wire.message)) return false;
+    }
+    const stage = parseAgentFailureStage(wire.stage) orelse return false;
+    const kind = parseAgentFailureKind(wire.kind) orelse return false;
+    const recovery = parseAgentFailureRecovery(wire.recovery) orelse return false;
+    const authority = parseAgentFailureAuthority(wire.authority) orelse return false;
+    if (wire.operation_id) |operation_id| {
+        if (!validOperationId(operation_id)) return false;
+    }
+    setAgentError(model, wire.message);
+    model.agent_failure_present = true;
+    model.agent_failure_stage = stage;
+    model.agent_failure_kind = kind;
+    model.agent_failure_recovery = recovery;
+    model.agent_failure_authority = authority;
+    model.agent_failure_retryable = wire.retryable;
+    model.agent_failure_operation_len = 0;
+    if (wire.operation_id) |operation_id| {
+        @memcpy(model.agent_failure_operation_storage[0..operation_id.len], operation_id);
+        model.agent_failure_operation_len = operation_id.len;
+    }
     return true;
 }
 
@@ -112,6 +177,7 @@ fn projectAgentExecutionContext(
     const causation_id = wire.causation_id orelse return false;
     const correlation_id = wire.correlation_id orelse return false;
     if (wire.event_id.len == 0 or
+        !validOperationId(correlation_id) or
         !std.mem.eql(u8, causation_id, correlation_id) or
         !std.mem.eql(u8, wire.payload.type, "agent_execution_context_recorded") or
         wire.payload.context.provider_id.len == 0 or
@@ -125,6 +191,18 @@ fn projectAgentExecutionContext(
         wire.payload.context.receipts.len > max_agent_execution_contexts)
     {
         return false;
+    }
+    if (wire.task_id) |task_id| {
+        if (!validOperationId(task_id) or
+            (model.agent_task_id_len > 0 and
+                !std.mem.eql(u8, model.agent_task_id_storage[0..model.agent_task_id_len], task_id))) return false;
+        if (model.agent_task_id_len == 0) {
+            @memcpy(model.agent_task_id_storage[0..task_id.len], task_id);
+            model.agent_task_id_len = task_id.len;
+        }
+    }
+    if (wire.operation_id) |operation_id| {
+        if (!validOperationId(operation_id)) return false;
     }
     for (wire.payload.context.receipts, 0..) |receipt, index| {
         if (receipt.schema_version != 1 or
@@ -176,6 +254,8 @@ fn projectAgentExecutionContext(
             .{model.agent_execution_context_count},
         ) catch return false;
     model.agent_execution_context_summary_len = summary.len;
+    @memcpy(model.agent_correlation_id_storage[0..correlation_id.len], correlation_id);
+    model.agent_correlation_id_len = correlation_id.len;
     return true;
 }
 
@@ -185,6 +265,47 @@ fn clearAgentExecutionContext(model: *Model, session_id: u8) void {
     model.agent_execution_context_session_id = session_id;
     model.agent_execution_context_expanded = false;
     model.agent_execution_context_summary_len = 0;
+    model.agent_correlation_id_len = 0;
+}
+
+fn parseAgentFailureStage(value: []const u8) ?AgentFailureStage {
+    if (std.mem.eql(u8, value, "provider")) return .provider;
+    if (std.mem.eql(u8, value, "mcp")) return .mcp;
+    if (std.mem.eql(u8, value, "approval")) return .approval;
+    if (std.mem.eql(u8, value, "compile")) return .compile;
+    if (std.mem.eql(u8, value, "artifact")) return .artifact;
+    if (std.mem.eql(u8, value, "turn")) return .turn;
+    return null;
+}
+
+fn parseAgentFailureKind(value: []const u8) ?AgentFailureKind {
+    if (std.mem.eql(u8, value, "user_rejected")) return .user_rejected;
+    if (std.mem.eql(u8, value, "user_cancelled")) return .user_cancelled;
+    if (std.mem.eql(u8, value, "policy_rejected")) return .policy_rejected;
+    if (std.mem.eql(u8, value, "runtime_failure")) return .runtime_failure;
+    if (std.mem.eql(u8, value, "invalid_response")) return .invalid_response;
+    return null;
+}
+
+fn parseAgentFailureRecovery(value: []const u8) ?AgentFailureRecovery {
+    if (std.mem.eql(u8, value, "retry_same_turn")) return .retry_same_turn;
+    if (std.mem.eql(u8, value, "restart_provider")) return .restart_provider;
+    if (std.mem.eql(u8, value, "review_approval")) return .review_approval;
+    if (std.mem.eql(u8, value, "refresh_provider")) return .refresh_provider;
+    return null;
+}
+
+fn parseAgentFailureAuthority(value: []const u8) ?AgentFailureAuthority {
+    if (std.mem.eql(u8, value, "proposal_only")) return .proposal_only;
+    if (std.mem.eql(u8, value, "rust_permission_broker")) return .rust_permission_broker;
+    return null;
+}
+
+fn validDiagnosticText(value: []const u8, maximum: usize) bool {
+    if (value.len == 0 or value.len > maximum) return false;
+    return for (value) |byte| {
+        if (byte < 0x20 or byte > 0x7e) break false;
+    } else true;
 }
 
 fn parseAgentExecutionMode(value: []const u8) ?AgentExecutionMode {
@@ -1070,10 +1191,16 @@ pub fn resetAgentProjection(model: *Model, session_id: u8) void {
     model.agent_document_revision = 0;
     model.agent_stream_sequence = 0;
     model.agent_turn_status = .idle;
+    clearAgentFailure(model);
+    model.agent_task_id_len = 0;
+    model.agent_correlation_id_len = 0;
+    model.agent_build_version_len = 0;
+    model.agent_source_commit_len = 0;
     model.agent_error_len = 0;
     model.agent_pending_operation_len = 0;
     model.agent_snapshot_resync_revision = 0;
     model.agent_permission_in_flight_session_id = 0;
+    model.agent_rejection_in_flight_session_id = 0;
     for (&model.agent_config_options) |*option| option.* = .{};
     for (&model.agent_commands) |*entry| entry.* = .{};
     model.agent_config_option_count = 0;
@@ -1093,9 +1220,22 @@ pub fn resetAgentProjection(model: *Model, session_id: u8) void {
 }
 
 pub fn setAgentError(model: *Model, message: []const u8) void {
+    clearAgentFailure(model);
     const length = utf8BoundedLength(message, model.agent_error_storage.len);
     @memcpy(model.agent_error_storage[0..length], message[0..length]);
     model.agent_error_len = length;
+    model.agent_diagnostic_len = 0;
+    model.agent_diagnostic_copy_state = .idle;
+}
+
+pub fn clearAgentFailure(model: *Model) void {
+    model.agent_failure_present = false;
+    model.agent_failure_stage = .turn;
+    model.agent_failure_kind = .runtime_failure;
+    model.agent_failure_recovery = .retry_same_turn;
+    model.agent_failure_authority = .proposal_only;
+    model.agent_failure_retryable = false;
+    model.agent_failure_operation_len = 0;
 }
 
 pub fn pendingAgentPrompt(model: *Model, session_id: u8) ?*PendingAgentPrompt {

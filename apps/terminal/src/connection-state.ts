@@ -39,6 +39,24 @@ export class TerminalConnectionState {
   }
 }
 
+export interface TerminalReconnectPresentation {
+  message: string;
+  visible: boolean;
+}
+
+export function terminalReconnectPresentation(
+  hasReachedReady: boolean,
+  delayMilliseconds: number,
+): TerminalReconnectPresentation {
+  if (hasReachedReady) return { message: "Reattaching…", visible: false };
+  return {
+    message: `Disconnected · retrying in ${
+      Math.round(delayMilliseconds / 100) / 10
+    }s`,
+    visible: true,
+  };
+}
+
 export function terminalAttachmentStorageKey(locationHref: string): string {
   const base = "hyper-term.terminal-attachment.v1";
   const tab = terminalSessionId(locationHref);

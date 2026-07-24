@@ -43,12 +43,16 @@ trap 'rm -rf "$hyper_staging_root"' EXIT
 hyper_staging_app="$hyper_staging_root/Hyper Term.app"
 
 cd "$hyper_repo_root"
+hyper_source_commit=${HYPER_TERM_SOURCE_COMMIT:-}
+if [[ -z "$hyper_source_commit" ]]; then
+  hyper_source_commit=$(git rev-parse HEAD)
+fi
 "$hyper_deno" task check
 "$hyper_deno" task test
 "$hyper_deno" task build:terminal
 "$hyper_deno" task build:workbench
 "$hyper_deno" task build:runtime
-cargo build \
+HYPER_TERM_SOURCE_COMMIT="$hyper_source_commit" cargo build \
   --locked \
   --release \
   --package hyper-term-daemon \

@@ -158,6 +158,10 @@ pub const BlockView = struct {
         return block.kind == .approval and block.decision == .none;
     }
 
+    pub fn wasRejected(block: *const BlockView) bool {
+        return block.kind == .approval and block.decision == .reject_once;
+    }
+
     pub fn canAllowOnce(block: *const BlockView) bool {
         return block.isApprovalPending() and block.allow_once_available and block.approval_detail_valid and
             (block.isBrokeredMcpReview() or block.isWorkspaceReview() or block.isTier2TerminalReview());

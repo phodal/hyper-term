@@ -150,7 +150,8 @@ smoke_cleanup() {
     echo "Hyper Term desktop smoke failed; supervisor log follows:" >&2
     grep -E 'ACP fixture|brokered GenUI|compile failed|timed out|Agent exited|provider' \
       "$smoke_log" | tail -n 40 >&2 || true
-    tail -n 80 "$smoke_log" >&2 || true
+    grep -Ev 'event="(gpu_surface_frame|timer|effects_wake)"' \
+      "$smoke_log" | tail -n 80 >&2 || true
     if [[ -n "$smoke_artifact_dir" ]]; then
       mkdir -p "$smoke_artifact_dir"
       cp "$smoke_log" "$smoke_artifact_dir/hyper-term-smoke.log"
@@ -557,8 +558,8 @@ PY
   native automate assert --timeout-ms 5000 'role=button name="Allowed once"'
   native automate assert --timeout-ms 30000 \
     'The Agentic UI was compiled by the brokered Deno runtime\.' \
-    'role=button name="Open Agent artifact editor".*enabled=true'
-  smoke_open_editor_id=$(smoke_widget_id 'role=button name="Open Agent artifact editor".*enabled=true')
+    'role=button name="Open Agent Artifact Workbench".*enabled=true'
+  smoke_open_editor_id=$(smoke_widget_id 'role=button name="Open Agent Artifact Workbench".*enabled=true')
   native automate widget-click hyper-term-canvas "$smoke_open_editor_id"
   native automate assert --timeout-ms 30000 \
     'name="Agent artifact editor"' \
@@ -613,9 +614,52 @@ PY
     'name="Agent artifact editor"' \
     'view @w1/hyper-term-genui-view'
   native automate assert \
-    'role=button name="Open Agent artifact editor".*enabled=true' \
+    'role=button name="Open Agent Artifact Workbench".*enabled=true' \
     'role=textbox name="Agent prompt".*focused=true'
   native automate assert --absent 'error event=' 'dispatch_errors=[1-9]'
+
+  # Exercise the recovery path on the same authenticated Agent session. A
+  # rejected GenUI proposal must not publish an Artifact, and the exact prompt
+  # must return to the composer so the user can review and resubmit it.
+  smoke_retry_prompt='Generate the Agentic UI'
+  smoke_composer_id=$(smoke_widget_id 'role=textbox name="Agent prompt".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_composer_id" set-text "$smoke_retry_prompt"
+  smoke_send_id=$(smoke_widget_id 'role=button name="Send prompt".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_send_id"
+  native automate assert --timeout-ms 30000 \
+    'Compile a bounded GenUI artifact with the supervised Deno runtime' \
+    'role=button name="Reject".*enabled=true'
+  native automate snapshot >/dev/null
+  smoke_reject_id=$(smoke_stable_latest_widget_id 'role=button name="Reject".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_reject_id" press
+  native automate assert --timeout-ms 30000 \
+    'Request rejected' \
+    'name="Agent failure recovery"' \
+    'The original prompt is restored\. Restart the provider, then retry this same turn\.' \
+    "role=textbox name=\"Agent prompt\".*enabled=true.*text=\"$smoke_retry_prompt\"" \
+    'role=button name="Copy redacted Agent diagnostics".*enabled=true' \
+    'role=button name="Review failed Agent approval".*enabled=true' \
+    'role=button name="Retry failed Agent turn".*enabled=true'
+  smoke_review_approval_id=$(smoke_widget_id 'role=button name="Review failed Agent approval".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_review_approval_id"
+  native automate assert \
+    'Request rejected' \
+    'The original prompt is restored in the composer so you can review and retry it\.'
+  smoke_retry_id=$(smoke_widget_id 'role=button name="Retry failed Agent turn".*enabled=true')
+  native automate widget-click hyper-term-canvas "$smoke_retry_id"
+  native automate assert --timeout-ms 30000 \
+    'role=button name="Allow once".*enabled=true'
+  native automate snapshot >/dev/null
+  smoke_allow_id=$(smoke_stable_latest_widget_id 'role=button name="Allow once".*enabled=true')
+  native automate widget-action hyper-term-canvas "$smoke_allow_id" press
+  native automate assert --timeout-ms 30000 \
+    'The Agentic UI was compiled by the brokered Deno runtime\.' \
+    'role=button name="Open Agent Artifact Workbench".*enabled=true' \
+    'role=textbox name="Agent prompt".*enabled=true'
+  native automate assert --absent \
+    'role=textbox name="Agent prompt".*text="Generate the Agentic UI"' \
+    'error event=' \
+    'dispatch_errors=[1-9]'
 
   native automate shortcut hyper-term.new-claude-acp-agent
   native automate assert \
@@ -793,7 +837,7 @@ PY
     'role=button name="Claude ACP tab 6.*".*state=.*selected' \
     'role=group name="Agent conversation"' \
     'role=group name="Recovered Agent history"' \
-    'History restored' \
+    'Conversation restored · provider restarted' \
     'Run the bounded terminal' \
     'Tier 2 terminal completed\.' \
     'role=button name="Allowed once"' \

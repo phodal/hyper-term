@@ -603,6 +603,10 @@ pub fn DesktopView(
                         }, .{
                             ui.text(.{ .wrap = true }, block.content()),
                             ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, decision),
+                            if (block.wasRejected())
+                                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "The original prompt is restored in the composer so you can review and retry it.")
+                            else
+                                ui.el(.stack, .{}, .{}),
                         })
                     else
                         ui.el(.stack, .{}, .{}),

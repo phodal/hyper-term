@@ -15,6 +15,7 @@ import {
 import {
   terminalAttachmentStorageKey,
   TerminalConnectionState,
+  terminalReconnectPresentation,
   terminalSessionId,
 } from "./connection-state.ts";
 import {
@@ -117,6 +118,7 @@ let afterSequence = 0n;
 let attachmentId = readAttachmentId();
 let transientStatusTimer: number | null = null;
 const connectionState = new TerminalConnectionState();
+let hasReachedReady = false;
 const terminalMetadata = new TerminalMetadataState();
 
 searchInput.addEventListener("input", () => findNext(true));
@@ -259,6 +261,7 @@ function receiveControl(message: TerminalWebServerControl): void {
         message.next_input_sequence,
         message.resize_generation,
       );
+      hasReachedReady = true;
       terminalMetadata.rebase(message.metadata_revision);
       publishMetadata(terminalMetadata.current());
       setStatus("Connected", false);
@@ -368,10 +371,8 @@ function scheduleReconnect(): void {
   if (reconnectTimer !== null) return;
   reconnectAttempt += 1;
   const delay = Math.min(4_000, 150 * 2 ** Math.min(reconnectAttempt, 5));
-  setStatus(
-    `Disconnected · retrying in ${Math.round(delay / 100) / 10}s`,
-    true,
-  );
+  const presentation = terminalReconnectPresentation(hasReachedReady, delay);
+  setStatus(presentation.message, presentation.visible);
   reconnectTimer = globalThis.setTimeout(() => {
     reconnectTimer = null;
     connect();

@@ -188,6 +188,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     });
 
     const reject = findByText(tree.root, .button, "Reject").?;
+    model.agent_pending_prompts[1].set("Retry the same GenUI request");
     main.update(&model, tree.msgForPointer(reject.id, .up).?, &fx);
     try testing.expect(model.agentPermissionBusy());
     const request = fx.pendingFetchAt(pendingFetchIndexByKey(&fx, main.agent_permission_effect_key_base + 2).?).?;
@@ -208,6 +209,7 @@ test "Agent snapshot renders trusted operation and approval blocks" {
     } }, &fx);
     try testing.expect(!model.agentPermissionBusy());
     try testing.expectEqual(main.AgentTurnStatus.running, model.agent_turn_status);
+    try testing.expectEqualStrings("Retry the same GenUI request", model.agentComposerText());
 
     const resolved_tree = try buildTree(arena_state.allocator(), &model);
     try testing.expect(findByLabel(resolved_tree.root, "Pending Agent approval actions") == null);
@@ -243,7 +245,7 @@ test "restored Agent history archives approvals from the previous runtime" {
     defer first_arena.deinit();
     const first_tree = try buildTree(first_arena.allocator(), &model);
     try testing.expect(findByLabel(first_tree.root, "Recovered Agent history") != null);
-    try testing.expect(containsText(first_tree.root, "History restored"));
+    try testing.expect(containsText(first_tree.root, "Conversation restored · provider restarted"));
     try testing.expect(containsText(first_tree.root, "Keep this after restart"));
     const archived = findByText(first_tree.root, .button, "Archived approval").?;
     try testing.expect(findByText(first_tree.root, .button, "Allow once") == null);
