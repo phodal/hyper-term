@@ -140,7 +140,7 @@
       <button size="sm" variant="outline" icon="plus" on-press="choose_terminal" disabled="{sessionLimitReached}" label="New Terminal tab">Terminal</button>
       <stack>
         <button-group gap="0" label="New Agent session">
-          <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" disabled="{sessionLimitReached}" label="New Agent tab">Agent</button>
+          <button size="sm" variant="outline" icon="circle-dot" on-press="choose_agent" disabled="{sessionLimitReached}" label="New Agent tab">New Agent</button>
           <button size="sm" variant="outline" icon="chevron-down" on-press="toggle_agent_provider_picker" disabled="{agentProviderPickerUnavailable}" label="Choose provider for a new Agent tab"></button>
         </button-group>
         <if test="{agent_provider_picker_open}">

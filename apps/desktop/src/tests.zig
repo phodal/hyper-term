@@ -371,7 +371,7 @@ test "session bar exposes direct Terminal and Agent creation" {
     fx.executor = .fake;
     var model = main.initialModel();
     var tree = try buildTree(arena, &model);
-    try testing.expectEqualStrings("Agent", findByLabel(tree.root, "New Agent tab").?.text);
+    try testing.expectEqualStrings("New Agent", findByLabel(tree.root, "New Agent tab").?.text);
     const terminal_tab = findByText(tree.root, .button, "zsh 1").?;
     const close_from_menu = tree.msgForContextMenu(terminal_tab.id, 0).?;
     switch (close_from_menu) {
