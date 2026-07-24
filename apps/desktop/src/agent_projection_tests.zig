@@ -1278,10 +1278,9 @@ test "Rust-verified Bug Capsule opens as a dedicated read-only Native tab" {
     try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &panes));
     model.terminal_webview_mounted = true;
     model.genui_webview_mounted = true;
-    try testing.expectEqual(@as(usize, 2), main.desktopPanes(&model, &panes));
-    try testing.expectEqualStrings(terminal_url ++ "&tab=1", panes[0].url);
-    try testing.expectEqualStrings(main.genui_view_anchor, panes[1].anchor.?);
-    try testing.expectEqualStrings(capsule_url, panes[1].url);
+    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
+    try testing.expectEqualStrings(main.genui_view_anchor, panes[0].anchor.?);
+    try testing.expectEqualStrings(capsule_url, panes[0].url);
 
     main.initializeModelWithDesktopServices(
         &model,
@@ -1348,10 +1347,7 @@ test "Agent tab switches preserve the mounted Terminal WebView namespace" {
     main.update(&model, .choose_agent, &fx);
     try testing.expectEqual(main.SessionMode.agent, model.activeSession().mode);
     try testing.expectEqualStrings(terminal_url ++ "&tab=1", model.terminalUrl());
-    try testing.expectEqual(@as(usize, 1), main.desktopPanes(&model, &panes));
-    try testing.expectEqualStrings(terminal_url ++ "&tab=1", panes[0].url);
-    try testing.expectEqual(@as(f32, 1), panes[0].frame.width);
-    try testing.expectEqual(@as(f32, 1), panes[0].frame.height);
+    try testing.expectEqual(@as(usize, 0), main.desktopPanes(&model, &panes));
 
     main.update(&model, .{ .select_session = 1 }, &fx);
     try testing.expectEqual(main.SessionMode.terminal, model.activeSession().mode);

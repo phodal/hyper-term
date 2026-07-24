@@ -43,6 +43,8 @@ const geometry = native_sdk.geometry;
 pub const canvas_label = "hyper-term-canvas";
 pub const terminal_view_label = "hyper-term-terminal-view";
 pub const terminal_view_anchor = "Terminal viewport";
+pub const terminal_active_layer: i32 = 20;
+pub const terminal_hidden_layer: i32 = -1;
 pub const genui_view_label = "hyper-term-genui-view";
 pub const genui_view_anchor = "Agent artifact editor viewport";
 pub const terminal_gateway_origin = "http://127.0.0.1:47437";
@@ -1383,14 +1385,18 @@ pub fn terminalPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize
 
 pub fn desktopPanes(model: *const Model, out: []HyperTermApp.WebViewPane) usize {
     var count: usize = 0;
-    if (model.terminal_webview_mounted and count < out.len) {
-        out[count] = if (model.isTerminal() and model.terminalReady()) .{
+    // An inactive Terminal remains mounted at its last full frame behind the
+    // opaque Native canvas. Omitting it here avoids shrinking a live WKWebView
+    // to 1x1, whose intermediate resize frames otherwise flash during tab
+    // switches. DeferredWebViewApp owns the corresponding layer projection.
+    if (model.terminal_webview_mounted and
+        model.isTerminal() and
+        model.terminalReady() and
+        count < out.len)
+    {
+        out[count] = .{
             .label = terminal_view_label,
             .anchor = terminal_view_anchor,
-            .url = model.terminalUrl(),
-        } else .{
-            .label = terminal_view_label,
-            .frame = geometry.RectF.init(0, 0, 1, 1),
             .url = model.terminalUrl(),
         };
         count += 1;
@@ -1489,6 +1495,7 @@ pub const DeferredWebViewApp = struct {
     acknowledged_attention: ?AgentAttention = null,
     focused_surface: FocusSurface = .none,
     focused_terminal_session_id: u8 = 0,
+    terminal_layer: ?i32 = null,
 
     pub fn init(app_state: *HyperTermApp) DeferredWebViewApp {
         return .{
@@ -1551,6 +1558,7 @@ pub const DeferredWebViewApp = struct {
 
         if (!self.mounting_enabled or self.primary_window_id == 0) return;
         try self.mountTerminal(runtime);
+        self.projectTerminalLayer(runtime);
         if (self.model.isCapsule() or self.model.hasAgentEditor()) {
             try self.mountGenUi(runtime);
         } else {
@@ -1601,16 +1609,35 @@ pub const DeferredWebViewApp = struct {
     fn mountTerminal(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) !void {
         if (self.model.terminal_webview_mounted) return;
         const url = if (self.model.terminalReady()) self.model.terminalUrl() else "zero://inline";
+        const layer = if (self.model.isTerminal()) terminal_active_layer else terminal_hidden_layer;
         _ = try runtime.createView(.{
             .window_id = self.primary_window_id,
             .label = terminal_view_label,
             .kind = .webview,
             .parent = canvas_label,
             .frame = geometry.RectF.init(0, 0, 1, 1),
-            .layer = 20,
+            .layer = layer,
             .url = url,
         });
         self.model.terminal_webview_mounted = true;
+        self.terminal_layer = layer;
+    }
+
+    /// Keeps the live Terminal WebView at its last layout frame and changes
+    /// only sibling ordering. The opaque GPU canvas covers the hidden layer,
+    /// while the active layer restores input and pixels without a WebKit
+    /// resize or navigation cycle.
+    fn projectTerminalLayer(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) void {
+        if (!self.model.terminal_webview_mounted) return;
+        const next = if (self.model.isTerminal()) terminal_active_layer else terminal_hidden_layer;
+        if (self.terminal_layer != null and self.terminal_layer.? == next) return;
+        _ = runtime.updateView(self.primary_window_id, terminal_view_label, .{
+            .layer = next,
+        }) catch |err| {
+            std.log.warn("native Terminal layer could not change: {s}", .{@errorName(err)});
+            return;
+        };
+        self.terminal_layer = next;
     }
 
     fn mountGenUi(self: *DeferredWebViewApp, runtime: *native_sdk.Runtime) !void {
