@@ -55,7 +55,7 @@ then let the Rust desktop supervisor own daemon and renderer lifetime:
 ```sh
 deno task build:terminal
 deno task build:workbench
-(cd apps/desktop && native build --release=fast)
+(cd apps/desktop && native build --release=fast -Dtrace=off)
 cargo run -p hyper-term-daemon --bin hyper-term-desktop -- \
   --ui "$PWD/apps/desktop/zig-out/bin/hyper-term" \
   --terminal-assets "$PWD/dist/terminal" \

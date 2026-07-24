@@ -13,6 +13,7 @@ real_genui=${HYPER_TERM_REAL_ACP_GENUI:-0}
 real_hostile=${HYPER_TERM_REAL_ACP_HOSTILE:-0}
 real_provider=${HYPER_TERM_REAL_ACP_PROVIDER:-codex}
 real_decision=${HYPER_TERM_REAL_ACP_DECISION:-allow_once}
+real_retry_after_reject=${HYPER_TERM_REAL_ACP_RETRY_AFTER_REJECT:-0}
 
 if [[ "$real_app" != /* ]]; then
   real_app="$PWD/$real_app"
@@ -42,6 +43,14 @@ if [[ "$real_decision" != allow_once && "$real_decision" != reject_once ]]; then
 fi
 if [[ "$real_decision" == reject_once && "$real_genui" != 1 ]]; then
   echo "HYPER_TERM_REAL_ACP_DECISION=reject_once requires HYPER_TERM_REAL_ACP_GENUI=1" >&2
+  exit 1
+fi
+if [[ "$real_retry_after_reject" != 0 && "$real_retry_after_reject" != 1 ]]; then
+  echo "HYPER_TERM_REAL_ACP_RETRY_AFTER_REJECT must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$real_retry_after_reject" == 1 && "$real_decision" != reject_once ]]; then
+  echo "HYPER_TERM_REAL_ACP_RETRY_AFTER_REJECT=1 requires HYPER_TERM_REAL_ACP_DECISION=reject_once" >&2
   exit 1
 fi
 if [[ "$real_hostile" == 1 && "$real_decision" != allow_once ]]; then
@@ -299,17 +308,52 @@ real_pid=$!
     'error event=' \
     'dispatch_errors=[1-9]'
 
+  if [[ "$real_retry_after_reject" == 1 ]]; then
+    native automate assert \
+      "role=textbox name=\"Agent prompt\".*enabled=true.*$real_expected" \
+      'role=button name="Send prompt".*enabled=true'
+    real_retry_id=$(real_widget_id 'role=button name="Retry failed Agent turn".*enabled=true')
+    if [[ -n "$real_retry_id" ]]; then
+      native automate widget-action hyper-term-canvas "$real_retry_id" press
+    elif ! real_widget_action_retry \
+      'role=button name="Send prompt".*enabled=true' \
+      press; then
+      echo "real $real_provider_label rejected GenUI turn could not be retried" >&2
+      exit 1
+    fi
+    native automate assert --timeout-ms 30000 'role=button name="Stop Agent turn"'
+    native automate assert --timeout-ms 120000 \
+      'Approval required' \
+      'role=button name="Allow once".*enabled=true'
+    real_retry_allow_id=$(real_widget_id 'role=button name="Allow once".*enabled=true')
+    if [[ -z "$real_retry_allow_id" ]]; then
+      echo "real $real_provider_label retry approval is unavailable" >&2
+      exit 1
+    fi
+    native automate widget-action hyper-term-canvas "$real_retry_allow_id" press
+    native automate assert --timeout-ms 150000 \
+      "$real_expected" \
+      'role=textbox name="Agent prompt".*enabled=true' \
+      'role=button name="Send prompt".*enabled=true'
+    native automate assert --absent \
+      'role=button name="Stop Agent turn"' \
+      'invalid ACP message:' \
+      'error event=' \
+      'dispatch_errors=[1-9]'
+  fi
+
   python3 - \
     "$real_root/state/events.jsonl" \
     "$real_expected" \
     "$real_genui" \
-    "$real_decision" <<'PY'
+    "$real_decision" \
+    "$real_retry_after_reject" <<'PY'
 import collections
 import json
 import pathlib
 import sys
 
-events_path, expected, genui, decision = sys.argv[1:]
+events_path, expected, genui, decision, retry_after_reject = sys.argv[1:]
 events = [
     json.loads(line)
     for line in pathlib.Path(events_path).read_text().splitlines()
@@ -317,7 +361,7 @@ events = [
 ]
 payloads = [event.get("payload", {}) for event in events]
 
-if decision == "allow_once":
+if decision == "allow_once" or retry_after_reject == "1":
     messages = collections.defaultdict(str)
     for payload in payloads:
         if payload.get("type") == "message_appended" and payload.get("role") == "agent":
@@ -344,25 +388,40 @@ if decision == "reject_once":
         for payload in payloads
     ):
         raise SystemExit("rejected GenUI operation did not enter cancelled state")
-    if any(payload.get("type") == "artifact_accepted" for payload in payloads):
-        raise SystemExit("rejected GenUI operation accepted an artifact")
-    if any(
-        payload.get("type") == "operation_receipt" and payload.get("succeeded") is True
-        for payload in payloads
-    ):
-        raise SystemExit("rejected GenUI operation produced a successful receipt")
+    if retry_after_reject == "1":
+        if not any(
+            payload.get("type") == "permission_decided"
+            and payload.get("decision") == "allow_once"
+            for payload in payloads
+        ):
+            raise SystemExit("retried GenUI operation did not record allow_once")
+        if not any(payload.get("type") == "artifact_accepted" for payload in payloads):
+            raise SystemExit("retried GenUI operation did not accept an artifact")
+        if not any(
+            payload.get("type") == "operation_receipt" and payload.get("succeeded") is True
+            for payload in payloads
+        ):
+            raise SystemExit("retried GenUI operation produced no successful receipt")
+    else:
+        if any(payload.get("type") == "artifact_accepted" for payload in payloads):
+            raise SystemExit("rejected GenUI operation accepted an artifact")
+        if any(
+            payload.get("type") == "operation_receipt" and payload.get("succeeded") is True
+            for payload in payloads
+        ):
+            raise SystemExit("rejected GenUI operation produced a successful receipt")
 PY
 
-  if [[ "$real_genui" == 1 && "$real_decision" == allow_once ]]; then
+  if [[ "$real_genui" == 1 && ("$real_decision" == allow_once || "$real_retry_after_reject" == 1) ]]; then
     native automate assert 'succeeded' 'Allowed once'
     grep -q '"type":"artifact_accepted"' "$real_root/state/events.jsonl"
     grep -q '"executor":"hyper-term-daemon","succeeded":true' \
       "$real_root/state/events.jsonl"
 
     native automate assert --timeout-ms 30000 \
-      'role=button name="Open Agent artifact editor".*enabled=true'
+      'role=button name="Open Agent Artifact Workbench".*enabled=true'
     real_editor_id=$(real_widget_id \
-      'role=button name="Open Agent artifact editor".*enabled=true')
+      'role=button name="Open Agent Artifact Workbench".*enabled=true')
     if [[ -z "$real_editor_id" ]]; then
       echo "real $real_provider_label artifact editor control is unavailable" >&2
       exit 1
@@ -546,7 +605,9 @@ PY
 
 real_copy_evidence
 
-if [[ "$real_decision" == reject_once ]]; then
+if [[ "$real_retry_after_reject" == 1 ]]; then
+  echo "real $real_provider_label GenUI rejection and same-prompt retry smoke passed: $real_expected"
+elif [[ "$real_decision" == reject_once ]]; then
   echo "real $real_provider_label GenUI rejection smoke passed"
 elif [[ "$real_genui" == 1 ]]; then
   echo "real $real_provider_label GenUI desktop smoke passed: $real_expected"

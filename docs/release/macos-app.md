@@ -121,7 +121,7 @@ For example, after packaging the app and building the explicitly
 automation-enabled test renderer:
 
 ```bash
-(cd apps/desktop && native build -Dautomation=true)
+(cd apps/desktop && native build --release=fast -Dautomation=true -Dtrace=off)
 HYPER_TERM_REAL_ACP_GENUI=1 \
 ./scripts/smoke_macos_real_codex.sh \
   "dist/macos/Hyper Term.app" \
@@ -129,6 +129,14 @@ HYPER_TERM_REAL_ACP_GENUI=1 \
 
 HYPER_TERM_REAL_ACP_PROVIDER=claude \
 HYPER_TERM_REAL_ACP_GENUI=1 \
+./scripts/smoke_macos_real_codex_acp.sh \
+  "dist/macos/Hyper Term.app" \
+  "apps/desktop/zig-out/bin/hyper-term"
+
+# Prove rejection keeps the exact prompt, then retry and approve it.
+HYPER_TERM_REAL_ACP_GENUI=1 \
+HYPER_TERM_REAL_ACP_DECISION=reject_once \
+HYPER_TERM_REAL_ACP_RETRY_AFTER_REJECT=1 \
 ./scripts/smoke_macos_real_codex_acp.sh \
   "dist/macos/Hyper Term.app" \
   "apps/desktop/zig-out/bin/hyper-term"
@@ -238,3 +246,39 @@ The stable part of the tag must match the Cargo workspace and
 tag with a suffix such as `v0.1.0-rc.1` creates a pre-release from application
 version `0.1.0`. Re-running the workflow replaces the assets for an existing
 release.
+
+## Manual upgrade and rollback
+
+The Alpha has no in-app updater. Install only a versioned archive and the
+`SHA256SUMS` file from the same GitHub Release. Select the archive for the
+machine architecture, then verify it before opening or replacing an app:
+
+```bash
+archive="Hyper-Term-0.1.0-macos-arm64.zip"
+grep -F "  $archive" SHA256SUMS | shasum -a 256 -c -
+```
+
+For a stable release, unpack into a temporary directory and require both Apple
+checks before installation:
+
+```bash
+staging="$(mktemp -d /tmp/hyper-term-upgrade.XXXXXX)"
+ditto -x -k "$archive" "$staging"
+codesign --verify --deep --strict --verbose=2 "$staging/Hyper Term.app"
+spctl --assess --type execute --verbose=4 "$staging/Hyper Term.app"
+```
+
+Quit Hyper Term before changing the application or its state. Back up
+`~/Library/Application Support/Hyper Term`, keep the currently working
+`Hyper Term.app` as `Hyper Term.previous.app`, and only then install the verified
+bundle. Do not overwrite the previous app until the new version has launched,
+restored its Terminal and Agent state, and completed the required provider and
+Workbench smoke for that release.
+
+To roll back, quit the failed version, preserve it under another name, and move
+`Hyper Term.previous.app` back to `Hyper Term.app`. Start with the current state
+directory because journals and artifacts are validated on reopen. If the older
+binary rejects that state or restores an incorrect layout, quit it and restore
+the pre-upgrade state backup before relaunching. A rollback is therefore a pair:
+the previous verified application archive plus the matching state snapshot;
+the project does not claim arbitrary backward-compatible state migrations.

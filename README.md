@@ -103,7 +103,7 @@ Build the Terminal, Workbench, and native application:
 ```bash
 deno task build:terminal
 deno task build:workbench
-(cd apps/desktop && native build --release=fast)
+(cd apps/desktop && native build --release=fast -Dtrace=off)
 ```
 
 Build the static Web Renderer Kit separately when embedding the same Terminal

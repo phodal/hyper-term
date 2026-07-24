@@ -199,7 +199,7 @@ jobs:
         run: |
           native check --strict
           native test
-          native build --release=fast -Dautomation=true
+          native build --release=fast -Dautomation=true -Dtrace=off
 
       - name: Run the integrated macOS desktop smoke
         env:
@@ -424,7 +424,7 @@ jobs:
         working-directory: apps/desktop
         run: |
           set -euo pipefail
-          native build --release=fast
+          native build --release=fast -Dtrace=off
           native package \
             --target macos \
             --binary zig-out/bin/hyper-term \

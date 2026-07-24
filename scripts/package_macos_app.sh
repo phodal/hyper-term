@@ -33,7 +33,7 @@ if [[ -z "$hyper_deno" || ! -x "$hyper_deno" ]]; then
   echo "Deno 2.9.3 is required; set HYPER_TERM_DENO to its executable" >&2
   exit 1
 fi
-if [[ $($hyper_deno --version | head -n 1) != "deno 2.9.3"* ]]; then
+if [[ $("$hyper_deno" --version | head -n 1) != "deno 2.9.3"* ]]; then
   echo "Hyper Term packaging requires the pinned Deno 2.9.3 runtime" >&2
   exit 1
 fi
@@ -62,7 +62,7 @@ HYPER_TERM_SOURCE_COMMIT="$hyper_source_commit" cargo build \
 cd "$hyper_repo_root/apps/desktop"
 native check --strict
 native test
-native build --release=fast
+native build --release=fast -Dtrace=off
 native package \
   --target macos \
   --output "$hyper_staging_app" \

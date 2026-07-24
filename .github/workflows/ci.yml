@@ -142,7 +142,7 @@ jobs:
         run: |
           native check --strict
           native test
-          native build --release=fast -Dautomation=true
+          native build --release=fast -Dautomation=true -Dtrace=off
 
       - name: Run integrated macOS desktop smokes
         env:
